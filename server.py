@@ -18,18 +18,15 @@ def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Thiếu hoặc sai token xác thực.")
     
     client_token = authorization.split(" ")[1]
-    print(f"Đang xử lý request từ khách hàng token: {client_token}")
 
     if not MASTER_API_KEY:
         raise HTTPException(status_code=500, detail="Server chưa nhận được GEMINI_API_KEY từ biến môi trường.")
 
-    # Danh sách các mô hình và phiên bản API ưu tiên để tự động quét phòng trường hợp Google cập nhật
+    # Danh sách ưu tiên lựa chọn giữa phiên bản 3.6 và 2.5
     models_to_try = [
-        "gemini-1.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro"
+        "gemini-3.6-flash",
+        "gemini-2.5-flash"
     ]
-    api_versions = ["v1", "v1beta"]
 
     # Định dạng lại lịch sử chat
     contents = []
@@ -44,31 +41,27 @@ def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
     response_data = None
     last_error = ""
 
-    # Vòng lặp thông minh tự động tìm phiên bản và model hoạt động tốt nhất
-    for version in api_versions:
-        for model in models_to_try:
-            gemini_url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={MASTER_API_KEY}"
-            headers = {"Content-Type": "application/json"}
+    # Tự động quét và chọn phiên bản khả dụng trong 2 bản 3.6 hoặc 2.5
+    for model in models_to_try:
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={MASTER_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        
+        try:
+            response = requests.post(gemini_url, json=payload, headers=headers, timeout=20)
+            res_data = response.json()
             
-            try:
-                response = requests.post(gemini_url, json=payload, headers=headers, timeout=20)
-                res_data = response.json()
-                
-                # Nếu gọi thành công và có kết quả trả về hợp lệ thì dừng vòng lặp
-                if "error" not in res_data and "candidates" in res_data and len(res_data["candidates"]) > 0:
-                    response_data = res_data
-                    break
-                else:
-                    if "error" in res_data:
-                        last_error = res_data["error"].get("message", "Unknown error")
-            except Exception as e:
-                last_error = str(e)
-                continue
-        if response_data:
-            break
+            if "error" not in res_data and "candidates" in res_data and len(res_data["candidates"]) > 0:
+                response_data = res_data
+                break
+            else:
+                if "error" in res_data:
+                    last_error = res_data["error"].get("message", "Unknown error")
+        except Exception as e:
+            last_error = str(e)
+            continue
 
     if not response_data:
-        raise HTTPException(status_code=400, detail=f"Gemini từ chối tất cả cấu hình. Lỗi cuối: {last_error}")
+        raise HTTPException(status_code=400, detail=f"Gemini từ chối cả hai phiên bản 3.6 và 2.5. Lỗi: {last_error}")
 
     try:
         answer = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
