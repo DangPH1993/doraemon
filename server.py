@@ -23,13 +23,14 @@ def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
     if not MASTER_API_KEY:
         raise HTTPException(status_code=500, detail="Server chưa nhận được GEMINI_API_KEY từ biến môi trường.")
 
-    # Sử dụng lại v1beta kết hợp với ?key= xác thực chuẩn xác
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={MASTER_API_KEY}"
-    
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
+    # Danh sách các mô hình và phiên bản API ưu tiên để tự động quét phòng trường hợp Google cập nhật
+    models_to_try = [
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro"
+    ]
+    api_versions = ["v1", "v1beta"]
+
     # Định dạng lại lịch sử chat
     contents = []
     for msg in req.chat_history:
@@ -40,25 +41,40 @@ def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
         "contents": contents
     }
 
-    try:
-        response = requests.post(gemini_url, json=payload, headers=headers, timeout=30)
-        res_data = response.json()
-        
-        # Kiểm tra lỗi trả về từ Google
-        if "error" in res_data:
-            err_msg = res_data["error"].get("message", "Lỗi không xác định từ Google")
-            raise HTTPException(status_code=400, detail=f"Gemini từ chối: {err_msg}")
-        
-        if "candidates" not in res_data or len(res_data["candidates"]) == 0:
-            raise HTTPException(status_code=500, detail="Google không trả về kết quả.")
+    response_data = None
+    last_error = ""
+
+    # Vòng lặp thông minh tự động tìm phiên bản và model hoạt động tốt nhất
+    for version in api_versions:
+        for model in models_to_try:
+            gemini_url = f"https://generativelanguage.googleapis.com/{version}/models/{model}:generateContent?key={MASTER_API_KEY}"
+            headers = {"Content-Type": "application/json"}
             
-        answer = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            try:
+                response = requests.post(gemini_url, json=payload, headers=headers, timeout=20)
+                res_data = response.json()
+                
+                # Nếu gọi thành công và có kết quả trả về hợp lệ thì dừng vòng lặp
+                if "error" not in res_data and "candidates" in res_data and len(res_data["candidates"]) > 0:
+                    response_data = res_data
+                    break
+                else:
+                    if "error" in res_data:
+                        last_error = res_data["error"].get("message", "Unknown error")
+            except Exception as e:
+                last_error = str(e)
+                continue
+        if response_data:
+            break
+
+    if not response_data:
+        raise HTTPException(status_code=400, detail=f"Gemini từ chối tất cả cấu hình. Lỗi cuối: {last_error}")
+
+    try:
+        answer = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
         return {"status": "success", "response": answer}
-        
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống proxy: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Lỗi phân tích dữ liệu trả về: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
