@@ -1,74 +1,62 @@
-import os
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Header, HTTPException, Depends
 from pydantic import BaseModel
-import requests
+import os
+import google.generativeai as genai
 
 app = FastAPI()
 
-# Đọc API Key từ biến môi trường trên Render
-MASTER_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# 1. Danh sách các Client Token được cấp cho khách hàng của bạn
+# Bạn có thể tự thêm hoặc xóa token của khách tại đây
+VALID_TOKENS = {
+    "DORA_VIP_001": {"client_name": "Nguyễn Văn A", "status": "active"},
+    "DORA_VIP_002": {"client_name": "Trần Thị B", "status": "active"}
+}
 
-class ProxyRequest(BaseModel):
+# 2. Hàm xác thực Token từ phía client gửi lên
+def verify_token(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Thiếu Client Token xác thực!")
+    
+    parts = authorization.split(" ")
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Định dạng Token không hợp lệ!")
+    
+    token = parts[1]
+    if token not in VALID_TOKENS or VALID_TOKENS[token]["status"] != "active":
+        raise HTTPException(status_code=403, detail="Client Token không tồn tại hoặc đã bị khóa!")
+    
+    return VALID_TOKENS[token]
+
+class ChatRequest(BaseModel):
     prompt: str
     chat_history: list = []
 
+# 3. Endpoint nhận tin nhắn từ ứng dụng của khách hàng
 @app.post("/api/proxy-chat")
-def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Thiếu hoặc sai token xác thực.")
-    
-    client_token = authorization.split(" ")[1]
-
-    if not MASTER_API_KEY:
-        raise HTTPException(status_code=500, detail="Server chưa nhận được GEMINI_API_KEY từ biến môi trường.")
-
-    # Danh sách ưu tiên lựa chọn giữa phiên bản 3.6 và 2.5
-    models_to_try = [
-        "gemini-3.6-flash",
-        "gemini-2.5-flash"
-    ]
-
-    # Định dạng lại lịch sử chat
-    contents = []
-    for msg in req.chat_history:
-        contents.append(msg)
-    contents.append({"role": "user", "parts": [{"text": req.prompt}]})
-
-    payload = {
-        "contents": contents
-    }
-
-    response_data = None
-    last_error = ""
-
-    # Tự động quét và chọn phiên bản khả dụng trong 2 bản 3.6 hoặc 2.5
-    for model in models_to_try:
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={MASTER_API_KEY}"
-        headers = {"Content-Type": "application/json"}
-        
-        try:
-            response = requests.post(gemini_url, json=payload, headers=headers, timeout=20)
-            res_data = response.json()
-            
-            if "error" not in res_data and "candidates" in res_data and len(res_data["candidates"]) > 0:
-                response_data = res_data
-                break
-            else:
-                if "error" in res_data:
-                    last_error = res_data["error"].get("message", "Unknown error")
-        except Exception as e:
-            last_error = str(e)
-            continue
-
-    if not response_data:
-        raise HTTPException(status_code=400, detail=f"Gemini từ chối cả hai phiên bản 3.6 và 2.5. Lỗi: {last_error}")
-
+async def proxy_chat(data: ChatRequest, client_info: dict = Depends(verify_token)):
     try:
-        answer = response_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return {"status": "success", "response": answer}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi phân tích dữ liệu trả về: {str(e)}")
+        # Ghi log nhẹ để biết khách hàng nào đang gọi
+        print(f"Khách hàng đang tương tác: {client_info['client_name']}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+        # Lấy API Key của Google Gemini từ biến môi trường trên Render
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="Server chưa cấu hình GEMINI_API_KEY!")
+
+        genai.configure(api_key=api_key)
+        
+        # Khởi tạo mô hình Gemini
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        # Gửi kèm lịch sử trò chuyện để AI nhớ ngữ cảnh
+        chat = model.start_chat(history=data.chat_history)
+        response = chat.send_message(data.prompt)
+
+        return {"response": response.text}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi từ server: {str(e)}")
+
+@app.get("/")
+def home():
+    return {"status": "Doraemon Proxy Server is running!"}
