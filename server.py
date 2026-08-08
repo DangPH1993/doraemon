@@ -23,8 +23,8 @@ def proxy_chat(req: ProxyRequest, authorization: str = Header(None)):
     if not MASTER_API_KEY:
         raise HTTPException(status_code=500, detail="Server chưa nhận được GEMINI_API_KEY từ biến môi trường.")
 
-    # Đã đổi từ v1beta sang v1 để tương thích chuẩn với model gemini-1.5-flash
-    gemini_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={MASTER_API_KEY}"
+    # Sử dụng lại v1beta kết hợp với ?key= xác thực chuẩn xác
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={MASTER_API_KEY}"
     
     headers = {
         "Content-Type": "application/json"
