@@ -292,7 +292,7 @@ Nhiệm vụ:
         # 6. Generate final answer
         # ----------------------------------------------------
         response = gemini.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=contents
         )
 
