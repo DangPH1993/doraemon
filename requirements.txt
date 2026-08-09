@@ -1,5 +1,10 @@
 fastapi
 uvicorn
-pydantic
 google-generativeai
-requests
+pydantic
+pinecone
+langchain
+langchain-google-genai
+langchain-community
+langchain-text-splitters
+pypdf
