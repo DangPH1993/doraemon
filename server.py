@@ -394,7 +394,7 @@ button.gray{background:#666}button.red{background:#d93025}
 </main>
 
 <script>
-let pw="", ws=null, wsToken="", selectedUser=null;
+let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null;
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
@@ -414,6 +414,7 @@ async function login(){
     document.getElementById("panel").style.display="block";
     await loadUsers();
     connectWS();
+    startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
 async function loadUsers(){
@@ -441,6 +442,7 @@ async function selectUser(id,nickname){
   document.getElementById("chatInput").disabled=false;
   document.getElementById("sendBtn").disabled=false;
   document.getElementById("messages").innerHTML="";
+  seenMessageIds=new Set();
   await loadUsers();
   try{
     const d=await api("/admin/api/chat/history?user_id="+id+"&password="+encodeURIComponent(pw));
@@ -448,6 +450,11 @@ async function selectUser(id,nickname){
   }catch(e){addMessage({sender:"system",message:"Lỗi tải lịch sử: "+e.message})}
 }
 function addMessage(m){
+  if(m && m.id !== undefined && m.id !== null){
+    const id=String(m.id);
+    if(seenMessageIds.has(id)) return;
+    seenMessageIds.add(id);
+  }
   const box=document.getElementById("messages");
   const div=document.createElement("div");
   div.className="msg "+(m.sender==="admin"?"admin":"user");
@@ -455,6 +462,21 @@ function addMessage(m){
   const when=m.created_at?new Date(m.created_at).toLocaleString("vi-VN"):"";
   div.innerHTML="<b>"+who+"</b><br>"+esc(m.message)+"<div class='meta'>"+when+"</div>";
   box.appendChild(div); box.scrollTop=box.scrollHeight;
+}
+async function pollSelectedChat(){
+  if(!selectedUser || !pw) return;
+  try{
+    const d=await api("/admin/api/chat/history?user_id="+selectedUser+"&password="+encodeURIComponent(pw)+"&limit=200");
+    d.messages.forEach(addMessage);
+  }catch(e){
+    console.log("Admin chat polling:",e.message);
+  }
+}
+function startChatPolling(){
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer=setInterval(()=>{
+    pollSelectedChat();
+  },1000);
 }
 function connectWS(){
   if(ws && ws.readyState===WebSocket.OPEN)return;
