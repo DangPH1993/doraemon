@@ -5,6 +5,7 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -18,6 +19,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_RENDER")
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
+ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
 GEMINI_MODEL = "gemini-3.6-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
@@ -321,6 +323,97 @@ Nội dung giáo trình:
         config=types.GenerateContentConfig(temperature=0.2)
     )
     return {"reply": response.text or "", "model": GEMINI_MODEL}
+
+
+def check_admin(password: str):
+    expected = os.getenv("ADMIN_PANEL_PASSWORD", os.getenv("ADMIN_WS_TOKEN", ""))
+    if not expected or password != expected:
+        raise HTTPException(401, "Admin password không đúng.")
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel():
+    return HTMLResponse("""<!doctype html><html lang="vi"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Doraemon Admin</title>
+<style>
+body{font-family:Arial;margin:0;background:#f4f6f8}header{background:#1677ff;color:#fff;padding:18px;font-size:22px;font-weight:bold}
+main{max-width:1200px;margin:20px auto;padding:15px}.card{background:#fff;padding:18px;border-radius:12px;margin-bottom:18px}
+input,button{padding:9px;border-radius:7px;border:1px solid #ccc}button{background:#1677ff;color:#fff;border:0;cursor:pointer}
+table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #eee;text-align:left}
+.active{color:green}.pending{color:#c87900}.locked{color:red}
+</style></head><body><header>🤖 Doraemon Admin</header><main>
+<div class="card" id="login"><h3>Đăng nhập Admin</h3>
+<input id="pw" type="password" placeholder="Mật khẩu Admin">
+<button onclick="login()">Đăng nhập</button><span id="err"></span></div>
+<div id="panel" style="display:none"><div class="card"><button onclick="loadUsers()">🔄 Làm mới</button>
+<span id="count"></span></div><div class="card"><table><thead><tr>
+<th>ID</th><th>Nickname</th><th>SĐT</th><th>Trạng thái</th><th>Gói</th><th>Hết hạn</th><th>Thao tác</th>
+</tr></thead><tbody id="users"></tbody></table></div></div></main>
+<script>
+let pw="";
+function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+async function api(u,o={}){o.headers={"Content-Type":"application/json",...(o.headers||{})};let r=await fetch(u,o),t=await r.text(),d={};try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw Error(d.detail||"Lỗi");return d}
+async function login(){pw=document.getElementById("pw").value;try{await api("/admin/api/users?password="+encodeURIComponent(pw));document.getElementById("login").style.display="none";document.getElementById("panel").style.display="block";loadUsers()}catch(e){document.getElementById("err").textContent=e.message}}
+async function loadUsers(){let d=await api("/admin/api/users?password="+encodeURIComponent(pw));document.getElementById("count").textContent=" Tổng: "+d.users.length;document.getElementById("users").innerHTML=d.users.map(u=>{let s=u.subscription||{},st=u.status||"PENDING",c=st==="ACTIVE"?"active":st==="LOCKED"?"locked":"pending",ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";return `<tr><td>${u.id}</td><td>${esc(u.nickname)}</td><td>${esc(u.phone)}</td><td class="${c}"><b>${st}</b></td><td>${esc(s.plan||"-")}</td><td>${ex}</td><td><button onclick="act(${u.id},1)">1 tháng</button> <button onclick="act(${u.id},3)">3 tháng</button> <button onclick="act(${u.id},12)">12 tháng</button> <button onclick="lock(${u.id})">Khóa</button></td></tr>`}).join("")}
+async function act(id,m){if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});loadUsers()}
+async function lock(id){if(!confirm("Khóa tài khoản?"))return;await api("/admin/api/users/"+id+"/status",{method:"POST",body:JSON.stringify({password:pw,status:"LOCKED"})});loadUsers()}
+</script></body></html>""")
+
+@app.get("/admin/api/users")
+def admin_users(password: str):
+    check_admin(password)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
+                    s.id subscription_id,s.plan,s.started_at,s.expires_at,s.status subscription_status
+                    FROM users u LEFT JOIN LATERAL
+                    (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
+                    ORDER BY u.id DESC""")
+            rows=cur.fetchall()
+    finally: conn.close()
+    return {"users":[{"id":r["id"],"phone":r["phone"],"nickname":r["nickname"],"status":r["status"],
+        "created_at":r["created_at"],
+        "subscription":None if r["subscription_id"] is None else
+        {"id":r["subscription_id"],"plan":r["plan"],"started_at":r["started_at"],
+         "expires_at":r["expires_at"],"status":r["subscription_status"]}} for r in rows]}
+
+@app.post("/admin/api/users/{user_id}/activate")
+def admin_activate(user_id:int,data:dict):
+    check_admin(str(data.get("password",""))); months=int(data.get("months",1))
+    if months not in (1,3,6,12): raise HTTPException(400,"Thời hạn phải 1, 3, 6 hoặc 12 tháng.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
+            if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
+            cur.execute("SELECT id,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
+            old=cur.fetchone(); now=datetime.now(timezone.utc)
+            start=old["expires_at"] if old and old["expires_at"] and old["expires_at"]>now else now
+            exp=start+timedelta(days=30*months)
+            if old:
+                cur.execute("UPDATE subscriptions SET plan=%s,started_at=COALESCE(started_at,%s),expires_at=%s,status='ACTIVE' WHERE id=%s",
+                            ("N5",now,exp,old["id"]))
+            else:
+                cur.execute("INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,'N5',%s,%s,'ACTIVE')",
+                            (user_id,now,exp))
+            cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
+        conn.commit()
+    finally: conn.close()
+    return {"success":True,"expires_at":exp}
+
+@app.post("/admin/api/users/{user_id}/status")
+def admin_status(user_id:int,data:dict):
+    check_admin(str(data.get("password",""))); status=str(data.get("status","")).upper()
+    if status not in ("ACTIVE","LOCKED","PENDING"): raise HTTPException(400,"Trạng thái không hợp lệ.")
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET status=%s WHERE id=%s",(status,user_id))
+            if cur.rowcount==0: raise HTTPException(404,"Không tìm thấy user.")
+        conn.commit()
+    finally: conn.close()
+    return {"success":True,"status":status}
 
 @app.get("/health")
 def health():
