@@ -20,7 +20,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 INDEX_NAME = os.getenv("PINECONE_INDEX", "doraemon")
-NAMESPACE = os.getenv("PINECONE_NAMESPACE", "japanese_n5")
+NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
 
 # Nếu đặt CLIENT_TOKEN trên Render thì server sẽ kiểm tra token.
 # Nếu để trống, server không bắt buộc token.
