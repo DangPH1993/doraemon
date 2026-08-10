@@ -332,32 +332,166 @@ def check_admin(password: str):
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
-    return HTMLResponse("""<!doctype html><html lang="vi"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    return HTMLResponse("""<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Doraemon Admin</title>
 <style>
-body{font-family:Arial;margin:0;background:#f4f6f8}header{background:#1677ff;color:#fff;padding:18px;font-size:22px;font-weight:bold}
-main{max-width:1200px;margin:20px auto;padding:15px}.card{background:#fff;padding:18px;border-radius:12px;margin-bottom:18px}
-input,button{padding:9px;border-radius:7px;border:1px solid #ccc}button{background:#1677ff;color:#fff;border:0;cursor:pointer}
-table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #eee;text-align:left}
-.active{color:green}.pending{color:#c87900}.locked{color:red}
-</style></head><body><header>🤖 Doraemon Admin</header><main>
-<div class="card" id="login"><h3>Đăng nhập Admin</h3>
-<input id="pw" type="password" placeholder="Mật khẩu Admin">
-<button onclick="login()">Đăng nhập</button><span id="err"></span></div>
-<div id="panel" style="display:none"><div class="card"><button onclick="loadUsers()">🔄 Làm mới</button>
-<span id="count"></span></div><div class="card"><table><thead><tr>
-<th>ID</th><th>Nickname</th><th>SĐT</th><th>Trạng thái</th><th>Gói</th><th>Hết hạn</th><th>Thao tác</th>
-</tr></thead><tbody id="users"></tbody></table></div></div></main>
+*{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;color:#222}
+header{background:#1677ff;color:#fff;padding:18px 24px;font-size:22px;font-weight:700}
+main{max-width:1250px;margin:20px auto;padding:0 15px}
+.card{background:#fff;padding:18px;border-radius:12px;margin-bottom:18px;box-shadow:0 2px 10px #0001}
+input,button{padding:9px;border-radius:7px;border:1px solid #ccc}
+button{background:#1677ff;color:#fff;border:0;cursor:pointer}
+button.gray{background:#666}button.red{background:#d93025}
+#login{max-width:420px;margin:60px auto}.layout{display:grid;grid-template-columns:52% 48%;gap:18px}
+.user{padding:10px;border-bottom:1px solid #eee;cursor:pointer}.user:hover{background:#f5f8ff}
+.user.sel{background:#e8f1ff}.status-ACTIVE{color:#16803c}.status-PENDING{color:#b76b00}.status-LOCKED{color:#c00}
+#users{max-height:610px;overflow:auto}.chat{display:flex;flex-direction:column;height:610px}
+#messages{flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
+.msg{margin:7px 0;padding:8px 10px;border-radius:10px;max-width:82%;white-space:pre-wrap}
+.msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
+.meta{font-size:11px;color:#777;margin-top:3px}
+.chatbar{display:flex;gap:7px;margin-top:10px}.chatbar input{flex:1}
+.small{font-size:13px;color:#666}
+@media(max-width:900px){.layout{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>🤖 Doraemon Admin</header>
+<main>
+<div class="card" id="login">
+<h3>Đăng nhập Admin</h3>
+<input id="pw" type="password" placeholder="Mật khẩu Admin" style="width:70%">
+<button onclick="login()">Đăng nhập</button>
+<div id="err" style="color:#c00;margin-top:8px"></div>
+</div>
+
+<div id="panel" style="display:none">
+<div class="card">
+<button onclick="loadUsers()">🔄 Làm mới</button>
+<span id="count" class="small"></span>
+<span id="wsState" class="small" style="float:right">● Chưa kết nối</span>
+</div>
+<div class="layout">
+<div class="card">
+<h3>👥 Tài khoản</h3>
+<div id="users"></div>
+</div>
+<div class="card chat">
+<h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
+<div id="messages"></div>
+<div class="chatbar">
+<input id="chatInput" placeholder="Nhập tin nhắn..." disabled
+       onkeydown="if(event.key==='Enter')sendAdminMessage()">
+<button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
+</div>
+</div>
+</div>
+</div>
+</main>
+
 <script>
-let pw="";
+let pw="", ws=null, wsToken="", selectedUser=null;
+
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
-async function api(u,o={}){o.headers={"Content-Type":"application/json",...(o.headers||{})};let r=await fetch(u,o),t=await r.text(),d={};try{d=JSON.parse(t)}catch{d={detail:t}}if(!r.ok)throw Error(d.detail||"Lỗi");return d}
-async function login(){pw=document.getElementById("pw").value;try{await api("/admin/api/users?password="+encodeURIComponent(pw));document.getElementById("login").style.display="none";document.getElementById("panel").style.display="block";loadUsers()}catch(e){document.getElementById("err").textContent=e.message}}
-async function loadUsers(){let d=await api("/admin/api/users?password="+encodeURIComponent(pw));document.getElementById("count").textContent=" Tổng: "+d.users.length;document.getElementById("users").innerHTML=d.users.map(u=>{let s=u.subscription||{},st=u.status||"PENDING",c=st==="ACTIVE"?"active":st==="LOCKED"?"locked":"pending",ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";return `<tr><td>${u.id}</td><td>${esc(u.nickname)}</td><td>${esc(u.phone)}</td><td class="${c}"><b>${st}</b></td><td>${esc(s.plan||"-")}</td><td>${ex}</td><td><button onclick="act(${u.id},1)">1 tháng</button> <button onclick="act(${u.id},3)">3 tháng</button> <button onclick="act(${u.id},12)">12 tháng</button> <button onclick="lock(${u.id})">Khóa</button></td></tr>`}).join("")}
-async function act(id,m){if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});loadUsers()}
-async function lock(id){if(!confirm("Khóa tài khoản?"))return;await api("/admin/api/users/"+id+"/status",{method:"POST",body:JSON.stringify({password:pw,status:"LOCKED"})});loadUsers()}
-</script></body></html>""")
+async function api(u,o={}) {
+  o.headers={"Content-Type":"application/json",...(o.headers||{})};
+  const r=await fetch(u,o); const t=await r.text(); let d={};
+  try{d=JSON.parse(t)}catch{d={detail:t}}
+  if(!r.ok) throw Error(d.detail||"Lỗi");
+  return d;
+}
+async function login(){
+  pw=document.getElementById("pw").value;
+  try{
+    await api("/admin/api/users?password="+encodeURIComponent(pw));
+    const td=await api("/admin/api/ws-token?password="+encodeURIComponent(pw));
+    wsToken=td.token;
+    document.getElementById("login").style.display="none";
+    document.getElementById("panel").style.display="block";
+    await loadUsers();
+    connectWS();
+  }catch(e){document.getElementById("err").textContent=e.message}
+}
+async function loadUsers(){
+  const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
+  document.getElementById("count").textContent="  Tổng: "+d.users.length;
+  document.getElementById("users").innerHTML=d.users.map(u=>{
+    const s=u.subscription||{}, st=u.status||"PENDING";
+    const ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";
+    return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
+      <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
+      <div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||"-")} · hết hạn: ${ex}</div>
+      <div class="small">Bấm để xem lịch sử và chat</div>
+      <div style="margin-top:7px">
+        <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},12)">12 tháng</button>
+        <button class="red" onclick="event.stopPropagation();lock(${u.id})">Khóa</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+async function selectUser(id,nickname){
+  selectedUser=id;
+  document.getElementById("chatTitle").textContent="💬 Chat với "+nickname+" (#"+id+")";
+  document.getElementById("chatInput").disabled=false;
+  document.getElementById("sendBtn").disabled=false;
+  document.getElementById("messages").innerHTML="";
+  await loadUsers();
+  try{
+    const d=await api("/admin/api/chat/history?user_id="+id+"&password="+encodeURIComponent(pw));
+    d.messages.forEach(addMessage);
+  }catch(e){addMessage({sender:"system",message:"Lỗi tải lịch sử: "+e.message})}
+}
+function addMessage(m){
+  const box=document.getElementById("messages");
+  const div=document.createElement("div");
+  div.className="msg "+(m.sender==="admin"?"admin":"user");
+  const who=m.sender==="admin"?"Admin":m.sender==="user"?"Khách":"System";
+  const when=m.created_at?new Date(m.created_at).toLocaleString("vi-VN"):"";
+  div.innerHTML="<b>"+who+"</b><br>"+esc(m.message)+"<div class='meta'>"+when+"</div>";
+  box.appendChild(div); box.scrollTop=box.scrollHeight;
+}
+function connectWS(){
+  if(ws && ws.readyState===WebSocket.OPEN)return;
+  const proto=location.protocol==="https:"?"wss":"ws";
+  ws=new WebSocket(proto+"://"+location.host+"/ws/admin?token="+encodeURIComponent(wsToken));
+  ws.onopen=()=>{document.getElementById("wsState").textContent="● Admin realtime: Đã kết nối";};
+  ws.onmessage=e=>{
+    try{
+      const d=JSON.parse(e.data);
+      if(d.type==="message" && d.data){
+        if(!selectedUser || Number(d.data.user_id)===Number(selectedUser)) addMessage(d.data);
+        loadUsers();
+      }
+    }catch(_){}
+  };
+  ws.onerror=()=>{document.getElementById("wsState").textContent="● WebSocket lỗi";};
+  ws.onclose=()=>{document.getElementById("wsState").textContent="● Mất kết nối, đang nối lại...";setTimeout(connectWS,2000)};
+}
+function sendAdminMessage(){
+  const inp=document.getElementById("chatInput"), msg=inp.value.trim();
+  if(!msg||!selectedUser)return;
+  if(!ws || ws.readyState!==WebSocket.OPEN){alert("Chat Admin chưa kết nối realtime.");return}
+  ws.send(JSON.stringify({user_id:selectedUser,message:msg}));
+  inp.value="";
+}
+async function act(id,m){
+  if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;
+  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});
+  loadUsers();
+}
+async function lock(id){
+  if(!confirm("Khóa tài khoản?"))return;
+  await api("/admin/api/users/"+id+"/status",{method:"POST",body:JSON.stringify({password:pw,status:"LOCKED"})});
+  loadUsers();
+}
+</script>
+</body></html>""")
 
 @app.get("/admin/api/users")
 def admin_users(password: str):
@@ -401,6 +535,33 @@ def admin_activate(user_id:int,data:dict):
         conn.commit()
     finally: conn.close()
     return {"success":True,"expires_at":exp}
+
+
+@app.get("/admin/api/chat/history")
+def admin_chat_history(user_id: int, password: str, limit: int = 200):
+    check_admin(password)
+    limit = max(1, min(limit, 500))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                           FROM admin_messages
+                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""",
+                        (user_id, limit))
+            rows = list(reversed(cur.fetchall()))
+            cur.execute("""UPDATE admin_messages SET is_read=TRUE
+                           WHERE user_id=%s AND sender='user'""", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"messages": [dict(r) for r in rows]}
+
+@app.get("/admin/api/ws-token")
+def admin_ws_token(password: str):
+    check_admin(password)
+    if not ADMIN_WS_TOKEN:
+        raise HTTPException(500, "ADMIN_WS_TOKEN chưa được cấu hình trên Render.")
+    return {"token": ADMIN_WS_TOKEN}
 
 @app.post("/admin/api/users/{user_id}/status")
 def admin_status(user_id:int,data:dict):
