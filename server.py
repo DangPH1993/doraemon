@@ -237,7 +237,7 @@ async def ws_user(websocket: WebSocket):
             finally:
                 conn.close()
             await websocket.send_json({"type":"message","data":row})
-            await notify_admin(row)
+            await notify_admin({"type":"message","data":row})
     except WebSocketDisconnect:
         pass
     finally:
@@ -464,14 +464,30 @@ function connectWS(){
   ws.onmessage=e=>{
     try{
       const d=JSON.parse(e.data);
+      if(d.type==="connected"){
+        document.getElementById("wsState").textContent="● Admin realtime: Đã kết nối";
+        return;
+      }
       if(d.type==="message" && d.data){
-        if(!selectedUser || Number(d.data.user_id)===Number(selectedUser)) addMessage(d.data);
+        const uid=Number(d.data.user_id);
+        if(selectedUser && uid===Number(selectedUser)){
+          addMessage(d.data);
+        } else {
+          // Có tin nhắn mới từ user khác: vẫn cập nhật danh sách.
+          // Khi chọn user đó, lịch sử sẽ được tải đầy đủ.
+        }
         loadUsers();
       }
-    }catch(_){}
+      if(d.type==="error"){
+        document.getElementById("wsState").textContent="● Lỗi: "+(d.message||"WebSocket");
+      }
+    }catch(err){ console.error("Admin WS message error",err); }
   };
   ws.onerror=()=>{document.getElementById("wsState").textContent="● WebSocket lỗi";};
-  ws.onclose=()=>{document.getElementById("wsState").textContent="● Mất kết nối, đang nối lại...";setTimeout(connectWS,2000)};
+  ws.onclose=()=>{
+    document.getElementById("wsState").textContent="● Mất kết nối, đang nối lại...";
+    setTimeout(()=>{ if(!ws || ws.readyState===WebSocket.CLOSED) connectWS(); },2000);
+  };
 }
 function sendAdminMessage(){
   const inp=document.getElementById("chatInput"), msg=inp.value.trim();
