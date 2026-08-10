@@ -1,5 +1,8 @@
 import os
 import base64
+import json
+import secrets
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from pinecone import Pinecone
@@ -20,11 +23,24 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 INDEX_NAME = os.getenv("PINECONE_INDEX", "doraemon")
-NAMESPACE = os.getenv("PINECONE_NAMESPACE", "__default__")
+NAMESPACE = os.getenv("PINECONE_NAMESPACE", "japanese_n5")
 
 # Nếu đặt CLIENT_TOKEN trên Render thì server sẽ kiểm tra token.
 # Nếu để trống, server không bắt buộc token.
 CLIENT_TOKEN = os.getenv("CLIENT_TOKEN", "")
+
+# Quản lý nhiều client và ngày hết hạn.
+# Ví dụ Render Environment Variable CLIENTS_JSON:
+# {"KH001":{"token":"TOKEN_ABC","expires_at":"2026-09-10T23:59:59+07:00","status":"active"}}
+CLIENTS_JSON = os.getenv("CLIENTS_JSON", "")
+
+try:
+    CLIENTS = json.loads(CLIENTS_JSON) if CLIENTS_JSON.strip() else {}
+    if not isinstance(CLIENTS, dict):
+        CLIENTS = {}
+except Exception as e:
+    CLIENTS = {}
+    print(f"WARNING: CLIENTS_JSON không hợp lệ: {e}")
 
 if not PINECONE_API_KEY:
     print("WARNING: PINECONE_API_KEY chưa được cấu hình.")
@@ -80,16 +96,63 @@ class ChatRequest(BaseModel):
 # ============================================================
 
 def check_token(authorization: str | None):
-    if not CLIENT_TOKEN:
+    """Kiểm tra token và thời hạn ở SERVER. Client không thể tự sửa hạn dùng."""
+    if not CLIENT_TOKEN and not CLIENTS:
         return
 
-    expected = f"Bearer {CLIENT_TOKEN}"
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail={
+            "code": "TOKEN_MISSING",
+            "message": "Chưa cung cấp Client Token."
+        })
 
-    if authorization != expected:
-        raise HTTPException(
-            status_code=401,
-            detail="Client Token không hợp lệ."
-        )
+    supplied = authorization[7:].strip()
+
+    # Chế độ cũ: một CLIENT_TOKEN duy nhất, không có ngày hết hạn.
+    if CLIENT_TOKEN and secrets.compare_digest(supplied, CLIENT_TOKEN):
+        return
+
+    # Chế độ SaaS: nhiều client, mỗi client có expires_at/status riêng.
+    for client_id, info in CLIENTS.items():
+        if not isinstance(info, dict):
+            continue
+        token = str(info.get("token", ""))
+        if token and secrets.compare_digest(supplied, token):
+            status = str(info.get("status", "active")).lower()
+            if status != "active":
+                raise HTTPException(status_code=403, detail={
+                    "code": "CLIENT_DISABLED",
+                    "message": "Client này đã bị khóa hoặc vô hiệu hóa.",
+                    "client_id": client_id
+                })
+
+            expires_at = info.get("expires_at")
+            if not expires_at:
+                return
+
+            try:
+                expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                if now >= expiry.astimezone(timezone.utc):
+                    raise HTTPException(status_code=403, detail={
+                        "code": "TOKEN_EXPIRED",
+                        "message": "Thời gian sử dụng Doraemon của client đã hết hạn.",
+                        "client_id": client_id,
+                        "expires_at": str(expires_at)
+                    })
+                return
+            except ValueError:
+                raise HTTPException(status_code=500, detail={
+                    "code": "INVALID_EXPIRY_CONFIG",
+                    "message": f"expires_at của {client_id} không đúng ISO-8601."
+                })
+
+    raise HTTPException(status_code=401, detail={
+        "code": "INVALID_TOKEN",
+        "message": "Client Token không hợp lệ."
+    })
 
 
 # ============================================================
@@ -292,7 +355,7 @@ Nhiệm vụ:
         # 6. Generate final answer
         # ----------------------------------------------------
         response = gemini.models.generate_content(
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=contents
         )
 
@@ -333,7 +396,9 @@ async def health_check():
         "pinecone": index is not None,
         "gemini": gemini is not None,
         "index": INDEX_NAME,
-        "namespace": NAMESPACE
+        "namespace": NAMESPACE,
+        "client_token_mode": "multi_client_expiry" if CLIENTS else ("single_token" if CLIENT_TOKEN else "disabled"),
+        "clients_configured": len(CLIENTS)
     }
 
 
