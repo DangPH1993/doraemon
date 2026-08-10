@@ -1,11 +1,9 @@
 fastapi
-uvicorn
-google-generativeai
-pydantic
+uvicorn[standard]
 pinecone
-langchain
-langchain-google-genai
-langchain-community
-langchain-text-splitters
-pypdf
+google-genai
 psycopg2-binary
+passlib[bcrypt]
+python-jose[cryptography]
+bcrypt<4
+pydantic
