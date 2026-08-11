@@ -5,6 +5,7 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -206,15 +207,85 @@ def me(authorization: Optional[str] = Header(default=None)):
     sub, msg = subscription_status(user["id"])
     return {"user": user, "subscription": sub, "subscription_message": msg}
 
+
+ADMIN_HTML = '<!doctype html>\n<html lang="vi">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Doraemon Admin</title>\n<style>\nbody{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;color:#222}\nheader{background:#fff;border-bottom:1px solid #ddd;padding:16px 22px;display:flex;justify-content:space-between;align-items:center}\nmain{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px;max-width:1400px;margin:auto}\n.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px}\ninput,button,select{padding:9px;border:1px solid #ccc;border-radius:7px}\nbutton{cursor:pointer;background:#2563eb;color:white;border:0}\nbutton.secondary{background:#666}\n#users{max-height:70vh;overflow:auto}\n.user{padding:10px;border-bottom:1px solid #eee;cursor:pointer}\n.user.active{background:#eaf2ff}\n#messages{height:55vh;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:10px;background:#fafafa}\n.msg{margin:7px 0;padding:8px 10px;border-radius:8px;max-width:75%;white-space:pre-wrap}\n.msg.user{background:#e8f0fe}.msg.admin{background:#dcfce7;margin-left:auto}\n.row{display:flex;gap:8px}.row>*{flex:1}\n.small{font-size:12px;color:#666}\n.stat{display:inline-block;margin:4px;padding:10px;background:#f0f4f8;border-radius:8px}\n</style>\n</head>\n<body>\n<header>\n  <div><b>🤖 Doraemon Admin</b><div class="small">Quản trị người dùng, chat và Learning</div></div>\n  <div class="row" style="max-width:430px"><input id="token" type="password" placeholder="ADMIN_WS_TOKEN"><button onclick="connect()">Kết nối</button></div>\n</header>\n<main>\n<section>\n<div class="card">\n<h3>Người dùng</h3>\n<button onclick="loadUsers()">Tải lại</button>\n<div id="users" style="margin-top:10px"></div>\n</div>\n</section>\n<section>\n<div class="card">\n<h3 id="title">Chọn người dùng</h3>\n<div id="stats"></div>\n<div id="messages"></div>\n<div class="row" style="margin-top:10px">\n<input id="message" placeholder="Nhập tin nhắn cho user..." onkeydown="if(event.key===\'Enter\')sendMessage()">\n<button onclick="sendMessage()">Gửi</button>\n</div>\n</div>\n</section>\n</main>\n<script>\nlet ws=null, selected=null, token=\'\';\nfunction connect(){\n token=document.getElementById(\'token\').value.trim();\n if(!token){alert(\'Nhập ADMIN_WS_TOKEN\');return}\n if(ws) ws.close();\n ws=new WebSocket((location.protocol===\'https:\'?\'wss://\':\'ws://\')+location.host+\'/ws/admin?token=\'+encodeURIComponent(token));\n ws.onopen=()=>{document.title=\'Doraemon Admin - Connected\';loadUsers()};\n ws.onmessage=e=>{\n   const x=JSON.parse(e.data);\n   if(x.type===\'message\'){renderMessage(x.data); if(selected) loadSummary(selected)}\n   if(x.type===\'error\') alert(x.message);\n };\n ws.onclose=()=>document.title=\'Doraemon Admin - Disconnected\';\n}\nasync function loadUsers(){\n if(!token){return}\n const r=await fetch(\'/admin/users?token=\'+encodeURIComponent(token));\n if(!r.ok){if(r.status===401)alert(\'ADMIN_WS_TOKEN không đúng\');return}\n const j=await r.json(), el=document.getElementById(\'users\'); el.innerHTML=\'\';\n (j.users||[]).forEach(u=>{\n   const d=document.createElement(\'div\'); d.className=\'user\'+(selected===u.id?\' active\':\'\');\n   d.innerHTML=\'<b>\'+esc(u.nickname)+\'</b><br><span class="small">\'+esc(u.phone)+\' · \'+esc(u.status)+\'</span>\';\n   d.onclick=()=>selectUser(u); el.appendChild(d);\n });\n}\nasync function selectUser(u){\n selected=u.id; document.getElementById(\'title\').textContent=u.nickname+\' (\'+u.phone+\')\';\n document.querySelectorAll(\'.user\').forEach(x=>x.classList.remove(\'active\'));\n const r=await fetch(\'/admin-chat/history?user_id=\'+u.id+\'&limit=100&token=\'+encodeURIComponent(token));\n if(r.ok){const j=await r.json();const box=document.getElementById(\'messages\');box.innerHTML=\'\';(j.messages||[]).forEach(renderMessage)}\n loadSummary(u.id); loadUsers();\n}\nfunction renderMessage(m){\n if(!selected || Number(m.user_id)!==Number(selected)) return;\n const box=document.getElementById(\'messages\'), d=document.createElement(\'div\');\n d.className=\'msg \'+(m.sender===\'admin\'?\'admin\':\'user\');\n d.textContent=(m.sender===\'admin\'?\'Admin: \':\'User: \')+m.message;\n box.appendChild(d);box.scrollTop=box.scrollHeight;\n}\nasync function sendMessage(){\n if(!ws||ws.readyState!==1){alert(\'Chưa kết nối Admin\');return}\n if(!selected)return;\n const inp=document.getElementById(\'message\'), msg=inp.value.trim();if(!msg)return;\n ws.send(JSON.stringify({user_id:selected,message:msg}));inp.value=\'\';\n}\nasync function loadSummary(uid){\n const r=await fetch(\'/admin/learning-summary/\'+uid+\'?token=\'+encodeURIComponent(token));\n if(!r.ok)return; const j=await r.json(),s=j.summary||{};\n document.getElementById(\'stats\').innerHTML=\n \'<span class="stat">Records: \'+(s.total_records||0)+\'</span>\'+\n \'<span class="stat">Completed: \'+(s.completed||0)+\'</span>\'+\n \'<span class="stat">Passed: \'+(s.passed||0)+\'</span>\'+\n \'<span class="stat">Avg: \'+(s.average_score==null?\'-\':Number(s.average_score).toFixed(1))+\'</span>\';\n}\nfunction esc(s){return String(s??\'\').replace(/[&<>"\']/g,m=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[m]))}\n</script>\n</body>\n</html>'
+
+
+def require_admin_token(token: Optional[str]):
+    if not ADMIN_WS_TOKEN or not token or token != ADMIN_WS_TOKEN:
+        raise HTTPException(401, "Admin token không hợp lệ.")
+    return True
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return HTMLResponse(content=ADMIN_HTML)
+
+
+@app.get("/admin/users")
+def admin_users(token: Optional[str] = None):
+    require_admin_token(token)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id,phone,nickname,status,created_at
+                FROM users ORDER BY id DESC
+            """)
+            users = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"users": users}
+
+
+@app.get("/admin/learning-summary/{user_id}")
+def admin_learning_summary(user_id: int, token: Optional[str] = None):
+    require_admin_token(token)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS total_records,
+                       COUNT(*) FILTER (WHERE status='COMPLETED') AS completed,
+                       COUNT(*) FILTER (WHERE status='IN_PROGRESS') AS in_progress,
+                       COUNT(*) FILTER (WHERE status='PASSED') AS passed,
+                       COUNT(*) FILTER (WHERE status='FAILED') AS failed,
+                       AVG(score) AS average_score,
+                       COUNT(DISTINCT lesson) AS lessons_studied,
+                       COUNT(DISTINCT topic) AS topics_studied
+                FROM learning_progress WHERE user_id=%s
+            """,(user_id,))
+            summary=dict(cur.fetchone())
+    finally:
+        conn.close()
+    return {"summary":summary}
+
+
 @app.get("/admin-chat/history")
-def history(limit: int = 100, authorization: Optional[str] = Header(default=None)):
-    user = current_user(bearer(authorization))
+def history(
+    limit: int = 100,
+    user_id: Optional[int] = None,
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None)
+):
+    # Admin UI uses ADMIN_WS_TOKEN; normal user client uses Bearer token.
+    if token:
+        require_admin_token(token)
+        target_user_id = user_id
+        if not target_user_id:
+            raise HTTPException(400, "Thiếu user_id.")
+    else:
+        user = current_user(bearer(authorization))
+        target_user_id = user["id"]
+
     limit = max(1, min(limit, 500))
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,sender,message,created_at,is_read FROM admin_messages
-                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""", (user["id"], limit))
+            cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                           FROM admin_messages
+                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""",
+                        (target_user_id, limit))
             rows = list(reversed(cur.fetchall()))
     finally:
         conn.close()
@@ -573,4 +644,5 @@ CONTEXT GIÁO TRÌNH:
 @app.get("/health")
 def health():
     return {"status":"ok","pinecone":index is not None,"gemini":gemini is not None,
-            "database":bool(DATABASE_URL),"gemini_model":GEMINI_MODEL}
+            "database":bool(DATABASE_URL),"gemini_model":GEMINI_MODEL,
+            "admin":True,"learning":True}
