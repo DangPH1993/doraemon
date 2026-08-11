@@ -194,6 +194,26 @@ def history(limit: int = 100, authorization: Optional[str] = Header(default=None
         conn.close()
     return {"messages": rows}
 
+
+@app.post("/admin-chat/send")
+def user_send_admin(data: dict, authorization: Optional[str] = Header(default=None)):
+    user = current_user(bearer(authorization))
+    msg = str(data.get("message", "")).strip()
+    if not msg:
+        raise HTTPException(400, "Tin nhắn trống.")
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO admin_messages(user_id,sender,message)
+                           VALUES(%s,'user',%s)
+                           RETURNING id,user_id,sender,message,created_at,is_read""",
+                        (user["id"], msg))
+            row = dict(cur.fetchone())
+        conn.commit()
+    finally:
+        conn.close()
+    return {"message": row}
+
 async def send_json(ws, data):
     try:
         await ws.send_json(data); return True
@@ -373,7 +393,7 @@ button.gray{background:#666}button.red{background:#d93025}
 <div class="card">
 <button onclick="loadUsers()">🔄 Làm mới</button>
 <span id="count" class="small"></span>
-<span id="wsState" class="small" style="float:right">● Chưa kết nối</span>
+<span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
 </div>
 <div class="layout">
 <div class="card">
@@ -394,26 +414,24 @@ button.gray{background:#666}button.red{background:#d93025}
 </main>
 
 <script>
-let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null;
+let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0;
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
   o.headers={"Content-Type":"application/json",...(o.headers||{})};
   const r=await fetch(u,o); const t=await r.text(); let d={};
   try{d=JSON.parse(t)}catch{d={detail:t}}
-  if(!r.ok) throw Error(d.detail||"Lỗi");
+  if(!r.ok) throw Error(d.detail||("HTTP "+r.status));
   return d;
 }
 async function login(){
   pw=document.getElementById("pw").value;
   try{
     await api("/admin/api/users?password="+encodeURIComponent(pw));
-    const td=await api("/admin/api/ws-token?password="+encodeURIComponent(pw));
-    wsToken=td.token;
     document.getElementById("login").style.display="none";
     document.getElementById("panel").style.display="block";
+    document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadUsers();
-    connectWS();
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
@@ -437,46 +455,38 @@ async function loadUsers(){
   }).join("");
 }
 async function selectUser(id,nickname){
-  selectedUser=id;
+  selectedUser=id; lastChatId=0; seenMessageIds=new Set();
   document.getElementById("chatTitle").textContent="💬 Chat với "+nickname+" (#"+id+")";
-  document.getElementById("chatInput").disabled=false;
-  document.getElementById("sendBtn").disabled=false;
+  document.getElementById("chatInput").disabled=false; document.getElementById("sendBtn").disabled=false;
   document.getElementById("messages").innerHTML="";
-  seenMessageIds=new Set();
   await loadUsers();
-  try{
-    const d=await api("/admin/api/chat/history?user_id="+id+"&password="+encodeURIComponent(pw));
-    d.messages.forEach(addMessage);
-  }catch(e){addMessage({sender:"system",message:"Lỗi tải lịch sử: "+e.message})}
+  await pollSelectedChat(true);
 }
 function addMessage(m){
-  if(m && m.id !== undefined && m.id !== null){
-    const id=String(m.id);
-    if(seenMessageIds.has(id)) return;
-    seenMessageIds.add(id);
-  }
-  const box=document.getElementById("messages");
-  const div=document.createElement("div");
+  if(m && m.id!=null){const id=String(m.id); if(seenMessageIds.has(id))return; seenMessageIds.add(id); lastChatId=Math.max(lastChatId,Number(m.id)||0);}
+  const box=document.getElementById("messages"), div=document.createElement("div");
   div.className="msg "+(m.sender==="admin"?"admin":"user");
   const who=m.sender==="admin"?"Admin":m.sender==="user"?"Khách":"System";
   const when=m.created_at?new Date(m.created_at).toLocaleString("vi-VN"):"";
   div.innerHTML="<b>"+who+"</b><br>"+esc(m.message)+"<div class='meta'>"+when+"</div>";
   box.appendChild(div); box.scrollTop=box.scrollHeight;
 }
-async function pollSelectedChat(){
-  if(!selectedUser || !pw) return;
+async function pollSelectedChat(initial=false){
+  if(!selectedUser||!pw||pollBusy)return;
+  pollBusy=true;
   try{
-    const d=await api("/admin/api/chat/history?user_id="+selectedUser+"&password="+encodeURIComponent(pw)+"&limit=200");
-    d.messages.forEach(addMessage);
+    const d=await api("/admin/api/chat/history?user_id="+selectedUser+"&password="+encodeURIComponent(pw)+"&limit=200&after_id="+(initial?0:lastChatId));
+    if(selectedUser) d.messages.forEach(addMessage);
+    if(d.last_id!=null) lastChatId=Math.max(lastChatId,Number(d.last_id)||0);
+    document.getElementById("wsState").textContent="● Chat đang đồng bộ tự động";
   }catch(e){
-    console.log("Admin chat polling:",e.message);
-  }
+    console.error("Admin polling error:",e);
+    document.getElementById("wsState").textContent="● Đang kết nối lại chat...";
+  }finally{pollBusy=false;}
 }
 function startChatPolling(){
-  if(pollTimer) clearInterval(pollTimer);
-  pollTimer=setInterval(()=>{
-    pollSelectedChat();
-  },1000);
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(()=>pollSelectedChat(false),1500);
 }
 function connectWS(){
   if(ws && ws.readyState===WebSocket.OPEN)return;
@@ -505,18 +515,22 @@ function connectWS(){
       }
     }catch(err){ console.error("Admin WS message error",err); }
   };
-  ws.onerror=()=>{document.getElementById("wsState").textContent="● WebSocket lỗi";};
-  ws.onclose=()=>{
-    document.getElementById("wsState").textContent="● Mất kết nối, đang nối lại...";
-    setTimeout(()=>{ if(!ws || ws.readyState===WebSocket.CLOSED) connectWS(); },2000);
-  };
+  ws.onerror=()=>{ console.log("Optional admin WebSocket unavailable; polling remains active."); };
+  ws.onclose=()=>{ console.log("Optional admin WebSocket closed; polling remains active."); };
 }
-function sendAdminMessage(){
+async function sendAdminMessage(){
   const inp=document.getElementById("chatInput"), msg=inp.value.trim();
   if(!msg||!selectedUser)return;
-  if(!ws || ws.readyState!==WebSocket.OPEN){alert("Chat Admin chưa kết nối realtime.");return}
-  ws.send(JSON.stringify({user_id:selectedUser,message:msg}));
-  inp.value="";
+  try{
+    await api("/admin/api/chat/send", {
+      method:"POST",
+      body:JSON.stringify({password:pw,user_id:selectedUser,message:msg})
+    });
+    inp.value="";
+    await pollSelectedChat();
+  }catch(e){
+    alert("Không gửi được tin nhắn: "+e.message);
+  }
 }
 async function act(id,m){
   if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;
@@ -575,24 +589,59 @@ def admin_activate(user_id:int,data:dict):
     return {"success":True,"expires_at":exp}
 
 
-@app.get("/admin/api/chat/history")
-def admin_chat_history(user_id: int, password: str, limit: int = 200):
-    check_admin(password)
-    limit = max(1, min(limit, 500))
+
+@app.post("/admin/api/chat/send")
+def admin_send_chat(data: dict):
+    check_admin(str(data.get("password", "")))
+    user_id = int(data.get("user_id"))
+    msg = str(data.get("message", "")).strip()
+    if not msg:
+        raise HTTPException(400, "Tin nhắn trống.")
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
-                           FROM admin_messages
-                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""",
-                        (user_id, limit))
-            rows = list(reversed(cur.fetchall()))
-            cur.execute("""UPDATE admin_messages SET is_read=TRUE
-                           WHERE user_id=%s AND sender='user'""", (user_id,))
+            cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, "Không tìm thấy user.")
+            cur.execute("""INSERT INTO admin_messages(user_id,sender,message)
+                           VALUES(%s,'admin',%s)
+                           RETURNING id,user_id,sender,message,created_at,is_read""",
+                        (user_id, msg))
+            row = dict(cur.fetchone())
         conn.commit()
     finally:
         conn.close()
-    return {"messages": [dict(r) for r in rows]}
+    return {"message": row}
+
+@app.get("/admin/api/chat/history")
+def admin_chat_history(user_id: int, password: str, limit: int = 200, after_id: int = 0):
+    check_admin(password)
+    limit = max(1, min(limit, 500))
+    after_id = max(0, int(after_id or 0))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if after_id > 0:
+                cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                               FROM admin_messages
+                               WHERE user_id=%s AND id>%s
+                               ORDER BY id ASC LIMIT %s""",
+                            (user_id, after_id, limit))
+            else:
+                cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                               FROM admin_messages
+                               WHERE user_id=%s
+                               ORDER BY id ASC LIMIT %s""",
+                            (user_id, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            if rows:
+                cur.execute("""UPDATE admin_messages SET is_read=TRUE
+                               WHERE user_id=%s AND sender='user' AND id<=%s""",
+                            (user_id, rows[-1]["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"messages": rows, "last_id": rows[-1]["id"] if rows else after_id}
 
 @app.get("/admin/api/ws-token")
 def admin_ws_token(password: str):
