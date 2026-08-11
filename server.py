@@ -1,10 +1,13 @@
 import os
+import io
+import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -12,6 +15,7 @@ from jose import jwt, JWTError
 from pinecone import Pinecone
 from google import genai
 from google.genai import types
+from pypdf import PdfReader
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "doraemon")
@@ -313,8 +317,13 @@ def require_active_user(authorization):
     return user
 
 def embed_text(text):
-    if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
-    r = gemini.models.embed_content(model=EMBEDDING_MODEL, contents=text)
+    if not gemini:
+        raise HTTPException(500, "Gemini chưa được khởi tạo.")
+    r = gemini.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
     return r.embeddings[0].values
 
 @app.post("/search")
@@ -407,6 +416,23 @@ button.gray{background:#666}button.red{background:#d93025}
 
 <div id="panel" style="display:none">
 <div class="card">
+<h3>📚 Knowledge Base</h3>
+<div class="small" style="margin-bottom:10px">
+Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __default__
+</div>
+<form id="uploadForm" onsubmit="uploadKnowledge(event)">
+<input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<input id="course" value="japanese_n5" placeholder="Course" style="flex:1">
+<input id="chunkSize" type="number" value="1200" min="300" max="5000" style="width:120px">
+<input id="overlap" type="number" value="200" min="0" max="4900" style="width:110px">
+<button id="uploadBtn" type="submit">⬆️ Upload PDF</button>
+</div>
+</form>
+<div id="uploadStatus" class="small" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
 <button onclick="loadUsers()">🔄 Làm mới</button>
 <span id="count" class="small"></span>
 <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
@@ -451,6 +477,28 @@ async function login(){
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
+async function uploadKnowledge(event){
+  event.preventDefault();
+  const file=document.getElementById("pdfFile").files[0];
+  if(!file)return;
+  const status=document.getElementById("uploadStatus"), btn=document.getElementById("uploadBtn");
+  btn.disabled=true;
+  status.textContent="⏳ Đang xử lý PDF và upload Pinecone...";
+  try{
+    const fd=new FormData();
+    fd.append("file",file);
+    fd.append("course",document.getElementById("course").value||"japanese_n5");
+    fd.append("chunk_size",document.getElementById("chunkSize").value||1200);
+    fd.append("overlap",document.getElementById("overlap").value||200);
+    const r=await fetch("/admin/api/knowledge/upload?password="+encodeURIComponent(pw),{method:"POST",body:fd});
+    const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}}
+    if(!r.ok)throw Error(d.detail||("HTTP "+r.status));
+    status.textContent=`✅ ${d.filename}: ${d.pages} trang · ${d.chunks} chunks · ${d.dimension} dimensions`;
+    document.getElementById("pdfFile").value="";
+  }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
+  finally{btn.disabled=false}
+}
+
 async function loadUsers(){
   const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
   document.getElementById("count").textContent="  Tổng: "+d.users.length;
@@ -560,6 +608,81 @@ async function lock(id){
 }
 </script>
 </body></html>""")
+
+
+# ============================================================
+# Knowledge Base upload from Admin
+# ============================================================
+def kb_chunk_text(text, chunk_size=1200, overlap=200):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return []
+    out=[]; start=0
+    while start < len(text):
+        end=min(len(text), start+chunk_size)
+        chunk=text[start:end].strip()
+        if chunk: out.append(chunk)
+        if end>=len(text): break
+        start=max(start+1, end-overlap)
+    return out
+
+@app.post("/admin/api/knowledge/upload")
+async def admin_knowledge_upload(
+    password: str,
+    file: UploadFile = File(...),
+    course: str = "japanese_n5",
+    chunk_size: int = 1200,
+    overlap: int = 200
+):
+    check_admin(password)
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Vui lòng chọn file PDF.")
+    if not gemini: raise HTTPException(500, "GEMINI_API_KEY chưa được cấu hình.")
+    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if chunk_size < 300 or chunk_size > 5000:
+        raise HTTPException(400, "chunk_size phải từ 300 đến 5000.")
+    if overlap < 0 or overlap >= chunk_size:
+        raise HTTPException(400, "overlap phải >= 0 và nhỏ hơn chunk_size.")
+
+    raw=await file.read()
+    if len(raw)>50*1024*1024:
+        raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
+    try:
+        reader=PdfReader(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"Không đọc được PDF: {e}")
+
+    records=[]; total=0; namespace="__default__"
+    source_file=os.path.basename(file.filename)
+    try:
+        for page_no,page in enumerate(reader.pages,1):
+            chunks=kb_chunk_text(page.extract_text() or "", chunk_size, overlap)
+            for chunk_no,chunk in enumerate(chunks):
+                vector=embed_text(chunk)
+                records.append({
+                    "id":uuid.uuid4().hex,
+                    "values":vector,
+                    "metadata":{
+                        "text":chunk,
+                        "course":course.strip() or "japanese_n5",
+                        "source_file":source_file,
+                        "page":page_no,
+                        "chunk_index":chunk_no
+                    }
+                })
+                total+=1
+                if len(records)>=50:
+                    index.upsert(vectors=records, namespace=namespace)
+                    records=[]
+        if records:
+            index.upsert(vectors=records, namespace=namespace)
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi embedding/Pinecone: {e}")
+
+    return {
+        "success":True,"filename":source_file,"pages":len(reader.pages),
+        "chunks":total,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace
+    }
 
 @app.get("/admin/api/users")
 def admin_users(password: str):
