@@ -84,7 +84,19 @@ class LoginRequest(BaseModel):
     password: str
 
 class ChatRequest(BaseModel):
-    message: str
+    # API mới dùng "message". Giữ "prompt" để tương thích với client cũ.
+    message: str | None = None
+    prompt: str | None = None
+    chat_history: list = []
+    image_base64: str | None = None
+    use_knowledge_base: bool = True
+    knowledge_namespace: str = "default"
+    top_k: int = 8
+
+    @property
+    def text(self) -> str:
+        value = self.message if self.message is not None else self.prompt
+        return (value or "").strip()
 
 def hash_password(p): return pwd_context.hash(p)
 def verify_password(p, h): return pwd_context.verify(p, h)
@@ -309,7 +321,9 @@ def embed_text(text):
 def search(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     require_active_user(authorization)
     if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
-    result = index.query(vector=embed_text(data.message), top_k=8, include_metadata=True)
+    if not data.text:
+        raise HTTPException(400, "Tin nhắn không được để trống.")
+    result = index.query(vector=embed_text(data.text), top_k=8, include_metadata=True)
     matches = []
     for m in result.matches:
         md = m.metadata or {}
@@ -322,7 +336,9 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     require_active_user(authorization)
     if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
     if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
-    result = index.query(vector=embed_text(data.message), top_k=8, include_metadata=True)
+    if not data.text:
+        raise HTTPException(400, "Tin nhắn không được để trống.")
+    result = index.query(vector=embed_text(data.text), top_k=8, include_metadata=True)
     contexts = []
     for m in result.matches:
         md = m.metadata or {}
@@ -333,7 +349,7 @@ Trả lời ưu tiên dựa vào giáo trình bên dưới. Không được kh�
 Nếu context không đủ, nói rõ tài liệu hiện tại chưa có thông tin đó.
 
 Câu hỏi:
-{data.message}
+{data.text}
 
 Nội dung giáo trình:
 {"\n\n---\n\n".join(contexts)}
