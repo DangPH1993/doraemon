@@ -5,7 +5,6 @@ google-genai
 psycopg2-binary
 passlib[bcrypt]
 python-jose[cryptography]
-bcrypt<4
 pydantic
 pypdf
 python-multipart
