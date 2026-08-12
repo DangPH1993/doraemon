@@ -4,6 +4,7 @@ pinecone
 google-genai
 psycopg2-binary
 passlib[bcrypt]
+bcrypt<4
 python-jose[cryptography]
 pydantic
 pypdf
