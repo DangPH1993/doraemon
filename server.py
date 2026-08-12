@@ -438,6 +438,14 @@ def learning_catalog(authorization: Optional[str] = Header(default=None)):
             return {"success":True,"documents":[dict(x) for x in cur.fetchall()]}
     finally: conn.close()
 
+def check_admin(password: str):
+    expected = os.getenv("ADMIN_PANEL_PASSWORD", os.getenv("ADMIN_WS_TOKEN", ""))
+    if not expected:
+        raise HTTPException(500, "ADMIN_PANEL_PASSWORD chưa được cấu hình trên Render.")
+    if password != expected:
+        raise HTTPException(401, "Admin password không đúng.")
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
