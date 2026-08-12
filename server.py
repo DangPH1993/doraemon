@@ -471,7 +471,7 @@ button.gray{background:#666}button.red{background:#d93025}
 .msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
 .meta{font-size:11px;color:#777;margin-top:3px}
 .chatbar{display:flex;gap:7px;margin-top:10px}.chatbar input{flex:1}
-.small{font-size:13px;color:#666}
+.small{font-size:13px;color:#666}\n.meta-row input{min-width:0}@media(max-width:1000px){.meta-row{grid-template-columns:1fr 1fr 1fr!important}}
 @media(max-width:900px){.layout{grid-template-columns:1fr}}
 </style>
 </head>
@@ -493,14 +493,21 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 </div>
 <form id="uploadForm" onsubmit="uploadKnowledge(event)">
 <input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
-<div style="display:flex;gap:8px;flex-wrap:wrap">
-<input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1">
-<input id="lesson" placeholder="Bài học" style="flex:1"><input id="lessonPages" placeholder="Trang bài học: 1-10" style="flex:1">
-<input id="topic" placeholder="Chủ đề" style="flex:1"><input id="topicPages" placeholder="Trang chủ đề: 3-5" style="flex:1">
-<input id="questionPages" placeholder="Trang câu hỏi: 8-10" style="flex:1"><input id="answerPages" placeholder="Trang đáp án: 20-21" style="flex:1">
-<input id="chunkSize" type="number" value="1200" min="300" max="5000" style="width:120px">
-<input id="overlap" type="number" value="200" min="0" max="4900" style="width:110px">
-<button id="uploadBtn" type="submit">⬆️ Upload PDF</button>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1;min-width:180px">
+<input id="chunkSize" type="number" value="1200" min="300" max="5000" title="Kích thước chunk" style="width:120px">
+<input id="overlap" type="number" value="200" min="0" max="4900" title="Độ chồng lấn" style="width:110px">
+</div>
+<div style="margin-top:12px">
+  <div style="font-weight:700;margin-bottom:7px">📚 Cấu hình nội dung trong PDF</div>
+  <div class="small" style="margin-bottom:8px">
+    Một file PDF chỉ chọn <b>1 Môn học</b>. Bạn có thể tạo nhiều dòng để mô tả nhiều bài học/chủ đề/câu hỏi/đáp án trong cùng file.
+  </div>
+  <div id="metaRows"></div>
+  <button type="button" class="gray" onclick="addMetaRow()" style="margin-top:8px">＋ Thêm bài/chủ đề</button>
+</div>
+<div style="margin-top:12px">
+  <button id="uploadBtn" type="submit">⬆️ Upload PDF</button>
 </div>
 </form>
 <div id="uploadStatus" class="small" style="margin-top:10px"></div>
@@ -551,22 +558,53 @@ async function login(){
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
+function addMetaRow(values={}){
+  const wrap=document.getElementById("metaRows");
+  const row=document.createElement("div");
+  row.className="meta-row";
+  row.style.cssText="display:grid;grid-template-columns:1.2fr .9fr 1.2fr .9fr .9fr .9fr auto;gap:6px;margin-bottom:7px;align-items:center";
+  row.innerHTML=`
+    <input class="m-lesson" placeholder="Bài học" value="${esc(values.lesson||"")}">
+    <input class="m-lesson-pages" placeholder="Trang bài: 1-10" value="${esc(values.lesson_pages||"")}">
+    <input class="m-topic" placeholder="Chủ đề" value="${esc(values.topic||"")}">
+    <input class="m-topic-pages" placeholder="Trang chủ đề: 3-5" value="${esc(values.topic_pages||"")}">
+    <input class="m-question-pages" placeholder="Trang câu hỏi: 8-10" value="${esc(values.question_pages||"")}">
+    <input class="m-answer-pages" placeholder="Trang đáp án: 20-21" value="${esc(values.answer_pages||"")}">
+    <button type="button" class="red" onclick="this.parentElement.remove()">✕</button>`;
+  wrap.appendChild(row);
+}
+function getMetaRows(){
+  return [...document.querySelectorAll(".meta-row")].map(row=>({
+    lesson:row.querySelector(".m-lesson").value.trim(),
+    lesson_pages:row.querySelector(".m-lesson-pages").value.trim(),
+    topic:row.querySelector(".m-topic").value.trim(),
+    topic_pages:row.querySelector(".m-topic-pages").value.trim(),
+    question_pages:row.querySelector(".m-question-pages").value.trim(),
+    answer_pages:row.querySelector(".m-answer-pages").value.trim()
+  })).filter(x=>x.lesson||x.lesson_pages||x.topic||x.topic_pages||x.question_pages||x.answer_pages);
+}
+addMetaRow();
+
 async function uploadKnowledge(event){
   event.preventDefault();
   const file=document.getElementById("pdfFile").files[0];
   if(!file)return;
   const status=document.getElementById("uploadStatus"), btn=document.getElementById("uploadBtn");
+  const rows=getMetaRows();
   btn.disabled=true;
   status.textContent="⏳ Đang xử lý PDF và upload Pinecone...";
   try{
     const fd=new FormData();
     fd.append("file",file);
-    const params=new URLSearchParams({password:pw,subject:document.getElementById("subject").value.trim(),lesson:document.getElementById("lesson").value.trim(),lesson_pages:document.getElementById("lessonPages").value.trim(),topic:document.getElementById("topic").value.trim(),topic_pages:document.getElementById("topicPages").value.trim(),question_pages:document.getElementById("questionPages").value.trim(),answer_pages:document.getElementById("answerPages").value.trim(),chunk_size:document.getElementById("chunkSize").value||1200,overlap:document.getElementById("overlap").value||200});
+    fd.append("password",pw);
+    fd.append("subject",document.getElementById("subject").value.trim());
+    fd.append("metadata_json",JSON.stringify(rows));
+    fd.append("chunk_size",document.getElementById("chunkSize").value||1200);
     fd.append("overlap",document.getElementById("overlap").value||200);
-    const r=await fetch("/admin/api/knowledge/upload?"+params.toString(),{method:"POST",body:fd});
+    const r=await fetch("/admin/api/knowledge/upload",{method:"POST",body:fd});
     const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}}
     if(!r.ok)throw Error(d.detail||("HTTP "+r.status));
-    status.textContent=`✅ ${d.filename}: ${d.pages} trang · ${d.chunks} chunks · ${d.dimension} dimensions`;
+    status.textContent=`✅ ${d.filename}: ${d.pages} trang · ${d.chunks} chunks · ${d.records} cấu hình · ${d.dimension} dimensions`;
     document.getElementById("pdfFile").value="";
   }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
   finally{btn.disabled=false}
@@ -699,19 +737,97 @@ def kb_chunk_text(text, chunk_size=1200, overlap=200):
         start=max(start+1, end-overlap)
     return out
 
+def parse_page_ranges(value: str):
+    """Parse '1-10,12,15-18' into a set of 1-based PDF page numbers."""
+    pages=set()
+    value=(value or "").strip()
+    if not value:
+        return pages
+    for part in value.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a,b=part.split("-",1)
+            if not a.isdigit() or not b.isdigit():
+                raise ValueError(f"Khoảng trang không hợp lệ: {part}")
+            a,b=int(a),int(b)
+            if a<1 or b<a:
+                raise ValueError(f"Khoảng trang không hợp lệ: {part}")
+            pages.update(range(a,b+1))
+        else:
+            if not part.isdigit() or int(part)<1:
+                raise ValueError(f"Trang không hợp lệ: {part}")
+            pages.add(int(part))
+    return pages
+
+def normalize_kb_records(metadata_json: str, total_pages: int):
+    try:
+        raw=json.loads(metadata_json or "[]")
+    except Exception as e:
+        raise ValueError(f"metadata_json không hợp lệ: {e}")
+    if not isinstance(raw,list):
+        raise ValueError("metadata_json phải là một danh sách các cấu hình.")
+
+    out=[]
+    for i,item in enumerate(raw,1):
+        if not isinstance(item,dict):
+            raise ValueError(f"Cấu hình dòng {i} không hợp lệ.")
+        rec={
+            "lesson":str(item.get("lesson","")).strip(),
+            "lesson_pages":str(item.get("lesson_pages","")).strip(),
+            "topic":str(item.get("topic","")).strip(),
+            "topic_pages":str(item.get("topic_pages","")).strip(),
+            "question_pages":str(item.get("question_pages","")).strip(),
+            "answer_pages":str(item.get("answer_pages","")).strip()
+        }
+        for key in ("lesson_pages","topic_pages","question_pages","answer_pages"):
+            pages=parse_page_ranges(rec[key])
+            if pages and max(pages)>total_pages:
+                raise ValueError(f"Dòng {i}: {key} có trang {max(pages)} vượt quá PDF ({total_pages} trang).")
+        if not any(rec.values()):
+            continue
+        if not (rec["lesson"] or rec["topic"]):
+            if rec["question_pages"] or rec["answer_pages"]:
+                rec["lesson"]=f"Nội dung câu hỏi {i}"
+            else:
+                raise ValueError(f"Dòng {i}: cần ít nhất Bài học hoặc Chủ đề.")
+        rec["_lesson_set"]=parse_page_ranges(rec["lesson_pages"])
+        rec["_topic_set"]=parse_page_ranges(rec["topic_pages"])
+        rec["_question_set"]=parse_page_ranges(rec["question_pages"])
+        rec["_answer_set"]=parse_page_ranges(rec["answer_pages"])
+        out.append(rec)
+    return out
+
+def metadata_for_page(records, page_no):
+    matched=[]
+    for r in records:
+        ranges=[r["_lesson_set"],r["_topic_set"],r["_question_set"],r["_answer_set"]]
+        if any(ranges):
+            if any(page_no in x for x in ranges if x):
+                matched.append(r)
+        else:
+            matched.append(r)
+    return matched
+
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
-    password: str, file: UploadFile = File(...),
-    subject: str = "", lesson: str = "", lesson_pages: str = "",
-    topic: str = "", topic_pages: str = "", question_pages: str = "", answer_pages: str = "",
-    chunk_size: int = 1200, overlap: int = 200
+    password: str = "",
+    file: UploadFile = File(...),
+    subject: str = "",
+    metadata_json: str = "[]",
+    chunk_size: int = 1200,
+    overlap: int = 200
 ):
     check_admin(password)
-    if not subject.strip(): raise HTTPException(400, "Môn học là bắt buộc.")
+    subject=subject.strip()
+    if not subject:
+        raise HTTPException(400, "Môn học là bắt buộc.")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Vui lòng chọn file PDF.")
-    if not gemini: raise HTTPException(500, "GEMINI_API_KEY chưa được cấu hình.")
-    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if not gemini:
+        raise HTTPException(500, "GEMINI_API_KEY chưa được cấu hình.")
+    if not index:
+        raise HTTPException(500, "Pinecone chưa được khởi tạo.")
     if chunk_size < 300 or chunk_size > 5000:
         raise HTTPException(400, "chunk_size phải từ 300 đến 5000.")
     if overlap < 0 or overlap >= chunk_size:
@@ -722,49 +838,64 @@ async def admin_knowledge_upload(
         raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
     try:
         reader=PdfReader(io.BytesIO(raw))
+        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
+    except ValueError as e:
+        raise HTTPException(400,str(e))
     except Exception as e:
-        raise HTTPException(400, f"Không đọc được PDF: {e}")
+        raise HTTPException(400,f"Không đọc được PDF: {e}")
 
-    records=[]; total=0; namespace="__default__"
+    namespace="__default__"
     source_file=os.path.basename(file.filename)
+    vectors=[]
+    total=0
     try:
         for page_no,page in enumerate(reader.pages,1):
-            chunks=kb_chunk_text(page.extract_text() or "", chunk_size, overlap)
+            chunks=kb_chunk_text(page.extract_text() or "",chunk_size,overlap)
+            page_meta=metadata_for_page(records_meta,page_no)
             for chunk_no,chunk in enumerate(chunks):
-                vector=embed_text(chunk)
-                records.append({
-                    "id":uuid.uuid4().hex,
-                    "values":vector,
-                    "metadata":{
-                        "text":chunk,
-                        "course":subject.strip(), "subject":subject.strip(),
-                        "lesson":lesson.strip(), "lesson_pages":lesson_pages.strip(),
-                        "topic":topic.strip(), "topic_pages":topic_pages.strip(),
-                        "question_pages":question_pages.strip(), "answer_pages":answer_pages.strip(),
-                        "source_file":source_file,
-                        "page":page_no,
-                        "chunk_index":chunk_no
-                    }
-                })
+                md_list=[{
+                    "lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
+                    "topic":r["topic"],"topic_pages":r["topic_pages"],
+                    "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
+                } for r in page_meta]
+                primary=page_meta[0] if page_meta else None
+                md={
+                    "text":chunk,"course":subject,"subject":subject,
+                    "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
+                    "metadata_records":json.dumps(md_list,ensure_ascii=False)
+                }
+                if primary:
+                    md.update({
+                        "lesson":primary["lesson"],"lesson_pages":primary["lesson_pages"],
+                        "topic":primary["topic"],"topic_pages":primary["topic_pages"],
+                        "question_pages":primary["question_pages"],"answer_pages":primary["answer_pages"]
+                    })
+                vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                 total+=1
-                if len(records)>=50:
-                    index.upsert(vectors=records, namespace=namespace)
-                    records=[]
-        if records:
-            index.upsert(vectors=records, namespace=namespace)
+                if len(vectors)>=50:
+                    index.upsert(vectors=vectors,namespace=namespace)
+                    vectors=[]
+        if vectors:
+            index.upsert(vectors=vectors,namespace=namespace)
     except Exception as e:
-        raise HTTPException(500, f"Lỗi embedding/Pinecone: {e}")
+        raise HTTPException(500,f"Lỗi embedding/Pinecone: {e}")
 
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO knowledge_documents(source_file,subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",(source_file,subject.strip(),lesson.strip(),lesson_pages.strip(),topic.strip(),topic_pages.strip(),question_pages.strip(),answer_pages.strip(),namespace))
+            for r in records_meta:
+                cur.execute("""INSERT INTO knowledge_documents
+                    (source_file,subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (source_file,subject,r["lesson"],r["lesson_pages"],r["topic"],
+                     r["topic_pages"],r["question_pages"],r["answer_pages"],namespace))
         conn.commit()
-    finally: conn.close()
-    return {
-        "success":True,"filename":source_file,"subject":subject.strip(),"lesson":lesson.strip(),"topic":topic.strip(),"pages":len(reader.pages),
-        "chunks":total,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace
-    }
+    finally:
+        conn.close()
+
+    return {"success":True,"filename":source_file,"subject":subject,
+            "pages":len(reader.pages),"chunks":total,"records":len(records_meta),
+            "dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/users")
 def admin_users(password: str):
