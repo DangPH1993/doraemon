@@ -1,10 +1,14 @@
 import os
+import io
+import uuid
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+import json
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -12,6 +16,7 @@ from jose import jwt, JWTError
 from pinecone import Pinecone
 from google import genai
 from google.genai import types
+from pypdf import PdfReader
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "doraemon")
@@ -19,6 +24,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_RENDER")
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
+ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
 GEMINI_MODEL = "gemini-3.6-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
@@ -55,22 +61,16 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 is_read BOOLEAN NOT NULL DEFAULT FALSE);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS learning_progress (
-                id BIGSERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                lesson VARCHAR(255),
-                topic VARCHAR(255),
-                content_type VARCHAR(50),
-                item_id VARCHAR(255),
-                status VARCHAR(30) NOT NULL DEFAULT 'IN_PROGRESS',
-                score DOUBLE PRECISION,
-                total_questions INTEGER,
-                correct_questions INTEGER,
-                note TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );""")
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user_updated
-                           ON learning_progress(user_id, updated_at DESC);""")
+                id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                subject VARCHAR(255) NOT NULL, lesson VARCHAR(255), topic VARCHAR(255), item_key VARCHAR(500),
+                score INTEGER, status VARCHAR(50) NOT NULL DEFAULT 'studied',
+                last_studied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user ON learning_progress(user_id,last_studied_at DESC);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
+                lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
+                question_pages VARCHAR(255), answer_pages VARCHAR(255), namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
         conn.commit()
     finally:
         conn.close()
@@ -100,18 +100,19 @@ class LoginRequest(BaseModel):
     password: str
 
 class ChatRequest(BaseModel):
-    message: str
+    # API mới dùng "message". Giữ "prompt" để tương thích với client cũ.
+    message: str | None = None
+    prompt: str | None = None
+    chat_history: list = []
+    image_base64: str | None = None
+    use_knowledge_base: bool = True
+    knowledge_namespace: str = "default"
+    top_k: int = 8
 
-class LearningProgressRequest(BaseModel):
-    lesson: Optional[str] = None
-    topic: Optional[str] = None
-    content_type: Optional[str] = None
-    item_id: Optional[str] = None
-    status: str = "IN_PROGRESS"
-    score: Optional[float] = None
-    total_questions: Optional[int] = None
-    correct_questions: Optional[int] = None
-    note: Optional[str] = None
+    @property
+    def text(self) -> str:
+        value = self.message if self.message is not None else self.prompt
+        return (value or "").strip()
 
 def hash_password(p): return pwd_context.hash(p)
 def verify_password(p, h): return pwd_context.verify(p, h)
@@ -207,89 +208,39 @@ def me(authorization: Optional[str] = Header(default=None)):
     sub, msg = subscription_status(user["id"])
     return {"user": user, "subscription": sub, "subscription_message": msg}
 
-
-ADMIN_HTML = '<!doctype html>\n<html lang="vi">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Doraemon Admin</title>\n<style>\nbody{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;color:#222}\nheader{background:#fff;border-bottom:1px solid #ddd;padding:16px 22px;display:flex;justify-content:space-between;align-items:center}\nmain{display:grid;grid-template-columns:300px 1fr;gap:16px;padding:16px;max-width:1400px;margin:auto}\n.card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px}\ninput,button,select{padding:9px;border:1px solid #ccc;border-radius:7px}\nbutton{cursor:pointer;background:#2563eb;color:white;border:0}\nbutton.secondary{background:#666}\n#users{max-height:70vh;overflow:auto}\n.user{padding:10px;border-bottom:1px solid #eee;cursor:pointer}\n.user.active{background:#eaf2ff}\n#messages{height:55vh;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:10px;background:#fafafa}\n.msg{margin:7px 0;padding:8px 10px;border-radius:8px;max-width:75%;white-space:pre-wrap}\n.msg.user{background:#e8f0fe}.msg.admin{background:#dcfce7;margin-left:auto}\n.row{display:flex;gap:8px}.row>*{flex:1}\n.small{font-size:12px;color:#666}\n.stat{display:inline-block;margin:4px;padding:10px;background:#f0f4f8;border-radius:8px}\n</style>\n</head>\n<body>\n<header>\n  <div><b>🤖 Doraemon Admin</b><div class="small">Quản trị người dùng, chat và Learning</div></div>\n  <div class="row" style="max-width:430px"><input id="token" type="password" placeholder="ADMIN_WS_TOKEN"><button onclick="connect()">Kết nối</button></div>\n</header>\n<main>\n<section>\n<div class="card">\n<h3>Người dùng</h3>\n<button onclick="loadUsers()">Tải lại</button>\n<div id="users" style="margin-top:10px"></div>\n</div>\n</section>\n<section>\n<div class="card">\n<h3 id="title">Chọn người dùng</h3>\n<div id="stats"></div>\n<div id="messages"></div>\n<div class="row" style="margin-top:10px">\n<input id="message" placeholder="Nhập tin nhắn cho user..." onkeydown="if(event.key===\'Enter\')sendMessage()">\n<button onclick="sendMessage()">Gửi</button>\n</div>\n</div>\n</section>\n</main>\n<script>\nlet ws=null, selected=null, token=\'\';\nfunction connect(){\n token=document.getElementById(\'token\').value.trim();\n if(!token){alert(\'Nhập ADMIN_WS_TOKEN\');return}\n if(ws) ws.close();\n ws=new WebSocket((location.protocol===\'https:\'?\'wss://\':\'ws://\')+location.host+\'/ws/admin?token=\'+encodeURIComponent(token));\n ws.onopen=()=>{document.title=\'Doraemon Admin - Connected\';loadUsers()};\n ws.onmessage=e=>{\n   const x=JSON.parse(e.data);\n   if(x.type===\'message\'){renderMessage(x.data); if(selected) loadSummary(selected)}\n   if(x.type===\'error\') alert(x.message);\n };\n ws.onclose=()=>document.title=\'Doraemon Admin - Disconnected\';\n}\nasync function loadUsers(){\n if(!token){return}\n const r=await fetch(\'/admin/users?token=\'+encodeURIComponent(token));\n if(!r.ok){if(r.status===401)alert(\'ADMIN_WS_TOKEN không đúng\');return}\n const j=await r.json(), el=document.getElementById(\'users\'); el.innerHTML=\'\';\n (j.users||[]).forEach(u=>{\n   const d=document.createElement(\'div\'); d.className=\'user\'+(selected===u.id?\' active\':\'\');\n   d.innerHTML=\'<b>\'+esc(u.nickname)+\'</b><br><span class="small">\'+esc(u.phone)+\' · \'+esc(u.status)+\'</span>\';\n   d.onclick=()=>selectUser(u); el.appendChild(d);\n });\n}\nasync function selectUser(u){\n selected=u.id; document.getElementById(\'title\').textContent=u.nickname+\' (\'+u.phone+\')\';\n document.querySelectorAll(\'.user\').forEach(x=>x.classList.remove(\'active\'));\n const r=await fetch(\'/admin-chat/history?user_id=\'+u.id+\'&limit=100&token=\'+encodeURIComponent(token));\n if(r.ok){const j=await r.json();const box=document.getElementById(\'messages\');box.innerHTML=\'\';(j.messages||[]).forEach(renderMessage)}\n loadSummary(u.id); loadUsers();\n}\nfunction renderMessage(m){\n if(!selected || Number(m.user_id)!==Number(selected)) return;\n const box=document.getElementById(\'messages\'), d=document.createElement(\'div\');\n d.className=\'msg \'+(m.sender===\'admin\'?\'admin\':\'user\');\n d.textContent=(m.sender===\'admin\'?\'Admin: \':\'User: \')+m.message;\n box.appendChild(d);box.scrollTop=box.scrollHeight;\n}\nasync function sendMessage(){\n if(!ws||ws.readyState!==1){alert(\'Chưa kết nối Admin\');return}\n if(!selected)return;\n const inp=document.getElementById(\'message\'), msg=inp.value.trim();if(!msg)return;\n ws.send(JSON.stringify({user_id:selected,message:msg}));inp.value=\'\';\n}\nasync function loadSummary(uid){\n const r=await fetch(\'/admin/learning-summary/\'+uid+\'?token=\'+encodeURIComponent(token));\n if(!r.ok)return; const j=await r.json(),s=j.summary||{};\n document.getElementById(\'stats\').innerHTML=\n \'<span class="stat">Records: \'+(s.total_records||0)+\'</span>\'+\n \'<span class="stat">Completed: \'+(s.completed||0)+\'</span>\'+\n \'<span class="stat">Passed: \'+(s.passed||0)+\'</span>\'+\n \'<span class="stat">Avg: \'+(s.average_score==null?\'-\':Number(s.average_score).toFixed(1))+\'</span>\';\n}\nfunction esc(s){return String(s??\'\').replace(/[&<>"\']/g,m=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[m]))}\n</script>\n</body>\n</html>'
-
-
-def require_admin_token(token: Optional[str]):
-    if not ADMIN_WS_TOKEN or not token or token != ADMIN_WS_TOKEN:
-        raise HTTPException(401, "Admin token không hợp lệ.")
-    return True
-
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    return HTMLResponse(content=ADMIN_HTML)
-
-
-@app.get("/admin/users")
-def admin_users(token: Optional[str] = None):
-    require_admin_token(token)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id,phone,nickname,status,created_at
-                FROM users ORDER BY id DESC
-            """)
-            users = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-    return {"users": users}
-
-
-@app.get("/admin/learning-summary/{user_id}")
-def admin_learning_summary(user_id: int, token: Optional[str] = None):
-    require_admin_token(token)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT COUNT(*) AS total_records,
-                       COUNT(*) FILTER (WHERE status='COMPLETED') AS completed,
-                       COUNT(*) FILTER (WHERE status='IN_PROGRESS') AS in_progress,
-                       COUNT(*) FILTER (WHERE status='PASSED') AS passed,
-                       COUNT(*) FILTER (WHERE status='FAILED') AS failed,
-                       AVG(score) AS average_score,
-                       COUNT(DISTINCT lesson) AS lessons_studied,
-                       COUNT(DISTINCT topic) AS topics_studied
-                FROM learning_progress WHERE user_id=%s
-            """,(user_id,))
-            summary=dict(cur.fetchone())
-    finally:
-        conn.close()
-    return {"summary":summary}
-
-
 @app.get("/admin-chat/history")
-def history(
-    limit: int = 100,
-    user_id: Optional[int] = None,
-    token: Optional[str] = None,
-    authorization: Optional[str] = Header(default=None)
-):
-    # Admin UI uses ADMIN_WS_TOKEN; normal user client uses Bearer token.
-    if token:
-        require_admin_token(token)
-        target_user_id = user_id
-        if not target_user_id:
-            raise HTTPException(400, "Thiếu user_id.")
-    else:
-        user = current_user(bearer(authorization))
-        target_user_id = user["id"]
-
+def history(limit: int = 100, authorization: Optional[str] = Header(default=None)):
+    user = current_user(bearer(authorization))
     limit = max(1, min(limit, 500))
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
-                           FROM admin_messages
-                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""",
-                        (target_user_id, limit))
+            cur.execute("""SELECT id,sender,message,created_at,is_read FROM admin_messages
+                           WHERE user_id=%s ORDER BY id DESC LIMIT %s""", (user["id"], limit))
             rows = list(reversed(cur.fetchall()))
     finally:
         conn.close()
     return {"messages": rows}
+
+
+@app.post("/admin-chat/send")
+def user_send_admin(data: dict, authorization: Optional[str] = Header(default=None)):
+    user = current_user(bearer(authorization))
+    msg = str(data.get("message", "")).strip()
+    if not msg:
+        raise HTTPException(400, "Tin nhắn trống.")
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO admin_messages(user_id,sender,message)
+                           VALUES(%s,'user',%s)
+                           RETURNING id,user_id,sender,message,created_at,is_read""",
+                        (user["id"], msg))
+            row = dict(cur.fetchone())
+        conn.commit()
+    finally:
+        conn.close()
+    return {"message": row}
 
 async def send_json(ws, data):
     try:
@@ -334,7 +285,7 @@ async def ws_user(websocket: WebSocket):
             finally:
                 conn.close()
             await websocket.send_json({"type":"message","data":row})
-            await notify_admin(row)
+            await notify_admin({"type":"message","data":row})
     except WebSocketDisconnect:
         pass
     finally:
@@ -378,271 +329,537 @@ def require_active_user(authorization):
     return user
 
 def embed_text(text):
-    if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
-    r = gemini.models.embed_content(model=EMBEDDING_MODEL, contents=text)
+    if not gemini:
+        raise HTTPException(500, "Gemini chưa được khởi tạo.")
+    r = gemini.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=768)
+    )
     return r.embeddings[0].values
-
-def pinecone_search(message, top_k=8, metadata_filter=None):
-    if not index:
-        raise HTTPException(500, "Pinecone chưa được khởi tạo.")
-    kwargs = {
-        "vector": embed_text(message),
-        "top_k": top_k,
-        "include_metadata": True
-    }
-    if metadata_filter:
-        kwargs["filter"] = metadata_filter
-    return index.query(**kwargs)
-
-
-def normalize_matches(result):
-    matches = []
-    for m in result.matches:
-        md = dict(m.metadata or {})
-        text = md.get("text", md.get("content", ""))
-        if text:
-            matches.append({
-                "id": getattr(m, "id", None),
-                "score": float(m.score),
-                "text": text,
-                "metadata": md
-            })
-    return matches
-
 
 @app.post("/search")
 def search(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     require_active_user(authorization)
-    return {"matches": normalize_matches(pinecone_search(data.message, top_k=8))}
-
-
-@app.get("/learning/lessons")
-def learning_lessons(authorization: Optional[str] = Header(default=None)):
-    require_active_user(authorization)
-    # Pinecone query là semantic discovery; upload service cần lưu metadata lesson.
-    result = pinecone_search("danh sách các bài học trong giáo trình", top_k=100)
-    lessons = {}
-    for item in normalize_matches(result):
-        md = item["metadata"]
-        lesson = md.get("lesson")
-        if lesson:
-            key = str(lesson).strip()
-            lessons.setdefault(key, {
-                "lesson": key,
-                "topic": md.get("topic"),
-                "source": md.get("source", md.get("filename"))
-            })
-    return {"lessons": list(lessons.values())}
-
-
-@app.get("/learning/topics")
-def learning_topics(
-    lesson: Optional[str] = None,
-    authorization: Optional[str] = Header(default=None)
-):
-    require_active_user(authorization)
-    metadata_filter = {"lesson": lesson} if lesson else None
-    result = pinecone_search("các chủ đề học tập", top_k=100, metadata_filter=metadata_filter)
-    topics = {}
-    for item in normalize_matches(result):
-        md = item["metadata"]
-        topic = md.get("topic")
-        if topic:
-            key = str(topic).strip()
-            topics.setdefault(key, {
-                "topic": key,
-                "lesson": md.get("lesson"),
-                "source": md.get("source", md.get("filename"))
-            })
-    return {"topics": list(topics.values())}
-
-
-@app.get("/learning/questions")
-def learning_questions(
-    lesson: Optional[str] = None,
-    topic: Optional[str] = None,
-    authorization: Optional[str] = Header(default=None)
-):
-    require_active_user(authorization)
-    metadata_filter = {"content_type": "question"}
-    if lesson:
-        metadata_filter["lesson"] = lesson
-    if topic:
-        metadata_filter["topic"] = topic
-    result = pinecone_search("câu hỏi bài tập", top_k=100, metadata_filter=metadata_filter)
-    return {"questions": normalize_matches(result)}
-
-
-@app.post("/learning/progress")
-def save_learning_progress(
-    data: LearningProgressRequest,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = require_active_user(authorization)
-    status = data.status.upper().strip()
-    allowed = {"IN_PROGRESS", "COMPLETED", "PASSED", "FAILED"}
-    if status not in allowed:
-        raise HTTPException(400, f"status phải là một trong: {', '.join(sorted(allowed))}")
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                INSERT INTO learning_progress (
-                    user_id, lesson, topic, content_type, item_id, status,
-                    score, total_questions, correct_questions, note
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id,user_id,lesson,topic,content_type,item_id,status,
-                          score,total_questions,correct_questions,note,
-                          created_at,updated_at
-            """, (
-                user["id"], data.lesson, data.topic, data.content_type,
-                data.item_id, status, data.score, data.total_questions,
-                data.correct_questions, data.note
-            ))
-            row = dict(cur.fetchone())
-        conn.commit()
-    finally:
-        conn.close()
-    return {"success": True, "progress": row}
-
-
-@app.get("/learning/progress")
-def get_learning_progress(
-    lesson: Optional[str] = None,
-    topic: Optional[str] = None,
-    limit: int = 100,
-    authorization: Optional[str] = Header(default=None)
-):
-    user = require_active_user(authorization)
-    limit = max(1, min(limit, 500))
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = """SELECT id,lesson,topic,content_type,item_id,status,score,
-                              total_questions,correct_questions,note,
-                              created_at,updated_at
-                       FROM learning_progress WHERE user_id=%s"""
-            params = [user["id"]]
-            if lesson:
-                query += " AND lesson=%s"
-                params.append(lesson)
-            if topic:
-                query += " AND topic=%s"
-                params.append(topic)
-            query += " ORDER BY updated_at DESC LIMIT %s"
-            params.append(limit)
-            cur.execute(query, params)
-            rows = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-    return {"progress": rows}
-
-
-@app.get("/learning/summary")
-def learning_summary(authorization: Optional[str] = Header(default=None)):
-    user = require_active_user(authorization)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT COUNT(*) AS total_records,
-                       COUNT(*) FILTER (WHERE status='COMPLETED') AS completed,
-                       COUNT(*) FILTER (WHERE status='IN_PROGRESS') AS in_progress,
-                       COUNT(*) FILTER (WHERE status='PASSED') AS passed,
-                       COUNT(*) FILTER (WHERE status='FAILED') AS failed,
-                       AVG(score) AS average_score,
-                       COUNT(DISTINCT lesson) FILTER (WHERE lesson IS NOT NULL) AS lessons_studied,
-                       COUNT(DISTINCT topic) FILTER (WHERE topic IS NOT NULL) AS topics_studied
-                FROM learning_progress WHERE user_id=%s
-            """, (user["id"],))
-            summary = dict(cur.fetchone())
-            cur.execute("""
-                SELECT lesson,topic,content_type,item_id,status,score,updated_at
-                FROM learning_progress WHERE user_id=%s
-                ORDER BY updated_at DESC LIMIT 10
-            """, (user["id"],))
-            recent = [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-    return {"summary": summary, "recent": recent}
-
+    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if not data.text:
+        raise HTTPException(400, "Tin nhắn không được để trống.")
+    result = index.query(vector=embed_text(data.text), top_k=8, include_metadata=True)
+    matches = []
+    for m in result.matches:
+        md = m.metadata or {}
+        text = md.get("text", md.get("content", ""))
+        if text: matches.append({"score":float(m.score),"text":text,"metadata":md})
+    return {"matches":matches}
 
 @app.post("/api/proxy-chat")
 def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     user = require_active_user(authorization)
-    if not gemini:
-        raise HTTPException(500, "Gemini chưa được khởi tạo.")
-    if not index:
-        raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
+    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if not data.text: raise HTTPException(400, "Tin nhắn không được để trống.")
+    result = index.query(vector=embed_text(data.text), top_k=data.top_k, include_metadata=True,
+                         namespace=data.knowledge_namespace or "__default__")
+    contexts=[]; source_meta=[]
+    for m in result.matches:
+        md=m.metadata or {}; txt=md.get("text",md.get("content",""))
+        if txt: contexts.append(txt); source_meta.append(md)
+    learning=[]; catalog=[]
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT subject,lesson,topic,item_key,score,status,last_studied_at FROM learning_progress WHERE user_id=%s ORDER BY last_studied_at DESC LIMIT 100",(user["id"],))
+            learning=[dict(x) for x in cur.fetchall()]
+            cur.execute("SELECT subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,source_file,namespace FROM knowledge_documents ORDER BY subject,lesson,topic,id")
+            catalog=[dict(x) for x in cur.fetchall()]
+    finally: conn.close()
+    prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
-    result = pinecone_search(data.message, top_k=8)
-    matches = normalize_matches(result)
+Khi người học hỏi chung như 'hôm nay học gì', hãy dựa vào DANH MỤC GIÁO TRÌNH để hỏi lần lượt: môn học -> bài học -> chủ đề -> luyện câu hỏi. Chỉ dùng tên môn/bài/chủ đề có trong danh mục. Nếu user muốn học mới, ưu tiên nội dung chưa có trong lịch sử; nếu muốn ôn, ưu tiên nội dung điểm thấp hoặc lâu chưa học. Metadata trang là nguồn tham chiếu: bài học, chủ đề, câu hỏi, đáp án. Không được bịa trang. Với câu hỏi, không tiết lộ đáp án trước khi user trả lời. Dạy theo tài liệu, có thể giải thích bằng tiếng Việt.
 
+DANH MỤC GIÁO TRÌNH:
+{json.dumps(catalog,ensure_ascii=False,default=str)}
+
+LỊCH SỬ HỌC:
+{json.dumps(learning,ensure_ascii=False,default=str)}
+
+NỘI DUNG TÌM ĐƯỢC:
+{chr(10).join(contexts)}
+
+TIN NHẮN:
+{data.text}"""
+    response=gemini.models.generate_content(model=GEMINI_MODEL,contents=prompt,config=types.GenerateContentConfig(temperature=0.2))
+    return {"reply":response.text or "","model":GEMINI_MODEL,"sources":source_meta[:10],"learning_history_count":len(learning)}
+
+@app.post("/learning/progress")
+def save_learning_progress(data: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization); subject=str(data.get("subject","")).strip()
+    if not subject: raise HTTPException(400,"subject là bắt buộc.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("INSERT INTO learning_progress(subject,lesson,topic,item_key,score,status,user_id) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *",(subject,str(data.get("lesson","")).strip(),str(data.get("topic","")).strip(),str(data.get("item_key","")).strip(),data.get("score"),str(data.get("status","studied")),user["id"]))
+            row=dict(cur.fetchone())
+        conn.commit(); return {"success":True,"progress":row}
+    finally: conn.close()
+
+@app.get("/learning/summary")
+def learning_summary(authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT subject,lesson,topic,item_key,score,status,last_studied_at FROM learning_progress WHERE user_id=%s ORDER BY last_studied_at DESC LIMIT 200",(user["id"],))
+            return {"success":True,"user_id":user["id"],"learning_history":[dict(x) for x in cur.fetchall()]}
+    finally: conn.close()
+
+@app.get("/learning/catalog")
+def learning_catalog(authorization: Optional[str] = Header(default=None)):
+    require_active_user(authorization); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,source_file,namespace FROM knowledge_documents ORDER BY subject,lesson,topic,id")
+            return {"success":True,"documents":[dict(x) for x in cur.fetchall()]}
+    finally: conn.close()
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel():
+    return HTMLResponse("""<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Doraemon Admin</title>
+<style>
+*{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;color:#222}
+header{background:#1677ff;color:#fff;padding:18px 24px;font-size:22px;font-weight:700}
+main{max-width:1250px;margin:20px auto;padding:0 15px}
+.card{background:#fff;padding:18px;border-radius:12px;margin-bottom:18px;box-shadow:0 2px 10px #0001}
+input,button{padding:9px;border-radius:7px;border:1px solid #ccc}
+button{background:#1677ff;color:#fff;border:0;cursor:pointer}
+button.gray{background:#666}button.red{background:#d93025}
+#login{max-width:420px;margin:60px auto}.layout{display:grid;grid-template-columns:52% 48%;gap:18px}
+.user{padding:10px;border-bottom:1px solid #eee;cursor:pointer}.user:hover{background:#f5f8ff}
+.user.sel{background:#e8f1ff}.status-ACTIVE{color:#16803c}.status-PENDING{color:#b76b00}.status-LOCKED{color:#c00}
+#users{max-height:610px;overflow:auto}.chat{display:flex;flex-direction:column;height:610px}
+#messages{flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
+.msg{margin:7px 0;padding:8px 10px;border-radius:10px;max-width:82%;white-space:pre-wrap}
+.msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
+.meta{font-size:11px;color:#777;margin-top:3px}
+.chatbar{display:flex;gap:7px;margin-top:10px}.chatbar input{flex:1}
+.small{font-size:13px;color:#666}
+@media(max-width:900px){.layout{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>🤖 Doraemon Admin</header>
+<main>
+<div class="card" id="login">
+<h3>Đăng nhập Admin</h3>
+<input id="pw" type="password" placeholder="Mật khẩu Admin" style="width:70%">
+<button onclick="login()">Đăng nhập</button>
+<div id="err" style="color:#c00;margin-top:8px"></div>
+</div>
+
+<div id="panel" style="display:none">
+<div class="card">
+<h3>📚 Knowledge Base</h3>
+<div class="small" style="margin-bottom:10px">
+Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __default__
+</div>
+<form id="uploadForm" onsubmit="uploadKnowledge(event)">
+<input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1">
+<input id="lesson" placeholder="Bài học" style="flex:1"><input id="lessonPages" placeholder="Trang bài học: 1-10" style="flex:1">
+<input id="topic" placeholder="Chủ đề" style="flex:1"><input id="topicPages" placeholder="Trang chủ đề: 3-5" style="flex:1">
+<input id="questionPages" placeholder="Trang câu hỏi: 8-10" style="flex:1"><input id="answerPages" placeholder="Trang đáp án: 20-21" style="flex:1">
+<input id="chunkSize" type="number" value="1200" min="300" max="5000" style="width:120px">
+<input id="overlap" type="number" value="200" min="0" max="4900" style="width:110px">
+<button id="uploadBtn" type="submit">⬆️ Upload PDF</button>
+</div>
+</form>
+<div id="uploadStatus" class="small" style="margin-top:10px"></div>
+</div>
+
+<div class="card">
+<button onclick="loadUsers()">🔄 Làm mới</button>
+<span id="count" class="small"></span>
+<span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
+</div>
+<div class="layout">
+<div class="card">
+<h3>👥 Tài khoản</h3>
+<div id="users"></div>
+</div>
+<div class="card chat">
+<h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
+<div id="messages"></div>
+<div class="chatbar">
+<input id="chatInput" placeholder="Nhập tin nhắn..." disabled
+       onkeydown="if(event.key==='Enter')sendAdminMessage()">
+<button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
+</div>
+</div>
+</div>
+</div>
+</main>
+
+<script>
+let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0;
+
+function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+async function api(u,o={}) {
+  o.headers={"Content-Type":"application/json",...(o.headers||{})};
+  const r=await fetch(u,o); const t=await r.text(); let d={};
+  try{d=JSON.parse(t)}catch{d={detail:t}}
+  if(!r.ok) throw Error(d.detail||("HTTP "+r.status));
+  return d;
+}
+async function login(){
+  pw=document.getElementById("pw").value;
+  try{
+    await api("/admin/api/users?password="+encodeURIComponent(pw));
+    document.getElementById("login").style.display="none";
+    document.getElementById("panel").style.display="block";
+    document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
+    await loadUsers();
+    startChatPolling();
+  }catch(e){document.getElementById("err").textContent=e.message}
+}
+async function uploadKnowledge(event){
+  event.preventDefault();
+  const file=document.getElementById("pdfFile").files[0];
+  if(!file)return;
+  const status=document.getElementById("uploadStatus"), btn=document.getElementById("uploadBtn");
+  btn.disabled=true;
+  status.textContent="⏳ Đang xử lý PDF và upload Pinecone...";
+  try{
+    const fd=new FormData();
+    fd.append("file",file);
+    const params=new URLSearchParams({password:pw,subject:document.getElementById("subject").value.trim(),lesson:document.getElementById("lesson").value.trim(),lesson_pages:document.getElementById("lessonPages").value.trim(),topic:document.getElementById("topic").value.trim(),topic_pages:document.getElementById("topicPages").value.trim(),question_pages:document.getElementById("questionPages").value.trim(),answer_pages:document.getElementById("answerPages").value.trim(),chunk_size:document.getElementById("chunkSize").value||1200,overlap:document.getElementById("overlap").value||200});
+    fd.append("overlap",document.getElementById("overlap").value||200);
+    const r=await fetch("/admin/api/knowledge/upload?"+params.toString(),{method:"POST",body:fd});
+    const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}}
+    if(!r.ok)throw Error(d.detail||("HTTP "+r.status));
+    status.textContent=`✅ ${d.filename}: ${d.pages} trang · ${d.chunks} chunks · ${d.dimension} dimensions`;
+    document.getElementById("pdfFile").value="";
+  }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
+  finally{btn.disabled=false}
+}
+
+async function loadUsers(){
+  const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
+  document.getElementById("count").textContent="  Tổng: "+d.users.length;
+  document.getElementById("users").innerHTML=d.users.map(u=>{
+    const s=u.subscription||{}, st=u.status||"PENDING";
+    const ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";
+    return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
+      <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
+      <div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||"-")} · hết hạn: ${ex}</div>
+      <div class="small">Bấm để xem lịch sử và chat</div>
+      <div style="margin-top:7px">
+        <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},12)">12 tháng</button>
+        <button class="red" onclick="event.stopPropagation();lock(${u.id})">Khóa</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+async function selectUser(id,nickname){
+  selectedUser=id; lastChatId=0; seenMessageIds=new Set();
+  document.getElementById("chatTitle").textContent="💬 Chat với "+nickname+" (#"+id+")";
+  document.getElementById("chatInput").disabled=false; document.getElementById("sendBtn").disabled=false;
+  document.getElementById("messages").innerHTML="";
+  await loadUsers();
+  await pollSelectedChat(true);
+}
+function addMessage(m){
+  if(m && m.id!=null){const id=String(m.id); if(seenMessageIds.has(id))return; seenMessageIds.add(id); lastChatId=Math.max(lastChatId,Number(m.id)||0);}
+  const box=document.getElementById("messages"), div=document.createElement("div");
+  div.className="msg "+(m.sender==="admin"?"admin":"user");
+  const who=m.sender==="admin"?"Admin":m.sender==="user"?"Khách":"System";
+  const when=m.created_at?new Date(m.created_at).toLocaleString("vi-VN"):"";
+  div.innerHTML="<b>"+who+"</b><br>"+esc(m.message)+"<div class='meta'>"+when+"</div>";
+  box.appendChild(div); box.scrollTop=box.scrollHeight;
+}
+async function pollSelectedChat(initial=false){
+  if(!selectedUser||!pw||pollBusy)return;
+  pollBusy=true;
+  try{
+    const d=await api("/admin/api/chat/history?user_id="+selectedUser+"&password="+encodeURIComponent(pw)+"&limit=200&after_id="+(initial?0:lastChatId));
+    if(selectedUser) d.messages.forEach(addMessage);
+    if(d.last_id!=null) lastChatId=Math.max(lastChatId,Number(d.last_id)||0);
+    document.getElementById("wsState").textContent="● Chat đang đồng bộ tự động";
+  }catch(e){
+    console.error("Admin polling error:",e);
+    document.getElementById("wsState").textContent="● Đang kết nối lại chat...";
+  }finally{pollBusy=false;}
+}
+function startChatPolling(){
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(()=>pollSelectedChat(false),1500);
+}
+function connectWS(){
+  if(ws && ws.readyState===WebSocket.OPEN)return;
+  const proto=location.protocol==="https:"?"wss":"ws";
+  ws=new WebSocket(proto+"://"+location.host+"/ws/admin?token="+encodeURIComponent(wsToken));
+  ws.onopen=()=>{document.getElementById("wsState").textContent="● Admin realtime: Đã kết nối";};
+  ws.onmessage=e=>{
+    try{
+      const d=JSON.parse(e.data);
+      if(d.type==="connected"){
+        document.getElementById("wsState").textContent="● Admin realtime: Đã kết nối";
+        return;
+      }
+      if(d.type==="message" && d.data){
+        const uid=Number(d.data.user_id);
+        if(selectedUser && uid===Number(selectedUser)){
+          addMessage(d.data);
+        } else {
+          // Có tin nhắn mới từ user khác: vẫn cập nhật danh sách.
+          // Khi chọn user đó, lịch sử sẽ được tải đầy đủ.
+        }
+        loadUsers();
+      }
+      if(d.type==="error"){
+        document.getElementById("wsState").textContent="● Lỗi: "+(d.message||"WebSocket");
+      }
+    }catch(err){ console.error("Admin WS message error",err); }
+  };
+  ws.onerror=()=>{ console.log("Optional admin WebSocket unavailable; polling remains active."); };
+  ws.onclose=()=>{ console.log("Optional admin WebSocket closed; polling remains active."); };
+}
+async function sendAdminMessage(){
+  const inp=document.getElementById("chatInput"), msg=inp.value.trim();
+  if(!msg||!selectedUser)return;
+  try{
+    await api("/admin/api/chat/send", {
+      method:"POST",
+      body:JSON.stringify({password:pw,user_id:selectedUser,message:msg})
+    });
+    inp.value="";
+    await pollSelectedChat();
+  }catch(e){
+    alert("Không gửi được tin nhắn: "+e.message);
+  }
+}
+async function act(id,m){
+  if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;
+  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});
+  loadUsers();
+}
+async function lock(id){
+  if(!confirm("Khóa tài khoản?"))return;
+  await api("/admin/api/users/"+id+"/status",{method:"POST",body:JSON.stringify({password:pw,status:"LOCKED"})});
+  loadUsers();
+}
+</script>
+</body></html>""")
+
+
+# ============================================================
+# Knowledge Base upload from Admin
+# ============================================================
+def kb_chunk_text(text, chunk_size=1200, overlap=200):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return []
+    out=[]; start=0
+    while start < len(text):
+        end=min(len(text), start+chunk_size)
+        chunk=text[start:end].strip()
+        if chunk: out.append(chunk)
+        if end>=len(text): break
+        start=max(start+1, end-overlap)
+    return out
+
+@app.post("/admin/api/knowledge/upload")
+async def admin_knowledge_upload(
+    password: str, file: UploadFile = File(...),
+    subject: str = "", lesson: str = "", lesson_pages: str = "",
+    topic: str = "", topic_pages: str = "", question_pages: str = "", answer_pages: str = "",
+    chunk_size: int = 1200, overlap: int = 200
+):
+    check_admin(password)
+    if not subject.strip(): raise HTTPException(400, "Môn học là bắt buộc.")
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Vui lòng chọn file PDF.")
+    if not gemini: raise HTTPException(500, "GEMINI_API_KEY chưa được cấu hình.")
+    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if chunk_size < 300 or chunk_size > 5000:
+        raise HTTPException(400, "chunk_size phải từ 300 đến 5000.")
+    if overlap < 0 or overlap >= chunk_size:
+        raise HTTPException(400, "overlap phải >= 0 và nhỏ hơn chunk_size.")
+
+    raw=await file.read()
+    if len(raw)>50*1024*1024:
+        raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
+    try:
+        reader=PdfReader(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(400, f"Không đọc được PDF: {e}")
+
+    records=[]; total=0; namespace="__default__"
+    source_file=os.path.basename(file.filename)
+    try:
+        for page_no,page in enumerate(reader.pages,1):
+            chunks=kb_chunk_text(page.extract_text() or "", chunk_size, overlap)
+            for chunk_no,chunk in enumerate(chunks):
+                vector=embed_text(chunk)
+                records.append({
+                    "id":uuid.uuid4().hex,
+                    "values":vector,
+                    "metadata":{
+                        "text":chunk,
+                        "course":subject.strip(), "subject":subject.strip(),
+                        "lesson":lesson.strip(), "lesson_pages":lesson_pages.strip(),
+                        "topic":topic.strip(), "topic_pages":topic_pages.strip(),
+                        "question_pages":question_pages.strip(), "answer_pages":answer_pages.strip(),
+                        "source_file":source_file,
+                        "page":page_no,
+                        "chunk_index":chunk_no
+                    }
+                })
+                total+=1
+                if len(records)>=50:
+                    index.upsert(vectors=records, namespace=namespace)
+                    records=[]
+        if records:
+            index.upsert(vectors=records, namespace=namespace)
+    except Exception as e:
+        raise HTTPException(500, f"Lỗi embedding/Pinecone: {e}")
+
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO knowledge_documents(source_file,subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",(source_file,subject.strip(),lesson.strip(),lesson_pages.strip(),topic.strip(),topic_pages.strip(),question_pages.strip(),answer_pages.strip(),namespace))
+        conn.commit()
+    finally: conn.close()
+    return {
+        "success":True,"filename":source_file,"subject":subject.strip(),"lesson":lesson.strip(),"topic":topic.strip(),"pages":len(reader.pages),
+        "chunks":total,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace
+    }
+
+@app.get("/admin/api/users")
+def admin_users(password: str):
+    check_admin(password)
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT lesson,topic,content_type,item_id,status,score
-                FROM learning_progress
-                WHERE user_id=%s
-                ORDER BY updated_at DESC LIMIT 10
-            """, (user["id"],))
-            progress = [dict(r) for r in cur.fetchall()]
+            cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
+                    s.id subscription_id,s.plan,s.started_at,s.expires_at,s.status subscription_status
+                    FROM users u LEFT JOIN LATERAL
+                    (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
+                    ORDER BY u.id DESC""")
+            rows=cur.fetchall()
+    finally: conn.close()
+    return {"users":[{"id":r["id"],"phone":r["phone"],"nickname":r["nickname"],"status":r["status"],
+        "created_at":r["created_at"],
+        "subscription":None if r["subscription_id"] is None else
+        {"id":r["subscription_id"],"plan":r["plan"],"started_at":r["started_at"],
+         "expires_at":r["expires_at"],"status":r["subscription_status"]}} for r in rows]}
+
+@app.post("/admin/api/users/{user_id}/activate")
+def admin_activate(user_id:int,data:dict):
+    check_admin(str(data.get("password",""))); months=int(data.get("months",1))
+    if months not in (1,3,6,12): raise HTTPException(400,"Thời hạn phải 1, 3, 6 hoặc 12 tháng.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
+            if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
+            cur.execute("SELECT id,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
+            old=cur.fetchone(); now=datetime.now(timezone.utc)
+            start=old["expires_at"] if old and old["expires_at"] and old["expires_at"]>now else now
+            exp=start+timedelta(days=30*months)
+            if old:
+                cur.execute("UPDATE subscriptions SET plan=%s,started_at=COALESCE(started_at,%s),expires_at=%s,status='ACTIVE' WHERE id=%s",
+                            ("N5",now,exp,old["id"]))
+            else:
+                cur.execute("INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,'N5',%s,%s,'ACTIVE')",
+                            (user_id,now,exp))
+            cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
+        conn.commit()
+    finally: conn.close()
+    return {"success":True,"expires_at":exp}
+
+
+
+@app.post("/admin/api/chat/send")
+def admin_send_chat(data: dict):
+    check_admin(str(data.get("password", "")))
+    user_id = int(data.get("user_id"))
+    msg = str(data.get("message", "")).strip()
+    if not msg:
+        raise HTTPException(400, "Tin nhắn trống.")
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, "Không tìm thấy user.")
+            cur.execute("""INSERT INTO admin_messages(user_id,sender,message)
+                           VALUES(%s,'admin',%s)
+                           RETURNING id,user_id,sender,message,created_at,is_read""",
+                        (user_id, msg))
+            row = dict(cur.fetchone())
+        conn.commit()
     finally:
         conn.close()
+    return {"message": row}
 
-    contexts = [
-        f"[metadata={item['metadata']}]\n{item['text']}"
-        for item in matches
-    ]
-    progress_text = "\n".join(
-        f"- lesson={p.get('lesson')}, topic={p.get('topic')}, "
-        f"type={p.get('content_type')}, item={p.get('item_id')}, "
-        f"status={p.get('status')}, score={p.get('score')}"
-        for p in progress
-    ) or "Chưa có lịch sử học tập."
+@app.get("/admin/api/chat/history")
+def admin_chat_history(user_id: int, password: str, limit: int = 200, after_id: int = 0):
+    check_admin(password)
+    limit = max(1, min(limit, 500))
+    after_id = max(0, int(after_id or 0))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if after_id > 0:
+                cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                               FROM admin_messages
+                               WHERE user_id=%s AND id>%s
+                               ORDER BY id ASC LIMIT %s""",
+                            (user_id, after_id, limit))
+            else:
+                cur.execute("""SELECT id,user_id,sender,message,created_at,is_read
+                               FROM admin_messages
+                               WHERE user_id=%s
+                               ORDER BY id ASC LIMIT %s""",
+                            (user_id, limit))
+            rows = [dict(r) for r in cur.fetchall()]
+            if rows:
+                cur.execute("""UPDATE admin_messages SET is_read=TRUE
+                               WHERE user_id=%s AND sender='user' AND id<=%s""",
+                            (user_id, rows[-1]["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"messages": rows, "last_id": rows[-1]["id"] if rows else after_id}
 
-    prompt = f"""Bạn là Doraemon, trợ lý học tiếng Nhật.
+@app.get("/admin/api/ws-token")
+def admin_ws_token(password: str):
+    check_admin(password)
+    if not ADMIN_WS_TOKEN:
+        raise HTTPException(500, "ADMIN_WS_TOKEN chưa được cấu hình trên Render.")
+    return {"token": ADMIN_WS_TOKEN}
 
-Mục tiêu:
-- Giúp người dùng học theo giáo trình đã nạp vào hệ thống.
-- Ưu tiên nội dung giáo trình trong CONTEXT.
-- Metadata lesson/topic/content_type dùng để hiểu cấu trúc tài liệu.
-- Khi người dùng muốn học bài, giúp chọn hoặc tiếp tục bài học.
-- Khi muốn học chủ đề, ưu tiên topic phù hợp.
-- Khi muốn làm bài, ưu tiên content_type='question'.
-- Không bịa nội dung giáo trình.
-- Nếu context không đủ, nói rõ tài liệu hiện tại chưa có thông tin đó.
-- Có thể dùng lịch sử học tập để đề xuất nội dung tiếp theo, nhưng không coi lịch sử là nội dung giáo trình.
-
-Lịch sử học tập gần đây:
-{progress_text}
-
-Câu hỏi:
-{data.message}
-
-CONTEXT GIÁO TRÌNH:
-{"\n\n---\n\n".join(contexts)}
-"""
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2)
-    )
-    return {
-        "reply": response.text or "",
-        "model": GEMINI_MODEL,
-        "learning": {
-            "recent_progress_count": len(progress),
-            "context_count": len(contexts)
-        }
-    }
-
+@app.post("/admin/api/users/{user_id}/status")
+def admin_status(user_id:int,data:dict):
+    check_admin(str(data.get("password",""))); status=str(data.get("status","")).upper()
+    if status not in ("ACTIVE","LOCKED","PENDING"): raise HTTPException(400,"Trạng thái không hợp lệ.")
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET status=%s WHERE id=%s",(status,user_id))
+            if cur.rowcount==0: raise HTTPException(404,"Không tìm thấy user.")
+        conn.commit()
+    finally: conn.close()
+    return {"success":True,"status":status}
 
 @app.get("/health")
 def health():
     return {"status":"ok","pinecone":index is not None,"gemini":gemini is not None,
-            "database":bool(DATABASE_URL),"gemini_model":GEMINI_MODEL,
-            "admin":True,"learning":True}
+            "database":bool(DATABASE_URL),"gemini_model":GEMINI_MODEL}
