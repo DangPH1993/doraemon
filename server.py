@@ -65,7 +65,24 @@ def init_db():
                 subject VARCHAR(255) NOT NULL, lesson VARCHAR(255), topic VARCHAR(255), item_key VARCHAR(500),
                 score INTEGER, status VARCHAR(50) NOT NULL DEFAULT 'studied',
                 last_studied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user ON learning_progress(user_id,last_studied_at DESC);""")
+
+            # Migration: database cũ có thể đã có bảng learning_progress
+            # nhưng chưa có các cột mới. ADD COLUMN IF NOT EXISTS giúp nâng cấp
+            # schema mà không xóa dữ liệu user đã học.
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS subject VARCHAR(255);")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS topic VARCHAR(255);")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS item_key VARCHAR(500);")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS score INTEGER;")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'studied';")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS last_studied_at TIMESTAMPTZ DEFAULT NOW();")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();")
+
+            # Các cột mới có thể được thêm vào bảng cũ với NULL. Đảm bảo
+            # last_studied_at luôn có giá trị trước khi tạo index.
+            cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user
+                           ON learning_progress(user_id,last_studied_at DESC);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
                 lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
