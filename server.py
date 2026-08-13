@@ -62,45 +62,60 @@ def init_db():
                 is_read BOOLEAN NOT NULL DEFAULT FALSE);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS learning_progress (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                subject VARCHAR(255) NOT NULL, lesson VARCHAR(255), topic VARCHAR(255), item_key VARCHAR(500),
-                score INTEGER, status VARCHAR(50) NOT NULL DEFAULT 'studied',
-                last_studied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+                subject VARCHAR(255) NOT NULL DEFAULT '',
+                content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
+                content_id VARCHAR(255),
+                lesson VARCHAR(255), topic VARCHAR(255), item_key VARCHAR(500),
+                score INTEGER,
+                status VARCHAR(50) NOT NULL DEFAULT 'in_progress',
+                current_position INTEGER DEFAULT 0,
+                current_page INTEGER,
+                attempt_count INTEGER DEFAULT 0,
+                correct_count INTEGER DEFAULT 0,
+                wrong_count INTEGER DEFAULT 0,
+                last_studied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                next_review_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL,
+                subject VARCHAR(255) NOT NULL,
+                content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
+                lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
+                question_pages VARCHAR(255), answer_pages VARCHAR(255),
+                namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
 
-            # Migration: database cũ có thể đã có bảng learning_progress
-            # nhưng chưa có các cột mới. ADD COLUMN IF NOT EXISTS giúp nâng cấp
-            # schema mà không xóa dữ liệu user đã học.
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS subject VARCHAR(255);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS topic VARCHAR(255);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS item_key VARCHAR(500);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS score INTEGER;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'studied';")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS last_studied_at TIMESTAMPTZ DEFAULT NOW();")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();")
-
-            # Các cột mới có thể được thêm vào bảng cũ với NULL. Đảm bảo
-            # last_studied_at luôn có giá trị trước khi tạo index.
+            # Safe migrations for databases created by previous versions.
+            for sql in [
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS content_id VARCHAR(255);",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS topic VARCHAR(255);",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS item_key VARCHAR(500);",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS score INTEGER;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'in_progress';",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_position INTEGER DEFAULT 0;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_page INTEGER;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS attempt_count INTEGER DEFAULT 0;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS correct_count INTEGER DEFAULT 0;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS wrong_count INTEGER DEFAULT 0;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS last_studied_at TIMESTAMPTZ DEFAULT NOW();",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS next_review_at TIMESTAMPTZ;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();",
+                "ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';",
+            ]:
+                cur.execute(sql)
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
+            cur.execute("UPDATE learning_progress SET subject='' WHERE subject IS NULL;")
+            cur.execute("UPDATE learning_progress SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
+            cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user
                            ON learning_progress(user_id,last_studied_at DESC);""")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS subject VARCHAR(255);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS content_id VARCHAR(255);")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_position INTEGER DEFAULT 0;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_page INTEGER;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS attempt_count INTEGER DEFAULT 0;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS correct_count INTEGER DEFAULT 0;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS wrong_count INTEGER DEFAULT 0;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS last_studied_at TIMESTAMPTZ DEFAULT NOW();")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS next_review_at TIMESTAMPTZ;")
-            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;")
-            cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';")
-            cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
-            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
-                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
-                lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
-                question_pages VARCHAR(255), answer_pages VARCHAR(255), namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_content
+                           ON learning_progress(user_id,content_type,content_id,last_studied_at DESC);""")
         conn.commit()
     finally:
         conn.close()
@@ -382,6 +397,178 @@ def search(data: ChatRequest, authorization: Optional[str] = Header(default=None
         if text: matches.append({"score":float(m.score),"text":text,"metadata":md})
     return {"matches":matches}
 
+
+CONTENT_TYPES = {"Từ vựng", "Ngữ pháp", "Bài tập", "Truyện đọc"}
+
+
+def _normalize_content_type(value):
+    value = str(value or "").strip()
+    return value if value in CONTENT_TYPES else "Từ vựng"
+
+
+def _review_days(content_type, score=None, status="in_progress"):
+    """Review schedule: exercises use score; non-scored learning uses a gentle revisit schedule."""
+    if content_type == "Truyện đọc":
+        return None
+    if content_type == "Bài tập" and score is not None:
+        try:
+            sc = float(score)
+        except Exception:
+            sc = None
+        if sc is not None:
+            if sc < 60: return 1
+            if sc < 80: return 3
+            if sc < 90: return 7
+            return 14
+    if status == "completed":
+        return 7 if content_type in {"Từ vựng", "Ngữ pháp"} else None
+    return 3 if content_type in {"Từ vựng", "Ngữ pháp"} else None
+
+
+def record_learning_event(user_id, event):
+    event = dict(event or {})
+    content_type = _normalize_content_type(event.get("content_type"))
+    subject = str(event.get("subject") or "Tiếng Nhật").strip()
+    lesson = str(event.get("lesson") or "").strip() or None
+    topic = str(event.get("topic") or "").strip() or None
+    item_key = str(event.get("item_key") or lesson or topic or "").strip() or None
+    content_id = str(event.get("content_id") or f"{content_type}|{subject}|{lesson or ''}|{topic or ''}|{item_key or ''}")[:255]
+    status = str(event.get("status") or "in_progress").strip()
+    if status not in {"in_progress", "completed", "review", "needs_review"}:
+        status = "in_progress"
+
+    score = event.get("score")
+    try:
+        score = int(score) if score is not None and str(score).strip() != "" else None
+    except Exception:
+        score = None
+    if score is not None:
+        score = max(0, min(100, score))
+
+    current_position = int(event.get("current_position") or 0)
+    current_page = event.get("current_page")
+    try:
+        current_page = int(current_page) if current_page is not None and str(current_page).strip() != "" else None
+    except Exception:
+        current_page = None
+    attempt_count = max(0, int(event.get("attempt_count") or 0))
+    correct_count = max(0, int(event.get("correct_count") or 0))
+    wrong_count = max(0, int(event.get("wrong_count") or 0))
+
+    # Exercise scoring: correct+wrong is the source of truth when supplied.
+    total = correct_count + wrong_count
+    if content_type == "Bài tập" and total > 0 and score is None:
+        score = round(correct_count * 100 / total)
+    if content_type == "Bài tập" and total > 0 and status == "in_progress":
+        status = "completed" if wrong_count == 0 else "needs_review"
+    if content_type != "Bài tập" and event.get("completed") is True:
+        status = "completed"
+
+    days = _review_days(content_type, score, status)
+    next_review = None if days is None else datetime.now(timezone.utc) + timedelta(days=days)
+    completed_at = datetime.now(timezone.utc) if status == "completed" else None
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT id,attempt_count,correct_count,wrong_count
+                           FROM learning_progress
+                           WHERE user_id=%s AND content_type=%s AND content_id=%s
+                           ORDER BY id DESC LIMIT 1""",
+                        (user_id, content_type, content_id))
+            old = cur.fetchone()
+            if old:
+                if content_type == "Bài tập":
+                    attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
+                else:
+                    attempts = max(int(old.get("attempt_count") or 0), attempt_count)
+                correct = max(int(old.get("correct_count") or 0), correct_count) if content_type == "Bài tập" else 0
+                wrong = max(int(old.get("wrong_count") or 0), wrong_count) if content_type == "Bài tập" else 0
+                cur.execute("""UPDATE learning_progress SET
+                    subject=%s,lesson=%s,topic=%s,item_key=%s,score=%s,status=%s,
+                    current_position=%s,current_page=%s,attempt_count=%s,correct_count=%s,wrong_count=%s,
+                    last_studied_at=NOW(),next_review_at=%s,completed_at=%s
+                    WHERE id=%s
+                    RETURNING *""",
+                    (subject,lesson,topic,item_key,score,status,current_position,current_page,
+                     attempts,correct,wrong,next_review,completed_at,old["id"]))
+            else:
+                attempts = max(1, attempt_count) if content_type == "Bài tập" else 0
+                cur.execute("""INSERT INTO learning_progress
+                    (user_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                     current_position,current_page,attempt_count,correct_count,wrong_count,
+                     last_studied_at,next_review_at,completed_at)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
+                    RETURNING *""",
+                    (user_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                     current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
+            row = dict(cur.fetchone())
+        conn.commit()
+        return row
+    finally:
+        conn.close()
+
+
+def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None):
+    """Infer only learning progress, never a score. Exercises are scored via /learning/progress."""
+    text = (user_text or "").strip()
+    low = text.lower()
+    source_meta = source_meta or []
+    chosen = None
+    for md in source_meta:
+        if md.get("content_type") in CONTENT_TYPES:
+            chosen = md
+            break
+
+    # Prefer explicit catalog matches in the user's request.
+    if not chosen:
+        for item in catalog:
+            hay = " ".join(str(item.get(k) or "") for k in ("lesson", "topic", "subject")).strip()
+            if hay and any(part.lower() in low for part in [str(item.get("lesson") or ""), str(item.get("topic") or "")] if part):
+                chosen = item
+                break
+
+    if not chosen:
+        # Detect the content type from explicit words in the conversation.
+        for typ, keys in {
+            "Truyện đọc": ["truyện", "câu chuyện", "đọc truyện"],
+            "Từ vựng": ["từ vựng", "từ mới", "vocabulary"],
+            "Ngữ pháp": ["ngữ pháp", "grammar"],
+            "Bài tập": ["bài tập", "làm bài", "câu hỏi", "quiz"]
+        }.items():
+            if any(k in low for k in keys):
+                chosen = {"content_type": typ, "subject": "Tiếng Nhật"}
+                break
+
+    if not chosen:
+        return None
+
+    content_type = _normalize_content_type(chosen.get("content_type"))
+    subject = chosen.get("subject") or chosen.get("course") or "Tiếng Nhật"
+    lesson = chosen.get("lesson") or None
+    topic = chosen.get("topic") or None
+    page = chosen.get("page")
+    # User can explicitly state a page: "trang 7", "đến trang 7".
+    m = re.search(r"(?:trang|page)\s*(\d+)", low)
+    if m:
+        page = int(m.group(1))
+
+    completed = any(x in low for x in ["đã học xong", "học xong", "đọc xong", "xong bài", "hoàn thành"])
+    status = "completed" if completed else "in_progress"
+    item_key = lesson or topic or str(chosen.get("source_file") or "") or None
+    return {
+        "content_type": content_type,
+        "subject": subject,
+        "content_id": f"{content_type}|{subject}|{lesson or ''}|{topic or ''}|{item_key or ''}",
+        "lesson": lesson,
+        "topic": topic,
+        "item_key": item_key,
+        "current_page": page,
+        "current_position": 0,
+        "status": status,
+        "completed": completed,
+    }
+
 @app.post("/api/proxy-chat")
 def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     user = require_active_user(authorization)
@@ -450,6 +637,9 @@ QUY TẮC QUAN TRỌNG:
 10. Với Ngữ pháp, giải thích, ví dụ và luyện tập.
 11. Dựa vào LỊCH SỬ HỌC để tiếp tục đúng phần user đang học dở.
 12. Không bịa trang tài liệu.
+13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
+14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả; không tự suy đoán điểm từ lời giải thích của Doraemon.
+15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
 
 DANH MỤC GIÁO TRÌNH:
 {json.dumps(catalog,ensure_ascii=False,default=str)}
@@ -474,7 +664,7 @@ TIN NHẮN:
     # của người học.
     tracked_event=None
     try:
-        event=infer_learning_event(user["id"],data.text,reply,catalog,learning)
+        event=infer_learning_event(user["id"],data.text,reply,catalog,learning,source_meta)
         if event:
             tracked_event=record_learning_event(user["id"],event)
     except Exception as e:
@@ -492,10 +682,14 @@ TIN NHẮN:
 @app.post("/learning/progress")
 def save_learning_progress(data: dict, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    if not data.get("content_type"):
-        # Backward compatible manual calls may still only provide subject.
-        data["content_type"]="Từ vựng"
-    row=record_learning_event(user["id"],data)
+    payload=dict(data or {})
+    payload["content_type"]=_normalize_content_type(payload.get("content_type"))
+    # Only Bài tập should normally carry score/correct/wrong.
+    if payload["content_type"] != "Bài tập":
+        payload.pop("score",None)
+        payload.pop("correct_count",None)
+        payload.pop("wrong_count",None)
+    row=record_learning_event(user["id"],payload)
     return {"success":True,"progress":row}
 
 @app.get("/learning/summary")
@@ -517,15 +711,6 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
     finally:
         conn.close()
 
-
-@app.get("/learning/summary")
-def learning_summary(authorization: Optional[str] = Header(default=None)):
-    user=require_active_user(authorization); conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT subject,lesson,topic,item_key,score,status,last_studied_at FROM learning_progress WHERE user_id=%s ORDER BY last_studied_at DESC LIMIT 200",(user["id"],))
-            return {"success":True,"user_id":user["id"],"learning_history":[dict(x) for x in cur.fetchall()]}
-    finally: conn.close()
 
 @app.get("/learning/catalog")
 def learning_catalog(authorization: Optional[str] = Header(default=None)):
@@ -593,6 +778,12 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 <input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
 <input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1;min-width:180px">
+<select id="contentType" required style="min-width:170px">
+  <option value="Từ vựng">Từ vựng</option>
+  <option value="Ngữ pháp">Ngữ pháp</option>
+  <option value="Bài tập">Bài tập</option>
+  <option value="Truyện đọc">Truyện đọc</option>
+</select>
 <input id="chunkSize" type="number" value="1200" min="300" max="5000" title="Kích thước chunk" style="width:120px">
 <input id="overlap" type="number" value="200" min="0" max="4900" title="Độ chồng lấn" style="width:110px">
 </div>
@@ -696,6 +887,7 @@ async function uploadKnowledge(event){
     fd.append("file",file);
     fd.append("password",pw);
     fd.append("subject",document.getElementById("subject").value.trim());
+    fd.append("content_type",document.getElementById("contentType").value);
     fd.append("metadata_json",JSON.stringify(rows));
     fd.append("chunk_size",document.getElementById("chunkSize").value||1200);
     fd.append("overlap",document.getElementById("overlap").value||200);
@@ -912,12 +1104,14 @@ async def admin_knowledge_upload(
     password: str = "",
     file: UploadFile = File(...),
     subject: str = "",
+    content_type: str = "Từ vựng",
     metadata_json: str = "[]",
     chunk_size: int = 1200,
     overlap: int = 200
 ):
     check_admin(password)
     subject=subject.strip()
+    content_type=_normalize_content_type(content_type)
     if not subject:
         raise HTTPException(400, "Môn học là bắt buộc.")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -958,7 +1152,7 @@ async def admin_knowledge_upload(
                 } for r in page_meta]
                 primary=page_meta[0] if page_meta else None
                 md={
-                    "text":chunk,"course":subject,"subject":subject,
+                    "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False)
                 }
@@ -983,9 +1177,9 @@ async def admin_knowledge_upload(
         with conn.cursor() as cur:
             for r in records_meta:
                 cur.execute("""INSERT INTO knowledge_documents
-                    (source_file,subject,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (source_file,subject,r["lesson"],r["lesson_pages"],r["topic"],
+                    (source_file,subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (source_file,subject,content_type,r["lesson"],r["lesson_pages"],r["topic"],
                      r["topic_pages"],r["question_pages"],r["answer_pages"],namespace))
         conn.commit()
     finally:
@@ -1116,4 +1310,4 @@ def admin_status(user_id:int,data:dict):
 @app.get("/health")
 def health():
     return {"status":"ok","pinecone":index is not None,"gemini":gemini is not None,
-            "database":bool(DATABASE_URL),"gemini_model":GEMINI_MODEL}
+            "database":bool(DATABASE_URL),"learning_engine":True,"content_types":sorted(CONTENT_TYPES),"gemini_model":GEMINI_MODEL}
