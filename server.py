@@ -778,12 +778,6 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 <input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
 <input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1;min-width:180px">
-<select id="contentType" required style="min-width:170px">
-  <option value="Từ vựng">Từ vựng</option>
-  <option value="Ngữ pháp">Ngữ pháp</option>
-  <option value="Bài tập">Bài tập</option>
-  <option value="Truyện đọc">Truyện đọc</option>
-</select>
 <input id="chunkSize" type="number" value="1200" min="300" max="5000" title="Kích thước chunk" style="width:120px">
 <input id="overlap" type="number" value="200" min="0" max="4900" title="Độ chồng lấn" style="width:110px">
 </div>
@@ -851,8 +845,14 @@ function addMetaRow(values={}){
   const wrap=document.getElementById("metaRows");
   const row=document.createElement("div");
   row.className="meta-row";
-  row.style.cssText="display:grid;grid-template-columns:1.2fr .9fr 1.2fr .9fr .9fr .9fr auto;gap:6px;margin-bottom:7px;align-items:center";
+  row.style.cssText="display:grid;grid-template-columns:1fr 1.2fr .9fr 1.2fr .9fr .9fr .9fr auto;gap:6px;margin-bottom:7px;align-items:center";
   row.innerHTML=`
+    <select class="m-content-type" title="Loại nội dung">
+      <option value="Từ vựng" ${values.content_type==="Từ vựng"?"selected":""}>Từ vựng</option>
+      <option value="Ngữ pháp" ${values.content_type==="Ngữ pháp"?"selected":""}>Ngữ pháp</option>
+      <option value="Bài tập" ${values.content_type==="Bài tập"?"selected":""}>Bài tập</option>
+      <option value="Truyện đọc" ${values.content_type==="Truyện đọc"?"selected":""}>Truyện đọc</option>
+    </select>
     <input class="m-lesson" placeholder="Bài học" value="${esc(values.lesson||"")}">
     <input class="m-lesson-pages" placeholder="Trang bài: 1-10" value="${esc(values.lesson_pages||"")}">
     <input class="m-topic" placeholder="Chủ đề" value="${esc(values.topic||"")}">
@@ -864,6 +864,7 @@ function addMetaRow(values={}){
 }
 function getMetaRows(){
   return [...document.querySelectorAll(".meta-row")].map(row=>({
+    content_type:row.querySelector(".m-content-type").value,
     lesson:row.querySelector(".m-lesson").value.trim(),
     lesson_pages:row.querySelector(".m-lesson-pages").value.trim(),
     topic:row.querySelector(".m-topic").value.trim(),
@@ -887,7 +888,6 @@ async function uploadKnowledge(event){
     fd.append("file",file);
     fd.append("password",pw);
     fd.append("subject",document.getElementById("subject").value.trim());
-    fd.append("content_type",document.getElementById("contentType").value);
     fd.append("metadata_json",JSON.stringify(rows));
     fd.append("chunk_size",document.getElementById("chunkSize").value||1200);
     fd.append("overlap",document.getElementById("overlap").value||200);
@@ -1063,6 +1063,7 @@ def normalize_kb_records(metadata_json: str, total_pages: int):
         if not isinstance(item,dict):
             raise ValueError(f"Cấu hình dòng {i} không hợp lệ.")
         rec={
+            "content_type":str(item.get("content_type","Từ vựng")).strip() or "Từ vựng",
             "lesson":str(item.get("lesson","")).strip(),
             "lesson_pages":str(item.get("lesson_pages","")).strip(),
             "topic":str(item.get("topic","")).strip(),
@@ -1070,6 +1071,7 @@ def normalize_kb_records(metadata_json: str, total_pages: int):
             "question_pages":str(item.get("question_pages","")).strip(),
             "answer_pages":str(item.get("answer_pages","")).strip()
         }
+        rec["content_type"]=_normalize_content_type(rec["content_type"])
         for key in ("lesson_pages","topic_pages","question_pages","answer_pages"):
             pages=parse_page_ranges(rec[key])
             if pages and max(pages)>total_pages:
@@ -1104,14 +1106,12 @@ async def admin_knowledge_upload(
     password: str = "",
     file: UploadFile = File(...),
     subject: str = "",
-    content_type: str = "Từ vựng",
     metadata_json: str = "[]",
     chunk_size: int = 1200,
     overlap: int = 200
 ):
     check_admin(password)
     subject=subject.strip()
-    content_type=_normalize_content_type(content_type)
     if not subject:
         raise HTTPException(400, "Môn học là bắt buộc.")
     if not file.filename or not file.filename.lower().endswith(".pdf"):
