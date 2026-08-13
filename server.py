@@ -8,7 +8,7 @@ import json
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -29,7 +29,6 @@ GEMINI_MODEL = "gemini-3.6-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-13-content-type-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -67,9 +66,6 @@ def init_db():
                 score INTEGER, status VARCHAR(50) NOT NULL DEFAULT 'studied',
                 last_studied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
 
-            # Migration: database cũ có thể đã có bảng learning_progress
-            # nhưng chưa có các cột mới. ADD COLUMN IF NOT EXISTS giúp nâng cấp
-            # schema mà không xóa dữ liệu user đã học.
             cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS subject VARCHAR(255);")
             cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);")
             cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS topic VARCHAR(255);")
@@ -98,15 +94,14 @@ def init_db():
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user
                            ON learning_progress(user_id,last_studied_at DESC);""")
+
+            cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';")
+            cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
-                content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
                 lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
                 question_pages VARCHAR(255), answer_pages VARCHAR(255), namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
-            # Migration for databases created by previous server versions.
-            cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';")
-            cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
         conn.commit()
     finally:
         conn.close()
@@ -388,177 +383,6 @@ def search(data: ChatRequest, authorization: Optional[str] = Header(default=None
         if text: matches.append({"score":float(m.score),"text":text,"metadata":md})
     return {"matches":matches}
 
-
-def _normalize_content_type(value):
-    v = str(value or "").strip()
-    aliases = {
-        "vocabulary": "Từ vựng", "từ vựng": "Từ vựng",
-        "grammar": "Ngữ pháp", "ngữ pháp": "Ngữ pháp",
-        "exercise": "Bài tập", "bài tập": "Bài tập",
-        "reading": "Truyện đọc", "truyện đọc": "Truyện đọc",
-    }
-    return aliases.get(v.lower(), v if v in {"Từ vựng","Ngữ pháp","Bài tập","Truyện đọc"} else "")
-
-def record_learning_event(user_id, event):
-    """Persist a normalized learning event. Non-scored content is tracked as progress only."""
-    ctype = _normalize_content_type(event.get("content_type"))
-    if not ctype:
-        return None
-
-    subject = str(event.get("subject") or "").strip() or None
-    lesson = str(event.get("lesson") or "").strip() or None
-    topic = str(event.get("topic") or "").strip() or None
-    content_id = str(event.get("content_id") or event.get("item_key") or "").strip() or None
-    status = str(event.get("status") or "studied").strip().lower()
-    if status not in {"studied","in_progress","completed","review"}:
-        status = "studied"
-
-    # Only exercises are scored.
-    score = event.get("score") if ctype == "Bài tập" else None
-    try:
-        score = int(score) if score is not None else None
-    except Exception:
-        score = None
-
-    def intval(k):
-        try:
-            return int(event[k]) if event.get(k) is not None else None
-        except Exception:
-            return None
-
-    current_position = intval("current_position")
-    current_page = intval("current_page")
-    attempt_inc = intval("attempt_increment") or 0
-    correct_inc = intval("correct_increment") or 0
-    wrong_inc = intval("wrong_increment") or 0
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # One active progress row per user/content. Legacy rows without
-            # content_type are left intact; new tracking uses content_id.
-            cur.execute("""
-                SELECT id,attempt_count,correct_count,wrong_count,score
-                FROM learning_progress
-                WHERE user_id=%s
-                  AND COALESCE(content_type,'')=%s
-                  AND COALESCE(content_id,'')=COALESCE(%s,'')
-                  AND COALESCE(subject,'')=COALESCE(%s,'')
-                  AND COALESCE(lesson,'')=COALESCE(%s,'')
-                  AND COALESCE(topic,'')=COALESCE(%s,'')
-                ORDER BY id DESC LIMIT 1
-            """, (user_id,ctype,content_id,subject,lesson,topic))
-            old = cur.fetchone()
-
-            if old:
-                new_score = score if score is not None else old.get("score")
-                cur.execute("""
-                    UPDATE learning_progress SET
-                      item_key=COALESCE(%s,item_key),
-                      score=%s,
-                      status=%s,
-                      current_position=COALESCE(%s,current_position),
-                      current_page=COALESCE(%s,current_page),
-                      attempt_count=COALESCE(attempt_count,0)+%s,
-                      correct_count=COALESCE(correct_count,0)+%s,
-                      wrong_count=COALESCE(wrong_count,0)+%s,
-                      last_studied_at=NOW(),
-                      completed_at=CASE WHEN %s='completed' THEN NOW() ELSE completed_at END,
-                      next_review_at=%s
-                    WHERE id=%s
-                    RETURNING *
-                """, (content_id,new_score,status,current_position,current_page,
-                      max(0,attempt_inc),max(0,correct_inc),max(0,wrong_inc),
-                      status,event.get("next_review_at"),old["id"]))
-            else:
-                cur.execute("""
-                    INSERT INTO learning_progress
-                    (user_id,subject,lesson,topic,item_key,score,status,last_studied_at,
-                     content_type,content_id,current_position,current_page,
-                     attempt_count,correct_count,wrong_count,next_review_at,completed_at)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s,%s,%s,%s,%s,%s,%s,
-                           CASE WHEN %s='completed' THEN NOW() ELSE NULL END)
-                    RETURNING *
-                """, (user_id,subject,lesson,topic,content_id,score,status,
-                      ctype,content_id,current_position,current_page,
-                      max(0,attempt_inc),max(0,correct_inc),max(0,wrong_inc),
-                      event.get("next_review_at"),status))
-            row = dict(cur.fetchone())
-        conn.commit()
-        return row
-    finally:
-        conn.close()
-
-def infer_learning_event(user_id, user_text, assistant_text, catalog, learning):
-    """
-    Ask Gemini for a tiny structured event describing what was actually studied.
-    If the model cannot identify a concrete event, it returns track=false.
-    This is intentionally separate from the teaching response so chat remains
-    compatible with the existing API.
-    """
-    if not gemini:
-        return None
-    event_prompt = f"""Bạn là bộ phận ghi nhận tiến độ học của Doraemon.
-Chỉ tạo JSON nếu lượt trò chuyện này thực sự có hoạt động học cụ thể.
-Không tạo event chỉ vì user chào hỏi, hỏi hệ thống, hoặc chỉ nói chuyện.
-
-QUY TẮC:
-- content_type chỉ được: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc.
-- Truyện đọc: chỉ ghi nhận truyện đã bắt đầu/đang đọc/đã hoàn thành và current_page nếu có.
-- Từ vựng: chỉ ghi nhận chủ đề/từ vựng đã học hoặc đang học và current_position nếu có.
-- Ngữ pháp: ghi nhận bài/chủ đề đã học hoặc đang học.
-- Bài tập: mới được ghi score/attempt/correct/wrong.
-- Không tự bịa score.
-- Không đánh dấu completed nếu hội thoại chưa cho thấy đã hoàn thành.
-- Chọn subject/lesson/topic/content_id từ danh mục nếu có.
-- Nếu không xác định được nội dung cụ thể, track=false.
-
-Trả về DUY NHẤT JSON:
-{{
- "track": true/false,
- "content_type": "...",
- "subject": "...",
- "lesson": "...",
- "topic": "...",
- "content_id": "...",
- "status": "in_progress|studied|completed|review",
- "current_position": null,
- "current_page": null,
- "score": null,
- "attempt_increment": 0,
- "correct_increment": 0,
- "wrong_increment": 0
-}}
-
-DANH MỤC:
-{json.dumps(catalog,ensure_ascii=False,default=str)}
-
-LỊCH SỬ:
-{json.dumps(learning[-30:],ensure_ascii=False,default=str)}
-
-USER:
-{user_text}
-
-DORAEMON:
-{assistant_text}
-"""
-    try:
-        r = gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=event_prompt,
-            config=types.GenerateContentConfig(temperature=0)
-        )
-        raw = (r.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw)
-        event = json.loads(raw)
-        if not isinstance(event, dict) or not event.get("track"):
-            return None
-        return event
-    except Exception as e:
-        print("Learning event inference skipped:", type(e).__name__, str(e))
-        return None
-
 @app.post("/api/proxy-chat")
 def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     user = require_active_user(authorization)
@@ -665,6 +489,7 @@ TIN NHẮN:
         "learning_progress":tracked_event
     }
 
+
 @app.post("/learning/progress")
 def save_learning_progress(data: dict, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
@@ -692,6 +517,7 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
         return {"success":True,"user_id":user["id"],"learning_history":rows}
     finally:
         conn.close()
+
 
 @app.get("/health")
 def health():
