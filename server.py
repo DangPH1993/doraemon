@@ -621,8 +621,6 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
         "completed": completed,
     }
 
-@app.post("/api/proxy-chat")
-
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
     """
     Build ordered content blocks so the client can render:
@@ -728,6 +726,7 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
     return blocks
 
 
+@app.post("/api/proxy-chat")
 def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     user = require_active_user(authorization)
     if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
