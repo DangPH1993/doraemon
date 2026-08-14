@@ -622,6 +622,112 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
     }
 
 @app.post("/api/proxy-chat")
+
+def build_rich_content_blocks(reply: str, image_items: list) -> list:
+    """
+    Build ordered content blocks so the client can render:
+        text -> image -> text -> image -> ...
+    Images are positioned using the vocabulary/meaning metadata attached to
+    each Pinecone image record. If an image cannot be mapped to a phrase in
+    the answer, it is appended at the end instead of being silently lost.
+    """
+    reply = reply or ""
+    if not image_items:
+        return [{"type": "text", "text": reply}] if reply else []
+
+    candidates = []
+    for item in image_items:
+        phrases = []
+        for field in ("term", "reading", "meaning", "associated_text"):
+            value = str(item.get(field) or "").strip()
+            if value and value not in phrases:
+                phrases.append(value)
+
+        # Prefer longer phrases first so a meaning like "bước đi" does not
+        # accidentally match a shorter substring before the actual term.
+        phrases.sort(key=len, reverse=True)
+
+        positions = []
+        low_reply = reply.casefold()
+        for phrase in phrases:
+            pos = low_reply.find(phrase.casefold())
+            if pos >= 0:
+                positions.append((pos, phrase))
+
+        if positions:
+            pos, phrase = min(positions, key=lambda x: x[0])
+            candidates.append({
+                "position": pos,
+                "phrase": phrase,
+                "item": item,
+            })
+        else:
+            candidates.append({
+                "position": None,
+                "phrase": "",
+                "item": item,
+            })
+
+    # Only one image should be inserted at a given textual position.
+    # Keep the strongest/relevant candidate at each position.
+    mapped = [x for x in candidates if x["position"] is not None]
+    mapped.sort(key=lambda x: (x["position"], -float(x["item"].get("score", 0))))
+
+    blocks = []
+    cursor = 0
+    used_keys = set()
+
+    for candidate in mapped:
+        item = candidate["item"]
+        key = str(item.get("key") or "")
+        if not key or key in used_keys:
+            continue
+
+        pos = candidate["position"]
+        if pos < cursor:
+            continue
+
+        if pos > cursor:
+            blocks.append({"type": "text", "text": reply[cursor:pos]})
+
+        blocks.append({
+            "type": "image",
+            "key": key,
+            "url": item.get("url"),
+            "term": item.get("term", ""),
+            "reading": item.get("reading", ""),
+            "meaning": item.get("meaning", ""),
+            "page": item.get("page"),
+        })
+        used_keys.add(key)
+
+        # Do not delete the matched word from the answer. Advance only to the
+        # end of the matched phrase so the image appears immediately after it.
+        cursor = pos + len(candidate["phrase"])
+
+    if cursor < len(reply):
+        blocks.append({"type": "text", "text": reply[cursor:]})
+
+    # Any selected image without a textual anchor is still useful. Append it
+    # after the answer rather than dropping it.
+    for candidate in candidates:
+        item = candidate["item"]
+        key = str(item.get("key") or "")
+        if key and key not in used_keys:
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            used_keys.add(key)
+
+    return blocks
+
+
 def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
     user = require_active_user(authorization)
     if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
@@ -740,14 +846,27 @@ TIN NHẮN:
             })
     image_candidates.sort(key=lambda x: x["score"], reverse=True)
     images=[]
+    rich_images=[]
     seen_image_keys=set()
     for item in image_candidates:
         if not item["url"] or item["key"] in seen_image_keys:
             continue
         seen_image_keys.add(item["key"])
+        image_payload = {
+            "key": item["key"],
+            "url": item["url"],
+            "term": item.get("term", ""),
+            "reading": item.get("reading", ""),
+            "meaning": item.get("meaning", ""),
+            "page": item.get("page"),
+            "score": item.get("score", 0),
+        }
         images.append({"key":item["key"],"url":item["url"]})
+        rich_images.append(image_payload)
         if len(images) >= 3:
             break
+
+    content_blocks = build_rich_content_blocks(reply, rich_images)
 
     # Tự động ghi nhận tiến độ. Nếu bước này lỗi thì KHÔNG làm hỏng câu trả lời
     # của người học.
@@ -764,6 +883,7 @@ TIN NHẮN:
         "model":GEMINI_MODEL,
         "sources":source_meta[:10],
         "images":images,
+        "content_blocks":content_blocks,
         "learning_history_count":len(learning),
         "learning_progress":tracked_event
     }
