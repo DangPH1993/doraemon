@@ -1,11 +1,12 @@
 fastapi
 uvicorn[standard]
+psycopg2-binary
 pinecone
 google-genai
-psycopg2-binary
-passlib[bcrypt]
-bcrypt<4
-python-jose[cryptography]
-pydantic
 pypdf
+passlib[bcrypt]
+python-jose[cryptography]
 python-multipart
+PyMuPDF
+Pillow
+boto3

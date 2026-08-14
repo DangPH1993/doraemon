@@ -18,6 +18,23 @@ from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
+try:
+    import fitz  # PyMuPDF - render scanned PDF pages
+except Exception:
+    fitz = None
+
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
+    import boto3
+    from botocore.client import Config as BotoConfig
+except Exception:
+    boto3 = None
+    BotoConfig = None
+
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX", "doraemon")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,7 +45,18 @@ ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
 GEMINI_MODEL = "gemini-3.6-flash"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
+# Optional Backblaze B2 object storage for original PDFs and extracted images.
+# Set these on Render for production image/PDF storage.
+B2_ENDPOINT = os.getenv("B2_ENDPOINT", "").strip().rstrip("/")
+B2_BUCKET = os.getenv("B2_BUCKET", "").strip()
+B2_KEY_ID = os.getenv("B2_KEY_ID", "").strip()
+B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "").strip()
+B2_PUBLIC_BASE_URL = os.getenv("B2_PUBLIC_BASE_URL", "").strip().rstrip("/")
+B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
+b2 = None
+
 app = FastAPI(title="Doraemon SaaS Server")
+SERVER_VERSION = "2026-08-14-gemini-ocr-b2-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -85,6 +113,12 @@ def init_db():
                 question_pages VARCHAR(255), answer_pages VARCHAR(255),
                 namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_images (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL,
+                subject VARCHAR(255) NOT NULL DEFAULT '', content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
+                lesson VARCHAR(255), topic VARCHAR(255), page INTEGER NOT NULL,
+                image_key TEXT NOT NULL, image_url TEXT, description TEXT,
+                width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
 
             # Safe migrations for databases created by previous versions.
             for sql in [
@@ -122,12 +156,24 @@ def init_db():
 
 @app.on_event("startup")
 def startup():
-    global pc, index, gemini
+    global pc, index, gemini, b2
     if PINECONE_API_KEY:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX)
     if GEMINI_API_KEY:
         gemini = genai.Client(api_key=GEMINI_API_KEY)
+    if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
+        b2 = boto3.client(
+            "s3",
+            endpoint_url=B2_ENDPOINT if B2_ENDPOINT.startswith("http") else f"https://{B2_ENDPOINT}",
+            aws_access_key_id=B2_KEY_ID,
+            aws_secret_access_key=B2_APPLICATION_KEY,
+            region_name="us-east-005",
+            config=BotoConfig(signature_version="s3v4") if BotoConfig else None,
+        )
+        print("Backblaze B2: OK", B2_BUCKET)
+    else:
+        print("WARNING: Backblaze B2 chưa được cấu hình; ảnh/PDF sẽ không được lưu cloud.")
     if DATABASE_URL:
         init_db()
         print("PostgreSQL: OK")
@@ -659,6 +705,16 @@ TIN NHẮN:
         config=types.GenerateContentConfig(temperature=0.2)
     )
     reply=response.text or ""
+    image_keys=[]
+    for md in source_meta:
+        try:
+            keys=json.loads(md.get("image_keys") or "[]")
+            if isinstance(keys,list):
+                image_keys.extend([str(k) for k in keys if k])
+        except Exception:
+            pass
+    image_keys=list(dict.fromkeys(image_keys))[:6]
+    images=[{"key":k,"url":b2_url(k)} for k in image_keys if b2_url(k)]
 
     # Tự động ghi nhận tiến độ. Nếu bước này lỗi thì KHÔNG làm hỏng câu trả lời
     # của người học.
@@ -674,6 +730,7 @@ TIN NHẮN:
         "reply":reply,
         "model":GEMINI_MODEL,
         "sources":source_meta[:10],
+        "images":images,
         "learning_history_count":len(learning),
         "learning_progress":tracked_event
     }
@@ -882,7 +939,7 @@ async function uploadKnowledge(event){
   const status=document.getElementById("uploadStatus"), btn=document.getElementById("uploadBtn");
   const rows=getMetaRows();
   btn.disabled=true;
-  status.textContent="⏳ Đang xử lý PDF và upload Pinecone...";
+  status.textContent="⏳ Đang phân tích PDF... PDF scan sẽ được OCR bằng Gemini và ảnh sẽ được lưu vào Backblaze B2 nếu đã cấu hình...";
   try{
     const fd=new FormData();
     fd.append("file",file);
@@ -894,7 +951,7 @@ async function uploadKnowledge(event){
     const r=await fetch("/admin/api/knowledge/upload",{method:"POST",body:fd});
     const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}}
     if(!r.ok)throw Error(d.detail||("HTTP "+r.status));
-    status.textContent=`✅ ${d.filename}: ${d.pages} trang · ${d.chunks} chunks · ${d.records} cấu hình · ${d.dimension} dimensions`;
+    status.textContent=`✅ ${d.filename}: ${d.pages} trang · OCR scan: ${d.scanned_pages_ocr||0} trang · ${d.chunks} chunks · ${d.records} cấu hình · ${d.images||0} ảnh · ${d.dimension} dimensions`;
     document.getElementById("pdfFile").value="";
   }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
   finally{btn.disabled=false}
@@ -1101,6 +1158,182 @@ def metadata_for_page(records, page_no):
             matched.append(r)
     return matched
 
+
+def b2_ready():
+    return b2 is not None and bool(B2_BUCKET)
+
+def b2_put_bytes(key: str, data: bytes, content_type: str):
+    if not b2_ready():
+        raise RuntimeError("Backblaze B2 chưa được cấu hình. Cần B2_ENDPOINT, B2_KEY_ID, B2_APPLICATION_KEY và B2_BUCKET.")
+    b2.put_object(Bucket=B2_BUCKET, Key=key, Body=data, ContentType=content_type)
+    if B2_PUBLIC_BASE_URL:
+        return f"{B2_PUBLIC_BASE_URL}/{key}"
+    return None
+
+def b2_url(key: str):
+    if not key:
+        return None
+    if B2_PUBLIC_BASE_URL:
+        return f"{B2_PUBLIC_BASE_URL}/{key}"
+    if not b2_ready():
+        return None
+    return b2.generate_presigned_url(
+        "get_object", Params={"Bucket": B2_BUCKET, "Key": key},
+        ExpiresIn=max(60, min(B2_PRESIGN_SECONDS, 604800))
+    )
+
+def render_pdf_page(raw_pdf: bytes, page_no: int, dpi: int = 150) -> bytes:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF chưa được cài đặt. Thêm PyMuPDF vào requirements.")
+    doc = fitz.open(stream=raw_pdf, filetype="pdf")
+    try:
+        page = doc.load_page(page_no - 1)
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+def _parse_gemini_json(text: str):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise ValueError("Gemini OCR không trả về JSON hợp lệ.")
+
+def gemini_ocr_page(page_png: bytes, page_no: int):
+    if not gemini:
+        raise RuntimeError("Gemini chưa được khởi tạo.")
+    prompt = f"""Đây là trang {page_no} của một sách học tập. Hãy OCR toàn bộ chữ nhìn thấy trên trang, giữ nguyên ngôn ngữ gốc, thứ tự đọc hợp lý và xuống dòng ở tiêu đề/ví dụ. Đồng thời phát hiện các hình minh họa, ảnh, biểu đồ hoặc sơ đồ có ý nghĩa giáo dục. Không coi các vùng chữ thuần túy là hình. Không coi toàn bộ trang là một hình. Với mỗi hình, trả về bounding box chuẩn hóa theo thang 0-1000 theo thứ tự [ymin, xmin, ymax, xmax], kèm mô tả ngắn.
+
+Chỉ trả JSON đúng schema:
+{{"text":"...","images":[{{"box":[0,0,1000,1000],"description":"..."}}]}}"""
+    part = types.Part.from_bytes(data=page_png, mime_type="image/png")
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[part, prompt],
+        config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
+    )
+    data = _parse_gemini_json(response.text or "{}")
+    text = str(data.get("text") or "").strip()
+    images = data.get("images") if isinstance(data.get("images"), list) else []
+    return text, images
+
+def crop_image_from_page(page_png: bytes, box):
+    if Image is None:
+        raise RuntimeError("Pillow chưa được cài đặt. Thêm Pillow vào requirements.")
+    im = Image.open(io.BytesIO(page_png)).convert("RGB")
+    w, h = im.size
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = [max(0, min(1000, int(float(x)))) for x in box]
+    except Exception:
+        return None
+    left = int(w * xmin / 1000); top = int(h * ymin / 1000)
+    right = int(w * xmax / 1000); bottom = int(h * ymax / 1000)
+    if right <= left or bottom <= top:
+        return None
+    # Avoid tiny false-positive boxes.
+    if (right-left) < 80 or (bottom-top) < 80:
+        return None
+    crop = im.crop((left, top, right, bottom))
+    out = io.BytesIO(); crop.save(out, format="JPEG", quality=88, optimize=True)
+    return out.getvalue(), crop.size
+
+def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta):
+    """Extract native images from non-scan PDFs with PyMuPDF."""
+    if fitz is None:
+        return []
+    if not b2_ready():
+        return []
+    doc = fitz.open(stream=raw_pdf, filetype="pdf")
+    stored=[]
+    try:
+        page=doc.load_page(page_no-1)
+        seen=set()
+        for idx, img in enumerate(page.get_images(full=True), 1):
+            xref=img[0]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            info=doc.extract_image(xref)
+            data=info.get("image")
+            ext=info.get("ext","png")
+            if not data or len(data)<1000:
+                continue
+            mime={"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}.get(ext.lower(), "image/png")
+            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/embedded_{idx:02d}.{ext}"
+            b2_put_bytes(key,data,mime)
+            primary=page_meta[0] if page_meta else {}
+            conn=db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO knowledge_images
+                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (source_file,subject,primary.get("content_type","Từ vựng"),primary.get("lesson"),primary.get("topic"),
+                         page_no,key,b2_url(key),"Embedded PDF image",info.get("width"),info.get("height")))
+                conn.commit()
+            finally:
+                conn.close()
+            stored.append({"key":key,"description":"Embedded PDF image","page":page_no})
+    finally:
+        doc.close()
+    return stored
+
+def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, subject: str):
+    """Extract text/images from normal PDFs and Gemini-OCR scanned pages."""
+    page_texts = {}
+    page_images = {}
+    for page_no, page in enumerate(reader.pages, 1):
+        page_meta = metadata_for_page(records_meta, page_no)
+        extracted = (page.extract_text() or "").strip()
+        text_len = len(re.sub(r"\s+", "", extracted))
+
+        if text_len >= 30:
+            page_texts[page_no] = extracted
+            embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
+            if embedded:
+                page_images[page_no] = embedded
+            continue
+
+        # Scan/image page: render it and let Gemini Vision OCR the page and
+        # identify meaningful educational images by bounding box.
+        png = render_pdf_page(raw_pdf, page_no, dpi=150)
+        ocr_text, detected = gemini_ocr_page(png, page_no)
+        page_texts[page_no] = ocr_text
+        stored = []
+        for idx, item in enumerate(detected, 1):
+            cropped = crop_image_from_page(png, item.get("box"))
+            if not cropped:
+                continue
+            image_bytes, (width, height) = cropped
+            primary = page_meta[0] if page_meta else {}
+            key = f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{idx:02d}.jpg"
+            b2_put_bytes(key, image_bytes, "image/jpeg")
+            description = str(item.get("description") or "").strip()
+            conn = db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO knowledge_images
+                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (source_file, subject, primary.get("content_type","Từ vựng"), primary.get("lesson"), primary.get("topic"),
+                         page_no, key, b2_url(key), description, width, height))
+                conn.commit()
+            finally:
+                conn.close()
+            stored.append({"key": key, "description": description, "page": page_no})
+        if stored:
+            page_images[page_no] = stored
+    return page_texts, page_images
+
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
     password: str = "",
@@ -1136,25 +1369,45 @@ async def admin_knowledge_upload(
     except Exception as e:
         raise HTTPException(400,f"Không đọc được PDF: {e}")
 
-    namespace="__default__"
     source_file=os.path.basename(file.filename)
+    namespace="__default__"
+
+    # Save original PDF to B2 when configured.
+    pdf_key = f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"
+    pdf_url = None
+    if b2_ready():
+        try:
+            pdf_url = b2_put_bytes(pdf_key, raw, "application/pdf")
+        except Exception as e:
+            raise HTTPException(500, f"Không lưu được PDF vào B2: {e}")
+
+    # Extract text normally; scanned/empty pages go through Gemini OCR.
+    try:
+        page_texts, page_images = process_pdf_pages(raw, reader, records_meta, source_file, subject)
+    except Exception as e:
+        raise HTTPException(500, f"OCR Gemini/xử lý ảnh thất bại: {e}")
+
     vectors=[]
     total=0
     try:
-        for page_no,page in enumerate(reader.pages,1):
-            chunks=kb_chunk_text(page.extract_text() or "",chunk_size,overlap)
+        for page_no in range(1, len(reader.pages)+1):
+            text = page_texts.get(page_no, "")
+            chunks=kb_chunk_text(text,chunk_size,overlap)
             page_meta=metadata_for_page(records_meta,page_no)
+            image_keys=[x["key"] for x in page_images.get(page_no, [])]
             for chunk_no,chunk in enumerate(chunks):
                 md_list=[{
-                    "lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
+                    "content_type":r["content_type"],"lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
                     "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
                 } for r in page_meta]
                 primary=page_meta[0] if page_meta else None
+                content_type=primary["content_type"] if primary else (records_meta[0]["content_type"] if records_meta else "Từ vựng")
                 md={
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
-                    "metadata_records":json.dumps(md_list,ensure_ascii=False)
+                    "metadata_records":json.dumps(md_list,ensure_ascii=False),
+                    "image_keys":json.dumps(image_keys,ensure_ascii=False)
                 }
                 if primary:
                     md.update({
@@ -1179,15 +1432,34 @@ async def admin_knowledge_upload(
                 cur.execute("""INSERT INTO knowledge_documents
                     (source_file,subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (source_file,subject,content_type,r["lesson"],r["lesson_pages"],r["topic"],
+                    (source_file,subject,r["content_type"],r["lesson"],r["lesson_pages"],r["topic"],
                      r["topic_pages"],r["question_pages"],r["answer_pages"],namespace))
         conn.commit()
     finally:
         conn.close()
 
+    image_count=sum(len(v) for v in page_images.values())
+    scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     return {"success":True,"filename":source_file,"subject":subject,
-            "pages":len(reader.pages),"chunks":total,"records":len(records_meta),
-            "dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
+            "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
+            "images":image_count,"pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
+
+@app.get("/admin/api/knowledge/images")
+def admin_knowledge_images(password: str, source_file: str = ""):
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if source_file:
+                cur.execute("SELECT * FROM knowledge_images WHERE source_file=%s ORDER BY page,id", (source_file,))
+            else:
+                cur.execute("SELECT * FROM knowledge_images ORDER BY created_at DESC LIMIT 500")
+            rows=[dict(x) for x in cur.fetchall()]
+    finally:
+        conn.close()
+    for row in rows:
+        row["url"]=b2_url(row.get("image_key"))
+    return {"success":True,"images":rows}
 
 @app.get("/admin/api/users")
 def admin_users(password: str):
