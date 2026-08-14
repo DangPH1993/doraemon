@@ -56,7 +56,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-14-gemini-ocr-b2-v1"
+SERVER_VERSION = "2026-08-14-image-semantic-mapping-v2"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -118,7 +118,8 @@ def init_db():
                 subject VARCHAR(255) NOT NULL DEFAULT '', content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
                 lesson VARCHAR(255), topic VARCHAR(255), page INTEGER NOT NULL,
                 image_key TEXT NOT NULL, image_url TEXT, description TEXT,
-                width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+                term TEXT, reading TEXT, meaning TEXT, associated_text TEXT,
+                bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
 
             # Safe migrations for databases created by previous versions.
             for sql in [
@@ -140,6 +141,11 @@ def init_db():
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();",
                 "ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';",
+                "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS term TEXT;",
+                "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS reading TEXT;",
+                "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS meaning TEXT;",
+                "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS associated_text TEXT;",
+                "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS bbox TEXT;",
             ]:
                 cur.execute(sql)
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
@@ -622,15 +628,18 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
     if not data.text: raise HTTPException(400, "Tin nhắn không được để trống.")
 
+    retrieval_k = max(16, int(data.top_k or 8))
     result = index.query(
         vector=embed_text(data.text),
-        top_k=data.top_k,
+        top_k=retrieval_k,
         include_metadata=True,
         namespace=data.knowledge_namespace or "__default__"
     )
     contexts=[]; source_meta=[]
     for m in result.matches:
         md=m.metadata or {}
+        if md.get("record_type") == "image":
+            continue
         txt=md.get("text",md.get("content",""))
         if txt:
             label=(
@@ -705,16 +714,40 @@ TIN NHẮN:
         config=types.GenerateContentConfig(temperature=0.2)
     )
     reply=response.text or ""
-    image_keys=[]
-    for md in source_meta:
-        try:
-            keys=json.loads(md.get("image_keys") or "[]")
-            if isinstance(keys,list):
-                image_keys.extend([str(k) for k in keys if k])
-        except Exception:
-            pass
-    image_keys=list(dict.fromkeys(image_keys))[:6]
-    images=[{"key":k,"url":b2_url(k)} for k in image_keys if b2_url(k)]
+    # Ảnh V2 được truy xuất như các vector độc lập, vì vậy câu hỏi về một
+    # từ cụ thể sẽ ưu tiên đúng ảnh đã được map với từ đó.
+    image_candidates=[]
+    query_low=(data.text or "").strip().casefold()
+    for m in result.matches:
+        md=m.metadata or {}
+        if md.get("record_type") == "image" and md.get("image_key"):
+            term=str(md.get("term") or "")
+            reading=str(md.get("reading") or "")
+            meaning=str(md.get("meaning") or "")
+            associated=str(md.get("associated_text") or "")
+            exact_boost=0.0
+            for field in (term, reading, meaning, associated):
+                if field and field.casefold() in query_low:
+                    exact_boost=max(exact_boost, 0.35)
+            image_candidates.append({
+                "score": float(m.score)+exact_boost,
+                "key": str(md.get("image_key")),
+                "url": b2_url(str(md.get("image_key"))),
+                "term": term,
+                "reading": reading,
+                "meaning": meaning,
+                "page": md.get("page")
+            })
+    image_candidates.sort(key=lambda x: x["score"], reverse=True)
+    images=[]
+    seen_image_keys=set()
+    for item in image_candidates:
+        if not item["url"] or item["key"] in seen_image_keys:
+            continue
+        seen_image_keys.add(item["key"])
+        images.append({"key":item["key"],"url":item["url"]})
+        if len(images) >= 3:
+            break
 
     # Tự động ghi nhận tiến độ. Nếu bước này lỗi thì KHÔNG làm hỏng câu trả lời
     # của người học.
@@ -1209,10 +1242,36 @@ def _parse_gemini_json(text: str):
 def gemini_ocr_page(page_png: bytes, page_no: int):
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
-    prompt = f"""Đây là trang {page_no} của một sách học tập. Hãy OCR toàn bộ chữ nhìn thấy trên trang, giữ nguyên ngôn ngữ gốc, thứ tự đọc hợp lý và xuống dòng ở tiêu đề/ví dụ. Đồng thời phát hiện các hình minh họa, ảnh, biểu đồ hoặc sơ đồ có ý nghĩa giáo dục. Không coi các vùng chữ thuần túy là hình. Không coi toàn bộ trang là một hình. Với mỗi hình, trả về bounding box chuẩn hóa theo thang 0-1000 theo thứ tự [ymin, xmin, ymax, xmax], kèm mô tả ngắn.
+    prompt = f"""Đây là trang {page_no} của một sách học tập, có thể là trang từ vựng/giáo trình tiếng Nhật.
+
+Hãy thực hiện ĐỒNG THỜI 2 việc:
+1) OCR toàn bộ chữ nhìn thấy trên trang, giữ nguyên ngôn ngữ gốc, thứ tự đọc hợp lý và xuống dòng ở tiêu đề/ví dụ.
+2) Phát hiện từng hình minh họa/ảnh/biểu đồ/sơ đồ có ý nghĩa giáo dục. Không gộp nhiều hình thành một hình. Không coi vùng chữ thuần túy là hình.
+
+Đặc biệt, với MỖI hình, hãy xác định nội dung chữ/từ vựng gần hình hoặc rõ ràng thuộc về hình đó. Nếu đây là trang từ vựng tiếng Nhật, hãy cố gắng map đúng từng hình với từ tiếng Nhật tương ứng. Không được dùng chung toàn bộ danh sách từ của cả trang cho mọi hình.
+
+Với mỗi hình trả về:
+- box: [ymin, xmin, ymax, xmax] chuẩn hóa 0-1000
+- term: từ/cụm từ tiếng Nhật gắn với hình, nếu xác định được
+- reading: cách đọc, nếu xác định được
+- meaning: nghĩa tiếng Việt, nếu có thể xác định từ chính trang; nếu không chắc để chuỗi rỗng
+- associated_text: đoạn chữ ngắn thực sự liên quan tới hình
+- description: mô tả ngắn hình
 
 Chỉ trả JSON đúng schema:
-{{"text":"...","images":[{{"box":[0,0,1000,1000],"description":"..."}}]}}"""
+{{
+  "text":"...",
+  "images":[
+    {{
+      "box":[0,0,1000,1000],
+      "term":"",
+      "reading":"",
+      "meaning":"",
+      "associated_text":"",
+      "description":""
+    }}
+  ]
+}}"""
     part = types.Part.from_bytes(data=page_png, mime_type="image/png")
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
@@ -1318,18 +1377,24 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             key = f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{idx:02d}.jpg"
             b2_put_bytes(key, image_bytes, "image/jpeg")
             description = str(item.get("description") or "").strip()
+            term = str(item.get("term") or "").strip()
+            reading = str(item.get("reading") or "").strip()
+            meaning = str(item.get("meaning") or "").strip()
+            associated_text = str(item.get("associated_text") or "").strip()
+            bbox = json.dumps(item.get("box"), ensure_ascii=False) if isinstance(item.get("box"), (list, tuple)) else ""
             conn = db()
             try:
                 with conn.cursor() as cur:
                     cur.execute("""INSERT INTO knowledge_images
-                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (source_file, subject, primary.get("content_type","Từ vựng"), primary.get("lesson"), primary.get("topic"),
-                         page_no, key, b2_url(key), description, width, height))
+                         page_no, key, b2_url(key), description, term, reading, meaning, associated_text, bbox, width, height))
                 conn.commit()
             finally:
                 conn.close()
-            stored.append({"key": key, "description": description, "page": page_no})
+            stored.append({"key": key, "description": description, "term": term, "reading": reading,
+                           "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
         if stored:
             page_images[page_no] = stored
     return page_texts, page_images
@@ -1389,25 +1454,33 @@ async def admin_knowledge_upload(
 
     vectors=[]
     total=0
+    image_vectors_total=0
     try:
+        # Khi re-upload cùng source_file, xóa các vector cũ của tài liệu này
+        # để tránh record V1 cũ tiếp tục cạnh tranh với record V2 mới.
+        try:
+            index.delete(filter={"source_file": source_file}, namespace=namespace)
+        except Exception as e:
+            print("Pinecone old-source cleanup skipped:", type(e).__name__, str(e))
+
         for page_no in range(1, len(reader.pages)+1):
             text = page_texts.get(page_no, "")
             chunks=kb_chunk_text(text,chunk_size,overlap)
             page_meta=metadata_for_page(records_meta,page_no)
-            image_keys=[x["key"] for x in page_images.get(page_no, [])]
+            primary=page_meta[0] if page_meta else None
+            content_type=primary["content_type"] if primary else (records_meta[0]["content_type"] if records_meta else "Từ vựng")
             for chunk_no,chunk in enumerate(chunks):
                 md_list=[{
                     "content_type":r["content_type"],"lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
                     "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
                 } for r in page_meta]
-                primary=page_meta[0] if page_meta else None
-                content_type=primary["content_type"] if primary else (records_meta[0]["content_type"] if records_meta else "Từ vựng")
                 md={
+                    "record_type":"text",
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
-                    "image_keys":json.dumps(image_keys,ensure_ascii=False)
+                    "image_keys":json.dumps([],ensure_ascii=False)
                 }
                 if primary:
                     md.update({
@@ -1417,9 +1490,42 @@ async def admin_knowledge_upload(
                     })
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                 total+=1
-                if len(vectors)>=50:
-                    index.upsert(vectors=vectors,namespace=namespace)
-                    vectors=[]
+
+            # Mỗi ảnh là MỘT Pinecone record độc lập. Không còn nhét toàn bộ
+            # ảnh của trang vào metadata của text chunk.
+            for img in page_images.get(page_no, []):
+                key = str(img.get("key") or "").strip()
+                if not key:
+                    continue
+                term = str(img.get("term") or "").strip()
+                reading = str(img.get("reading") or "").strip()
+                meaning = str(img.get("meaning") or "").strip()
+                associated_text = str(img.get("associated_text") or "").strip()
+                description = str(img.get("description") or "").strip()
+                search_text = " | ".join(x for x in [term, reading, meaning, associated_text, description, f"Trang {page_no}"] if x)
+                if not search_text:
+                    search_text = f"Hình minh họa trang {page_no}"
+                image_md={
+                    "record_type":"image",
+                    "text":search_text,
+                    "course":subject,"subject":subject,"content_type":content_type,
+                    "source_file":source_file,"page":page_no,
+                    "image_key":key,"image_url":b2_url(key),
+                    "term":term,"reading":reading,"meaning":meaning,
+                    "associated_text":associated_text,"description":description,
+                    "bbox":str(img.get("bbox") or "")
+                }
+                if primary:
+                    image_md.update({
+                        "lesson":primary["lesson"],"topic":primary["topic"],
+                        "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
+                    })
+                vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
+                image_vectors_total += 1
+
+            if len(vectors)>=50:
+                index.upsert(vectors=vectors,namespace=namespace)
+                vectors=[]
         if vectors:
             index.upsert(vectors=vectors,namespace=namespace)
     except Exception as e:
@@ -1442,7 +1548,7 @@ async def admin_knowledge_upload(
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
-            "images":image_count,"pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
+            "images":image_count,"image_vectors":image_vectors_total,"pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
 def admin_knowledge_images(password: str, source_file: str = ""):
