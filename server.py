@@ -2,13 +2,15 @@ import os
 import io
 import uuid
 import re
+import time
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -56,13 +58,22 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-15-doraemon-learning-flow-v3.1"
+SERVER_VERSION = "2026-08-15-doraemon-learning-flow-v3.2-performance"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
 gemini = None
 connected_users = {}
 admin_connections = set()
+
+# Short-lived in-process cache for the learning catalog. The catalog changes only
+# when knowledge documents are uploaded, so there is no reason to query the full
+# table on every chat request. A short TTL also keeps the cache safe if an admin
+# changes data directly in PostgreSQL.
+CATALOG_CACHE_TTL = 300.0
+_catalog_cache = None
+_catalog_cache_at = 0.0
+_catalog_cache_lock = threading.Lock()
 
 def db():
     if not DATABASE_URL:
@@ -425,6 +436,107 @@ async def ws_admin(websocket: WebSocket):
     finally:
         admin_connections.discard(websocket)
 
+def _load_catalog_cached():
+    """Load the full knowledge catalog once per short TTL instead of per chat."""
+    global _catalog_cache, _catalog_cache_at
+    now = time.monotonic()
+    if _catalog_cache is not None and (now - _catalog_cache_at) < CATALOG_CACHE_TTL:
+        return _catalog_cache
+
+    with _catalog_cache_lock:
+        now = time.monotonic()
+        if _catalog_cache is not None and (now - _catalog_cache_at) < CATALOG_CACHE_TTL:
+            return _catalog_cache
+        conn = db()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
+                           question_pages,answer_pages,source_file,namespace
+                    FROM knowledge_documents
+                    ORDER BY subject,content_type,lesson,topic,id
+                """)
+                _catalog_cache = [dict(x) for x in cur.fetchall()]
+                _catalog_cache_at = now
+        finally:
+            conn.close()
+    return _catalog_cache or []
+
+def _invalidate_catalog_cache():
+    global _catalog_cache, _catalog_cache_at
+    with _catalog_cache_lock:
+        _catalog_cache = None
+        _catalog_cache_at = 0.0
+
+def _compact_catalog_for_prompt(catalog, active_scope=None, limit=30):
+    """Keep the Gemini prompt small without changing routing data."""
+    active_scope = active_scope or {}
+    ct = active_scope.get("content_type")
+    course = _clean_scope_value(active_scope.get("course"))
+    lesson = _clean_scope_value(active_scope.get("lesson"))
+    topic = _clean_scope_value(active_scope.get("topic"))
+
+    rows = []
+    for item in catalog or []:
+        item_ct = _normalize_content_type(item.get("content_type"))
+        item_course = _clean_scope_value(item.get("course") or item.get("course_name"))
+        item_lesson = _clean_scope_value(item.get("lesson"))
+        item_topic = _clean_scope_value(item.get("topic"))
+
+        if ct and item_ct != ct:
+            continue
+        if course and item_course and item_course != course:
+            continue
+        if lesson and item_lesson and item_lesson != lesson:
+            continue
+        if topic and item_topic and item_topic != topic:
+            continue
+
+        rows.append({
+            "subject": item.get("subject"),
+            "content_type": item.get("content_type"),
+            "lesson": item.get("lesson"),
+            "topic": item.get("topic"),
+            "lesson_pages": item.get("lesson_pages"),
+            "topic_pages": item.get("topic_pages"),
+            "question_pages": item.get("question_pages"),
+            "answer_pages": item.get("answer_pages"),
+            "source_file": item.get("source_file"),
+        })
+        if len(rows) >= limit:
+            break
+
+    # For an entirely generic request, show a compact sample of the catalog
+    # rather than dumping every document row into Gemini. Routing itself still
+    # uses the full cached catalog above.
+    if not rows:
+        for item in catalog or []:
+            rows.append({
+                "subject": item.get("subject"),
+                "content_type": item.get("content_type"),
+                "lesson": item.get("lesson"),
+                "topic": item.get("topic"),
+                "lesson_pages": item.get("lesson_pages"),
+                "topic_pages": item.get("topic_pages"),
+                "question_pages": item.get("question_pages"),
+                "answer_pages": item.get("answer_pages"),
+                "source_file": item.get("source_file"),
+            })
+            if len(rows) >= limit:
+                break
+    return rows
+
+def _save_learning_event_background(user_id, user_text, reply, catalog, learning, source_meta, active_scope):
+    """Persist learning progress after the HTTP response has been sent."""
+    try:
+        event = infer_learning_event(
+            user_id, user_text, reply, catalog, learning, source_meta, active_scope=active_scope
+        )
+        if event:
+            record_learning_event(user_id, event)
+    except Exception as e:
+        print("Learning progress background save skipped:", type(e).__name__, str(e))
+
 def require_active_user(authorization):
     user = current_user(bearer(authorization))
     sub, msg = subscription_status(user["id"])
@@ -745,11 +857,16 @@ def _select_active_scope(query_text, text_matches, catalog):
     }
 
 
-def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None):
+def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None, active_scope=None):
     """Infer only learning progress, never a score. Exercises are scored via /learning/progress."""
     text = (user_text or "").strip()
     low = text.lower()
     source_meta = source_meta or []
+    active_scope = active_scope or {}
+    active_content_type = active_scope.get("content_type")
+    active_course = active_scope.get("course")
+    active_lesson = active_scope.get("lesson")
+    active_topic = active_scope.get("topic")
 
     chosen = None
 
@@ -1096,21 +1213,28 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
 
 
 @app.post("/api/proxy-chat")
-def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=None)):
+def proxy_chat(
+    data: ChatRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(default=None),
+):
+    perf_total = time.perf_counter()
     user = require_active_user(authorization)
-    if not gemini: raise HTTPException(500, "Gemini chưa được khởi tạo.")
-    if not index: raise HTTPException(500, "Pinecone chưa được khởi tạo.")
-    if not data.text: raise HTTPException(400, "Tin nhắn không được để trống.")
+    perf_auth = time.perf_counter()
 
-    retrieval_k = max(16, int(data.top_k or 8))
-    query_vector = embed_text(data.text)
+    if not gemini:
+        raise HTTPException(500, "Gemini chưa được khởi tạo.")
+    if not index:
+        raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+    if not data.text:
+        raise HTTPException(400, "Tin nhắn không được để trống.")
+
     namespace = data.knowledge_namespace or "__default__"
+    query_text = data.text
 
-    # Load learning history and catalog BEFORE retrieval.
-    # This is important because an explicit lesson such as "Bộ thủ" must
-    # constrain BOTH text and image retrieval before Pinecone ranks results.
-    learning=[]; catalog=[]
-    conn=db()
+    # Keep enough history for continuity, but do not send 100 rows to Gemini.
+    # The full learning state remains in PostgreSQL; this is only the prompt view.
+    conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -1119,33 +1243,25 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
                        last_studied_at,next_review_at,completed_at
                 FROM learning_progress
                 WHERE user_id=%s
-                ORDER BY last_studied_at DESC LIMIT 100
-            """,(user["id"],))
-            learning=[dict(x) for x in cur.fetchall()]
-            cur.execute("""
-                SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
-                       question_pages,answer_pages,source_file,namespace
-                FROM knowledge_documents
-                ORDER BY subject,content_type,lesson,topic,id
-            """)
-            catalog=[dict(x) for x in cur.fetchall()]
+                ORDER BY last_studied_at DESC LIMIT 20
+            """, (user["id"],))
+            learning = [dict(x) for x in cur.fetchall()]
     finally:
         conn.close()
+    catalog = _load_catalog_cached()
+    perf_state = time.perf_counter()
 
-    low=(data.text or "").strip().lower()
+    low = query_text.strip().lower()
 
-    # First resolve only from explicit user intent/catalog. Do NOT let a
-    # generic high-similarity RAG result decide the lesson when the user has
-    # explicitly asked for one. Kanji/Bộ thủ remain lessons under Từ vựng.
-    requested_scope=_select_active_scope(low, [], catalog)
-    requested_content_type=requested_scope.get("content_type")
-    requested_course=requested_scope.get("course")
-    requested_lesson=requested_scope.get("lesson")
-    requested_topic=requested_scope.get("topic")
+    # Resolve explicit intent before any semantic retrieval. Kanji/Bộ thủ are
+    # lessons under Từ vựng, never standalone content types.
+    requested_scope = _select_active_scope(low, [], catalog)
+    requested_content_type = requested_scope.get("content_type")
+    requested_course = requested_scope.get("course")
+    requested_lesson = requested_scope.get("lesson")
+    requested_topic = requested_scope.get("topic")
 
-    # Continue the current lesson when the follow-up message does not repeat
-    # the lesson name. This keeps a conversation inside Từ vựng -> Bộ thủ (or
-    # Từ vựng -> Kanji) instead of letting a semantically similar lesson win.
+    # Continue an active Kanji/Bộ thủ lesson on short follow-up questions.
     if not (requested_content_type or requested_course or requested_lesson or requested_topic):
         for lp in learning:
             lp_type = _normalize_content_type(lp.get("content_type"))
@@ -1157,117 +1273,129 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
                 break
 
     def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
-        scope_filter={"record_type":{"$eq":record_type}}
+        scope_filter = {"record_type": {"$eq": record_type}}
         if content_type:
-            scope_filter["content_type"]={"$eq":content_type}
+            scope_filter["content_type"] = {"$eq": content_type}
         if course:
-            scope_filter["course"]={"$eq":course}
+            scope_filter["course"] = {"$eq": course}
         if lesson:
-            scope_filter["lesson"]={"$eq":lesson}
+            scope_filter["lesson"] = {"$eq": lesson}
         if topic:
-            scope_filter["topic"]={"$eq":topic}
+            scope_filter["topic"] = {"$eq": topic}
         return scope_filter
 
-    retrieval_k=max(16,int(data.top_k or 8))
-    query_vector=embed_text(data.text)
-    namespace=data.knowledge_namespace or "__default__"
+    explicit_scope = bool(
+        requested_content_type or requested_course or requested_lesson or requested_topic
+    )
+    active_scope = requested_scope if explicit_scope else None
 
-    # If the user explicitly selected a lesson, retrieve TEXT only inside that
-    # exact hierarchy. This is the critical fix for requests such as
-    # "Học Bộ thủ" / "Dạy Bộ thủ": Từ vựng -> Bộ thủ must win before
-    # similarity ranking can choose another lesson such as Kanji.
-    text_filter=build_scope_filter(
+    # One embedding request per chat. The previous V3 path accidentally called
+    # embed_text() twice before retrieval, which added an unnecessary Gemini call.
+    embed_started = time.perf_counter()
+    query_vector = embed_text(query_text)
+    perf_embed = time.perf_counter()
+
+    # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
+    # Never exceed 10 unless the client explicitly sends a smaller value.
+    retrieval_k = min(10, max(4, int(data.top_k or 8)))
+
+    text_filter = build_scope_filter(
         "text",
         requested_content_type,
         requested_course,
         requested_lesson,
         requested_topic,
     )
-    result=index.query(
-        vector=query_vector,
-        top_k=retrieval_k,
-        include_metadata=True,
-        namespace=namespace,
-        filter=text_filter
-    )
 
-    contexts=[]; source_meta=[]
+    def query_text_matches():
+        return index.query(
+            vector=query_vector,
+            top_k=retrieval_k,
+            include_metadata=True,
+            namespace=namespace,
+            filter=text_filter,
+        )
+
+    # When the user explicitly selected the hierarchy, text and image retrieval
+    # are independent and can safely run in parallel. For a generic query we
+    # first need the text result to establish the active scope.
+    if explicit_scope:
+        image_filter = build_scope_filter(
+            "image",
+            requested_content_type,
+            requested_course,
+            requested_lesson,
+            requested_topic,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+        def query_images_scoped():
+            return index.query(
+                vector=query_vector,
+                top_k=16,
+                include_metadata=True,
+                namespace=namespace,
+                filter=image_filter,
+            )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            text_future = executor.submit(query_text_matches)
+            image_future = executor.submit(query_images_scoped)
+            result = text_future.result()
+            image_result = image_future.result()
+    else:
+        result = query_text_matches()
+        active_scope = _select_active_scope(low, result.matches, catalog)
+        image_filter = build_scope_filter(
+            "image",
+            active_scope.get("content_type"),
+            active_scope.get("course"),
+            active_scope.get("lesson"),
+            active_scope.get("topic"),
+        )
+        image_result = index.query(
+            vector=query_vector,
+            top_k=16,
+            include_metadata=True,
+            namespace=namespace,
+            filter=image_filter,
+        )
+
+    perf_rag = time.perf_counter()
+
+    active_content_type = active_scope.get("content_type")
+    active_course = active_scope.get("course")
+    active_lesson = active_scope.get("lesson")
+    active_topic = active_scope.get("topic")
+
+    contexts = []
+    source_meta = []
     for m in result.matches:
-        md=m.metadata or {}
-        if md.get("record_type")=="image":
+        md = m.metadata or {}
+        if md.get("record_type") == "image":
             continue
-        txt=md.get("text",md.get("content",""))
+        txt = md.get("text", md.get("content", ""))
         if txt:
-            label=(
+            label = (
                 f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
                 f"Môn: {md.get('subject',md.get('course',''))} | "
                 f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | Trang: {md.get('page','')}]"
             )
-            contexts.append(label+"\n"+txt)
+            contexts.append(label + "\n" + txt)
             source_meta.append(md)
 
-    # If the query did not explicitly identify a hierarchy, let the best text
-    # result establish the scope. If it did, NEVER replace that explicit scope
-    # with a different RAG lesson.
-    if requested_content_type or requested_course or requested_lesson or requested_topic:
-        active_scope=requested_scope
-    else:
-        active_scope=_select_active_scope(low,result.matches,catalog)
-
-    active_content_type=active_scope.get("content_type")
-    active_course=active_scope.get("course")
-    active_lesson=active_scope.get("lesson")
-    active_topic=active_scope.get("topic")
-
-    # Keep exact source/page references for non-vocabulary images. This is
-    # especially important for exercises: an exercise illustration/menu may
-    # have no term/reading metadata, so its identity is the page it belongs to.
-    active_text_pages=set()
+    # Exact source/page references are needed only for non-vocabulary images.
+    active_text_pages = set()
     for md in source_meta:
-        sf=str(md.get("source_file") or "").strip()
-        page=str(md.get("page") or "").strip()
+        sf = str(md.get("source_file") or "").strip()
+        page = str(md.get("page") or "").strip()
         if sf and page:
             active_text_pages.add((sf, page))
 
-    # Image retrieval happens AFTER the active scope is known, so text and
-    # image are searched in the same hierarchy. This keeps the existing strict
-    # term/reading-to-image mapping intact while preventing Kanji/other lessons
-    # from competing with an explicitly requested Bộ thủ lesson.
-    image_filter=build_scope_filter(
-        "image",
-        active_content_type,
-        active_course,
-        active_lesson,
-        active_topic,
-    )
-    image_result=index.query(
-        vector=query_vector,
-        top_k=48,
-        include_metadata=True,
-        namespace=namespace,
-        filter=image_filter
-    )
+    # Keep only a compact catalog view in Gemini. Routing above still uses the
+    # full cached catalog, so this is a prompt-size optimization only.
+    prompt_catalog = _compact_catalog_for_prompt(catalog, active_scope, limit=30)
+    prompt_learning = learning[:12]
 
-    active_source_files=set()
-    active_lessons=set()
-    active_topics=set()
-    active_courses=set()
-
-    for m in result.matches[:12]:
-        md=m.metadata or {}
-        ctype=_normalize_content_type(md.get("content_type"))
-        if active_content_type and ctype!=active_content_type:
-            continue
-        sf=str(md.get("source_file") or "").strip()
-        course=str(md.get("course") or md.get("course_name") or "").strip()
-        lesson_md=str(md.get("lesson") or "").strip()
-        topic_md=str(md.get("topic") or "").strip()
-        if sf: active_source_files.add(sf)
-        if course: active_courses.add(course)
-        if lesson_md: active_lessons.add(lesson_md)
-        if topic_md: active_topics.add(topic_md)
-
-    prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
+    prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
 QUY TẮC QUAN TRỌNG:
 1. Nếu user đã chọn một nội dung cụ thể và yêu cầu thực hiện nó, HÃY THỰC HIỆN NGAY.
@@ -1280,71 +1408,61 @@ QUY TẮC QUAN TRỌNG:
 5. Nếu user muốn ôn, ưu tiên nội dung có status review, điểm thấp hoặc lâu chưa học.
 6. Loại nội dung gồm: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc.
 7. Với Bài tập, hỏi user làm trước rồi mới đưa đáp án. Không tiết lộ đáp án trước.
-8. Với Truyện đọc, hãy kể/đọc trực tiếp theo tài liệu khi user yêu cầu; có thể chia
-   thành từng đoạn và hỏi tiếp khi cần, nhưng không hỏi lại việc có muốn đọc hay không.
+8. Với Truyện đọc, hãy kể/đọc trực tiếp theo tài liệu khi user yêu cầu.
 9. Với Từ vựng, dạy từ mới và có thể kiểm tra nhẹ nhưng không bắt buộc chấm điểm.
 10. Với Ngữ pháp, giải thích, ví dụ và luyện tập.
 11. Dựa vào LỊCH SỬ HỌC để tiếp tục đúng phần user đang học dở.
 12. Không bịa trang tài liệu.
 13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
-14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả; không tự suy đoán điểm từ lời giải thích của Doraemon.
+14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả.
 15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
 16. Luôn định tuyến nội dung theo thứ tự Course -> loại nội dung -> lesson -> topic.
     Khi user nêu rõ lesson/chủ đề, phải trả lời trong đúng lesson/chủ đề đó; không được
-    chọn lesson khác chỉ vì RAG similarity cao hơn. Nếu tài liệu không có lesson/topic,
-    chỉ bỏ qua tầng metadata bị thiếu.
-17. Khi ghi nhận tiến độ, nếu user nói rõ "chỉ học Từ vựng", "chỉ học Ngữ pháp",
-    "chỉ làm Bài tập" hoặc tương tự, phải ghi đúng loại nội dung user đã chọn.
-    Không được dùng loại nội dung của kết quả RAG khác để ghi tiến độ.
-17. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen giữa 4 loại nội dung:
-    Từ vựng → Ngữ pháp → Bài tập → Truyện đọc, rồi quay vòng ôn tập theo tiến độ.
-    Trong loại Từ vựng có các lesson như Kanji và Bộ thủ; tuyệt đối không coi
-    Kanji/Bộ thủ là content type riêng.
-18. Khi user hỏi chung kiểu "nên học gì", hãy đề xuất lộ trình trên và giải thích ngắn gọn.
+    chọn lesson khác chỉ vì RAG similarity cao hơn.
+17. Khi ghi nhận tiến độ, nếu user nói rõ loại nội dung, phải ghi đúng loại nội dung đó.
+18. Khi người mới chưa biết học gì, hướng dẫn lộ trình 4 loại nội dung:
+    Từ vựng -> Ngữ pháp -> Bài tập -> Truyện đọc. Trong Từ vựng có lesson Kanji và Bộ thủ;
+    tuyệt đối không coi Kanji/Bộ thủ là content type riêng.
 19. Nếu user đã chọn nội dung cụ thể, không đưa lại menu/lộ trình; hãy bắt đầu dạy ngay.
 20. Khi đang dạy một lesson có hình ảnh, nếu giới thiệu một term/bộ thủ có ảnh tương ứng,
-    hãy đặt term/reading đó trong tiêu đề Markdown (ví dụ "### **BỘ VI (囗)**").
-    Không dùng một từ xuất hiện trong phần giải nghĩa như "bao quanh" để ám chỉ term khác.
+    hãy đặt term/reading đó trong tiêu đề Markdown. Không dùng một từ xuất hiện trong
+    phần giải nghĩa như "bao quanh" để ám chỉ term khác.
 21. Với Bài tập/Truyện đọc có ảnh minh họa, ảnh có thể không có term/reading. Khi đó ảnh
-    phải được lấy đúng theo cùng source_file + page với phần văn bản đang được dùng; không
-    lấy ảnh của trang khác chỉ vì nội dung/ý nghĩa tương tự.
+    phải được lấy đúng theo cùng source_file + page với phần văn bản đang được dùng.
 
 DANH MỤC GIÁO TRÌNH:
-{json.dumps(catalog,ensure_ascii=False,default=str)}
+{json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
 
 LỊCH SỬ HỌC CỦA USER:
-{json.dumps(learning,ensure_ascii=False,default=str)}
+{json.dumps(prompt_learning, ensure_ascii=False, default=str, separators=(",", ":"))}
 
 NỘI DUNG TÌM ĐƯỢC:
 {chr(10).join(contexts)}
 
 TIN NHẮN:
-{data.text}"""
+{query_text}"""
 
-    response=gemini.models.generate_content(
+    gen_started = time.perf_counter()
+    response = gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2)
+        config=types.GenerateContentConfig(temperature=0.2),
     )
-    reply=response.text or ""
-    # Ảnh V2 được truy xuất như các vector độc lập, vì vậy câu hỏi về một
-    # từ cụ thể sẽ ưu tiên đúng ảnh đã được map với từ đó.
-    # Image retrieval is independent from text retrieval. We keep only images
-    # whose actual term/reading is explicitly present in the user's question
-    # OR in Doraemon's generated answer. Meaning/description similarity is
-    # intentionally ignored because it is not a reliable image identity.
-    image_candidates=[]
-    query_text=(data.text or "").strip()
-    answer_text=reply or ""
+    reply = response.text or ""
+    perf_gen = time.perf_counter()
+
+    # Strict image mapping remains unchanged in principle:
+    # vocabulary/Kanji/Bộ thủ require term/reading; exercises/stories can use
+    # exact source_file + page mapping when their image has no term/reading.
+    image_candidates = []
+    answer_text = reply or ""
 
     for m in image_result.matches:
-        md=m.metadata or {}
+        md = m.metadata or {}
         if not md.get("image_key"):
             continue
 
         image_content_type = _normalize_content_type(md.get("content_type"))
-
-        # HARD SCOPE: Course -> content type -> lesson -> topic.
         if active_content_type and image_content_type != active_content_type:
             continue
 
@@ -1356,9 +1474,6 @@ TIN NHẮN:
         if active_course and image_course:
             if _clean_scope_value(image_course) != _clean_scope_value(active_course):
                 continue
-
-        # Only constrain lesson/topic when the active route explicitly knows
-        # them. Legacy uploads with empty lesson/topic remain usable.
         if active_lesson and image_lesson:
             if _clean_scope_value(image_lesson) != _clean_scope_value(active_lesson):
                 continue
@@ -1366,24 +1481,15 @@ TIN NHẮN:
             if _clean_scope_value(image_topic) != _clean_scope_value(active_topic):
                 continue
 
-        # Text and image records may come from different Pinecone vectors/files.
-        # Course -> content_type -> lesson -> topic is the authoritative scope.
-        # Vocabulary images remain strictly identified by term/reading.
-        # Exercises/reading pages have a second strict identity: same source_file
-        # + page as the retrieved text, because their images may have no term.
-        term=str(md.get("term") or "").strip()
-        reading=str(md.get("reading") or "").strip()
-        meaning=str(md.get("meaning") or "").strip()
-        image_source=str(md.get("source_file") or "").strip()
-        image_page=str(md.get("page") or "").strip()
+        term = str(md.get("term") or "").strip()
+        reading = str(md.get("reading") or "").strip()
+        meaning = str(md.get("meaning") or "").strip()
+        image_page = str(md.get("page") or "").strip()
 
         anchors = [x for x in (term, reading) if x]
         query_anchor = None
         page_anchor = False
 
-        # Từ vựng (including Kanji/Bộ thủ lessons): term/reading is mandatory.
-        # This prevents words in explanations such as "bao quanh" from pulling
-        # the image for Bộ Bao.
         if anchors:
             for anchor in anchors:
                 pos = _find_explicit_term_in_query(query_text, anchor)
@@ -1391,9 +1497,6 @@ TIN NHẮN:
                     query_anchor = pos
                     break
         elif active_content_type in {"Bài tập", "Truyện đọc"}:
-            # Exercise/story images are page illustrations, not vocabulary cards.
-            # They are accepted only when they belong to the exact same source
-            # file + page as one of the retrieved text records.
             if image_source and image_page and (image_source, image_page) in active_text_pages:
                 page_anchor = True
             else:
@@ -1403,7 +1506,6 @@ TIN NHẮN:
 
         exact_boost = 2.00 if query_anchor is not None else 0.0
         page_boost = 1.50 if page_anchor else 0.0
-
         image_candidates.append({
             "score": float(m.score) + exact_boost + page_boost,
             "key": str(md.get("image_key")),
@@ -1419,18 +1521,16 @@ TIN NHẮN:
 
     image_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    images=[]
-    rich_images=[]
-    seen_image_keys=set()
-    seen_page_images=set()
+    images = []
+    rich_images = []
+    seen_image_keys = set()
+    seen_page_images = set()
 
-    # Keep more images so a multi-vocabulary answer can render
-    # term -> image -> next term -> image.
     for item in image_candidates:
         if not item["url"] or item["key"] in seen_image_keys:
             continue
         if item.get("_page_anchor"):
-            page_identity=(item.get("source_file", ""), str(item.get("page") or ""))
+            page_identity = (item.get("source_file", ""), str(item.get("page") or ""))
             if page_identity in seen_page_images:
                 continue
             seen_page_images.add(page_identity)
@@ -1447,33 +1547,51 @@ TIN NHẮN:
             "_page_anchor": bool(item.get("_page_anchor")),
             "_query_anchor": item.get("_query_anchor"),
         }
-        images.append({"key":item["key"],"url":item["url"]})
+        images.append({"key": item["key"], "url": item["url"]})
         rich_images.append(image_payload)
         if len(images) >= 6:
             break
 
     content_blocks = build_rich_content_blocks(reply, rich_images)
+    perf_blocks = time.perf_counter()
 
-    # Tự động ghi nhận tiến độ. Nếu bước này lỗi thì KHÔNG làm hỏng câu trả lời
-    # của người học.
-    tracked_event=None
-    try:
-        event=infer_learning_event(user["id"],data.text,reply,catalog,learning,source_meta)
-        if event:
-            tracked_event=record_learning_event(user["id"],event)
-    except Exception as e:
-        print("Learning progress save skipped:", type(e).__name__, str(e))
+    # Save progress AFTER the response has been sent. This removes another
+    # PostgreSQL round-trip from the user's critical path while preserving the
+    # same learning logic in the background.
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _save_learning_event_background,
+            user["id"], query_text, reply, catalog, learning, source_meta, active_scope,
+        )
+
+    perf_total_done = time.perf_counter()
+    print(
+        "[PERF proxy_chat] auth=%.3fs state=%.3fs embed=%.3fs rag=%.3fs "
+        "gemini=%.3fs blocks=%.3fs total=%.3fs text_k=%d image_k=%d prompt_catalog=%d prompt_learning=%d"
+        % (
+            perf_auth - perf_total,
+            perf_state - perf_auth,
+            perf_embed - perf_state,
+            perf_rag - perf_embed,
+            perf_gen - perf_rag,
+            perf_blocks - perf_gen,
+            perf_total_done - perf_total,
+            len(result.matches),
+            len(image_result.matches),
+            len(prompt_catalog),
+            len(prompt_learning),
+        )
+    )
 
     return {
-        "reply":reply,
-        "model":GEMINI_MODEL,
-        "sources":source_meta[:10],
-        "images":images,
-        "content_blocks":content_blocks,
-        "learning_history_count":len(learning),
-        "learning_progress":tracked_event
+        "reply": reply,
+        "model": GEMINI_MODEL,
+        "sources": source_meta[:10],
+        "images": images,
+        "content_blocks": content_blocks,
+        "learning_history_count": len(learning),
+        "learning_progress": {"queued": True},
     }
-
 
 
 @app.get("/session/welcome")
@@ -2395,6 +2513,8 @@ async def admin_knowledge_upload(
         conn.commit()
     finally:
         conn.close()
+
+    _invalidate_catalog_cache()
 
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
