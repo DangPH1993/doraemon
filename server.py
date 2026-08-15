@@ -654,6 +654,7 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
     - Do NOT append unmatched images at the end.
     - If an image cannot be mapped, omit it rather than showing an unrelated
       image. This is safer for a learning assistant.
+    - Images must be scoped to the active content type/document context.
     """
     reply = reply or ""
     if not reply:
@@ -760,9 +761,16 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
         namespace=namespace,
         filter={"record_type": {"$eq": "text"}}
     )
+    # Image retrieval is kept separate from text retrieval, but images must
+    # ALSO belong to the same active content type as the text context.
+    # Otherwise a generic word such as "bộ" in a Bài tập/Hội thoại answer can
+    # accidentally activate an unrelated Từ vựng/radical image.
+    #
+    # We query a wider image pool and apply a strict scope below because the
+    # active content type is determined by the best text match.
     image_result = index.query(
         vector=query_vector,
-        top_k=24,
+        top_k=48,
         include_metadata=True,
         namespace=namespace,
         filter={"record_type": {"$eq": "image"}}
@@ -782,6 +790,30 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
             )
             contexts.append(label+"\n"+txt)
             source_meta.append(md)
+
+    # The highest-ranked text result defines the active learning context.
+    # Images from another content type must never leak into this answer.
+    active_content_type = None
+    active_source_files = set()
+    active_lessons = set()
+    active_topics = set()
+
+    for m in result.matches[:8]:
+        md = m.metadata or {}
+        ctype = _normalize_content_type(md.get("content_type"))
+        if active_content_type is None:
+            active_content_type = ctype
+
+        if ctype == active_content_type:
+            sf = str(md.get("source_file") or "").strip()
+            lesson = str(md.get("lesson") or "").strip()
+            topic = str(md.get("topic") or "").strip()
+            if sf:
+                active_source_files.add(sf)
+            if lesson:
+                active_lessons.add(lesson)
+            if topic:
+                active_topics.add(topic)
 
     learning=[]; catalog=[]
     conn=db()
@@ -860,6 +892,28 @@ TIN NHẮN:
     for m in image_result.matches:
         md=m.metadata or {}
         if not md.get("image_key"):
+            continue
+
+        image_content_type = _normalize_content_type(md.get("content_type"))
+
+        # HARD SCOPE: an image can only be shown when it belongs to the same
+        # content type as the text being answered.
+        if active_content_type and image_content_type != active_content_type:
+            continue
+
+        # When source/lesson/topic metadata is available, keep the image in
+        # the same document context as the retrieved text. Do not require
+        # lesson/topic when they are empty because older records may not have
+        # these fields.
+        image_source = str(md.get("source_file") or "").strip()
+        image_lesson = str(md.get("lesson") or "").strip()
+        image_topic = str(md.get("topic") or "").strip()
+
+        if active_source_files and image_source and image_source not in active_source_files:
+            continue
+        if active_lessons and image_lesson and image_lesson not in active_lessons:
+            continue
+        if active_topics and image_topic and image_topic not in active_topics:
             continue
 
         term=str(md.get("term") or "").strip()
