@@ -1823,7 +1823,7 @@ TIN NHẮN HIỆN TẠI:
         image_candidates.append({
             "score": float(m.score) + exact_boost + page_boost,
             "key": str(md.get("image_key")),
-            "url": md.get("image_url") or b2_url(str(md.get("image_key"))),
+            "url": b2_url(str(md.get("image_key"))) or md.get("image_url"),
             "term": term,
             "reading": reading,
             "meaning": meaning,
@@ -1954,6 +1954,15 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
         "deleted_progress": deleted,
         "message": "Đã xóa lịch sử học và reset giáo trình về trạng thái ban đầu."
     }
+
+
+@app.post("/api/learning/reset")
+def reset_learning_compat(authorization: Optional[str] = Header(default=None)):
+    """
+    Compatibility alias for older clients.
+    Canonical endpoint remains POST /learning/reset.
+    """
+    return reset_learning(authorization)
 
 
 @app.post("/learning/progress")
