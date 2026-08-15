@@ -1033,6 +1033,7 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
 
     # The highest-ranked text result defines the active learning context.
     # Images from another content type must never leak into this answer.
+    low = (data.text or "").strip().lower()
     # Resolve the active hierarchy HERE, where query text, RAG matches and
     # catalog are all available:
     # Course -> content type -> lesson -> topic.
