@@ -1243,7 +1243,7 @@ def proxy_chat(
                        last_studied_at,next_review_at,completed_at
                 FROM learning_progress
                 WHERE user_id=%s
-                ORDER BY last_studied_at DESC LIMIT 20
+                ORDER BY last_studied_at DESC LIMIT 8
             """, (user["id"],))
             learning = [dict(x) for x in cur.fetchall()]
     finally:
@@ -1258,7 +1258,7 @@ def proxy_chat(
     # The client already sends chat_history; this is deliberately kept compact
     # to control latency while preserving the current exercise/lesson context.
     recent_history = []
-    for item in (data.chat_history or [])[-8:]:
+    for item in (data.chat_history or [])[-4:]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
@@ -1276,21 +1276,9 @@ def proxy_chat(
             text = str(item.get("content")).strip()
         if role in {"user", "model", "assistant"} and text:
             role = "model" if role == "assistant" else role
-            recent_history.append({"role": role, "text": text[-2500:]})
+            recent_history.append({"role": role, "text": text[-900:]})
 
-    # For very short follow-ups, include the recent conversation in the RAG
-    # embedding query. This prevents a query like "A" from losing the fact that
-    # the current exercise is Gọi món. The explicit active lesson/scope still
-    # controls the Pinecone filters, so history cannot leak another lesson.
-    rag_query_text = query_text
-    if recent_history and len(query_text) <= 80:
-        history_tail = recent_history[-4:]
-        history_context = " ".join(
-            f"{h['role']}: {h['text']}" for h in history_tail
-        )
-        rag_query_text = f"Ngữ cảnh hội thoại gần đây: {history_context}\nTin nhắn mới: {query_text}"
-
-    # Resolve explicit intent before any semantic retrieval. Kanji/Bộ thủ are
+    # Resolve explicit intent before semantic retrieval. Kanji/Bộ thủ are
     # lessons under Từ vựng, never standalone content types.
     requested_scope = _select_active_scope(low, [], catalog)
     requested_content_type = requested_scope.get("content_type")
@@ -1298,16 +1286,25 @@ def proxy_chat(
     requested_lesson = requested_scope.get("lesson")
     requested_topic = requested_scope.get("topic")
 
-    # Continue an active Kanji/Bộ thủ lesson on short follow-up questions.
-    if not (requested_content_type or requested_course or requested_lesson or requested_topic):
+    # Continue the most recent in-progress lesson for short follow-ups. This
+    # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
+    # PostgreSQL is the durable state; chat history is only the conversational hint.
+    recommendation_words = ("học gì", "học gì hôm nay", "gợi ý", "đề xuất", "chọn bài", "nên học")
+    wants_recommendation = any(w in low for w in recommendation_words)
+    active_learning = None
+    if not (requested_content_type or requested_course or requested_lesson or requested_topic) and not wants_recommendation:
         for lp in learning:
-            lp_type = _normalize_content_type(lp.get("content_type"))
-            lp_lesson = str(lp.get("lesson") or "").strip()
-            if lp_type == "Từ vựng" and lp_lesson in {"Bộ thủ", "Kanji"}:
-                requested_content_type = "Từ vựng"
-                requested_lesson = lp_lesson
-                requested_course = str(lp.get("subject") or "").strip() or None
+            if str(lp.get("status") or "").strip().lower() in {"in_progress", "review", "active"}:
+                active_learning = lp
                 break
+        if active_learning is None and learning:
+            active_learning = learning[0]
+
+        if active_learning:
+            requested_content_type = _normalize_content_type(active_learning.get("content_type")) or None
+            requested_course = str(active_learning.get("subject") or "").strip() or None
+            requested_lesson = str(active_learning.get("lesson") or "").strip() or None
+            requested_topic = str(active_learning.get("topic") or "").strip() or None
 
     def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
         scope_filter = {"record_type": {"$eq": record_type}}
@@ -1326,7 +1323,32 @@ def proxy_chat(
     )
     active_scope = requested_scope if explicit_scope else None
 
-    # One embedding request per chat. The previous V3 path accidentally called
+    # Build a tiny semantic query. If durable learning state already identifies
+    # the active lesson/exercise, do NOT embed the whole chat history. Only the
+    # active scope/state plus the new user message is needed. For a genuinely
+    # unscoped query, use at most the two latest chat turns as a fallback hint.
+    rag_query_text = query_text
+    if active_scope:
+        scope_parts = [
+            str(active_scope.get("content_type") or ""),
+            str(active_scope.get("course") or ""),
+            str(active_scope.get("lesson") or ""),
+            str(active_scope.get("topic") or ""),
+        ]
+        scope_label = " / ".join(x for x in scope_parts if x)
+        position_label = ""
+        if active_learning:
+            position_label = (
+                f" Vị trí hiện tại: {active_learning.get('current_position') or ''};"
+                f" trang: {active_learning.get('current_page') or ''}."
+            )
+        rag_query_text = f"Ngữ cảnh học tập: {scope_label}.{position_label}\nTin nhắn: {query_text}"
+    elif recent_history:
+        history_tail = recent_history[-2:]
+        history_context = " ".join(f"{h['role']}: {h['text'][-500:]}" for h in history_tail)
+        rag_query_text = f"Ngữ cảnh gần đây: {history_context}\nTin nhắn: {query_text}"
+
+    # One embedding request per chat.
     # embed_text() twice before retrieval, which added an unnecessary Gemini call.
     embed_started = time.perf_counter()
     query_vector = embed_text(rag_query_text)
@@ -1368,7 +1390,7 @@ def proxy_chat(
         def query_images_scoped():
             return index.query(
                 vector=query_vector,
-                top_k=16,
+                top_k=12,
                 include_metadata=True,
                 namespace=namespace,
                 filter=image_filter,
@@ -1427,57 +1449,59 @@ def proxy_chat(
         if sf and page:
             active_text_pages.add((sf, page))
 
-    # Keep only a compact catalog view in Gemini. Routing above still uses the
-    # full cached catalog, so this is a prompt-size optimization only.
-    prompt_catalog = _compact_catalog_for_prompt(catalog, active_scope, limit=30)
-    prompt_learning = learning[:12]
+    # Only send durable state that matters for THIS turn. The full catalog and
+    # full learning history stay on the server for routing/tracking. They are not
+    # repeatedly paid for as Gemini input tokens.
+    active_state = {
+        "content_type": active_content_type,
+        "course": active_course,
+        "lesson": active_lesson,
+        "topic": active_topic,
+        "current_position": (active_learning or {}).get("current_position"),
+        "current_page": (active_learning or {}).get("current_page"),
+        "status": (active_learning or {}).get("status"),
+    }
+    prompt_catalog = []
+    # Only expose catalog names when the user has not yet selected an active
+    # lesson and is asking for a recommendation/choice.
+    if not active_scope and wants_recommendation:
+        prompt_catalog = _compact_catalog_for_prompt(catalog, {}, limit=12)
+
+    # Keep only the last two turns and cap each one aggressively. This is enough
+    # for pronouns/short answers while durable lesson state comes from PostgreSQL.
+    prompt_history = recent_history[-2:]
+
+    # Keep the RAG context compact: retrieval still uses up to 10 matches, but
+    # Gemini only needs the best few chunks for the answer.
+    prompt_contexts = []
+    for c in contexts[:6]:
+        if len(c) > 1800:
+            c = c[:1800] + "…"
+        prompt_contexts.append(c)
 
     prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
-QUY TẮC QUAN TRỌNG:
-1. Nếu user đã chọn một nội dung cụ thể và yêu cầu thực hiện nó, HÃY THỰC HIỆN NGAY.
-   Ví dụ user nói "hãy kể cho mình truyện Cô bé quàng khăn đỏ" thì phải bắt đầu
-   kể truyện, không hỏi lại "có muốn đọc truyện không?".
-2. Không liên tục quay lại câu hỏi "Hôm nay bạn muốn học gì?" khi user đã xác định
-   bài/chủ đề/nội dung. Chỉ hỏi lại lựa chọn học khi user thực sự chưa chọn nội dung.
-3. Khi user muốn học mới, có thể hỏi lần lượt môn học -> loại nội dung -> bài học/chủ đề.
-4. Chỉ dùng tên môn/bài/chủ đề có trong DANH MỤC nếu đang đề xuất nội dung.
-5. Nếu user muốn ôn, ưu tiên nội dung có status review, điểm thấp hoặc lâu chưa học.
-6. Loại nội dung gồm: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc.
-7. Với Bài tập, hỏi user làm trước rồi mới đưa đáp án. Không tiết lộ đáp án trước.
-8. Với Truyện đọc, hãy kể/đọc trực tiếp theo tài liệu khi user yêu cầu.
-9. Với Từ vựng, dạy từ mới và có thể kiểm tra nhẹ nhưng không bắt buộc chấm điểm.
-10. Với Ngữ pháp, giải thích, ví dụ và luyện tập.
-11. Dựa vào LỊCH SỬ HỌC để tiếp tục đúng phần user đang học dở.
-12. Không bịa trang tài liệu.
-13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
-14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả.
-15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
-16. Luôn định tuyến nội dung theo thứ tự Course -> loại nội dung -> lesson -> topic.
-    Khi user nêu rõ lesson/chủ đề, phải trả lời trong đúng lesson/chủ đề đó; không được
-    chọn lesson khác chỉ vì RAG similarity cao hơn.
-17. Khi ghi nhận tiến độ, nếu user nói rõ loại nội dung, phải ghi đúng loại nội dung đó.
-18. Khi người mới chưa biết học gì, hướng dẫn lộ trình 4 loại nội dung:
-    Từ vựng -> Ngữ pháp -> Bài tập -> Truyện đọc. Trong Từ vựng có lesson Kanji và Bộ thủ;
-    tuyệt đối không coi Kanji/Bộ thủ là content type riêng.
-19. Nếu user đã chọn nội dung cụ thể, không đưa lại menu/lộ trình; hãy bắt đầu dạy ngay.
-20. Khi đang dạy một lesson có hình ảnh, nếu giới thiệu một term/bộ thủ có ảnh tương ứng,
-    hãy đặt term/reading đó trong tiêu đề Markdown. Không dùng một từ xuất hiện trong
-    phần giải nghĩa như "bao quanh" để ám chỉ term khác.
-21. Với Bài tập/Truyện đọc có ảnh minh họa, ảnh có thể không có term/reading. Khi đó ảnh
-    phải được lấy đúng theo cùng source_file + page với phần văn bản đang được dùng.
+NGUYÊN TẮC:
+- Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
+- Nội dung gồm đúng 4 loại: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
+- Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
+- Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
+- Với Truyện đọc: bám tài liệu được RAG cung cấp. Với Từ vựng/Ngữ pháp: giải thích và luyện tập theo tài liệu.
+- Không bịa nội dung/trang không có trong RAG.
+- Nếu đang dạy term/bộ thủ có ảnh, dùng đúng term/reading làm tiêu đề; không lấy một từ xuất hiện trong phần nghĩa (ví dụ “bao quanh”) làm term khác.
+- Ảnh Bài tập/Truyện đọc được map theo source_file + page; ảnh Từ vựng/Kanji/Bộ thủ map theo term/reading.
 
-DANH MỤC GIÁO TRÌNH:
+ACTIVE LEARNING STATE:
+{json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
+
+DANH MỤC (chỉ có khi cần gợi ý):
 {json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
 
-LỊCH SỬ HỌC CỦA USER:
-{json.dumps(prompt_learning, ensure_ascii=False, default=str, separators=(",", ":"))}
+RAG CONTEXT:
+{chr(10).join(prompt_contexts)}
 
-NỘI DUNG TÌM ĐƯỢC:
-{chr(10).join(contexts)}
-
-LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
-{json.dumps(recent_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+RECENT CHAT (chỉ để hiểu câu nói ngắn/đại từ):
+{json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
@@ -1656,7 +1680,7 @@ TIN NHẮN HIỆN TẠI:
     perf_total_done = time.perf_counter()
     print(
         "[PERF proxy_chat] auth=%.3fs state=%.3fs embed=%.3fs rag=%.3fs "
-        "gemini=%.3fs blocks=%.3fs total=%.3fs text_k=%d image_k=%d prompt_catalog=%d prompt_learning=%d"
+        "gemini=%.3fs blocks=%.3fs total=%.3fs text_k=%d image_k=%d prompt_catalog=%d prompt_active_state=%d"
         % (
             perf_auth - perf_total,
             perf_state - perf_auth,
@@ -1668,7 +1692,7 @@ TIN NHẮN HIỆN TẠI:
             len(result.matches),
             len(image_result.matches),
             len(prompt_catalog),
-            len(prompt_learning),
+            1 if active_learning else 0,
         )
     )
 
@@ -1847,7 +1871,7 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
                        last_studied_at,next_review_at,completed_at
                 FROM learning_progress
                 WHERE user_id=%s
-                ORDER BY last_studied_at DESC LIMIT 200
+                ORDER BY last_studied_at DESC LIMIT 80
             """,(user["id"],))
             rows=[dict(x) for x in cur.fetchall()]
         return {"success":True,"user_id":user["id"],"learning_history":rows}
