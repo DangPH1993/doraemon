@@ -621,55 +621,80 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
         "completed": completed,
     }
 
+def _find_phrase_position(text: str, phrase: str):
+    """Find a meaningful exact occurrence, avoiding tiny Latin substring matches."""
+    text = text or ""
+    phrase = str(phrase or "").strip()
+    if not phrase:
+        return None
+
+    # For Latin/number-only phrases, require word boundaries.
+    # This prevents a term such as "Vi" from matching inside unrelated
+    # Vietnamese words such as "vì".
+    if re.fullmatch(r"[A-Za-zÀ-ỹ0-9][A-Za-zÀ-ỹ0-9 _-]*", phrase):
+        pattern = re.compile(
+            rf"(?<![A-Za-zÀ-ỹ0-9]){re.escape(phrase)}(?![A-Za-zÀ-ỹ0-9])",
+            re.IGNORECASE
+        )
+        match = pattern.search(text)
+        return match.start() if match else None
+
+    # Japanese/CJK and mixed strings: exact case-insensitive substring match.
+    pos = text.casefold().find(phrase.casefold())
+    return pos if pos >= 0 else None
+
+
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
     """
-    Build ordered content blocks so the client can render:
-        text -> image -> text -> image -> ...
-    Images are positioned using the vocabulary/meaning metadata attached to
-    each Pinecone image record. If an image cannot be mapped to a phrase in
-    the answer, it is appended at the end instead of being silently lost.
+    Render only images that can be confidently mapped to a real term,
+    reading, or meaning in the answer.
+
+    IMPORTANT:
+    - Do NOT use generic description/associated_text for image placement.
+    - Do NOT append unmatched images at the end.
+    - If an image cannot be mapped, omit it rather than showing an unrelated
+      image. This is safer for a learning assistant.
     """
     reply = reply or ""
-    if not image_items:
-        return [{"type": "text", "text": reply}] if reply else []
+    if not reply:
+        return []
 
     candidates = []
     for item in image_items:
+        # Only educational identity fields are allowed to anchor an image.
         phrases = []
-        for field in ("term", "reading", "meaning", "associated_text"):
+        for field in ("term", "reading", "meaning"):
             value = str(item.get(field) or "").strip()
-            if value and value not in phrases:
+            if value and value not in phrases and len(value) >= 1:
                 phrases.append(value)
 
-        # Prefer longer phrases first so a meaning like "bước đi" does not
-        # accidentally match a shorter substring before the actual term.
-        phrases.sort(key=len, reverse=True)
-
         positions = []
-        low_reply = reply.casefold()
-        for phrase in phrases:
-            pos = low_reply.find(phrase.casefold())
-            if pos >= 0:
-                positions.append((pos, phrase))
+        for phrase in sorted(phrases, key=len, reverse=True):
+            pos = _find_phrase_position(reply, phrase)
+            if pos is not None:
+                positions.append((pos, phrase, field))
 
-        if positions:
-            pos, phrase = min(positions, key=lambda x: x[0])
-            candidates.append({
-                "position": pos,
-                "phrase": phrase,
-                "item": item,
-            })
-        else:
-            candidates.append({
-                "position": None,
-                "phrase": "",
-                "item": item,
-            })
+        if not positions:
+            # Never append an unanchored image.
+            continue
 
-    # Only one image should be inserted at a given textual position.
-    # Keep the strongest/relevant candidate at each position.
-    mapped = [x for x in candidates if x["position"] is not None]
-    mapped.sort(key=lambda x: (x["position"], -float(x["item"].get("score", 0))))
+        # Prefer the earliest match; for equal positions prefer the longer phrase.
+        pos, phrase, _ = min(positions, key=lambda x: (x[0], -len(x[1])))
+        candidates.append({
+            "position": pos,
+            "phrase": phrase,
+            "item": item,
+        })
+
+    # At one textual position, keep the highest-scoring image only.
+    by_position = {}
+    for candidate in candidates:
+        pos = candidate["position"]
+        current = by_position.get(pos)
+        if current is None or float(candidate["item"].get("score", 0)) > float(current["item"].get("score", 0)):
+            by_position[pos] = candidate
+
+    mapped = sorted(by_position.values(), key=lambda x: x["position"])
 
     blocks = []
     cursor = 0
@@ -698,32 +723,13 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
             "page": item.get("page"),
         })
         used_keys.add(key)
-
-        # Do not delete the matched word from the answer. Advance only to the
-        # end of the matched phrase so the image appears immediately after it.
         cursor = pos + len(candidate["phrase"])
 
     if cursor < len(reply):
         blocks.append({"type": "text", "text": reply[cursor:]})
 
-    # Any selected image without a textual anchor is still useful. Append it
-    # after the answer rather than dropping it.
-    for candidate in candidates:
-        item = candidate["item"]
-        key = str(item.get("key") or "")
-        if key and key not in used_keys:
-            blocks.append({
-                "type": "image",
-                "key": key,
-                "url": item.get("url"),
-                "term": item.get("term", ""),
-                "reading": item.get("reading", ""),
-                "meaning": item.get("meaning", ""),
-                "page": item.get("page"),
-            })
-            used_keys.add(key)
-
     return blocks
+
 
 
 @app.post("/api/proxy-chat")
@@ -734,12 +740,27 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     if not data.text: raise HTTPException(400, "Tin nhắn không được để trống.")
 
     retrieval_k = max(16, int(data.top_k or 8))
+    query_vector = embed_text(data.text)
+    namespace = data.knowledge_namespace or "__default__"
+
+    # Text and image retrieval are separated. Otherwise a page with many
+    # image vectors can crowd the text records out of the top-k results, or
+    # unrelated image vectors can leak into the response.
     result = index.query(
-        vector=embed_text(data.text),
+        vector=query_vector,
         top_k=retrieval_k,
         include_metadata=True,
-        namespace=data.knowledge_namespace or "__default__"
+        namespace=namespace,
+        filter={"record_type": {"$eq": "text"}}
     )
+    image_result = index.query(
+        vector=query_vector,
+        top_k=24,
+        include_metadata=True,
+        namespace=namespace,
+        filter={"record_type": {"$eq": "image"}}
+    )
+
     contexts=[]; source_meta=[]
     for m in result.matches:
         md=m.metadata or {}
@@ -821,32 +842,57 @@ TIN NHẮN:
     reply=response.text or ""
     # Ảnh V2 được truy xuất như các vector độc lập, vì vậy câu hỏi về một
     # từ cụ thể sẽ ưu tiên đúng ảnh đã được map với từ đó.
+    # Image retrieval is independent from text retrieval. We keep only images
+    # whose term/reading/meaning is explicitly present in the user's question
+    # OR in Doraemon's generated answer. Generic descriptions are NOT enough.
     image_candidates=[]
-    query_low=(data.text or "").strip().casefold()
-    for m in result.matches:
+    query_text=(data.text or "").strip()
+    answer_text=reply or ""
+
+    for m in image_result.matches:
         md=m.metadata or {}
-        if md.get("record_type") == "image" and md.get("image_key"):
-            term=str(md.get("term") or "")
-            reading=str(md.get("reading") or "")
-            meaning=str(md.get("meaning") or "")
-            associated=str(md.get("associated_text") or "")
-            exact_boost=0.0
-            for field in (term, reading, meaning, associated):
-                if field and field.casefold() in query_low:
-                    exact_boost=max(exact_boost, 0.35)
-            image_candidates.append({
-                "score": float(m.score)+exact_boost,
-                "key": str(md.get("image_key")),
-                "url": b2_url(str(md.get("image_key"))),
-                "term": term,
-                "reading": reading,
-                "meaning": meaning,
-                "page": md.get("page")
-            })
+        if not md.get("image_key"):
+            continue
+
+        term=str(md.get("term") or "").strip()
+        reading=str(md.get("reading") or "").strip()
+        meaning=str(md.get("meaning") or "").strip()
+
+        anchors = [x for x in (term, reading, meaning) if x]
+        if not anchors:
+            continue
+
+        matched_in_query = any(_find_phrase_position(query_text, x) is not None for x in anchors)
+        matched_in_reply = any(_find_phrase_position(answer_text, x) is not None for x in anchors)
+
+        # If the image has no explicit vocabulary/meaning match, do not show it.
+        if not matched_in_query and not matched_in_reply:
+            continue
+
+        exact_boost = 0.0
+        if matched_in_query:
+            exact_boost += 1.00
+        if matched_in_reply:
+            exact_boost += 0.50
+
+        image_candidates.append({
+            "score": float(m.score) + exact_boost,
+            "key": str(md.get("image_key")),
+            "url": b2_url(str(md.get("image_key"))),
+            "term": term,
+            "reading": reading,
+            "meaning": meaning,
+            "page": md.get("page")
+        })
+
     image_candidates.sort(key=lambda x: x["score"], reverse=True)
+
     images=[]
     rich_images=[]
     seen_image_keys=set()
+
+    # Keep more images so a multi-vocabulary answer can render
+    # term -> image -> next term -> image.
     for item in image_candidates:
         if not item["url"] or item["key"] in seen_image_keys:
             continue
@@ -862,7 +908,7 @@ TIN NHẮN:
         }
         images.append({"key":item["key"],"url":item["url"]})
         rich_images.append(image_payload)
-        if len(images) >= 3:
+        if len(images) >= 6:
             break
 
     content_blocks = build_rich_content_blocks(reply, rich_images)
