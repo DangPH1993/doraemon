@@ -920,17 +920,80 @@ def _find_phrase_position(text: str, phrase: str):
     return pos if pos >= 0 else None
 
 
+def _find_structural_phrase_position(text: str, phrase: str):
+    """
+    Find a term only in a structural/title part of Doraemon's answer.
+
+    We do NOT search the whole answer: a term such as "Bao" can appear inside
+    the explanation of another radical, e.g. "Ý nghĩa: bao quanh". That must
+    not cause the image for Bộ Bao to be inserted while teaching Bộ Vi.
+    """
+    text = text or ""
+    phrase = str(phrase or "").strip()
+    if not text or not phrase:
+        return None
+
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        is_heading = bool(re.match(r"^#{1,6}\s+", stripped))
+        is_bold_title = stripped.startswith("**") and stripped.endswith("**")
+
+        if is_heading or is_bold_title:
+            pos = _find_phrase_position(line, phrase)
+            if pos is not None:
+                return offset + pos
+
+        offset += len(line)
+
+    return None
+
+
+def _find_explicit_term_in_query(query: str, phrase: str):
+    """
+    Match a term in the user's query only when it is explicitly named.
+
+    This prevents a Vietnamese meaning such as "bao quanh" from being
+    interpreted as a request for the vocabulary/radical "Bao".
+    """
+    query = query or ""
+    phrase = str(phrase or "").strip()
+    if not query or not phrase:
+        return None
+
+    q = query.casefold()
+    p = phrase.casefold()
+
+    patterns = [
+        rf"\bbộ\s+{re.escape(p)}\b",
+        rf"\bbộ\s+thủ\s*[:：-]?\s*{re.escape(p)}\b",
+        rf"\btừ\s+{re.escape(p)}\b",
+        rf"\bkanji\s*[:：-]?\s*{re.escape(p)}\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, q, flags=re.IGNORECASE)
+        if m:
+            pos = q.find(p, m.start())
+            return pos if pos >= 0 else m.start()
+
+    # Japanese/Chinese characters are distinctive enough to be explicit.
+    if re.search(r"[\u3400-\u9fff\u3040-\u30ff]", phrase):
+        return _find_phrase_position(query, phrase)
+
+    return None
+
+
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
     """
-    Render only images that can be confidently mapped to a real term,
-    reading, or meaning in the answer.
+    Insert an image only when its term/reading is confidently anchored.
 
-    IMPORTANT:
-    - Do NOT use generic description/associated_text for image placement.
-    - Do NOT append unmatched images at the end.
-    - If an image cannot be mapped, omit it rather than showing an unrelated
-      image. This is safer for a learning assistant.
-    - Images must be scoped to the active content type/document context.
+    Priority:
+      1. Explicit term in the user's query ("Bộ Vi", "Kanji 水", ...)
+      2. Term/reading in a Markdown heading/title in Doraemon's answer.
+
+    We never scan the entire explanatory answer for image anchors. This is
+    what prevents "bao quanh" in the explanation of Bộ Vi from inserting the
+    image of Bộ Bao.
     """
     reply = reply or ""
     if not reply:
@@ -938,34 +1001,38 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
 
     candidates = []
     for item in image_items:
-        # Only the actual vocabulary identity is allowed to anchor an image.
-        # NEVER use meaning here: several radicals can have overlapping
-        # meanings, which can cause an unrelated image to be selected.
         phrases = []
         for field in ("term", "reading"):
             value = str(item.get(field) or "").strip()
-            if value and value not in phrases and len(value) >= 1:
+            if value and value not in phrases:
                 phrases.append(value)
 
         positions = []
         for phrase in sorted(phrases, key=len, reverse=True):
-            pos = _find_phrase_position(reply, phrase)
+            pos = _find_structural_phrase_position(reply, phrase)
             if pos is not None:
-                positions.append((pos, phrase, field))
+                positions.append((pos, phrase))
+
+        # The proxy already selected/scored candidates using the user's query.
+        # If the term is explicitly in the query but the model did not put it
+        # in a heading, allow the first normal occurrence as a fallback only
+        # for that exact candidate.
+        if not positions and item.get("_query_anchor") is not None:
+            for phrase in sorted(phrases, key=len, reverse=True):
+                pos = _find_phrase_position(reply, phrase)
+                if pos is not None:
+                    positions.append((pos, phrase))
 
         if not positions:
-            # Never append an unanchored image.
             continue
 
-        # Prefer the earliest match; for equal positions prefer the longer phrase.
-        pos, phrase, _ = min(positions, key=lambda x: (x[0], -len(x[1])))
+        pos, phrase = min(positions, key=lambda x: (x[0], -len(x[1])))
         candidates.append({
             "position": pos,
             "phrase": phrase,
             "item": item,
         })
 
-    # At one textual position, keep the highest-scoring image only.
     by_position = {}
     for candidate in candidates:
         pos = candidate["position"]
@@ -989,9 +1056,6 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
         if pos < cursor:
             continue
 
-        # Giữ nguyên từ/phrase trong câu trả lời rồi mới chèn ảnh ngay sau nó.
-        # V2.2 cũ advance cursor qua phrase trước khi tạo text block,
-        # khiến chính từ được match (ví dụ "Khẩu") bị mất khỏi UI.
         phrase_end = pos + len(candidate["phrase"])
 
         if phrase_end > cursor:
@@ -1013,7 +1077,6 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
         blocks.append({"type": "text", "text": reply[cursor:]})
 
     return blocks
-
 
 
 @app.post("/api/proxy-chat")
@@ -1063,6 +1126,19 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     requested_course=requested_scope.get("course")
     requested_lesson=requested_scope.get("lesson")
     requested_topic=requested_scope.get("topic")
+
+    # Continue the current lesson when the follow-up message does not repeat
+    # the lesson name. This keeps a conversation inside Từ vựng -> Bộ thủ (or
+    # Từ vựng -> Kanji) instead of letting a semantically similar lesson win.
+    if not (requested_content_type or requested_course or requested_lesson or requested_topic):
+        for lp in learning:
+            lp_type = _normalize_content_type(lp.get("content_type"))
+            lp_lesson = str(lp.get("lesson") or "").strip()
+            if lp_type == "Từ vựng" and lp_lesson in {"Bộ thủ", "Kanji"}:
+                requested_content_type = "Từ vựng"
+                requested_lesson = lp_lesson
+                requested_course = str(lp.get("subject") or "").strip() or None
+                break
 
     def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
         scope_filter={"record_type":{"$eq":record_type}}
@@ -1194,11 +1270,15 @@ QUY TẮC QUAN TRỌNG:
 17. Khi ghi nhận tiến độ, nếu user nói rõ "chỉ học Từ vựng", "chỉ học Ngữ pháp",
     "chỉ làm Bài tập" hoặc tương tự, phải ghi đúng loại nội dung user đã chọn.
     Không được dùng loại nội dung của kết quả RAG khác để ghi tiến độ.
-17. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen theo thứ tự:
-    Từ vựng → Ngữ pháp → Bài tập → Truyện đọc → Kanji → Bộ thủ, rồi quay vòng ôn tập
-    và học tiếp theo tiến độ. Không bắt buộc học cứng một loại nội dung cho đến hết.
-17. Khi user hỏi chung kiểu "nên học gì", hãy đề xuất lộ trình trên và giải thích ngắn gọn.
-18. Nếu user đã chọn nội dung cụ thể, không đưa lại menu/lộ trình; hãy bắt đầu dạy ngay.
+17. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen giữa 4 loại nội dung:
+    Từ vựng → Ngữ pháp → Bài tập → Truyện đọc, rồi quay vòng ôn tập theo tiến độ.
+    Trong loại Từ vựng có các lesson như Kanji và Bộ thủ; tuyệt đối không coi
+    Kanji/Bộ thủ là content type riêng.
+18. Khi user hỏi chung kiểu "nên học gì", hãy đề xuất lộ trình trên và giải thích ngắn gọn.
+19. Nếu user đã chọn nội dung cụ thể, không đưa lại menu/lộ trình; hãy bắt đầu dạy ngay.
+20. Khi đang dạy một lesson có hình ảnh, nếu giới thiệu một term/bộ thủ có ảnh tương ứng,
+    hãy đặt term/reading đó trong tiêu đề Markdown (ví dụ "### **BỘ VI (囗)**").
+    Không dùng một từ xuất hiện trong phần giải nghĩa như "bao quanh" để ám chỉ term khác.
 
 DANH MỤC GIÁO TRÌNH:
 {json.dumps(catalog,ensure_ascii=False,default=str)}
@@ -1257,9 +1337,9 @@ TIN NHẮN:
             if _clean_scope_value(image_topic) != _clean_scope_value(active_topic):
                 continue
 
-        if active_source_files and image_source and image_source not in active_source_files:
-            continue
-
+        # Text and image records may come from different Pinecone vectors/files.
+        # Course -> content_type -> lesson -> topic is the authoritative scope.
+        # Do not require image.source_file to equal the text source_file.
         term=str(md.get("term") or "").strip()
         reading=str(md.get("reading") or "").strip()
         meaning=str(md.get("meaning") or "").strip()
@@ -1270,27 +1350,26 @@ TIN NHẮN:
         if not anchors:
             continue
 
-        matched_in_query = any(_find_phrase_position(query_text, x) is not None for x in anchors)
-        matched_in_reply = any(_find_phrase_position(answer_text, x) is not None for x in anchors)
+        # Never scan the full generated explanation for the term. For example,
+        # "Bao" in "Ý nghĩa: bao quanh" is not the radical Bộ Bao.
+        query_anchor = None
+        for anchor in anchors:
+            pos = _find_explicit_term_in_query(query_text, anchor)
+            if pos is not None:
+                query_anchor = pos
+                break
 
-        # If the actual term/reading is not explicitly present, do not show it.
-        if not matched_in_query and not matched_in_reply:
-            continue
-
-        exact_boost = 0.0
-        if matched_in_query:
-            exact_boost += 2.00
-        if matched_in_reply:
-            exact_boost += 0.75
+        exact_boost = 2.00 if query_anchor is not None else 0.0
 
         image_candidates.append({
             "score": float(m.score) + exact_boost,
             "key": str(md.get("image_key")),
-            "url": b2_url(str(md.get("image_key"))),
+            "url": md.get("image_url") or b2_url(str(md.get("image_key"))),
             "term": term,
             "reading": reading,
             "meaning": meaning,
-            "page": md.get("page")
+            "page": md.get("page"),
+            "_query_anchor": query_anchor,
         })
 
     image_candidates.sort(key=lambda x: x["score"], reverse=True)
