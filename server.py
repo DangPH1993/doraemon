@@ -1850,10 +1850,16 @@ TIN NHẮN HIỆN TẠI:
 
         exact_boost = 2.00 if query_anchor is not None else 0.0
         page_boost = 1.50 if page_anchor else 0.0
+        normalized_image_key = _extract_image_key(md.get("image_key"))
+        if not normalized_image_key:
+            continue
+
         image_candidates.append({
             "score": float(m.score) + exact_boost + page_boost,
-            "key": str(md.get("image_key")),
-            "url": b2_url(str(md.get("image_key"))) or md.get("image_url"),
+            "key": normalized_image_key,
+            # Always prefer a fresh B2 URL. Stored image_url may be an expired
+            # presigned URL from upload time.
+            "url": b2_url(normalized_image_key) or md.get("image_url"),
             "term": term,
             "reading": reading,
             "meaning": meaning,
@@ -1873,11 +1879,9 @@ TIN NHẮN HIỆN TẠI:
     for item in image_candidates:
         if not item["url"] or item["key"] in seen_image_keys:
             continue
-        if item.get("_page_anchor"):
-            page_identity = (item.get("source_file", ""), str(item.get("page") or ""))
-            if page_identity in seen_page_images:
-                continue
-            seen_page_images.add(page_identity)
+        # For stories/exercises, multiple educational images can legitimately
+        # live on the same page. Deduplicate by image key, not by page.
+        # Vocabulary/Kanji/Bộ thủ remain strict term/reading mapped.
         seen_image_keys.add(item["key"])
         image_payload = {
             "key": item["key"],
@@ -2428,6 +2432,60 @@ def b2_put_bytes(key: str, data: bytes, content_type: str):
     if B2_PUBLIC_BASE_URL:
         return f"{B2_PUBLIC_BASE_URL}/{key}"
     return None
+
+def _extract_image_key(raw_key):
+    """
+    Normalize Pinecone image_key metadata.
+
+    Older/newer uploaders may store image_key as:
+      - "images/file.pdf/page_0001/img_01.jpg"
+      - ["images/file.pdf/page_0001/img_01.jpg"]
+      - JSON string containing the list above
+    """
+    if raw_key is None:
+        return ""
+
+    if isinstance(raw_key, (list, tuple)):
+        for item in raw_key:
+            key = _extract_image_key(item)
+            if key:
+                return key
+        return ""
+
+    if isinstance(raw_key, dict):
+        for field in ("key", "image_key", "path"):
+            if field in raw_key:
+                key = _extract_image_key(raw_key.get(field))
+                if key:
+                    return key
+        return ""
+
+    value = str(raw_key).strip()
+    if not value:
+        return ""
+
+    # Try JSON first because Pinecone metadata often contains a JSON list.
+    if value.startswith("[") or value.startswith("{"):
+        try:
+            parsed = json.loads(value)
+            key = _extract_image_key(parsed)
+            if key:
+                return key
+        except Exception:
+            pass
+
+    # Fallback for Python-literal list strings from older uploaders.
+    if value.startswith("[") or value.startswith("("):
+        try:
+            parsed = ast.literal_eval(value)
+            key = _extract_image_key(parsed)
+            if key:
+                return key
+        except Exception:
+            pass
+
+    # Last fallback: remove accidental wrapping quotes only.
+    return value.strip().strip('"').strip("'")
 
 def b2_url(key: str):
     if not key:
