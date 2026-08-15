@@ -1033,6 +1033,12 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
 
     # The highest-ranked text result defines the active learning context.
     # Images from another content type must never leak into this answer.
+    # Resolve the active hierarchy HERE, where query text, RAG matches and
+    # catalog are all available:
+    # Course -> content type -> lesson -> topic.
+    # Explicit lesson/topic from the user wins over generic RAG similarity.
+    low = (data.text or "").strip().lower()
+    active_scope = _select_active_scope(low, result.matches, catalog)
     active_content_type = active_scope.get("content_type")
     active_course = active_scope.get("course")
     active_lesson = active_scope.get("lesson")
@@ -1087,12 +1093,6 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     finally:
         conn.close()
 
-    # Resolve the active hierarchy HERE, where query text, RAG matches and
-    # catalog are all available:
-    # Course -> content type -> lesson -> topic.
-    # Explicit lesson/topic from the user wins over generic RAG similarity.
-    low = (data.text or "").strip().lower()
-    active_scope = _select_active_scope(low, result.matches, catalog)
     active_content_type = active_scope.get("content_type")
     active_course = active_scope.get("course")
     active_lesson = active_scope.get("lesson")
