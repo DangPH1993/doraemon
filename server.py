@@ -1212,6 +1212,193 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
     return blocks
 
 
+_GREETING_EXACT = {
+    "chào", "chào bạn", "chào cậu", "chào doraemon",
+    "xin chào", "xin chào bạn", "xin chào doraemon",
+    "hello", "hello doraemon", "hi", "hi doraemon",
+    "hey", "hey doraemon", "alo", "alo doraemon",
+    "doraemon ơi", "doraemon ơi chào",
+}
+
+def _is_pure_greeting(text: str) -> bool:
+    """True only for a standalone greeting, not for a greeting + request."""
+    low = str(text or "").strip().casefold()
+    if not low:
+        return False
+    normalized = re.sub(r"[\W_]+", " ", low, flags=re.UNICODE).strip()
+    return normalized in _GREETING_EXACT
+
+
+def _build_welcome_for_user(user, mark_seen: bool = False):
+    """
+    Build the same concise onboarding/returning-user message for both
+    /session/welcome and a standalone 'Chào' sent through /api/proxy-chat.
+
+    Important:
+    - The curriculum is always shown.
+    - Only unfinished / reviewable learning is shown.
+    - Completed learning is NOT presented as 'đang học dở'.
+    - No Gemini/Pinecone call is needed for a greeting.
+    """
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT welcome_seen, reset_count
+                FROM user_learning_state
+                WHERE user_id=%s
+            """, (user["id"],))
+            state = cur.fetchone()
+
+            cur.execute("""
+                SELECT content_type, lesson, topic, status, current_position,
+                       current_page, score, last_studied_at
+                FROM learning_progress
+                WHERE user_id=%s
+                  AND LOWER(COALESCE(status,'')) IN
+                      ('in_progress','active','review','needs_review')
+                ORDER BY
+                    CASE
+                        WHEN LOWER(COALESCE(status,'')) IN ('in_progress','active') THEN 0
+                        ELSE 1
+                    END,
+                    last_studied_at DESC
+                LIMIT 12
+            """, (user["id"],))
+            unfinished_rows = [dict(r) for r in cur.fetchall()]
+
+            all_progress_exists = False
+            cur.execute("""
+                SELECT 1
+                FROM learning_progress
+                WHERE user_id=%s
+                LIMIT 1
+            """, (user["id"],))
+            all_progress_exists = cur.fetchone() is not None
+
+            if state is None:
+                is_new = not all_progress_exists
+                if mark_seen:
+                    cur.execute("""
+                        INSERT INTO user_learning_state(user_id,welcome_seen,reset_count)
+                        VALUES(%s,TRUE,0)
+                    """, (user["id"],))
+            else:
+                # A reset explicitly sets welcome_seen=False and should behave
+                # like a fresh learner. Otherwise an account with no progress
+                # is still new, while an account with progress is returning.
+                is_new = (not bool(state["welcome_seen"])) and not all_progress_exists
+                if not all_progress_exists and not bool(state["welcome_seen"]):
+                    is_new = True
+                elif all_progress_exists:
+                    is_new = False
+
+                if mark_seen:
+                    cur.execute("""
+                        UPDATE user_learning_state
+                        SET welcome_seen=TRUE, updated_at=NOW()
+                        WHERE user_id=%s
+                    """, (user["id"],))
+        if mark_seen:
+            conn.commit()
+    finally:
+        conn.close()
+
+    nickname = user.get("nickname") or "bạn"
+
+    curriculum = (
+        "📚 Giáo trình N5 của cậu gồm 4 phần:\n"
+        "1. Ngữ pháp\n"
+        "2. Bài tập\n"
+        "3. Từ vựng\n"
+        "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
+        "4. Truyện đọc"
+    )
+
+    if is_new:
+        message = (
+            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
+            f"{curriculum}\n\n"
+            "Cậu muốn bắt đầu học phần nào? Nếu chưa biết nên bắt đầu từ đâu, "
+            "tớ có thể gợi ý lộ trình cho cậu nhé! 😊"
+        )
+        return {
+            "success": True,
+            "mode": "new",
+            "message": message,
+            "learning_history": [],
+        }
+
+    parts = []
+    seen = set()
+    for row in unfinished_rows:
+        key = (
+            row.get("content_type"),
+            row.get("lesson"),
+            row.get("topic"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = str(row.get("content_type") or "Nội dung")
+        detail = " ".join(
+            str(x).strip()
+            for x in (row.get("lesson"), row.get("topic"))
+            if x and str(x).strip()
+        )
+        status = str(row.get("status") or "").strip().lower()
+        page = row.get("current_page")
+        position = row.get("current_position")
+
+        if status in {"needs_review", "review"}:
+            state_text = "cần ôn lại"
+        else:
+            state_text = "đang học dở"
+
+        extras = []
+        if page:
+            extras.append(f"trang {page}")
+        if position not in (None, "", 0):
+            extras.append(f"vị trí {position}")
+        suffix = f" – {', '.join(extras)}" if extras else ""
+
+        parts.append(
+            f"• {label}{(': ' + detail) if detail else ''} – {state_text}{suffix}"
+        )
+        if len(parts) >= 6:
+            break
+
+    if parts:
+        unfinished_summary = "\n".join(parts)
+        progress_text = (
+            "📖 Những phần cậu đang học dở/cần ôn:\n"
+            f"{unfinished_summary}"
+        )
+        closing = (
+            "\n\nCậu muốn học tiếp từ chỗ đang dở hay chọn một phần khác? 😊"
+        )
+    else:
+        progress_text = (
+            "📖 Hiện tại cậu không có phần nào đang học dở hoặc cần ôn "
+            "được lưu trong tiến độ."
+        )
+        closing = "\n\nCậu muốn bắt đầu hoặc chọn một phần để học tiếp? 😊"
+
+    message = (
+        f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
+        f"{curriculum}\n\n"
+        f"{progress_text}"
+        f"{closing}"
+    )
+    return {
+        "success": True,
+        "mode": "returning",
+        "message": message,
+        "learning_history": unfinished_rows,
+    }
+
+
 @app.post("/api/proxy-chat")
 def proxy_chat(
     data: ChatRequest,
@@ -1228,6 +1415,24 @@ def proxy_chat(
         raise HTTPException(500, "Pinecone chưa được khởi tạo.")
     if not data.text:
         raise HTTPException(400, "Tin nhắn không được để trống.")
+
+    # A standalone greeting is a session/onboarding action, NOT a knowledge
+    # question. Do not send "Chào" through embedding/Pinecone/Gemini, because
+    # generic RAG similarity can accidentally make Doraemon start teaching a
+    # random lesson (for example Bài tập) immediately after saying hello.
+    if _is_pure_greeting(data.text):
+        welcome = _build_welcome_for_user(user, mark_seen=False)
+        return {
+            "reply": welcome["message"],
+            "model": GEMINI_MODEL,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": welcome["message"]}],
+            "learning_history_count": len(welcome.get("learning_history") or []),
+            "learning_progress": None,
+            "welcome": True,
+            "welcome_mode": welcome.get("mode"),
+        }
 
     namespace = data.knowledge_namespace or "__default__"
     query_text = data.text
@@ -1710,106 +1915,11 @@ TIN NHẮN HIỆN TẠI:
 @app.get("/session/welcome")
 def session_welcome(authorization: Optional[str] = Header(default=None)):
     """
-    Trả lời lời chào khi user đăng nhập:
-    - User mới/chưa có tiến độ: giới thiệu Doraemon + khóa N5 + hỏi muốn học gì.
-    - User cũ: tóm tắt những gì đang học dở + hỏi học tiếp hay ôn tập.
+    Welcome/onboarding endpoint used after login.
+    The same welcome logic is also used for a standalone "Chào" in chat.
     """
     user = require_active_user(authorization)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT welcome_seen, reset_count
-                FROM user_learning_state
-                WHERE user_id=%s
-            """, (user["id"],))
-            state = cur.fetchone()
-
-            cur.execute("""
-                SELECT content_type, lesson, topic, status, current_page,
-                       score, last_studied_at
-                FROM learning_progress
-                WHERE user_id=%s
-                ORDER BY last_studied_at DESC
-                LIMIT 30
-            """, (user["id"],))
-            rows = [dict(r) for r in cur.fetchall()]
-
-            if state is None:
-                # Accounts created before V3 may not have state yet. If they
-                # already have progress, they are returning users.
-                is_new = len(rows) == 0
-                cur.execute("""
-                    INSERT INTO user_learning_state(user_id,welcome_seen,reset_count)
-                    VALUES(%s,TRUE,0)
-                """, (user["id"],))
-            else:
-                # welcome_seen=False is deliberately used after a learning reset.
-                is_new = not bool(state["welcome_seen"]) or len(rows) == 0
-                cur.execute("""
-                    UPDATE user_learning_state
-                    SET welcome_seen=TRUE, updated_at=NOW()
-                    WHERE user_id=%s
-                """, (user["id"],))
-        conn.commit()
-    finally:
-        conn.close()
-
-    nickname = user.get("nickname") or "bạn"
-
-    if is_new:
-        message = (
-            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
-            "Tớ đang có khóa học tiếng Nhật N5 với giáo trình gồm Từ vựng, "
-            "Ngữ pháp, Bài tập và Truyện đọc; trong Từ vựng có các lesson như "
-            "Kanji và Bộ thủ. Chúng mình có thể "
-            "học đan xen để vừa hiểu bài vừa nhớ lâu.\n\n"
-            "Cậu muốn học gì trước? Nếu chưa biết bắt đầu từ đâu thì cứ nói "
-            "\"mình chưa biết học gì\", tớ sẽ hướng dẫn lộ trình cho cậu nhé! 😊"
-        )
-        return {"success": True, "mode": "new", "message": message, "learning_history": []}
-
-    # Keep the summary short enough for the speech bubble.
-    parts = []
-    seen = set()
-    for row in rows:
-        key = (
-            row.get("content_type"),
-            row.get("lesson"),
-            row.get("topic"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-
-        label = str(row.get("content_type") or "Nội dung")
-        detail = " ".join(
-            str(x).strip()
-            for x in (row.get("lesson"), row.get("topic"))
-            if x and str(x).strip()
-        )
-        status = str(row.get("status") or "")
-        page = row.get("current_page")
-        extra = f" – trang {page}" if page else ""
-        if status in {"needs_review", "review"}:
-            state_text = "cần ôn lại"
-        elif status == "completed":
-            state_text = "đã hoàn thành"
-        else:
-            state_text = "đang học dở"
-
-        parts.append(f"• {label}{(': ' + detail) if detail else ''}{extra} – {state_text}")
-        if len(parts) >= 6:
-            break
-
-    summary = "\n".join(parts) if parts else "• Chưa có tiến độ học được lưu."
-    message = (
-        f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
-        "Lần trước chúng mình đang học:\n"
-        f"{summary}\n\n"
-        "Cậu muốn **học tiếp** từ chỗ đang dở hay **ôn tập lại** những phần đã học? 😊"
-    )
-    return {"success": True, "mode": "returning", "message": message, "learning_history": rows}
+    return _build_welcome_for_user(user, mark_seen=True)
 
 
 @app.post("/learning/reset")
