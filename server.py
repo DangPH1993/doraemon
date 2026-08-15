@@ -1013,6 +1013,22 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
             if pos is not None:
                 positions.append((pos, phrase))
 
+        # Exercise/reading images can legitimately have no term/reading.
+        # In that case the proxy has already proved that the image belongs to
+        # the same source/page as the retrieved text. Put the image after the
+        # first non-empty line instead of trying to infer a vocabulary anchor.
+        if not positions and item.get("_page_anchor"):
+            lines = reply.splitlines(True)
+            running = 0
+            for line in lines:
+                if line.strip():
+                    running += len(line)
+                    positions.append((running, ""))
+                    break
+                running += len(line)
+            if not positions:
+                positions.append((0, ""))
+
         # The proxy already selected/scored candidates using the user's query.
         # If the term is explicitly in the query but the model did not put it
         # in a heading, allow the first normal occurrence as a fallback only
@@ -1203,6 +1219,16 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     active_lesson=active_scope.get("lesson")
     active_topic=active_scope.get("topic")
 
+    # Keep exact source/page references for non-vocabulary images. This is
+    # especially important for exercises: an exercise illustration/menu may
+    # have no term/reading metadata, so its identity is the page it belongs to.
+    active_text_pages=set()
+    for md in source_meta:
+        sf=str(md.get("source_file") or "").strip()
+        page=str(md.get("page") or "").strip()
+        if sf and page:
+            active_text_pages.add((sf, page))
+
     # Image retrieval happens AFTER the active scope is known, so text and
     # image are searched in the same hierarchy. This keeps the existing strict
     # term/reading-to-image mapping intact while preventing Kanji/other lessons
@@ -1279,6 +1305,9 @@ QUY TẮC QUAN TRỌNG:
 20. Khi đang dạy một lesson có hình ảnh, nếu giới thiệu một term/bộ thủ có ảnh tương ứng,
     hãy đặt term/reading đó trong tiêu đề Markdown (ví dụ "### **BỘ VI (囗)**").
     Không dùng một từ xuất hiện trong phần giải nghĩa như "bao quanh" để ám chỉ term khác.
+21. Với Bài tập/Truyện đọc có ảnh minh họa, ảnh có thể không có term/reading. Khi đó ảnh
+    phải được lấy đúng theo cùng source_file + page với phần văn bản đang được dùng; không
+    lấy ảnh của trang khác chỉ vì nội dung/ý nghĩa tương tự.
 
 DANH MỤC GIÁO TRÌNH:
 {json.dumps(catalog,ensure_ascii=False,default=str)}
@@ -1339,37 +1368,53 @@ TIN NHẮN:
 
         # Text and image records may come from different Pinecone vectors/files.
         # Course -> content_type -> lesson -> topic is the authoritative scope.
-        # Do not require image.source_file to equal the text source_file.
+        # Vocabulary images remain strictly identified by term/reading.
+        # Exercises/reading pages have a second strict identity: same source_file
+        # + page as the retrieved text, because their images may have no term.
         term=str(md.get("term") or "").strip()
         reading=str(md.get("reading") or "").strip()
         meaning=str(md.get("meaning") or "").strip()
+        image_source=str(md.get("source_file") or "").strip()
+        image_page=str(md.get("page") or "").strip()
 
-        # term/reading identify the picture. meaning is explanatory metadata
-        # only and must never be used to select an image.
         anchors = [x for x in (term, reading) if x]
-        if not anchors:
+        query_anchor = None
+        page_anchor = False
+
+        # Từ vựng (including Kanji/Bộ thủ lessons): term/reading is mandatory.
+        # This prevents words in explanations such as "bao quanh" from pulling
+        # the image for Bộ Bao.
+        if anchors:
+            for anchor in anchors:
+                pos = _find_explicit_term_in_query(query_text, anchor)
+                if pos is not None:
+                    query_anchor = pos
+                    break
+        elif active_content_type in {"Bài tập", "Truyện đọc"}:
+            # Exercise/story images are page illustrations, not vocabulary cards.
+            # They are accepted only when they belong to the exact same source
+            # file + page as one of the retrieved text records.
+            if image_source and image_page and (image_source, image_page) in active_text_pages:
+                page_anchor = True
+            else:
+                continue
+        else:
             continue
 
-        # Never scan the full generated explanation for the term. For example,
-        # "Bao" in "Ý nghĩa: bao quanh" is not the radical Bộ Bao.
-        query_anchor = None
-        for anchor in anchors:
-            pos = _find_explicit_term_in_query(query_text, anchor)
-            if pos is not None:
-                query_anchor = pos
-                break
-
         exact_boost = 2.00 if query_anchor is not None else 0.0
+        page_boost = 1.50 if page_anchor else 0.0
 
         image_candidates.append({
-            "score": float(m.score) + exact_boost,
+            "score": float(m.score) + exact_boost + page_boost,
             "key": str(md.get("image_key")),
             "url": md.get("image_url") or b2_url(str(md.get("image_key"))),
             "term": term,
             "reading": reading,
             "meaning": meaning,
             "page": md.get("page"),
+            "source_file": image_source,
             "_query_anchor": query_anchor,
+            "_page_anchor": page_anchor,
         })
 
     image_candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -1377,12 +1422,18 @@ TIN NHẮN:
     images=[]
     rich_images=[]
     seen_image_keys=set()
+    seen_page_images=set()
 
     # Keep more images so a multi-vocabulary answer can render
     # term -> image -> next term -> image.
     for item in image_candidates:
         if not item["url"] or item["key"] in seen_image_keys:
             continue
+        if item.get("_page_anchor"):
+            page_identity=(item.get("source_file", ""), str(item.get("page") or ""))
+            if page_identity in seen_page_images:
+                continue
+            seen_page_images.add(page_identity)
         seen_image_keys.add(item["key"])
         image_payload = {
             "key": item["key"],
@@ -1391,7 +1442,10 @@ TIN NHẮN:
             "reading": item.get("reading", ""),
             "meaning": item.get("meaning", ""),
             "page": item.get("page"),
+            "source_file": item.get("source_file", ""),
             "score": item.get("score", 0),
+            "_page_anchor": bool(item.get("_page_anchor")),
+            "_query_anchor": item.get("_query_anchor"),
         }
         images.append({"key":item["key"],"url":item["url"]})
         rich_images.append(image_payload)
