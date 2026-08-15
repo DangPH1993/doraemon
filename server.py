@@ -567,11 +567,180 @@ def record_learning_event(user_id, event):
         conn.close()
 
 
+
+def _clean_scope_value(value):
+    """Normalize course/content/lesson/topic metadata for matching."""
+    if value is None:
+        return ""
+    text = str(value).strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _metadata_scope(md):
+    """Return the hierarchy used to route a learning query."""
+    return {
+        "course": str(md.get("course") or md.get("course_name") or "").strip(),
+        "content_type": _normalize_content_type(md.get("content_type")),
+        "lesson": str(md.get("lesson") or "").strip(),
+        "topic": str(md.get("topic") or "").strip(),
+    }
+
+
+def _scope_matches(query_text, md, require_lesson=False, require_topic=False):
+    """
+    Match a document against the requested hierarchy.
+
+    Course -> content_type -> lesson -> topic.
+    Empty lesson/topic metadata is allowed for legacy uploads.
+    """
+    q = _clean_scope_value(query_text)
+    scope = _metadata_scope(md)
+
+    course = _clean_scope_value(scope["course"])
+    lesson = _clean_scope_value(scope["lesson"])
+    topic = _clean_scope_value(scope["topic"])
+
+    if course and course not in q:
+        return False
+
+    if require_lesson and lesson and lesson not in q:
+        return False
+
+    if require_topic and topic and topic not in q:
+        return False
+
+    return True
+
+
+def _explicit_lesson_topic(query_text, catalog):
+    """Find the most specific lesson/topic explicitly mentioned by the user."""
+    q = _clean_scope_value(query_text)
+    best = None
+    best_score = -1
+
+    for item in catalog or []:
+        lesson = str(item.get("lesson") or "").strip()
+        topic = str(item.get("topic") or "").strip()
+        course = str(item.get("course") or item.get("course_name") or "").strip()
+
+        score = 0
+        if course and _clean_scope_value(course) in q:
+            score += 10
+        if lesson and _clean_scope_value(lesson) in q:
+            score += 20
+        if topic and _clean_scope_value(topic) in q:
+            score += 30
+
+        if score > best_score:
+            best_score = score
+            best = item
+
+    return best if best_score > 0 else None
+
+
+def _select_active_scope(query_text, text_matches, catalog):
+    """
+    Determine the active learning scope in strict order:
+    Course -> content type -> lesson -> topic.
+
+    Explicit user terms win over generic RAG similarity. If the user names
+    a lesson such as "Bộ thủ", the router must not fall back to another
+    lesson such as "Kanji" merely because its vector similarity is higher.
+    """
+    q = _clean_scope_value(query_text)
+
+    # Course
+    course = None
+    for item in catalog or []:
+        c = str(item.get("course") or item.get("course_name") or "").strip()
+        if c and _clean_scope_value(c) in q:
+            course = c
+            break
+
+    # Content type
+    explicit_type = None
+    explicit_patterns = [
+        ("Truyện đọc", ["truyện đọc", "đọc truyện", "câu chuyện", "học truyện"]),
+        ("Bài tập", ["bài tập", "làm bài", "bài quiz", "quiz"]),
+        ("Ngữ pháp", ["ngữ pháp", "học ngữ pháp", "ôn ngữ pháp", "grammar"]),
+        ("Từ vựng", ["từ vựng", "học từ vựng", "từ mới", "học từ mới", "vocabulary"]),
+        ("Kanji", ["kanji", "học kanji"]),
+        ("Bộ thủ", ["bộ thủ", "học bộ thủ", "radical"]),
+    ]
+    for typ, keys in explicit_patterns:
+        if any(k in q for k in keys):
+            explicit_type = typ
+            break
+
+    # Lesson/topic from catalog. Prefer exact metadata mention.
+    lesson = None
+    topic = None
+    best_score = -1
+    for item in catalog or []:
+        item_course = str(item.get("course") or item.get("course_name") or "").strip()
+        item_type = _normalize_content_type(item.get("content_type"))
+        item_lesson = str(item.get("lesson") or "").strip()
+        item_topic = str(item.get("topic") or "").strip()
+
+        score = 0
+        if item_course and _clean_scope_value(item_course) in q:
+            score += 10
+        if explicit_type and item_type == explicit_type:
+            score += 20
+        if item_lesson and _clean_scope_value(item_lesson) in q:
+            score += 40
+        if item_topic and _clean_scope_value(item_topic) in q:
+            score += 50
+
+        if score > best_score:
+            best_score = score
+            lesson = item_lesson or lesson
+            topic = item_topic or topic
+            if score > 0:
+                if item_course and not course:
+                    course = item_course
+                if item_type and not explicit_type:
+                    explicit_type = item_type
+
+    # If no explicit routing was possible, use top RAG metadata as a fallback.
+    if not explicit_type:
+        for m in text_matches or []:
+            md = m.metadata or {}
+            typ = _normalize_content_type(md.get("content_type"))
+            if typ:
+                explicit_type = typ
+                if not course:
+                    course = str(md.get("course") or md.get("course_name") or "").strip() or None
+                if not lesson:
+                    lesson = str(md.get("lesson") or "").strip() or None
+                if not topic:
+                    topic = str(md.get("topic") or "").strip() or None
+                break
+
+    return {
+        "course": course,
+        "content_type": explicit_type,
+        "lesson": lesson,
+        "topic": topic,
+    }
+
+
 def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None):
     """Infer only learning progress, never a score. Exercises are scored via /learning/progress."""
     text = (user_text or "").strip()
     low = text.lower()
     source_meta = source_meta or []
+
+    # Hierarchical router: Course -> content type -> lesson -> topic.
+    # This prevents a "Kanji" lesson from winning over an explicitly requested
+    # "Bộ thủ" lesson merely because the Kanji vectors are more similar.
+    active_scope = _select_active_scope(low, result.matches, catalog)
+    active_course = active_scope.get("course")
+    active_content_type = active_scope.get("content_type")
+    active_lesson = active_scope.get("lesson")
+    active_topic = active_scope.get("topic")
+
     chosen = None
 
     # IMPORTANT:
@@ -626,8 +795,30 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
                 chosen = item
                 break
 
-    # If the user did NOT explicitly choose a content type, then use the
-    # catalog/source metadata as context.
+    # If a hierarchy was identified, choose a catalog item only from that
+    # exact scope. Never let a generic/high-similarity Kanji item override an
+    # explicit Bộ thủ lesson request.
+    if not chosen and (active_content_type or active_lesson or active_topic):
+        for item in catalog:
+            item_type = _normalize_content_type(item.get("content_type"))
+            item_course = str(item.get("course") or item.get("course_name") or "").strip()
+            item_lesson = str(item.get("lesson") or "").strip()
+            item_topic = str(item.get("topic") or "").strip()
+
+            if active_content_type and item_type != active_content_type:
+                continue
+            if active_course and item_course and _clean_scope_value(item_course) != _clean_scope_value(active_course):
+                continue
+            if active_lesson and item_lesson and _clean_scope_value(item_lesson) != _clean_scope_value(active_lesson):
+                continue
+            if active_topic and item_topic and _clean_scope_value(item_topic) != _clean_scope_value(active_topic):
+                continue
+
+            chosen = item
+            break
+
+    # If the user did NOT explicitly choose a content type/lesson/topic, then
+    # use catalog/source metadata as a fallback.
     if not chosen:
         for item in catalog:
             hay = " ".join(
@@ -851,27 +1042,36 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
 
     # The highest-ranked text result defines the active learning context.
     # Images from another content type must never leak into this answer.
-    active_content_type = None
+    active_content_type = active_scope.get("content_type")
+    active_course = active_scope.get("course")
+    active_lesson = active_scope.get("lesson")
+    active_topic = active_scope.get("topic")
+
     active_source_files = set()
     active_lessons = set()
     active_topics = set()
+    active_courses = set()
 
-    for m in result.matches[:8]:
+    for m in result.matches[:12]:
         md = m.metadata or {}
         ctype = _normalize_content_type(md.get("content_type"))
-        if active_content_type is None:
-            active_content_type = ctype
 
-        if ctype == active_content_type:
-            sf = str(md.get("source_file") or "").strip()
-            lesson = str(md.get("lesson") or "").strip()
-            topic = str(md.get("topic") or "").strip()
-            if sf:
-                active_source_files.add(sf)
-            if lesson:
-                active_lessons.add(lesson)
-            if topic:
-                active_topics.add(topic)
+        if active_content_type and ctype != active_content_type:
+            continue
+
+        sf = str(md.get("source_file") or "").strip()
+        course = str(md.get("course") or md.get("course_name") or "").strip()
+        lesson_md = str(md.get("lesson") or "").strip()
+        topic_md = str(md.get("topic") or "").strip()
+
+        if sf:
+            active_source_files.add(sf)
+        if course:
+            active_courses.add(course)
+        if lesson_md:
+            active_lessons.add(lesson_md)
+        if topic_md:
+            active_topics.add(topic_md)
 
     learning=[]; catalog=[]
     conn=db()
@@ -918,7 +1118,11 @@ QUY TẮC QUAN TRỌNG:
 13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
 14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả; không tự suy đoán điểm từ lời giải thích của Doraemon.
 15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
-16. Khi ghi nhận tiến độ, nếu user nói rõ "chỉ học Từ vựng", "chỉ học Ngữ pháp",
+16. Luôn định tuyến nội dung theo thứ tự Course -> loại nội dung -> lesson -> topic.
+    Khi user nêu rõ lesson/chủ đề, phải trả lời trong đúng lesson/chủ đề đó; không được
+    chọn lesson khác chỉ vì RAG similarity cao hơn. Nếu tài liệu không có lesson/topic,
+    chỉ bỏ qua tầng metadata bị thiếu.
+17. Khi ghi nhận tiến độ, nếu user nói rõ "chỉ học Từ vựng", "chỉ học Ngữ pháp",
     "chỉ làm Bài tập" hoặc tương tự, phải ghi đúng loại nội dung user đã chọn.
     Không được dùng loại nội dung của kết quả RAG khác để ghi tiến độ.
 17. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen theo thứ tự:
@@ -962,24 +1166,29 @@ TIN NHẮN:
 
         image_content_type = _normalize_content_type(md.get("content_type"))
 
-        # HARD SCOPE: an image can only be shown when it belongs to the same
-        # content type as the text being answered.
+        # HARD SCOPE: Course -> content type -> lesson -> topic.
         if active_content_type and image_content_type != active_content_type:
             continue
 
-        # When source/lesson/topic metadata is available, keep the image in
-        # the same document context as the retrieved text. Do not require
-        # lesson/topic when they are empty because older records may not have
-        # these fields.
+        image_course = str(md.get("course") or md.get("course_name") or "").strip()
         image_source = str(md.get("source_file") or "").strip()
         image_lesson = str(md.get("lesson") or "").strip()
         image_topic = str(md.get("topic") or "").strip()
 
+        if active_course and image_course:
+            if _clean_scope_value(image_course) != _clean_scope_value(active_course):
+                continue
+
+        # Only constrain lesson/topic when the active route explicitly knows
+        # them. Legacy uploads with empty lesson/topic remain usable.
+        if active_lesson and image_lesson:
+            if _clean_scope_value(image_lesson) != _clean_scope_value(active_lesson):
+                continue
+        if active_topic and image_topic:
+            if _clean_scope_value(image_topic) != _clean_scope_value(active_topic):
+                continue
+
         if active_source_files and image_source and image_source not in active_source_files:
-            continue
-        if active_lessons and image_lesson and image_lesson not in active_lessons:
-            continue
-        if active_topics and image_topic and image_topic not in active_topics:
             continue
 
         term=str(md.get("term") or "").strip()
