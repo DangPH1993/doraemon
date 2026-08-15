@@ -1632,18 +1632,48 @@ def proxy_chat(
 
     contexts = []
     source_meta = []
+    image_text_fallbacks = []
+
     for m in result.matches:
         md = m.metadata or {}
-        if md.get("record_type") == "image":
-            continue
+        record_type = str(md.get("record_type") or "").strip().lower()
         txt = md.get("text", md.get("content", ""))
+
+        # Story/exercise image records can also contain OCR text.  The current
+        # Pinecone schema stores some story pages as independent image records
+        # with a useful `text`/`associated_text` field.  Do NOT throw that text
+        # away merely because the record is an image: for Truyện đọc it may be
+        # the actual reading passage the user expects Doraemon to read.
+        if record_type == "image":
+            if active_content_type in {"Truyện đọc", "Bài tập"}:
+                ocr_txt = str(txt or md.get("associated_text") or "").strip()
+                if ocr_txt:
+                    label = (
+                        f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
+                        f"Môn: {md.get('subject',md.get('course',''))} | "
+                        f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | "
+                        f"Trang: {md.get('page','')}]"
+                    )
+                    image_text_fallbacks.append((float(m.score), label + "\n" + ocr_txt, md))
+            continue
+
         if txt:
             label = (
                 f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
                 f"Môn: {md.get('subject',md.get('course',''))} | "
                 f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | Trang: {md.get('page','')}]"
             )
-            contexts.append(label + "\n" + txt)
+            contexts.append(label + "\n" + str(txt))
+            source_meta.append(md)
+
+    # If a story has little/no standalone text records, use the OCR text
+    # attached to the matching image records as a secondary RAG source.
+    # This restores the behaviour of older baselines without allowing generic
+    # image OCR from another lesson to leak into the answer.
+    if active_content_type in {"Truyện đọc", "Bài tập"} and len(contexts) < 2 and image_text_fallbacks:
+        image_text_fallbacks.sort(key=lambda x: x[0], reverse=True)
+        for score, txt, md in image_text_fallbacks[:4]:
+            contexts.append(txt)
             source_meta.append(md)
 
     # Exact source/page references are needed only for non-vocabulary images.
@@ -1691,7 +1721,7 @@ NGUYÊN TẮC:
 - Nội dung gồm đúng 4 loại: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
 - Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
-- Với Truyện đọc: bám tài liệu được RAG cung cấp. Với Từ vựng/Ngữ pháp: giải thích và luyện tập theo tài liệu.
+- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu RAG cung cấp OCR/text từ record ảnh của trang truyện thì coi đó là văn bản nguồn hợp lệ để đọc/kể lại; không được nói là thiếu văn bản khi context đã có đoạn truyện. Với Từ vựng/Ngữ pháp: giải thích và luyện tập theo tài liệu.
 - Không bịa nội dung/trang không có trong RAG.
 - Nếu đang dạy term/bộ thủ có ảnh, dùng đúng term/reading làm tiêu đề; không lấy một từ xuất hiện trong phần nghĩa (ví dụ “bao quanh”) làm term khác.
 - Ảnh Bài tập/Truyện đọc được map theo source_file + page; ảnh Từ vựng/Kanji/Bộ thủ map theo term/reading.
