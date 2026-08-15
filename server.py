@@ -1776,6 +1776,84 @@ def proxy_chat(
     # They are resolved later from the exact text chunks that actually enter the
     # RAG context. This is the chunk-locked text↔image rule.
     result = query_text_matches()
+
+    # Compatibility fallback for older Pinecone records:
+    # some documents uploaded by previous baselines do not contain
+    # `record_type="text"` even though they are valid text chunks. A strict
+    # record_type filter would therefore return zero rows and make Doraemon
+    # incorrectly claim that the story/document does not exist.
+    #
+    # We keep the strict query as the fast/default path. Only when it returns
+    # no usable text do we retry with the same lesson/content/page scope but
+    # WITHOUT the record_type condition, then discard true image records in
+    # Python. This preserves the chunk-locked architecture while remaining
+    # compatible with old Pinecone data.
+    def _usable_text_matches(matches):
+        usable = []
+        for m in matches or []:
+            md = m.metadata or {}
+            rt = str(md.get("record_type") or "").strip().lower()
+            txt = str(md.get("text", md.get("content", "")) or "").strip()
+            if rt == "image":
+                # Legacy story OCR can still be a text-bearing image record;
+                # it will be considered below only when there are no normal
+                # text chunks.
+                continue
+            if txt:
+                usable.append(m)
+        return usable
+
+    usable_initial = _usable_text_matches(result.matches)
+
+    if not usable_initial:
+        compat_filter = {}
+        if requested_content_type:
+            compat_filter["content_type"] = {"$eq": requested_content_type}
+        if requested_course:
+            # course is historically stored as either `course` or `subject`;
+            # Pinecone metadata filters cannot OR these fields portably, so
+            # prefer course and use a second subject fallback below if needed.
+            compat_filter["course"] = {"$eq": requested_course}
+        if requested_lesson:
+            compat_filter["lesson"] = {"$eq": requested_lesson}
+        if requested_topic:
+            compat_filter["topic"] = {"$eq": requested_topic}
+
+        try:
+            compat_result = index.query(
+                vector=query_vector,
+                top_k=retrieval_k,
+                include_metadata=True,
+                namespace=namespace,
+                filter=compat_filter or None,
+            )
+            compat_usable = _usable_text_matches(compat_result.matches)
+
+            # If the old data uses `subject` instead of `course`, retry once
+            # with subject while preserving the exact lesson/content scope.
+            if not compat_usable and requested_course:
+                compat_filter2 = {
+                    k: v for k, v in compat_filter.items() if k != "course"
+                }
+                compat_filter2["subject"] = {"$eq": requested_course}
+                compat_result = index.query(
+                    vector=query_vector,
+                    top_k=retrieval_k,
+                    include_metadata=True,
+                    namespace=namespace,
+                    filter=compat_filter2 or None,
+                )
+                compat_usable = _usable_text_matches(compat_result.matches)
+
+            if compat_usable:
+                result = compat_result
+                print(
+                    "[RAG compat] strict record_type=text returned no text; "
+                    f"using legacy metadata-compatible retrieval ({len(compat_usable)} chunks)"
+                )
+        except Exception as exc:
+            print("[RAG compat] fallback failed:", type(exc).__name__, str(exc))
+
     if not explicit_scope:
         active_scope = _select_active_scope(low, result.matches, catalog)
 
@@ -1859,8 +1937,36 @@ def proxy_chat(
         if len(text_chunks) >= 6:
             break
 
+    # Legacy compatibility: an older story/exercise uploader may have stored
+    # OCR text only on an image record. If no normal text chunk survived, use
+    # that exact retrieved image record as the text-bearing chunk. Its own
+    # image_key then becomes the only allowed image for that chunk.
+    if not text_chunks and active_content_type in {"Truyện đọc", "Bài tập"}:
+        for m in result.matches:
+            md = m.metadata or {}
+            rt = str(md.get("record_type") or "").strip().lower()
+            if rt != "image":
+                continue
+            ocr_txt = str(
+                md.get("associated_text")
+                or md.get("text")
+                or md.get("content")
+                or ""
+            ).strip()
+            if not ocr_txt:
+                continue
+            text_chunks.append({
+                "text": ocr_txt,
+                "metadata": md,
+                "score": float(getattr(m, "score", 0) or 0),
+            })
+            if len(text_chunks) >= 6:
+                break
+
     # Resolve images ONLY for these exact text chunks.
-    rich_images = _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector)
+    rich_images = _retrieve_images_for_text_chunks(
+        text_chunks, index, namespace, query_vector
+    )
 
     contexts = []
     source_meta = []
