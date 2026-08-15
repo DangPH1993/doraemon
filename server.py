@@ -56,7 +56,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-14-image-semantic-mapping-v2"
+SERVER_VERSION = "2026-08-15-doraemon-learning-flow-v3.1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -120,6 +120,12 @@ def init_db():
                 image_key TEXT NOT NULL, image_url TEXT, description TEXT,
                 term TEXT, reading TEXT, meaning TEXT, associated_text TEXT,
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
+                reset_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
 
             # Safe migrations for databases created by previous versions.
             for sql in [
@@ -860,6 +866,11 @@ QUY TẮC QUAN TRỌNG:
 13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
 14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả; không tự suy đoán điểm từ lời giải thích của Doraemon.
 15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
+16. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen theo thứ tự:
+    Từ vựng → Ngữ pháp → Bài tập → Truyện đọc → Kanji → Bộ thủ, rồi quay vòng ôn tập
+    và học tiếp theo tiến độ. Không bắt buộc học cứng một loại nội dung cho đến hết.
+17. Khi user hỏi chung kiểu "nên học gì", hãy đề xuất lộ trình trên và giải thích ngắn gọn.
+18. Nếu user đã chọn nội dung cụ thể, không đưa lại menu/lộ trình; hãy bắt đầu dạy ngay.
 
 DANH MỤC GIÁO TRÌNH:
 {json.dumps(catalog,ensure_ascii=False,default=str)}
@@ -995,6 +1006,143 @@ TIN NHẮN:
         "content_blocks":content_blocks,
         "learning_history_count":len(learning),
         "learning_progress":tracked_event
+    }
+
+
+
+@app.get("/session/welcome")
+def session_welcome(authorization: Optional[str] = Header(default=None)):
+    """
+    Trả lời lời chào khi user đăng nhập:
+    - User mới/chưa có tiến độ: giới thiệu Doraemon + khóa N5 + hỏi muốn học gì.
+    - User cũ: tóm tắt những gì đang học dở + hỏi học tiếp hay ôn tập.
+    """
+    user = require_active_user(authorization)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT welcome_seen, reset_count
+                FROM user_learning_state
+                WHERE user_id=%s
+            """, (user["id"],))
+            state = cur.fetchone()
+
+            cur.execute("""
+                SELECT content_type, lesson, topic, status, current_page,
+                       score, last_studied_at
+                FROM learning_progress
+                WHERE user_id=%s
+                ORDER BY last_studied_at DESC
+                LIMIT 30
+            """, (user["id"],))
+            rows = [dict(r) for r in cur.fetchall()]
+
+            if state is None:
+                # Accounts created before V3 may not have state yet. If they
+                # already have progress, they are returning users.
+                is_new = len(rows) == 0
+                cur.execute("""
+                    INSERT INTO user_learning_state(user_id,welcome_seen,reset_count)
+                    VALUES(%s,TRUE,0)
+                """, (user["id"],))
+            else:
+                # welcome_seen=False is deliberately used after a learning reset.
+                is_new = not bool(state["welcome_seen"]) or len(rows) == 0
+                cur.execute("""
+                    UPDATE user_learning_state
+                    SET welcome_seen=TRUE, updated_at=NOW()
+                    WHERE user_id=%s
+                """, (user["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    nickname = user.get("nickname") or "bạn"
+
+    if is_new:
+        message = (
+            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
+            "Tớ đang có khóa học tiếng Nhật N5 với giáo trình gồm Từ vựng, "
+            "Ngữ pháp, Bài tập, Truyện đọc, Kanji và Bộ thủ. Chúng mình có thể "
+            "học đan xen để vừa hiểu bài vừa nhớ lâu.\n\n"
+            "Cậu muốn học gì trước? Nếu chưa biết bắt đầu từ đâu thì cứ nói "
+            "\"mình chưa biết học gì\", tớ sẽ hướng dẫn lộ trình cho cậu nhé! 😊"
+        )
+        return {"success": True, "mode": "new", "message": message, "learning_history": []}
+
+    # Keep the summary short enough for the speech bubble.
+    parts = []
+    seen = set()
+    for row in rows:
+        key = (
+            row.get("content_type"),
+            row.get("lesson"),
+            row.get("topic"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = str(row.get("content_type") or "Nội dung")
+        detail = " ".join(
+            str(x).strip()
+            for x in (row.get("lesson"), row.get("topic"))
+            if x and str(x).strip()
+        )
+        status = str(row.get("status") or "")
+        page = row.get("current_page")
+        extra = f" – trang {page}" if page else ""
+        if status in {"needs_review", "review"}:
+            state_text = "cần ôn lại"
+        elif status == "completed":
+            state_text = "đã hoàn thành"
+        else:
+            state_text = "đang học dở"
+
+        parts.append(f"• {label}{(': ' + detail) if detail else ''}{extra} – {state_text}")
+        if len(parts) >= 6:
+            break
+
+    summary = "\n".join(parts) if parts else "• Chưa có tiến độ học được lưu."
+    message = (
+        f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
+        "Lần trước chúng mình đang học:\n"
+        f"{summary}\n\n"
+        "Cậu muốn **học tiếp** từ chỗ đang dở hay **ôn tập lại** những phần đã học? 😊"
+    )
+    return {"success": True, "mode": "returning", "message": message, "learning_history": rows}
+
+
+@app.post("/learning/reset")
+def reset_learning(authorization: Optional[str] = Header(default=None)):
+    """
+    Xóa toàn bộ tiến độ học của user và đưa trạng thái giáo trình về như user mới.
+    Không xóa tài khoản, gói dịch vụ, hay dữ liệu Knowledge Base.
+    """
+    user = require_active_user(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM learning_progress WHERE user_id=%s", (user["id"],))
+            deleted = cur.rowcount
+            cur.execute("""
+                INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,updated_at)
+                VALUES(%s,FALSE,1,NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    welcome_seen=FALSE,
+                    reset_count=user_learning_state.reset_count + 1,
+                    updated_at=NOW()
+            """, (user["id"],))
+            deleted = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "success": True,
+        "deleted_progress": deleted,
+        "message": "Đã xóa lịch sử học và reset giáo trình về trạng thái ban đầu."
     }
 
 
