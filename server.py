@@ -644,9 +644,8 @@ def _select_active_scope(query_text, text_matches, catalog):
     Determine the active learning scope in strict order:
     Course -> content type -> lesson -> topic.
 
-    Explicit user terms win over generic RAG similarity. If the user names
-    a lesson such as "Bộ thủ", the router must not fall back to another
-    lesson such as "Kanji" merely because its vector similarity is higher.
+    Kanji and Bộ thủ are LESSONS under content_type="Từ vựng",
+    not content types themselves.
     """
     q = _clean_scope_value(query_text)
 
@@ -658,22 +657,21 @@ def _select_active_scope(query_text, text_matches, catalog):
             course = c
             break
 
-    # Content type
+    # Content type: ONLY the four real content types.
     explicit_type = None
     explicit_patterns = [
         ("Truyện đọc", ["truyện đọc", "đọc truyện", "câu chuyện", "học truyện"]),
         ("Bài tập", ["bài tập", "làm bài", "bài quiz", "quiz"]),
         ("Ngữ pháp", ["ngữ pháp", "học ngữ pháp", "ôn ngữ pháp", "grammar"]),
         ("Từ vựng", ["từ vựng", "học từ vựng", "từ mới", "học từ mới", "vocabulary"]),
-        ("Kanji", ["kanji", "học kanji"]),
-        ("Bộ thủ", ["bộ thủ", "học bộ thủ", "radical"]),
     ]
     for typ, keys in explicit_patterns:
         if any(k in q for k in keys):
             explicit_type = typ
             break
 
-    # Lesson/topic from catalog. Prefer exact metadata mention.
+    # Lesson/topic from catalog.
+    # "Kanji" / "Bộ thủ" are matched here as lesson values.
     lesson = None
     topic = None
     best_score = -1
@@ -686,12 +684,21 @@ def _select_active_scope(query_text, text_matches, catalog):
         score = 0
         if item_course and _clean_scope_value(item_course) in q:
             score += 10
+
         if explicit_type and item_type == explicit_type:
             score += 20
+
         if item_lesson and _clean_scope_value(item_lesson) in q:
             score += 40
+            # A named lesson is authoritative. If it is Kanji/Bộ thủ,
+            # its content type must come from the catalog and therefore be Từ vựng.
+            if not explicit_type:
+                explicit_type = item_type
+
         if item_topic and _clean_scope_value(item_topic) in q:
             score += 50
+            if not explicit_type:
+                explicit_type = item_type
 
         if score > best_score:
             best_score = score
@@ -703,7 +710,19 @@ def _select_active_scope(query_text, text_matches, catalog):
                 if item_type and not explicit_type:
                     explicit_type = item_type
 
-    # If no explicit routing was possible, use top RAG metadata as a fallback.
+    # If the user explicitly names Kanji/Bộ thủ but the catalog has not
+    # provided a matching lesson row, still route them as Từ vựng lessons.
+    # This prevents RAG similarity from selecting another content type.
+    if any(k in q for k in ["kanji", "học kanji"]):
+        if not lesson:
+            lesson = "Kanji"
+        explicit_type = "Từ vựng"
+    elif any(k in q for k in ["bộ thủ", "học bộ thủ", "radical"]):
+        if not lesson:
+            lesson = "Bộ thủ"
+        explicit_type = "Từ vựng"
+
+    # If no explicit routing was possible, use top RAG metadata as fallback.
     if not explicit_type:
         for m in text_matches or []:
             md = m.metadata or {}
@@ -762,6 +781,23 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
         if any(k in low for k in keys):
             explicit_type = typ
             break
+
+    # Kanji and Bộ thủ are lessons under Từ vựng, never content types.
+    # If explicitly requested, lock the event to Từ vựng and the corresponding lesson.
+    explicit_lesson = None
+    if any(k in low for k in ["kanji", "học kanji"]):
+        explicit_type = "Từ vựng"
+        explicit_lesson = "Kanji"
+    elif any(k in low for k in ["bộ thủ", "học bộ thủ", "radical"]):
+        explicit_type = "Từ vựng"
+        explicit_lesson = "Bộ thủ"
+
+    if explicit_lesson:
+        chosen = {
+            "content_type": "Từ vựng",
+            "subject": "Tiếng Nhật",
+            "lesson": explicit_lesson,
+        }
 
     # Phrases such as "chỉ học từ vựng" are an even stronger signal.
     # Keep the explicit type and never let RAG override it.
@@ -1039,6 +1075,31 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     # Course -> content type -> lesson -> topic.
     # Explicit lesson/topic from the user wins over generic RAG similarity.
     low = (data.text or "").strip().lower()
+    # Load learning history and catalog BEFORE resolving active_scope.
+    # _select_active_scope needs catalog to route Course -> content type -> lesson -> topic.
+    learning=[]; catalog=[]
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT subject,content_type,content_id,lesson,topic,item_key,score,status,
+                       current_position,current_page,attempt_count,correct_count,wrong_count,
+                       last_studied_at,next_review_at,completed_at
+                FROM learning_progress
+                WHERE user_id=%s
+                ORDER BY last_studied_at DESC LIMIT 100
+            """,(user["id"],))
+            learning=[dict(x) for x in cur.fetchall()]
+            cur.execute("""
+                SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
+                       question_pages,answer_pages,source_file,namespace
+                FROM knowledge_documents
+                ORDER BY subject,content_type,lesson,topic,id
+            """)
+            catalog=[dict(x) for x in cur.fetchall()]
+    finally:
+        conn.close()
+
     active_scope = _select_active_scope(low, result.matches, catalog)
     active_content_type = active_scope.get("content_type")
     active_course = active_scope.get("course")
@@ -1070,29 +1131,6 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
             active_lessons.add(lesson_md)
         if topic_md:
             active_topics.add(topic_md)
-
-    learning=[]; catalog=[]
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT subject,content_type,content_id,lesson,topic,item_key,score,status,
-                       current_position,current_page,attempt_count,correct_count,wrong_count,
-                       last_studied_at,next_review_at,completed_at
-                FROM learning_progress
-                WHERE user_id=%s
-                ORDER BY last_studied_at DESC LIMIT 100
-            """,(user["id"],))
-            learning=[dict(x) for x in cur.fetchall()]
-            cur.execute("""
-                SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
-                       question_pages,answer_pages,source_file,namespace
-                FROM knowledge_documents
-                ORDER BY subject,content_type,lesson,topic,id
-            """)
-            catalog=[dict(x) for x in cur.fetchall()]
-    finally:
-        conn.close()
 
     active_content_type = active_scope.get("content_type")
     active_course = active_scope.get("course")
@@ -1354,7 +1392,8 @@ def session_welcome(authorization: Optional[str] = Header(default=None)):
         message = (
             f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
             "Tớ đang có khóa học tiếng Nhật N5 với giáo trình gồm Từ vựng, "
-            "Ngữ pháp, Bài tập, Truyện đọc, Kanji và Bộ thủ. Chúng mình có thể "
+            "Ngữ pháp, Bài tập và Truyện đọc; trong Từ vựng có các lesson như "
+            "Kanji và Bộ thủ. Chúng mình có thể "
             "học đan xen để vừa hiểu bài vừa nhớ lâu.\n\n"
             "Cậu muốn học gì trước? Nếu chưa biết bắt đầu từ đâu thì cứ nói "
             "\"mình chưa biết học gì\", tớ sẽ hướng dẫn lộ trình cho cậu nhé! 😊"
