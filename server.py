@@ -661,9 +661,11 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
 
     candidates = []
     for item in image_items:
-        # Only educational identity fields are allowed to anchor an image.
+        # Only the actual vocabulary identity is allowed to anchor an image.
+        # NEVER use meaning here: several radicals can have overlapping
+        # meanings, which can cause an unrelated image to be selected.
         phrases = []
-        for field in ("term", "reading", "meaning"):
+        for field in ("term", "reading"):
             value = str(item.get(field) or "").strip()
             if value and value not in phrases and len(value) >= 1:
                 phrases.append(value)
@@ -710,8 +712,13 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
         if pos < cursor:
             continue
 
-        if pos > cursor:
-            blocks.append({"type": "text", "text": reply[cursor:pos]})
+        # Giữ nguyên từ/phrase trong câu trả lời rồi mới chèn ảnh ngay sau nó.
+        # V2.2 cũ advance cursor qua phrase trước khi tạo text block,
+        # khiến chính từ được match (ví dụ "Khẩu") bị mất khỏi UI.
+        phrase_end = pos + len(candidate["phrase"])
+
+        if phrase_end > cursor:
+            blocks.append({"type": "text", "text": reply[cursor:phrase_end]})
 
         blocks.append({
             "type": "image",
@@ -723,7 +730,7 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
             "page": item.get("page"),
         })
         used_keys.add(key)
-        cursor = pos + len(candidate["phrase"])
+        cursor = phrase_end
 
     if cursor < len(reply):
         blocks.append({"type": "text", "text": reply[cursor:]})
@@ -843,8 +850,9 @@ TIN NHẮN:
     # Ảnh V2 được truy xuất như các vector độc lập, vì vậy câu hỏi về một
     # từ cụ thể sẽ ưu tiên đúng ảnh đã được map với từ đó.
     # Image retrieval is independent from text retrieval. We keep only images
-    # whose term/reading/meaning is explicitly present in the user's question
-    # OR in Doraemon's generated answer. Generic descriptions are NOT enough.
+    # whose actual term/reading is explicitly present in the user's question
+    # OR in Doraemon's generated answer. Meaning/description similarity is
+    # intentionally ignored because it is not a reliable image identity.
     image_candidates=[]
     query_text=(data.text or "").strip()
     answer_text=reply or ""
@@ -858,22 +866,24 @@ TIN NHẮN:
         reading=str(md.get("reading") or "").strip()
         meaning=str(md.get("meaning") or "").strip()
 
-        anchors = [x for x in (term, reading, meaning) if x]
+        # term/reading identify the picture. meaning is explanatory metadata
+        # only and must never be used to select an image.
+        anchors = [x for x in (term, reading) if x]
         if not anchors:
             continue
 
         matched_in_query = any(_find_phrase_position(query_text, x) is not None for x in anchors)
         matched_in_reply = any(_find_phrase_position(answer_text, x) is not None for x in anchors)
 
-        # If the image has no explicit vocabulary/meaning match, do not show it.
+        # If the actual term/reading is not explicitly present, do not show it.
         if not matched_in_query and not matched_in_reply:
             continue
 
         exact_boost = 0.0
         if matched_in_query:
-            exact_boost += 1.00
+            exact_boost += 2.00
         if matched_in_reply:
-            exact_boost += 0.50
+            exact_boost += 0.75
 
         image_candidates.append({
             "score": float(m.score) + exact_boost,
@@ -1413,14 +1423,20 @@ Hãy thực hiện ĐỒNG THỜI 2 việc:
 1) OCR toàn bộ chữ nhìn thấy trên trang, giữ nguyên ngôn ngữ gốc, thứ tự đọc hợp lý và xuống dòng ở tiêu đề/ví dụ.
 2) Phát hiện từng hình minh họa/ảnh/biểu đồ/sơ đồ có ý nghĩa giáo dục. Không gộp nhiều hình thành một hình. Không coi vùng chữ thuần túy là hình.
 
-Đặc biệt, với MỖI hình, hãy xác định nội dung chữ/từ vựng gần hình hoặc rõ ràng thuộc về hình đó. Nếu đây là trang từ vựng tiếng Nhật, hãy cố gắng map đúng từng hình với từ tiếng Nhật tương ứng. Không được dùng chung toàn bộ danh sách từ của cả trang cho mọi hình.
+Đặc biệt, với MỖI hình, hãy xác định ĐÚNG nhãn/từ vựng gần hình nhất hoặc rõ ràng thuộc về hình đó. Nếu đây là trang từ vựng tiếng Nhật, mỗi hình phải được map 1-1 với nhãn của chính hình đó. TUYỆT ĐỐI KHÔNG gán một hình cho một từ khác chỉ vì nghĩa của chúng giống nhau, và không dùng nghĩa của cả trang để suy đoán.
+
+Quy tắc quan trọng:
+- term phải là TỪ/NHÃN thực sự gắn với chính hình đó, ưu tiên chữ nằm ngay cạnh/trên/dưới hình.
+- Nếu không thể xác định chắc term của một hình, để term và reading là chuỗi rỗng thay vì đoán.
+- Không được copy cùng một term cho nhiều hình.
+- meaning chỉ là thông tin mô tả, KHÔNG dùng meaning để xác định hình.
 
 Với mỗi hình trả về:
 - box: [ymin, xmin, ymax, xmax] chuẩn hóa 0-1000
-- term: từ/cụm từ tiếng Nhật gắn với hình, nếu xác định được
-- reading: cách đọc, nếu xác định được
+- term: từ/cụm từ tiếng Nhật gắn với CHÍNH hình này, nếu xác định được
+- reading: cách đọc của CHÍNH term đó, nếu xác định được
 - meaning: nghĩa tiếng Việt, nếu có thể xác định từ chính trang; nếu không chắc để chuỗi rỗng
-- associated_text: đoạn chữ ngắn thực sự liên quan tới hình
+- associated_text: đoạn chữ ngắn thực sự liên quan tới CHÍNH hình
 - description: mô tả ngắn hình
 
 Chỉ trả JSON đúng schema:
