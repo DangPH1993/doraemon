@@ -1497,7 +1497,36 @@ TIN NHẮN HIỆN TẠI:
     image_candidates = []
     answer_text = reply or ""
 
-    for m in image_result.matches:
+    # The normal performance path uses top_k=16. For exercises/reading, if
+    # none of those image vectors belongs to a page used by the retrieved text,
+    # do one wider fallback query. This avoids losing the correct page image
+    # merely because its generic image embedding ranked below unrelated images.
+    image_matches = list(image_result.matches)
+    if active_content_type in {"Bài tập", "Truyện đọc"} and active_text_pages:
+        first_pass_has_page = any(
+            str((m.metadata or {}).get("source_file") or "").strip()
+            and str((m.metadata or {}).get("page") or "").strip()
+            and (
+                str((m.metadata or {}).get("source_file") or "").strip(),
+                str((m.metadata or {}).get("page") or "").strip(),
+            ) in active_text_pages
+            for m in image_matches
+        )
+        if not first_pass_has_page:
+            try:
+                wider_image_result = index.query(
+                    vector=query_vector,
+                    top_k=48,
+                    include_metadata=True,
+                    namespace=namespace,
+                    filter=image_filter,
+                )
+                image_matches = list(wider_image_result.matches)
+                print("[IMAGE fallback] widened exercise/reading image search to top_k=48")
+            except Exception as e:
+                print("[IMAGE fallback] skipped:", type(e).__name__, str(e))
+
+    for m in image_matches:
         md = m.metadata or {}
         if not md.get("image_key"):
             continue
@@ -1530,19 +1559,35 @@ TIN NHẮN HIỆN TẠI:
         query_anchor = None
         page_anchor = False
 
-        if anchors:
+        # IMPORTANT: For exercises/reading, page mapping is authoritative even
+        # when an image happens to have term/reading metadata. The previous
+        # version only used page mapping in the `elif not anchors` branch, so
+        # an exercise image with OCR-provided term/reading could be discarded
+        # simply because the user's query did not literally contain that term.
+        if active_content_type in {"Bài tập", "Truyện đọc"}:
+            if image_source and image_page and (image_source, image_page) in active_text_pages:
+                page_anchor = True
+            else:
+                continue
+
+            # Keep an explicit term match as an additional ranking signal, but
+            # NEVER require it for an exercise/reading image.
             for anchor in anchors:
                 pos = _find_explicit_term_in_query(query_text, anchor)
                 if pos is not None:
                     query_anchor = pos
                     break
-        elif active_content_type in {"Bài tập", "Truyện đọc"}:
-            if image_source and image_page and (image_source, image_page) in active_text_pages:
-                page_anchor = True
-            else:
-                continue
         else:
-            continue
+            # Vocabulary / Kanji / Bộ thủ remain strict: an image must be
+            # anchored by its actual term/reading. Meaning text is never used
+            # as an image anchor.
+            if not anchors:
+                continue
+            for anchor in anchors:
+                pos = _find_explicit_term_in_query(query_text, anchor)
+                if pos is not None:
+                    query_anchor = pos
+                    break
 
         exact_boost = 2.00 if query_anchor is not None else 0.0
         page_boost = 1.50 if page_anchor else 0.0
