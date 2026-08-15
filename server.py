@@ -1786,10 +1786,44 @@ def proxy_chat(
 
     perf_rag = time.perf_counter()
 
-    active_content_type = active_scope.get("content_type")
-    active_course = active_scope.get("course")
-    active_lesson = active_scope.get("lesson")
-    active_topic = active_scope.get("topic")
+    # active_state is the compact, prompt-facing snapshot of the durable
+    # PostgreSQL learning state. V3.7 referenced it in the Gemini prompt but
+    # forgot to construct it, which caused every normal chat request to fail
+    # with NameError: active_state is not defined.
+    active_content_type = (active_scope or {}).get("content_type")
+    active_course = (active_scope or {}).get("course")
+    active_lesson = (active_scope or {}).get("lesson")
+    active_topic = (active_scope or {}).get("topic")
+
+    active_state = {}
+    if active_learning:
+        active_state = {
+            "content_type": _normalize_content_type(active_learning.get("content_type")),
+            "subject": active_learning.get("subject"),
+            "lesson": active_learning.get("lesson"),
+            "topic": active_learning.get("topic"),
+            "content_id": active_learning.get("content_id"),
+            "item_key": active_learning.get("item_key"),
+            "status": active_learning.get("status"),
+            "current_position": active_learning.get("current_position"),
+            "current_page": active_learning.get("current_page"),
+            "attempt_count": active_learning.get("attempt_count"),
+            "correct_count": active_learning.get("correct_count"),
+            "wrong_count": active_learning.get("wrong_count"),
+            "last_studied_at": active_learning.get("last_studied_at"),
+            "next_review_at": active_learning.get("next_review_at"),
+            "completed_at": active_learning.get("completed_at"),
+        }
+
+    # If there is no durable active record, still expose the scope inferred from
+    # the current request/RAG so Gemini has a consistent compact state object.
+    if active_scope:
+        active_state["scope"] = {
+            "content_type": active_content_type,
+            "course": active_course,
+            "lesson": active_lesson,
+            "topic": active_topic,
+        }
 
     # Select the exact text chunks that will be sent to Gemini. These are the
     # ONLY chunks allowed to contribute images.
