@@ -1027,56 +1027,9 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     query_vector = embed_text(data.text)
     namespace = data.knowledge_namespace or "__default__"
 
-    # Text and image retrieval are separated. Otherwise a page with many
-    # image vectors can crowd the text records out of the top-k results, or
-    # unrelated image vectors can leak into the response.
-    result = index.query(
-        vector=query_vector,
-        top_k=retrieval_k,
-        include_metadata=True,
-        namespace=namespace,
-        filter={"record_type": {"$eq": "text"}}
-    )
-    # Image retrieval is kept separate from text retrieval, but images must
-    # ALSO belong to the same active content type as the text context.
-    # Otherwise a generic word such as "bộ" in a Bài tập/Hội thoại answer can
-    # accidentally activate an unrelated Từ vựng/radical image.
-    #
-    # We query a wider image pool and apply a strict scope below because the
-    # active content type is determined by the best text match.
-    image_result = index.query(
-        vector=query_vector,
-        top_k=48,
-        include_metadata=True,
-        namespace=namespace,
-        filter={"record_type": {"$eq": "image"}}
-    )
-
-    contexts=[]; source_meta=[]
-    for m in result.matches:
-        md=m.metadata or {}
-        if md.get("record_type") == "image":
-            continue
-        txt=md.get("text",md.get("content",""))
-        if txt:
-            label=(
-                f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
-                f"Môn: {md.get('subject',md.get('course',''))} | "
-                f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | Trang: {md.get('page','')}]"
-            )
-            contexts.append(label+"\n"+txt)
-            source_meta.append(md)
-
-    # The highest-ranked text result defines the active learning context.
-    # Images from another content type must never leak into this answer.
-    low = (data.text or "").strip().lower()
-    # Resolve the active hierarchy HERE, where query text, RAG matches and
-    # catalog are all available:
-    # Course -> content type -> lesson -> topic.
-    # Explicit lesson/topic from the user wins over generic RAG similarity.
-    low = (data.text or "").strip().lower()
-    # Load learning history and catalog BEFORE resolving active_scope.
-    # _select_active_scope needs catalog to route Course -> content type -> lesson -> topic.
+    # Load learning history and catalog BEFORE retrieval.
+    # This is important because an explicit lesson such as "Bộ thủ" must
+    # constrain BOTH text and image retrieval before Pinecone ranks results.
     learning=[]; catalog=[]
     conn=db()
     try:
@@ -1100,65 +1053,117 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
     finally:
         conn.close()
 
-    active_scope = _select_active_scope(low, result.matches, catalog)
-    active_content_type = active_scope.get("content_type")
-    active_course = active_scope.get("course")
-    active_lesson = active_scope.get("lesson")
-    active_topic = active_scope.get("topic")
+    low=(data.text or "").strip().lower()
 
-    active_source_files = set()
-    active_lessons = set()
-    active_topics = set()
-    active_courses = set()
+    # First resolve only from explicit user intent/catalog. Do NOT let a
+    # generic high-similarity RAG result decide the lesson when the user has
+    # explicitly asked for one. Kanji/Bộ thủ remain lessons under Từ vựng.
+    requested_scope=_select_active_scope(low, [], catalog)
+    requested_content_type=requested_scope.get("content_type")
+    requested_course=requested_scope.get("course")
+    requested_lesson=requested_scope.get("lesson")
+    requested_topic=requested_scope.get("topic")
+
+    def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
+        scope_filter={"record_type":{"$eq":record_type}}
+        if content_type:
+            scope_filter["content_type"]={"$eq":content_type}
+        if course:
+            scope_filter["course"]={"$eq":course}
+        if lesson:
+            scope_filter["lesson"]={"$eq":lesson}
+        if topic:
+            scope_filter["topic"]={"$eq":topic}
+        return scope_filter
+
+    retrieval_k=max(16,int(data.top_k or 8))
+    query_vector=embed_text(data.text)
+    namespace=data.knowledge_namespace or "__default__"
+
+    # If the user explicitly selected a lesson, retrieve TEXT only inside that
+    # exact hierarchy. This is the critical fix for requests such as
+    # "Học Bộ thủ" / "Dạy Bộ thủ": Từ vựng -> Bộ thủ must win before
+    # similarity ranking can choose another lesson such as Kanji.
+    text_filter=build_scope_filter(
+        "text",
+        requested_content_type,
+        requested_course,
+        requested_lesson,
+        requested_topic,
+    )
+    result=index.query(
+        vector=query_vector,
+        top_k=retrieval_k,
+        include_metadata=True,
+        namespace=namespace,
+        filter=text_filter
+    )
+
+    contexts=[]; source_meta=[]
+    for m in result.matches:
+        md=m.metadata or {}
+        if md.get("record_type")=="image":
+            continue
+        txt=md.get("text",md.get("content",""))
+        if txt:
+            label=(
+                f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
+                f"Môn: {md.get('subject',md.get('course',''))} | "
+                f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | Trang: {md.get('page','')}]"
+            )
+            contexts.append(label+"\n"+txt)
+            source_meta.append(md)
+
+    # If the query did not explicitly identify a hierarchy, let the best text
+    # result establish the scope. If it did, NEVER replace that explicit scope
+    # with a different RAG lesson.
+    if requested_content_type or requested_course or requested_lesson or requested_topic:
+        active_scope=requested_scope
+    else:
+        active_scope=_select_active_scope(low,result.matches,catalog)
+
+    active_content_type=active_scope.get("content_type")
+    active_course=active_scope.get("course")
+    active_lesson=active_scope.get("lesson")
+    active_topic=active_scope.get("topic")
+
+    # Image retrieval happens AFTER the active scope is known, so text and
+    # image are searched in the same hierarchy. This keeps the existing strict
+    # term/reading-to-image mapping intact while preventing Kanji/other lessons
+    # from competing with an explicitly requested Bộ thủ lesson.
+    image_filter=build_scope_filter(
+        "image",
+        active_content_type,
+        active_course,
+        active_lesson,
+        active_topic,
+    )
+    image_result=index.query(
+        vector=query_vector,
+        top_k=48,
+        include_metadata=True,
+        namespace=namespace,
+        filter=image_filter
+    )
+
+    active_source_files=set()
+    active_lessons=set()
+    active_topics=set()
+    active_courses=set()
 
     for m in result.matches[:12]:
-        md = m.metadata or {}
-        ctype = _normalize_content_type(md.get("content_type"))
-
-        if active_content_type and ctype != active_content_type:
+        md=m.metadata or {}
+        ctype=_normalize_content_type(md.get("content_type"))
+        if active_content_type and ctype!=active_content_type:
             continue
-
-        sf = str(md.get("source_file") or "").strip()
-        course = str(md.get("course") or md.get("course_name") or "").strip()
-        lesson_md = str(md.get("lesson") or "").strip()
-        topic_md = str(md.get("topic") or "").strip()
-
-        if sf:
-            active_source_files.add(sf)
-        if course:
-            active_courses.add(course)
-        if lesson_md:
-            active_lessons.add(lesson_md)
-        if topic_md:
-            active_topics.add(topic_md)
-
-    active_content_type = active_scope.get("content_type")
-    active_course = active_scope.get("course")
-    active_lesson = active_scope.get("lesson")
-    active_topic = active_scope.get("topic")
-
-    active_source_files = set()
-    active_lessons = set()
-    active_topics = set()
-    active_courses = set()
-
-    for m in result.matches[:12]:
-        md = m.metadata or {}
-        ctype = _normalize_content_type(md.get("content_type"))
-        if active_content_type and ctype != active_content_type:
-            continue
-        sf = str(md.get("source_file") or "").strip()
-        course = str(md.get("course") or md.get("course_name") or "").strip()
-        lesson_md = str(md.get("lesson") or "").strip()
-        topic_md = str(md.get("topic") or "").strip()
-        if sf:
-            active_source_files.add(sf)
-        if course:
-            active_courses.add(course)
-        if lesson_md:
-            active_lessons.add(lesson_md)
-        if topic_md:
-            active_topics.add(topic_md)
+        sf=str(md.get("source_file") or "").strip()
+        course=str(md.get("course") or md.get("course_name") or "").strip()
+        lesson_md=str(md.get("lesson") or "").strip()
+        topic_md=str(md.get("topic") or "").strip()
+        if sf: active_source_files.add(sf)
+        if course: active_courses.add(course)
+        if lesson_md: active_lessons.add(lesson_md)
+        if topic_md: active_topics.add(topic_md)
 
     prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
