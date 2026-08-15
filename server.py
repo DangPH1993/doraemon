@@ -732,15 +732,6 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
     low = text.lower()
     source_meta = source_meta or []
 
-    # Hierarchical router: Course -> content type -> lesson -> topic.
-    # This prevents a "Kanji" lesson from winning over an explicitly requested
-    # "Bộ thủ" lesson merely because the Kanji vectors are more similar.
-    active_scope = _select_active_scope(low, result.matches, catalog)
-    active_course = active_scope.get("course")
-    active_content_type = active_scope.get("content_type")
-    active_lesson = active_scope.get("lesson")
-    active_topic = active_scope.get("topic")
-
     chosen = None
 
     # IMPORTANT:
@@ -1095,6 +1086,40 @@ def proxy_chat(data: ChatRequest, authorization: Optional[str] = Header(default=
             catalog=[dict(x) for x in cur.fetchall()]
     finally:
         conn.close()
+
+    # Resolve the active hierarchy HERE, where query text, RAG matches and
+    # catalog are all available:
+    # Course -> content type -> lesson -> topic.
+    # Explicit lesson/topic from the user wins over generic RAG similarity.
+    low = (data.text or "").strip().lower()
+    active_scope = _select_active_scope(low, result.matches, catalog)
+    active_content_type = active_scope.get("content_type")
+    active_course = active_scope.get("course")
+    active_lesson = active_scope.get("lesson")
+    active_topic = active_scope.get("topic")
+
+    active_source_files = set()
+    active_lessons = set()
+    active_topics = set()
+    active_courses = set()
+
+    for m in result.matches[:12]:
+        md = m.metadata or {}
+        ctype = _normalize_content_type(md.get("content_type"))
+        if active_content_type and ctype != active_content_type:
+            continue
+        sf = str(md.get("source_file") or "").strip()
+        course = str(md.get("course") or md.get("course_name") or "").strip()
+        lesson_md = str(md.get("lesson") or "").strip()
+        topic_md = str(md.get("topic") or "").strip()
+        if sf:
+            active_source_files.add(sf)
+        if course:
+            active_courses.add(course)
+        if lesson_md:
+            active_lessons.add(lesson_md)
+        if topic_md:
+            active_topics.add(topic_md)
 
     prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
