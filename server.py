@@ -573,29 +573,81 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
     low = text.lower()
     source_meta = source_meta or []
     chosen = None
-    for md in source_meta:
-        if md.get("content_type") in CONTENT_TYPES:
-            chosen = md
+
+    # IMPORTANT:
+    # Learning progress must follow the user's explicit learning intent first.
+    # RAG ranking is NOT reliable enough to decide whether the user is studying
+    # vocabulary or grammar. For example, a vocabulary request may retrieve a
+    # grammar page because the two documents share words/context.
+    explicit_type = None
+    explicit_patterns = [
+        ("Truyện đọc", [
+            "truyện đọc", "đọc truyện", "câu chuyện", "học truyện",
+            "muốn đọc truyện", "học truyện"
+        ]),
+        ("Bài tập", [
+            "bài tập", "làm bài", "làm bài tập", "bài quiz", "quiz",
+            "bài kiểm tra"
+        ]),
+        ("Ngữ pháp", [
+            "ngữ pháp", "học ngữ pháp", "ôn ngữ pháp", "grammar"
+        ]),
+        ("Từ vựng", [
+            "từ vựng", "học từ vựng", "ôn từ vựng", "từ mới",
+            "học từ mới", "vocabulary"
+        ]),
+    ]
+
+    for typ, keys in explicit_patterns:
+        if any(k in low for k in keys):
+            explicit_type = typ
             break
 
-    # Prefer explicit catalog matches in the user's request.
+    # Phrases such as "chỉ học từ vựng" are an even stronger signal.
+    # Keep the explicit type and never let RAG override it.
+    if explicit_type:
+        chosen = {"content_type": explicit_type, "subject": "Tiếng Nhật"}
+
+        # If the user explicitly named a lesson/topic in the catalog, attach it
+        # to the chosen type only when the catalog item has the same type.
+        for item in catalog:
+            item_type = _normalize_content_type(item.get("content_type"))
+            if item_type != explicit_type:
+                continue
+            hay = " ".join(
+                str(item.get(k) or "")
+                for k in ("lesson", "topic", "subject")
+            ).strip()
+            parts = [
+                str(item.get("lesson") or ""),
+                str(item.get("topic") or ""),
+            ]
+            if hay and any(part and part.lower() in low for part in parts):
+                chosen = item
+                break
+
+    # If the user did NOT explicitly choose a content type, then use the
+    # catalog/source metadata as context.
     if not chosen:
         for item in catalog:
-            hay = " ".join(str(item.get(k) or "") for k in ("lesson", "topic", "subject")).strip()
-            if hay and any(part.lower() in low for part in [str(item.get("lesson") or ""), str(item.get("topic") or "")] if part):
+            hay = " ".join(
+                str(item.get(k) or "")
+                for k in ("lesson", "topic", "subject")
+            ).strip()
+            if hay and any(
+                part.lower() in low
+                for part in [
+                    str(item.get("lesson") or ""),
+                    str(item.get("topic") or "")
+                ] if part
+            ):
                 chosen = item
                 break
 
     if not chosen:
-        # Detect the content type from explicit words in the conversation.
-        for typ, keys in {
-            "Truyện đọc": ["truyện", "câu chuyện", "đọc truyện"],
-            "Từ vựng": ["từ vựng", "từ mới", "vocabulary"],
-            "Ngữ pháp": ["ngữ pháp", "grammar"],
-            "Bài tập": ["bài tập", "làm bài", "câu hỏi", "quiz"]
-        }.items():
-            if any(k in low for k in keys):
-                chosen = {"content_type": typ, "subject": "Tiếng Nhật"}
+        for md in source_meta:
+            if md.get("content_type") in CONTENT_TYPES:
+                chosen = md
                 break
 
     if not chosen:
@@ -866,7 +918,10 @@ QUY TẮC QUAN TRỌNG:
 13. Không tự chấm điểm Từ vựng, Ngữ pháp hoặc Truyện đọc. Chỉ ghi nhận tiến độ.
 14. Với Bài tập, chỉ chấm khi người học thực sự nộp/được xác định kết quả; không tự suy đoán điểm từ lời giải thích của Doraemon.
 15. Nếu người học đang học dở, tiếp tục từ tiến độ đã lưu thay vì hỏi lại từ đầu.
-16. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen theo thứ tự:
+16. Khi ghi nhận tiến độ, nếu user nói rõ "chỉ học Từ vựng", "chỉ học Ngữ pháp",
+    "chỉ làm Bài tập" hoặc tương tự, phải ghi đúng loại nội dung user đã chọn.
+    Không được dùng loại nội dung của kết quả RAG khác để ghi tiến độ.
+17. Khi user là người mới và chưa biết học gì, hướng dẫn lộ trình đan xen theo thứ tự:
     Từ vựng → Ngữ pháp → Bài tập → Truyện đọc → Kanji → Bộ thủ, rồi quay vòng ôn tập
     và học tiếp theo tiến độ. Không bắt buộc học cứng một loại nội dung cho đến hết.
 17. Khi user hỏi chung kiểu "nên học gì", hãy đề xuất lộ trình trên và giải thích ngắn gọn.
@@ -1126,6 +1181,9 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM learning_progress WHERE user_id=%s", (user["id"],))
             deleted = cur.rowcount
+
+            # Mark the account as a fresh learner. The next /session/welcome
+            # therefore returns the same onboarding flow as a brand-new user.
             cur.execute("""
                 INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,updated_at)
                 VALUES(%s,FALSE,1,NOW())
@@ -1134,7 +1192,6 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
                     reset_count=user_learning_state.reset_count + 1,
                     updated_at=NOW()
             """, (user["id"],))
-            deleted = cur.rowcount
         conn.commit()
     finally:
         conn.close()
