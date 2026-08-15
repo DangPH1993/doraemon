@@ -1100,114 +1100,306 @@ def _find_explicit_term_in_query(query: str, phrase: str):
     return None
 
 
+
+def _parse_image_keys(raw):
+    """Return normalized image keys from text-chunk metadata."""
+    if raw is None:
+        return []
+    values = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            values.extend(_parse_image_keys(item))
+        return list(dict.fromkeys(values))
+    if isinstance(raw, dict):
+        for field in ("key", "image_key", "image_keys", "path"):
+            if field in raw:
+                values.extend(_parse_image_keys(raw.get(field)))
+        return list(dict.fromkeys(values))
+
+    value = str(raw).strip()
+    if not value:
+        return []
+    if value.startswith("[") or value.startswith("{"):
+        try:
+            return _parse_image_keys(json.loads(value))
+        except Exception:
+            try:
+                return _parse_image_keys(ast.literal_eval(value))
+            except Exception:
+                pass
+    value = value.strip().strip('"').strip("'")
+    return [value] if value else []
+
+
+def _chunk_identity(md):
+    """
+    Identity of one RAG text chunk.
+
+    chunk_index is intentionally included when present. We never use a
+    page-level image as a substitute for a different chunk on the same page.
+    """
+    source_file = str(md.get("source_file") or "").strip()
+    page = str(md.get("page") or "").strip()
+    raw_chunk = md.get("chunk_index")
+    chunk_index = None
+    if raw_chunk not in (None, ""):
+        try:
+            chunk_index = int(raw_chunk)
+        except Exception:
+            chunk_index = str(raw_chunk).strip()
+    return source_file, page, chunk_index
+
+
+def _same_chunk_image(md, chunk_md):
+    """Strictly determine whether an image record belongs to a text chunk."""
+    sf, page, chunk_index = _chunk_identity(chunk_md)
+    if not sf or not page:
+        return False
+    if str(md.get("source_file") or "").strip() != sf:
+        return False
+    if str(md.get("page") or "").strip() != page:
+        return False
+
+    # If the text chunk has chunk_index, the image MUST have the same one.
+    # This is the core rule: no page-only fallback can leak another chunk's image.
+    if chunk_index is not None:
+        raw_img_chunk = md.get("chunk_index")
+        if raw_img_chunk in (None, ""):
+            return False
+        try:
+            img_chunk = int(raw_img_chunk)
+        except Exception:
+            img_chunk = str(raw_img_chunk).strip()
+        return img_chunk == chunk_index
+
+    # Legacy text chunks without chunk_index can only match image records that
+    # also lack chunk_index. This prevents accidentally attaching a chunk-0 image
+    # to an unrelated legacy chunk on the same page.
+    return md.get("chunk_index") in (None, "")
+
+
+def _image_payload_from_metadata(md, score=0.0, chunk_order=None, chunk_text=""):
+    keys = _parse_image_keys(md.get("image_key"))
+    if not keys:
+        keys = _parse_image_keys(md.get("image_keys"))
+    if not keys:
+        return []
+
+    payloads = []
+    for key in keys:
+        url = b2_url(key) or md.get("image_url")
+        if not url:
+            continue
+        payloads.append({
+            "key": key,
+            "url": url,
+            "term": str(md.get("term") or "").strip(),
+            "reading": str(md.get("reading") or "").strip(),
+            "meaning": str(md.get("meaning") or "").strip(),
+            "page": md.get("page"),
+            "source_file": str(md.get("source_file") or "").strip(),
+            "score": float(score or 0),
+            "_chunk_order": chunk_order,
+            "_chunk_text": chunk_text,
+            "_chunk_key": (
+                str(md.get("source_file") or "").strip(),
+                str(md.get("page") or "").strip(),
+                str(md.get("chunk_index") if md.get("chunk_index") not in (None, "") else ""),
+            ),
+        })
+    return payloads
+
+
+def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector):
+    """
+    The only image retrieval path.
+
+    For every text chunk actually selected into RAG:
+      1. use image_key/image_keys directly if present on the chunk;
+      2. otherwise query Pinecone IMAGE records by the exact same
+         source_file + page + chunk_index;
+      3. if no exact match exists, return no image.
+
+    We deliberately do NOT run a semantic image query. This prevents an image
+    from another chunk/lesson/page from being injected just because its vector
+    happens to be similar to the user's question.
+    """
+    if not text_chunks or not index:
+        return []
+
+    results = []
+    jobs = []
+
+    # Direct image keys are strongest and require no Pinecone round trip.
+    for order, chunk in enumerate(text_chunks):
+        md = chunk["metadata"]
+        chunk_text = chunk["text"]
+        direct_keys = _parse_image_keys(md.get("image_key")) + _parse_image_keys(md.get("image_keys"))
+        direct_keys = list(dict.fromkeys(direct_keys))
+        if direct_keys:
+            direct_md = dict(md)
+            direct_md["image_key"] = direct_keys
+            results.extend(_image_payload_from_metadata(
+                direct_md, chunk.get("score", 0), order, chunk_text
+            ))
+            continue
+
+        sf, page, chunk_index = _chunk_identity(md)
+        if sf and page and chunk_index is not None:
+            jobs.append((order, chunk, sf, page, chunk_index))
+
+    def fetch_exact(job):
+        order, chunk, sf, page, chunk_index = job
+        filt = {
+            "record_type": {"$eq": "image"},
+            "source_file": {"$eq": sf},
+            "page": {"$eq": int(page) if str(page).isdigit() else page},
+            "chunk_index": {"$eq": chunk_index},
+        }
+        try:
+            res = index.query(
+                vector=query_vector,
+                top_k=20,
+                include_metadata=True,
+                namespace=namespace,
+                filter=filt,
+            )
+            found = []
+            for m in res.matches:
+                md = m.metadata or {}
+                if not _same_chunk_image(md, chunk["metadata"]):
+                    continue
+                found.extend(_image_payload_from_metadata(
+                    md, getattr(m, "score", 0), order, chunk["text"]
+                ))
+            return found
+        except Exception as exc:
+            print("[IMAGE chunk-exact] failed:", sf, page, chunk_index, type(exc).__name__, str(exc))
+            return []
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+            for found in executor.map(fetch_exact, jobs):
+                results.extend(found)
+
+    # Deduplicate only by actual object key, never by page/chunk position.
+    unique = []
+    seen = set()
+    for item in results:
+        key = item.get("key")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
     """
-    Insert an image only when its term/reading is confidently anchored.
+    Insert images only for the RAG chunks that supplied the answer.
 
-    Priority:
-      1. Explicit term in the user's query ("Bộ Vi", "Kanji 水", ...)
-      2. Term/reading in a Markdown heading/title in Doraemon's answer.
+    Gemini receives an internal marker instruction such as [[IMG_CHUNK_2]].
+    The marker is removed before returning the reply and becomes the exact
+    insertion point for images belonging to that chunk.
 
-    We never scan the entire explanatory answer for image anchors. This is
-    what prevents "bao quanh" in the explanation of Bộ Vi from inserting the
-    image of Bộ Bao.
+    If Gemini omits a marker, that chunk's image is appended after the nearest
+    answer text rather than being attached to a different chunk.
     """
     reply = reply or ""
     if not reply:
         return []
 
-    candidates = []
+    marker_re = re.compile(r"\[\[IMG_CHUNK_(\d+)\]\]")
+    chunks = {}
     for item in image_items:
-        phrases = []
-        for field in ("term", "reading"):
-            value = str(item.get(field) or "").strip()
-            if value and value not in phrases:
-                phrases.append(value)
-
-        positions = []
-        for phrase in sorted(phrases, key=len, reverse=True):
-            pos = _find_structural_phrase_position(reply, phrase)
-            if pos is not None:
-                positions.append((pos, phrase))
-
-        # Exercise/reading images can legitimately have no term/reading.
-        # In that case the proxy has already proved that the image belongs to
-        # the same source/page as the retrieved text. Put the image after the
-        # first non-empty line instead of trying to infer a vocabulary anchor.
-        if not positions and item.get("_page_anchor"):
-            lines = reply.splitlines(True)
-            running = 0
-            for line in lines:
-                if line.strip():
-                    running += len(line)
-                    positions.append((running, ""))
-                    break
-                running += len(line)
-            if not positions:
-                positions.append((0, ""))
-
-        # The proxy already selected/scored candidates using the user's query.
-        # If the term is explicitly in the query but the model did not put it
-        # in a heading, allow the first normal occurrence as a fallback only
-        # for that exact candidate.
-        if not positions and item.get("_query_anchor") is not None:
-            for phrase in sorted(phrases, key=len, reverse=True):
-                pos = _find_phrase_position(reply, phrase)
-                if pos is not None:
-                    positions.append((pos, phrase))
-
-        if not positions:
+        order = item.get("_chunk_order")
+        if order is None:
             continue
+        chunks.setdefault(int(order), []).append(item)
 
-        pos, phrase = min(positions, key=lambda x: (x[0], -len(x[1])))
-        candidates.append({
-            "position": pos,
-            "phrase": phrase,
-            "item": item,
-        })
+    # First use explicit markers. This is deterministic and does not depend on
+    # term/meaning words accidentally appearing in the answer.
+    marker_positions = []
+    for m in marker_re.finditer(reply):
+        marker_positions.append((m.start(), int(m.group(1)), m.end()))
 
-    by_position = {}
-    for candidate in candidates:
-        pos = candidate["position"]
-        current = by_position.get(pos)
-        if current is None or float(candidate["item"].get("score", 0)) > float(current["item"].get("score", 0)):
-            by_position[pos] = candidate
-
-    mapped = sorted(by_position.values(), key=lambda x: x["position"])
+    # Remove markers from user-visible text.
+    clean_reply = marker_re.sub("", reply)
 
     blocks = []
     cursor = 0
-    used_keys = set()
+    inserted_keys = set()
 
-    for candidate in mapped:
-        item = candidate["item"]
-        key = str(item.get("key") or "")
-        if not key or key in used_keys:
+    # Convert positions from original reply to clean-reply positions.
+    removed_before = 0
+    for pos, chunk_order, marker_end in marker_positions:
+        clean_pos = pos - removed_before
+        removed_before += marker_end - pos
+
+        if clean_pos > cursor:
+            blocks.append({"type": "text", "text": clean_reply[cursor:clean_pos]})
+
+        for item in chunks.get(chunk_order, []):
+            key = item.get("key")
+            if not key or key in inserted_keys:
+                continue
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            inserted_keys.add(key)
+        cursor = clean_pos
+
+    # If Gemini did not emit a marker, fall back to chunk-order placement:
+    # put each unmarked chunk's images after the answer text, in the same order
+    # as the retrieved chunks. Never borrow an image from another chunk.
+    if not marker_positions:
+        if clean_reply:
+            blocks.append({"type": "text", "text": clean_reply})
+        for order in sorted(chunks):
+            for item in chunks[order]:
+                key = item.get("key")
+                if not key or key in inserted_keys:
+                    continue
+                blocks.append({
+                    "type": "image",
+                    "key": key,
+                    "url": item.get("url"),
+                    "term": item.get("term", ""),
+                    "reading": item.get("reading", ""),
+                    "meaning": item.get("meaning", ""),
+                    "page": item.get("page"),
+                })
+                inserted_keys.add(key)
+        return blocks
+
+    if cursor < len(clean_reply):
+        blocks.append({"type": "text", "text": clean_reply[cursor:]})
+
+    # If some image chunks were not marked, append only those exact chunk images.
+    marked_orders = {order for _, order, _ in marker_positions}
+    for order in sorted(chunks):
+        if order in marked_orders:
             continue
-
-        pos = candidate["position"]
-        if pos < cursor:
-            continue
-
-        phrase_end = pos + len(candidate["phrase"])
-
-        if phrase_end > cursor:
-            blocks.append({"type": "text", "text": reply[cursor:phrase_end]})
-
-        blocks.append({
-            "type": "image",
-            "key": key,
-            "url": item.get("url"),
-            "term": item.get("term", ""),
-            "reading": item.get("reading", ""),
-            "meaning": item.get("meaning", ""),
-            "page": item.get("page"),
-        })
-        used_keys.add(key)
-        cursor = phrase_end
-
-    if cursor < len(reply):
-        blocks.append({"type": "text", "text": reply[cursor:]})
+        for item in chunks[order]:
+            key = item.get("key")
+            if not key or key in inserted_keys:
+                continue
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            inserted_keys.add(key)
 
     return blocks
 
@@ -1580,48 +1772,17 @@ def proxy_chat(
             filter=text_filter,
         )
 
-    # When the user explicitly selected the hierarchy, text and image retrieval
-    # are independent and can safely run in parallel. For a generic query we
-    # first need the text result to establish the active scope.
-    if explicit_scope:
-        image_filter = build_scope_filter(
-            "image",
-            requested_content_type,
-            requested_course,
-            requested_lesson,
-            requested_topic,
-        )
-        from concurrent.futures import ThreadPoolExecutor
-        def query_images_scoped():
-            return index.query(
-                vector=query_vector,
-                top_k=12,
-                include_metadata=True,
-                namespace=namespace,
-                filter=image_filter,
-            )
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            text_future = executor.submit(query_text_matches)
-            image_future = executor.submit(query_images_scoped)
-            result = text_future.result()
-            image_result = image_future.result()
-    else:
-        result = query_text_matches()
+    # IMPORTANT: retrieve TEXT first. Images are NOT searched independently.
+    # They are resolved later from the exact text chunks that actually enter the
+    # RAG context. This is the chunk-locked text↔image rule.
+    result = query_text_matches()
+    if not explicit_scope:
         active_scope = _select_active_scope(low, result.matches, catalog)
-        image_filter = build_scope_filter(
-            "image",
-            active_scope.get("content_type"),
-            active_scope.get("course"),
-            active_scope.get("lesson"),
-            active_scope.get("topic"),
-        )
-        image_result = index.query(
-            vector=query_vector,
-            top_k=16,
-            include_metadata=True,
-            namespace=namespace,
-            filter=image_filter,
-        )
+
+        # If the active scope was inferred from the text result, the text query
+        # above may have included mixed lessons. Keep the existing scope routing
+        # behaviour, but do not perform a second independent image search.
+    image_result = type("_EmptyImageResult", (), {"matches": []})()
 
     perf_rag = time.perf_counter()
 
@@ -1630,89 +1791,90 @@ def proxy_chat(
     active_lesson = active_scope.get("lesson")
     active_topic = active_scope.get("topic")
 
-    contexts = []
-    source_meta = []
-    image_text_fallbacks = []
-
+    # Select the exact text chunks that will be sent to Gemini. These are the
+    # ONLY chunks allowed to contribute images.
+    text_chunks = []
     for m in result.matches:
         md = m.metadata or {}
         record_type = str(md.get("record_type") or "").strip().lower()
-        txt = md.get("text", md.get("content", ""))
+        txt = str(md.get("text", md.get("content", "")) or "").strip()
 
-        # Story/exercise image records can also contain OCR text.  The current
-        # Pinecone schema stores some story pages as independent image records
-        # with a useful `text`/`associated_text` field.  Do NOT throw that text
-        # away merely because the record is an image: for Truyện đọc it may be
-        # the actual reading passage the user expects Doraemon to read.
-        if record_type == "image":
-            if active_content_type in {"Truyện đọc", "Bài tập"}:
-                ocr_txt = str(txt or md.get("associated_text") or "").strip()
-                if ocr_txt:
-                    label = (
-                        f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
-                        f"Môn: {md.get('subject',md.get('course',''))} | "
-                        f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | "
-                        f"Trang: {md.get('page','')}]"
-                    )
-                    image_text_fallbacks.append((float(m.score), label + "\n" + ocr_txt, md))
+        if not txt:
             continue
 
-        if txt:
-            label = (
-                f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
-                f"Môn: {md.get('subject',md.get('course',''))} | "
-                f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | Trang: {md.get('page','')}]"
-            )
-            contexts.append(label + "\n" + str(txt))
-            source_meta.append(md)
+        # Image records are not treated as an independent RAG source. They may
+        # only participate when they themselves are the text-bearing chunk
+        # selected by a future/legacy OCR schema.
+        if record_type == "image":
+            if active_content_type in {"Truyện đọc", "Bài tập"}:
+                ocr_txt = str(md.get("associated_text") or txt).strip()
+                if ocr_txt:
+                    text_chunks.append({
+                        "text": ocr_txt,
+                        "metadata": md,
+                        "score": float(getattr(m, "score", 0) or 0),
+                    })
+            continue
 
-    # If a story has little/no standalone text records, use the OCR text
-    # attached to the matching image records as a secondary RAG source.
-    # This restores the behaviour of older baselines without allowing generic
-    # image OCR from another lesson to leak into the answer.
-    if active_content_type in {"Truyện đọc", "Bài tập"} and len(contexts) < 2 and image_text_fallbacks:
-        image_text_fallbacks.sort(key=lambda x: x[0], reverse=True)
-        for score, txt, md in image_text_fallbacks[:4]:
-            contexts.append(txt)
-            source_meta.append(md)
+        text_chunks.append({
+            "text": txt,
+            "metadata": md,
+            "score": float(getattr(m, "score", 0) or 0),
+        })
 
-    # Exact source/page references are needed only for non-vocabulary images.
+        if len(text_chunks) >= 6:
+            break
+
+    # Resolve images ONLY for these exact text chunks.
+    rich_images = _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector)
+
+    contexts = []
+    source_meta = []
+    for order, chunk in enumerate(text_chunks):
+        md = chunk["metadata"]
+        label = (
+            f"[CHUNK_{order}] "
+            f"[Loại: {md.get('content_type','') or 'Không rõ'} | "
+            f"Môn: {md.get('subject',md.get('course',''))} | "
+            f"Bài: {md.get('lesson','')} | Chủ đề: {md.get('topic','')} | "
+            f"Trang: {md.get('page','')}]"
+        )
+        contexts.append(label + "\n" + chunk["text"])
+        source_meta.append(md)
+
     active_text_pages = set()
-    for md in source_meta:
+    for chunk in text_chunks:
+        md = chunk["metadata"]
         sf = str(md.get("source_file") or "").strip()
         page = str(md.get("page") or "").strip()
         if sf and page:
             active_text_pages.add((sf, page))
 
-    # Only send durable state that matters for THIS turn. The full catalog and
-    # full learning history stay on the server for routing/tracking. They are not
-    # repeatedly paid for as Gemini input tokens.
-    active_state = {
-        "content_type": active_content_type,
-        "course": active_course,
-        "lesson": active_lesson,
-        "topic": active_topic,
-        "current_position": (active_learning or {}).get("current_position"),
-        "current_page": (active_learning or {}).get("current_page"),
-        "status": (active_learning or {}).get("status"),
-    }
-    prompt_catalog = []
-    # Only expose catalog names when the user has not yet selected an active
-    # lesson and is asking for a recommendation/choice.
-    if not active_scope and wants_recommendation:
-        prompt_catalog = _compact_catalog_for_prompt(catalog, {}, limit=12)
+    # Mark which chunks actually have images. Gemini is asked to emit the
+    # corresponding internal marker immediately after the relevant explanation.
+    image_orders = sorted({
+        int(item["_chunk_order"])
+        for item in rich_images
+        if item.get("_chunk_order") is not None
+    })
 
-    # Keep only the last two turns and cap each one aggressively. This is enough
-    # for pronouns/short answers while durable lesson state comes from PostgreSQL.
-    prompt_history = recent_history[-2:]
-
-    # Keep the RAG context compact: retrieval still uses up to 10 matches, but
-    # Gemini only needs the best few chunks for the answer.
+    # Keep the RAG context compact: retrieval still uses up to 10 matches,
+    # but Gemini only receives the best six selected text chunks.
     prompt_contexts = []
-    for c in contexts[:6]:
+    for c in contexts:
         if len(c) > 1800:
             c = c[:1800] + "…"
         prompt_contexts.append(c)
+
+    image_marker_rule = ""
+    if image_orders:
+        markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
+        image_marker_rule = (
+            f"\n- Các chunk có ảnh tương ứng là: {markers}. "
+            "Khi phần trả lời của cậu sử dụng nội dung của một chunk có ảnh, "
+            "hãy đặt marker tương ứng ngay sau đoạn giải thích của chunk đó. "
+            "Marker chỉ là kỹ thuật nội bộ, không được giải thích cho học sinh."
+        )
 
     prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
@@ -1721,10 +1883,11 @@ NGUYÊN TẮC:
 - Nội dung gồm đúng 4 loại: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
 - Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
-- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu RAG cung cấp OCR/text từ record ảnh của trang truyện thì coi đó là văn bản nguồn hợp lệ để đọc/kể lại; không được nói là thiếu văn bản khi context đã có đoạn truyện. Với Từ vựng/Ngữ pháp: giải thích và luyện tập theo tài liệu.
+- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
-- Nếu đang dạy term/bộ thủ có ảnh, dùng đúng term/reading làm tiêu đề; không lấy một từ xuất hiện trong phần nghĩa (ví dụ “bao quanh”) làm term khác.
-- Ảnh Bài tập/Truyện đọc được map theo source_file + page; ảnh Từ vựng/Kanji/Bộ thủ map theo term/reading.
+- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh chỉ thuộc về đúng CHUNK có ảnh tương ứng trong RAG.
+- Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
+{image_marker_rule}
 
 ACTIVE LEARNING STATE:
 {json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
@@ -1750,157 +1913,11 @@ TIN NHẮN HIỆN TẠI:
     reply = response.text or ""
     perf_gen = time.perf_counter()
 
-    # Strict image mapping remains unchanged in principle:
-    # vocabulary/Kanji/Bộ thủ require term/reading; exercises/stories can use
-    # exact source_file + page mapping when their image has no term/reading.
-    image_candidates = []
-    answer_text = reply or ""
-
-    # The normal performance path uses top_k=16. For exercises/reading, if
-    # none of those image vectors belongs to a page used by the retrieved text,
-    # do one wider fallback query. This avoids losing the correct page image
-    # merely because its generic image embedding ranked below unrelated images.
-    image_matches = list(image_result.matches)
-    if active_content_type in {"Bài tập", "Truyện đọc"} and active_text_pages:
-        first_pass_has_page = any(
-            str((m.metadata or {}).get("source_file") or "").strip()
-            and str((m.metadata or {}).get("page") or "").strip()
-            and (
-                str((m.metadata or {}).get("source_file") or "").strip(),
-                str((m.metadata or {}).get("page") or "").strip(),
-            ) in active_text_pages
-            for m in image_matches
-        )
-        if not first_pass_has_page:
-            try:
-                wider_image_result = index.query(
-                    vector=query_vector,
-                    top_k=48,
-                    include_metadata=True,
-                    namespace=namespace,
-                    filter=image_filter,
-                )
-                image_matches = list(wider_image_result.matches)
-                print("[IMAGE fallback] widened exercise/reading image search to top_k=48")
-            except Exception as e:
-                print("[IMAGE fallback] skipped:", type(e).__name__, str(e))
-
-    for m in image_matches:
-        md = m.metadata or {}
-        if not md.get("image_key"):
-            continue
-
-        image_content_type = _normalize_content_type(md.get("content_type"))
-        if active_content_type and image_content_type != active_content_type:
-            continue
-
-        image_course = str(md.get("course") or md.get("course_name") or "").strip()
-        image_source = str(md.get("source_file") or "").strip()
-        image_lesson = str(md.get("lesson") or "").strip()
-        image_topic = str(md.get("topic") or "").strip()
-
-        if active_course and image_course:
-            if _clean_scope_value(image_course) != _clean_scope_value(active_course):
-                continue
-        if active_lesson and image_lesson:
-            if _clean_scope_value(image_lesson) != _clean_scope_value(active_lesson):
-                continue
-        if active_topic and image_topic:
-            if _clean_scope_value(image_topic) != _clean_scope_value(active_topic):
-                continue
-
-        term = str(md.get("term") or "").strip()
-        reading = str(md.get("reading") or "").strip()
-        meaning = str(md.get("meaning") or "").strip()
-        image_page = str(md.get("page") or "").strip()
-
-        anchors = [x for x in (term, reading) if x]
-        query_anchor = None
-        page_anchor = False
-
-        # IMPORTANT: For exercises/reading, page mapping is authoritative even
-        # when an image happens to have term/reading metadata. The previous
-        # version only used page mapping in the `elif not anchors` branch, so
-        # an exercise image with OCR-provided term/reading could be discarded
-        # simply because the user's query did not literally contain that term.
-        if active_content_type in {"Bài tập", "Truyện đọc"}:
-            if image_source and image_page and (image_source, image_page) in active_text_pages:
-                page_anchor = True
-            else:
-                continue
-
-            # Keep an explicit term match as an additional ranking signal, but
-            # NEVER require it for an exercise/reading image.
-            for anchor in anchors:
-                pos = _find_explicit_term_in_query(query_text, anchor)
-                if pos is not None:
-                    query_anchor = pos
-                    break
-        else:
-            # Vocabulary / Kanji / Bộ thủ remain strict: an image must be
-            # anchored by its actual term/reading. Meaning text is never used
-            # as an image anchor.
-            if not anchors:
-                continue
-            for anchor in anchors:
-                pos = _find_explicit_term_in_query(query_text, anchor)
-                if pos is not None:
-                    query_anchor = pos
-                    break
-
-        exact_boost = 2.00 if query_anchor is not None else 0.0
-        page_boost = 1.50 if page_anchor else 0.0
-        normalized_image_key = _extract_image_key(md.get("image_key"))
-        if not normalized_image_key:
-            continue
-
-        image_candidates.append({
-            "score": float(m.score) + exact_boost + page_boost,
-            "key": normalized_image_key,
-            # Always prefer a fresh B2 URL. Stored image_url may be an expired
-            # presigned URL from upload time.
-            "url": b2_url(normalized_image_key) or md.get("image_url"),
-            "term": term,
-            "reading": reading,
-            "meaning": meaning,
-            "page": md.get("page"),
-            "source_file": image_source,
-            "_query_anchor": query_anchor,
-            "_page_anchor": page_anchor,
-        })
-
-    image_candidates.sort(key=lambda x: x["score"], reverse=True)
-
-    images = []
-    rich_images = []
-    seen_image_keys = set()
-    seen_page_images = set()
-
-    for item in image_candidates:
-        if not item["url"] or item["key"] in seen_image_keys:
-            continue
-        # For stories/exercises, multiple educational images can legitimately
-        # live on the same page. Deduplicate by image key, not by page.
-        # Vocabulary/Kanji/Bộ thủ remain strict term/reading mapped.
-        seen_image_keys.add(item["key"])
-        image_payload = {
-            "key": item["key"],
-            "url": item["url"],
-            "term": item.get("term", ""),
-            "reading": item.get("reading", ""),
-            "meaning": item.get("meaning", ""),
-            "page": item.get("page"),
-            "source_file": item.get("source_file", ""),
-            "score": item.get("score", 0),
-            "_page_anchor": bool(item.get("_page_anchor")),
-            "_query_anchor": item.get("_query_anchor"),
-        }
-        images.append({"key": item["key"], "url": item["url"]})
-        rich_images.append(image_payload)
-        if len(images) >= 6:
-            break
-
+    # rich_images was resolved BEFORE Gemini from the exact text chunks.
+    # Do not perform any second semantic image search here.
     content_blocks = build_rich_content_blocks(reply, rich_images)
+    # The client still receives a flat images array for backwards compatibility.
+    images = [{"key": item["key"], "url": item["url"]} for item in rich_images if item.get("url")]
     perf_blocks = time.perf_counter()
 
     # Learning progress is authoritative state for the next turn. Save it before
@@ -2783,6 +2800,7 @@ async def admin_knowledge_upload(
 
             # Mỗi ảnh là MỘT Pinecone record độc lập. Không còn nhét toàn bộ
             # ảnh của trang vào metadata của text chunk.
+            page_chunk_count = len(chunks)
             for img in page_images.get(page_no, []):
                 key = str(img.get("key") or "").strip()
                 if not key:
@@ -2801,10 +2819,23 @@ async def admin_knowledge_upload(
                     "course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,
                     "image_key":key,"image_url":b2_url(key),
+                    # Strict chunk mapping: if the page contains exactly one
+                    # text chunk, the image belongs unambiguously to chunk 0.
+                    # For multi-chunk pages we leave chunk_index unset unless
+                    # the extractor later supplies an explicit mapping.
                     "term":term,"reading":reading,"meaning":meaning,
                     "associated_text":associated_text,"description":description,
                     "bbox":str(img.get("bbox") or "")
                 }
+                if page_chunk_count == 1:
+                    image_md["chunk_index"] = 0
+
+                if img.get("chunk_index") not in (None, ""):
+                    try:
+                        image_md["chunk_index"] = int(img.get("chunk_index"))
+                    except Exception:
+                        image_md["chunk_index"] = str(img.get("chunk_index")).strip()
+
                 if primary:
                     image_md.update({
                         "lesson":primary["lesson"],"topic":primary["topic"],
