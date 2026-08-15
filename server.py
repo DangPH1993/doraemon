@@ -1253,6 +1253,43 @@ def proxy_chat(
 
     low = query_text.strip().lower()
 
+    # Conversational memory: keep the recent turns so short follow-ups such as
+    # "A", "câu tiếp theo", "giải thích câu này" still have their real context.
+    # The client already sends chat_history; this is deliberately kept compact
+    # to control latency while preserving the current exercise/lesson context.
+    recent_history = []
+    for item in (data.chat_history or [])[-8:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        parts = item.get("parts")
+        text = ""
+        if isinstance(parts, list):
+            texts = []
+            for part in parts:
+                if isinstance(part, dict) and part.get("text"):
+                    texts.append(str(part.get("text")))
+            text = " ".join(texts).strip()
+        elif item.get("text"):
+            text = str(item.get("text")).strip()
+        elif item.get("content"):
+            text = str(item.get("content")).strip()
+        if role in {"user", "model", "assistant"} and text:
+            role = "model" if role == "assistant" else role
+            recent_history.append({"role": role, "text": text[-2500:]})
+
+    # For very short follow-ups, include the recent conversation in the RAG
+    # embedding query. This prevents a query like "A" from losing the fact that
+    # the current exercise is Gọi món. The explicit active lesson/scope still
+    # controls the Pinecone filters, so history cannot leak another lesson.
+    rag_query_text = query_text
+    if recent_history and len(query_text) <= 80:
+        history_tail = recent_history[-4:]
+        history_context = " ".join(
+            f"{h['role']}: {h['text']}" for h in history_tail
+        )
+        rag_query_text = f"Ngữ cảnh hội thoại gần đây: {history_context}\nTin nhắn mới: {query_text}"
+
     # Resolve explicit intent before any semantic retrieval. Kanji/Bộ thủ are
     # lessons under Từ vựng, never standalone content types.
     requested_scope = _select_active_scope(low, [], catalog)
@@ -1292,7 +1329,7 @@ def proxy_chat(
     # One embedding request per chat. The previous V3 path accidentally called
     # embed_text() twice before retrieval, which added an unnecessary Gemini call.
     embed_started = time.perf_counter()
-    query_vector = embed_text(query_text)
+    query_vector = embed_text(rag_query_text)
     perf_embed = time.perf_counter()
 
     # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
@@ -1439,7 +1476,10 @@ LỊCH SỬ HỌC CỦA USER:
 NỘI DUNG TÌM ĐƯỢC:
 {chr(10).join(contexts)}
 
-TIN NHẮN:
+LỊCH SỬ HỘI THOẠI GẦN ĐÂY:
+{json.dumps(recent_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+
+TIN NHẮN HIỆN TẠI:
 {query_text}"""
 
     gen_started = time.perf_counter()
@@ -1555,14 +1595,18 @@ TIN NHẮN:
     content_blocks = build_rich_content_blocks(reply, rich_images)
     perf_blocks = time.perf_counter()
 
-    # Save progress AFTER the response has been sent. This removes another
-    # PostgreSQL round-trip from the user's critical path while preserving the
-    # same learning logic in the background.
-    if background_tasks is not None:
-        background_tasks.add_task(
-            _save_learning_event_background,
-            user["id"], query_text, reply, catalog, learning, source_meta, active_scope,
+    # Learning progress is authoritative state for the next turn. Save it before
+    # returning so a follow-up such as "câu tiếp theo" sees the updated position.
+    # The write is kept after Gemini/image construction, so it remains a small
+    # final PostgreSQL operation rather than part of the RAG/Gemini latency.
+    try:
+        event = infer_learning_event(
+            user["id"], query_text, reply, catalog, learning, source_meta, active_scope=active_scope
         )
+        tracked_event = record_learning_event(user["id"], event) if event else None
+    except Exception as e:
+        print("Learning progress save skipped:", type(e).__name__, str(e))
+        tracked_event = None
 
     perf_total_done = time.perf_counter()
     print(
@@ -1590,7 +1634,7 @@ TIN NHẮN:
         "images": images,
         "content_blocks": content_blocks,
         "learning_history_count": len(learning),
-        "learning_progress": {"queued": True},
+        "learning_progress": tracked_event,
     }
 
 
