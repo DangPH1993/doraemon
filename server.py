@@ -1900,6 +1900,28 @@ def proxy_chat(
             c = c[:1800] + "…"
         prompt_contexts.append(c)
 
+    # Compact prompt-only catalog/history. V3.7 accidentally referenced
+    # prompt_catalog/prompt_history without constructing them, causing
+    # NameError before Gemini was called.
+    prompt_history = recent_history[-4:] if recent_history else []
+
+    # Do not send the full catalog on every request. Only expose a compact
+    # catalog when the user is actually asking what to study / for a
+    # recommendation. For ordinary questions this stays empty.
+    prompt_catalog = []
+    if wants_recommendation:
+        for item in (catalog or []):
+            if not isinstance(item, dict):
+                continue
+            prompt_catalog.append({
+                "content_type": item.get("content_type"),
+                "subject": item.get("subject") or item.get("course"),
+                "lesson": item.get("lesson"),
+                "topic": item.get("topic"),
+            })
+            if len(prompt_catalog) >= 24:
+                break
+
     image_marker_rule = ""
     if image_orders:
         markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
