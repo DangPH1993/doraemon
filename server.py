@@ -1351,6 +1351,32 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     if img_lesson and chunk_lesson and img_lesson != chunk_lesson:
         return False
 
+    # Legacy page-chunk fallback for non-vocabulary learning materials.
+    #
+    # The exercise records shown by the user have this schema:
+    #   text chunk: record_type=text, source_file/page/lesson, chunk_index=0
+    #   image records: record_type=image, same source_file/page/lesson,
+    #                  NO chunk_index, each with associated_text + image_key
+    #
+    # In this legacy uploader, the page is the chunk boundary. Therefore all
+    # images belonging to the same source/page/lesson are images of that
+    # selected chunk. We deliberately DO NOT enable this for vocabulary,
+    # because vocabulary items must remain item-locked (Vi != Bao != Khẩu).
+    img_ct = norm_field(md.get("content_type"))
+    chunk_ct = norm_field(chunk_md.get("content_type"))
+    vocabulary_types = {"từ vựng", "tu vung", "vocabulary"}
+
+    if (
+        chunk_index is not None
+        and img_chunk_index is None
+        and img_lesson
+        and chunk_lesson
+        and img_lesson == chunk_lesson
+        and chunk_ct not in vocabulary_types
+        and (not img_ct or not chunk_ct or img_ct == chunk_ct)
+    ):
+        return True
+
     identity_pairs = [
         ("reading", "reading"),
         ("term", "term"),
@@ -1535,6 +1561,8 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
             print(
                 "[IMAGE chunk-exact] "
                 f"order={order} source={sf!r} page={page!r} chunk_index={chunk_index!r} "
+                f"lesson={chunk['metadata'].get('lesson')!r} "
+                f"content_type={chunk['metadata'].get('content_type')!r} "
                 f"candidates={len(res.matches)} accepted={len(found)} rejected={rejected}"
             )
             return found
