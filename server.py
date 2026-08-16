@@ -1,4 +1,5 @@
 import os
+import ast
 import io
 import uuid
 import re
@@ -58,7 +59,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-15-doraemon-learning-flow-v3.2-performance"
+SERVER_VERSION = "2026-08-16-doraemon-learning-flow-v3.3-exercise-chunk-image-lock"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1260,6 +1261,53 @@ def _parse_image_keys(raw):
     return [value] if value else []
 
 
+def _split_exercise_logical_chunks(text: str):
+    """
+    Split a retrieved Bài tập chunk into logical sub-chunks when a single
+    Pinecone text record contains multiple customer/order blocks.
+
+    This is intentionally deterministic and text-only. It never uses image
+    similarity or image metadata to decide where a text chunk starts/ends.
+    The splitter is conservative: when no clear boundary is found, the
+    original text remains one chunk.
+    """
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+
+    # First prefer blank-line separated blocks. OCR/PDF extraction for
+    # conversation-style exercises commonly preserves this structure.
+    blocks = [b.strip() for b in re.split(r"\n\s*\n+", raw) if b.strip()]
+    if len(blocks) > 1 and len(blocks) <= 20:
+        return blocks
+
+    # Then detect common customer/speaker/order headers. The lookahead keeps
+    # the header attached to the following text.
+    header_re = re.compile(
+        r"(?im)^(?=\s*(?:"
+        r"khách(?:\s*hàng)?(?:\s*(?:số\s*)?\d+)?\s*[:：.-]?|"
+        r"kh\s*\d+\s*[:：.-]|"
+        r"người\s*(?:khách|mua)\s*(?:số\s*)?\d+\s*[:：.-]?|"
+        r"[A-H]\s*[:：.-]|"
+        r"お客(?:さん|様)?(?:\s*\d+)?\s*[:：.-]?|"
+        r"客\s*\d+\s*[:：.-]|"
+        r"[①-⑩]"
+        r"))"
+    )
+    starts = [m.start() for m in header_re.finditer(raw)]
+    if len(starts) > 1:
+        chunks = []
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(raw)
+            part = raw[start:end].strip()
+            if part:
+                chunks.append(part)
+        if 1 < len(chunks) <= 20:
+            return chunks
+
+    return [raw]
+
+
 def _chunk_identity(md):
     """
     Identity of one RAG text chunk.
@@ -1317,9 +1365,34 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
         except Exception:
             img_chunk_index = str(raw_img_chunk).strip()
 
+    chunk_type = _normalize_chunk_text_for_match(chunk_md.get("content_type"))
+    is_exercise = chunk_type == "bài tập"
+    is_virtual_exercise = bool(chunk_md.get("_virtual_exercise_split"))
+
+    # For exercise material, associated_text is the safest bridge when older
+    # image records were created before per-chunk image_index metadata existed.
+    # It MUST win over a stale/shared chunk_index (for example, several images
+    # accidentally carrying chunk_index=0 on the same page).
+    img_associated = _normalize_chunk_text_for_match(md.get("associated_text"))
+    chunk_norm = _normalize_chunk_text_for_match(chunk_text)
+    if is_exercise and img_associated and chunk_norm:
+        if img_associated == chunk_norm:
+            return True
+        if len(img_associated) >= 20 and len(chunk_norm) >= 20:
+            shorter, longer = sorted((img_associated, chunk_norm), key=len)
+            if shorter in longer and len(shorter) / len(longer) >= 0.65:
+                return True
+        # An explicitly associated exercise image that does not match this
+        # logical customer/order must never fall through to page/chunk matching.
+        return False
+
     # Strongest identity: both sides have chunk_index and it is identical.
     if chunk_index is not None:
         if img_chunk_index is not None:
+            if is_virtual_exercise:
+                # Virtual exercise chunks are mapped by associated_text above.
+                # A stale shared index is not enough.
+                return False
             return img_chunk_index == chunk_index
     elif img_chunk_index is not None:
         # A chunked image cannot be attached to an unchunked text record.
@@ -1329,7 +1402,6 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     img_text = _normalize_chunk_text_for_match(
         md.get("associated_text") or md.get("text") or md.get("content")
     )
-    chunk_norm = _normalize_chunk_text_for_match(chunk_text)
     if img_text and chunk_norm:
         if img_text == chunk_norm:
             return True
@@ -1351,31 +1423,9 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     if img_lesson and chunk_lesson and img_lesson != chunk_lesson:
         return False
 
-    # Legacy page-chunk fallback for non-vocabulary learning materials.
-    #
-    # The exercise records shown by the user have this schema:
-    #   text chunk: record_type=text, source_file/page/lesson, chunk_index=0
-    #   image records: record_type=image, same source_file/page/lesson,
-    #                  NO chunk_index, each with associated_text + image_key
-    #
-    # In this legacy uploader, the page is the chunk boundary. Therefore all
-    # images belonging to the same source/page/lesson are images of that
-    # selected chunk. We deliberately DO NOT enable this for vocabulary,
-    # because vocabulary items must remain item-locked (Vi != Bao != Khẩu).
-    img_ct = norm_field(md.get("content_type"))
-    chunk_ct = norm_field(chunk_md.get("content_type"))
-    vocabulary_types = {"từ vựng", "tu vung", "vocabulary"}
-
-    if (
-        chunk_index is not None
-        and img_chunk_index is None
-        and img_lesson
-        and chunk_lesson
-        and img_lesson == chunk_lesson
-        and chunk_ct not in vocabulary_types
-        and (not img_ct or not chunk_ct or img_ct == chunk_ct)
-    ):
-        return True
+    # IMPORTANT: no page+lesson fallback for Bài tập.
+    # When chunk_index is unavailable, an exercise image must have exact/strong
+    # associated_text identity; otherwise it is not safe to attach.
 
     identity_pairs = [
         ("reading", "reading"),
@@ -1516,7 +1566,9 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
             "source_file": {"$eq": sf},
             "page": {"$eq": int(page) if str(page).isdigit() else page},
         }
-        if chunk_index is not None:
+        is_exercise = _normalize_chunk_text_for_match(chunk["metadata"].get("content_type")) == "bài tập"
+        is_virtual_exercise = bool(chunk["metadata"].get("_virtual_exercise_split"))
+        if chunk_index is not None and not (is_exercise and is_virtual_exercise):
             filt["chunk_index"] = {"$eq": chunk_index}
 
         # IMPORTANT: do not add reading/term/meaning as Pinecone filter fields
@@ -1527,7 +1579,7 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         try:
             res = index.query(
                 vector=query_vector,
-                top_k=20,
+                top_k=50 if is_exercise else 20,
                 include_metadata=True,
                 namespace=namespace,
                 filter=filt,
@@ -1541,7 +1593,7 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
                 }
                 res = index.query(
                     vector=query_vector,
-                    top_k=20,
+                    top_k=50 if is_exercise else 20,
                     include_metadata=True,
                     namespace=namespace,
                     filter=legacy_filt,
@@ -2074,7 +2126,8 @@ def proxy_chat(
 
     # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
     # Never exceed 10 unless the client explicitly sends a smaller value.
-    retrieval_k = min(10, max(4, int(data.top_k or 8)))
+    retrieval_k = min(50 if requested_content_type == "Bài tập" and (requested_lesson or requested_topic) else 10,
+                      max(4, int(data.top_k or 8)))
 
     text_filter = build_scope_filter(
         "text",
@@ -2165,21 +2218,54 @@ def proxy_chat(
             candidate = query_text_matches(pf)
             usable = _usable_matches(candidate.matches)
 
-            # Legacy records may omit record_type. Retry the same metadata
-            # identity without record_type before relaxing lesson/topic.
-            if not usable:
-                legacy_filter = dict(pf)
-                legacy_filter.pop("record_type", None)
+            legacy_filter = dict(pf)
+            legacy_filter.pop("record_type", None)
+
+            # Bài tập is frequently multi-chunk and older records may omit
+            # record_type. Do not discard those valid text chunks just because
+            # one modern record matched the strict filter. Merge both views
+            # while staying inside the SAME metadata lesson/topic scope.
+            should_merge_legacy = (
+                requested_content_type == "Bài tập" and
+                (requested_lesson or requested_topic)
+            )
+            if should_merge_legacy or not usable:
                 legacy_candidate = index.query(
                     vector=query_vector,
-                    top_k=retrieval_k,
+                    top_k=50 if should_merge_legacy else retrieval_k,
                     include_metadata=True,
                     namespace=namespace,
                     filter=legacy_filter,
                 )
-                usable = _usable_matches(legacy_candidate.matches)
-                if usable:
+                legacy_usable = _usable_matches(legacy_candidate.matches)
+
+                if usable and legacy_usable and should_merge_legacy:
+                    merged = []
+                    seen_keys = set()
+                    for m in list(candidate.matches or []) + list(legacy_candidate.matches or []):
+                        md = m.metadata or {}
+                        key = (
+                            str(getattr(m, "id", "")),
+                            str(md.get("source_file") or ""),
+                            str(md.get("page") or ""),
+                            str(md.get("chunk_index") or ""),
+                            str(md.get("text", md.get("content", "")) or "")[:240],
+                        )
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        if m in usable or m in legacy_usable:
+                            merged.append(m)
+                    candidate.matches = merged
+                    usable = _usable_matches(candidate.matches)
+                    print(
+                        "[RAG priority-merge] metadata match "
+                        f"level={idx_priority + 1} strict={len(_usable_matches(candidate.matches))} "
+                        f"legacy={len(legacy_usable)} total={len(usable)}"
+                    )
+                elif legacy_usable:
                     candidate = legacy_candidate
+                    usable = legacy_usable
                     print(
                         "[RAG priority-legacy] metadata match "
                         f"level={idx_priority + 1} chunks={len(usable)}"
@@ -2409,8 +2495,11 @@ def proxy_chat(
     #   image_key=images/b_th_pdf/page_0001/img_07.jpg
     # Therefore we must use its text AND its image together.
     text_chunks = []
+    seen_chunk_keys = set()
+    exercise_scope = requested_content_type == "Bài tập" and (requested_lesson or requested_topic)
+
     for m in result.matches:
-        md = m.metadata or {}
+        md = dict(m.metadata or {})
         record_type = str(md.get("record_type") or "").strip().lower()
         txt = str(md.get("text", md.get("content", "")) or "").strip()
         associated = str(md.get("associated_text") or "").strip()
@@ -2421,23 +2510,46 @@ def proxy_chat(
                 image_keys = _parse_image_keys(md.get("image_keys"))
 
             if (txt or associated) and image_keys:
-                text_chunks.append({
-                    "text": txt or associated,
-                    "metadata": md,
-                    "score": float(getattr(m, "score", 0) or 0),
-                })
-            continue
+                txt = txt or associated
+            else:
+                continue
 
         if not txt:
             continue
 
-        text_chunks.append({
-            "text": txt,
-            "metadata": md,
-            "score": float(getattr(m, "score", 0) or 0),
-        })
+        base_key = (
+            str(md.get("source_file") or ""),
+            str(md.get("page") or ""),
+            str(md.get("chunk_index") if md.get("chunk_index") not in (None, "") else ""),
+            _normalize_chunk_text_for_match(txt)[:280],
+        )
+        if base_key in seen_chunk_keys:
+            continue
+        seen_chunk_keys.add(base_key)
 
-        if len(text_chunks) >= 6:
+        # A single stored PDF chunk can still contain several customer/order
+        # blocks. Split those deterministically before resolving images so that
+        # each customer gets its own text context and its own image marker.
+        parts = _split_exercise_logical_chunks(txt) if exercise_scope else [txt]
+        do_virtual = exercise_scope and len(parts) > 1
+        for sub_index, part in enumerate(parts):
+            sub_md = dict(md)
+            if do_virtual:
+                # Keep original identity for tracing, but mark the chunk as a
+                # virtual exercise split. Image resolution will use associated
+                # text identity instead of a potentially stale page chunk_index.
+                sub_md["_parent_chunk_index"] = md.get("chunk_index")
+                sub_md["_virtual_exercise_split"] = True
+                sub_md["chunk_index"] = f"virtual:{sub_index}"
+            text_chunks.append({
+                "text": part,
+                "metadata": sub_md,
+                "score": float(getattr(m, "score", 0) or 0),
+            })
+            if len(text_chunks) >= (12 if exercise_scope else 6):
+                break
+
+        if len(text_chunks) >= (12 if exercise_scope else 6):
             break
 
     chunk_debug = []
@@ -2451,6 +2563,8 @@ def proxy_chat(
             "source_file": md.get("source_file"),
             "page": md.get("page"),
             "image_keys": len(_parse_image_keys(md.get("image_key"))),
+            "virtual": bool(md.get("_virtual_exercise_split")),
+            "chunk_index": md.get("chunk_index"),
         })
     print("[RAG chunks]", chunk_debug)
 
@@ -2526,7 +2640,8 @@ def proxy_chat(
         image_marker_rule = (
             f"\n- Các chunk có ảnh tương ứng là: {markers}. "
             "Khi phần trả lời của cậu sử dụng nội dung của một chunk có ảnh, "
-            "hãy đặt marker tương ứng ngay sau đoạn giải thích của chunk đó. "
+            "hãy đặt marker tương ứng NGAY SAU đúng đoạn/câu trả lời của chunk đó. "
+            "Không gom nhiều marker về cuối câu trả lời. Không đổi thứ tự marker. "
             "Marker chỉ là kỹ thuật nội bộ, không được giải thích cho học sinh."
         )
 
