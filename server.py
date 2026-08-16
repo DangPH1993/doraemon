@@ -59,7 +59,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-16-doraemon-learning-flow-v3.3-exercise-chunk-image-lock"
+SERVER_VERSION = "2026-08-16-doraemon-baseline-v5-curriculum-content-type"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -569,7 +569,7 @@ def search(data: ChatRequest, authorization: Optional[str] = Header(default=None
     return {"matches":matches}
 
 
-CONTENT_TYPES = {"Từ vựng", "Ngữ pháp", "Bài tập", "Truyện đọc"}
+CONTENT_TYPES = {"Giáo trình", "Từ vựng", "Ngữ pháp", "Bài tập", "Truyện đọc"}
 
 
 def _normalize_content_type(value):
@@ -899,9 +899,10 @@ def _select_active_scope(query_text, text_matches, catalog):
             course = c
             break
 
-    # Content type: ONLY the four real content types.
+    # Content type: five peer content types.
     explicit_type = None
     explicit_patterns = [
+        ("Giáo trình", ["giáo trình", "học theo giáo trình", "học giáo trình", "theo giáo trình", "trong giáo trình"]),
         ("Truyện đọc", ["truyện đọc", "đọc truyện", "câu chuyện", "học truyện"]),
         ("Bài tập", ["bài tập", "làm bài", "bài quiz", "quiz"]),
         ("Ngữ pháp", ["ngữ pháp", "học ngữ pháp", "ôn ngữ pháp", "grammar"]),
@@ -1007,6 +1008,10 @@ def infer_learning_event(user_id, user_text, reply, catalog, learning, source_me
     # grammar page because the two documents share words/context.
     explicit_type = None
     explicit_patterns = [
+        ("Giáo trình", [
+            "giáo trình", "học theo giáo trình", "học giáo trình",
+            "theo giáo trình", "trong giáo trình"
+        ]),
         ("Truyện đọc", [
             "truyện đọc", "đọc truyện", "câu chuyện", "học truyện",
             "muốn đọc truyện", "học truyện"
@@ -1844,12 +1849,13 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     nickname = user.get("nickname") or "bạn"
 
     curriculum = (
-        "📚 Giáo trình N5 của cậu gồm 4 phần:\n"
-        "1. Ngữ pháp\n"
-        "2. Bài tập\n"
-        "3. Từ vựng\n"
+        "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
+        "1. Giáo trình\n"
+        "2. Ngữ pháp\n"
+        "3. Bài tập\n"
+        "4. Từ vựng\n"
         "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
-        "4. Truyện đọc"
+        "5. Truyện đọc"
     )
 
     if is_new:
@@ -2649,7 +2655,9 @@ def proxy_chat(
 
 NGUYÊN TẮC:
 - Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
-- Nội dung gồm đúng 4 loại: Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
+- Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
+- Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
+- Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
 - Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
@@ -2954,6 +2962,7 @@ function addMetaRow(values={}){
   row.style.cssText="display:grid;grid-template-columns:1fr 1.2fr .9fr 1.2fr .9fr .9fr .9fr auto;gap:6px;margin-bottom:7px;align-items:center";
   row.innerHTML=`
     <select class="m-content-type" title="Loại nội dung">
+      <option value="Giáo trình" ${values.content_type==="Giáo trình"?"selected":""}>Giáo trình</option>
       <option value="Từ vựng" ${values.content_type==="Từ vựng"?"selected":""}>Từ vựng</option>
       <option value="Ngữ pháp" ${values.content_type==="Ngữ pháp"?"selected":""}>Ngữ pháp</option>
       <option value="Bài tập" ${values.content_type==="Bài tập"?"selected":""}>Bài tập</option>
