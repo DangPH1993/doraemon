@@ -2174,7 +2174,7 @@ def proxy_chat(
     if result is not None and (requested_lesson or requested_topic):
         focused_matches = _focus_metadata_matches(
             result.matches,
-            user_message,
+            query_text,
             requested_lesson,
             requested_topic,
             requested_content_type,
@@ -2199,9 +2199,10 @@ def proxy_chat(
             if _usable_matches(candidate.matches):
                 focused_matches = _focus_metadata_matches(
                     _usable_matches(candidate.matches),
-                    user_message,
+                    query_text,
                     requested_lesson,
                     requested_topic,
+                    requested_content_type,
                 )
                 candidate.matches = focused_matches or _usable_matches(candidate.matches)
                 result = candidate
