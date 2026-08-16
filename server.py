@@ -726,29 +726,62 @@ def _scope_matches(query_text, md, require_lesson=False, require_topic=False):
 
 
 def _explicit_lesson_topic(query_text, catalog):
-    """Find the most specific lesson/topic explicitly mentioned by the user."""
-    q = _clean_scope_value(query_text)
-    best = None
-    best_score = -1
+    """
+    Resolve the user's named lesson/topic BEFORE semantic text retrieval.
 
+    Priority:
+      1. exact/longest topic name
+      2. exact/longest lesson name
+      3. course/content type as supporting scope
+
+    Kanji and Bộ thủ are lesson values under Từ vựng.
+    """
+    q = _clean_scope_value(query_text)
+    if not q:
+        return None
+
+    candidates = []
     for item in catalog or []:
         lesson = str(item.get("lesson") or "").strip()
         topic = str(item.get("topic") or "").strip()
         course = str(item.get("course") or item.get("course_name") or "").strip()
+        content_type = _normalize_content_type(item.get("content_type"))
 
+        lesson_n = _clean_scope_value(lesson)
+        topic_n = _clean_scope_value(topic)
+        course_n = _clean_scope_value(course)
+
+        topic_hit = bool(topic_n and (
+            topic_n == q or
+            re.search(rf"(?<!\w){re.escape(topic_n)}(?!\w)", q) or
+            topic_n in q
+        ))
+        lesson_hit = bool(lesson_n and (
+            lesson_n == q or
+            re.search(rf"(?<!\w){re.escape(lesson_n)}(?!\w)", q) or
+            lesson_n in q
+        ))
+        course_hit = bool(course_n and course_n in q)
+
+        if not topic_hit and not lesson_hit:
+            continue
+
+        # Topic is more specific than lesson. Longer names win ties.
         score = 0
-        if course and _clean_scope_value(course) in q:
-            score += 10
-        if lesson and _clean_scope_value(lesson) in q:
-            score += 20
-        if topic and _clean_scope_value(topic) in q:
-            score += 30
+        if topic_hit:
+            score += 1000 + len(topic_n) * 10
+        if lesson_hit:
+            score += 500 + len(lesson_n) * 5
+        if course_hit:
+            score += 50
 
-        if score > best_score:
-            best_score = score
-            best = item
+        candidates.append((score, item))
 
-    return best if best_score > 0 else None
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 def _select_active_scope(query_text, text_matches, catalog):
@@ -1150,6 +1183,72 @@ def _chunk_identity(md):
     return source_file, page, chunk_index
 
 
+def _normalize_chunk_text_for_match(value):
+    value = str(value or "").strip().casefold()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
+    """
+    Strict chunk lock with legacy-safe matching.
+
+    Preferred:
+      source_file + page + chunk_index
+
+    Legacy fallback:
+      source_file + page + associated_text/text matching the selected text
+      chunk. This is still chunk-level, not lesson-level or semantic-image
+      matching.
+    """
+    sf, page, chunk_index = _chunk_identity(chunk_md)
+    img_sf = str(md.get("source_file") or "").strip()
+    img_page = str(md.get("page") or "").strip()
+
+    if not sf or not page or img_sf != sf or img_page != page:
+        return False
+
+    if chunk_index is not None:
+        raw_img_chunk = md.get("chunk_index")
+        if raw_img_chunk not in (None, ""):
+            try:
+                img_chunk = int(raw_img_chunk)
+            except Exception:
+                img_chunk = str(raw_img_chunk).strip()
+            return img_chunk == chunk_index
+
+        # Legacy image record has no chunk_index: only accept it when its own
+        # OCR/associated text identifies the same chunk.
+        img_text = _normalize_chunk_text_for_match(
+            md.get("associated_text") or md.get("text") or md.get("content")
+        )
+        chunk_norm = _normalize_chunk_text_for_match(chunk_text)
+        if not img_text or not chunk_norm:
+            return False
+        if img_text == chunk_norm:
+            return True
+        # Safe containment for OCR variants. Require a substantial shared span.
+        if len(img_text) >= 20 and len(chunk_norm) >= 20:
+            shorter, longer = sorted((img_text, chunk_norm), key=len)
+            if shorter in longer and len(shorter) / len(longer) >= 0.65:
+                return True
+        return False
+
+    # Legacy text chunk without chunk_index: image must also identify the same
+    # chunk by its associated text. Page-only matching is forbidden.
+    img_text = _normalize_chunk_text_for_match(
+        md.get("associated_text") or md.get("text") or md.get("content")
+    )
+    chunk_norm = _normalize_chunk_text_for_match(chunk_text)
+    if not img_text or not chunk_norm:
+        return False
+    if img_text == chunk_norm:
+        return True
+    if len(img_text) >= 20 and len(chunk_norm) >= 20:
+        shorter, longer = sorted((img_text, chunk_norm), key=len)
+        return shorter in longer and len(shorter) / len(longer) >= 0.65
+    return False
+
 def _same_chunk_image(md, chunk_md):
     """Strictly determine whether an image record belongs to a text chunk."""
     sf, page, chunk_index = _chunk_identity(chunk_md)
@@ -1245,7 +1344,7 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
             continue
 
         sf, page, chunk_index = _chunk_identity(md)
-        if sf and page and chunk_index is not None:
+        if sf and page:
             jobs.append((order, chunk, sf, page, chunk_index))
 
     def fetch_exact(job):
@@ -1254,8 +1353,9 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
             "record_type": {"$eq": "image"},
             "source_file": {"$eq": sf},
             "page": {"$eq": int(page) if str(page).isdigit() else page},
-            "chunk_index": {"$eq": chunk_index},
         }
+        if chunk_index is not None:
+            filt["chunk_index"] = {"$eq": chunk_index}
         try:
             res = index.query(
                 vector=query_vector,
@@ -1267,7 +1367,7 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
             found = []
             for m in res.matches:
                 md = m.metadata or {}
-                if not _same_chunk_image(md, chunk["metadata"]):
+                if not _image_belongs_to_text_chunk(md, chunk["metadata"], chunk["text"]):
                     continue
                 found.extend(_image_payload_from_metadata(
                     md, getattr(m, "score", 0), order, chunk["text"]
@@ -1677,7 +1777,23 @@ def proxy_chat(
 
     # Resolve explicit intent before semantic retrieval. Kanji/Bộ thủ are
     # lessons under Từ vựng, never standalone content types.
-    requested_scope = _select_active_scope(low, [], catalog)
+    named_lesson_topic = _explicit_lesson_topic(low, catalog)
+    if named_lesson_topic:
+        requested_scope = {
+            "course": str(
+                named_lesson_topic.get("course")
+                or named_lesson_topic.get("course_name")
+                or ""
+            ).strip() or None,
+            "content_type": _normalize_content_type(
+                named_lesson_topic.get("content_type")
+            ),
+            "lesson": str(named_lesson_topic.get("lesson") or "").strip() or None,
+            "topic": str(named_lesson_topic.get("topic") or "").strip() or None,
+        }
+    else:
+        requested_scope = _select_active_scope(low, [], catalog)
+
     requested_content_type = requested_scope.get("content_type")
     requested_course = requested_scope.get("course")
     requested_lesson = requested_scope.get("lesson")
@@ -1763,19 +1879,65 @@ def proxy_chat(
         requested_topic,
     )
 
-    def query_text_matches():
+    def query_text_matches(filter_override=None):
         return index.query(
             vector=query_vector,
             top_k=retrieval_k,
             include_metadata=True,
             namespace=namespace,
-            filter=text_filter,
+            filter=filter_override if filter_override is not None else text_filter,
         )
+
+    # IMPORTANT: metadata identity wins over semantic similarity.
+    # If the user named a lesson/topic, first select chunks from that exact
+    # lesson/topic. Only when those metadata-scoped queries produce no usable
+    # text do we fall back to broader semantic text retrieval.
+    result = None
+    priority_filters = []
+
+    if requested_lesson and requested_topic:
+        priority_filters.append(build_scope_filter(
+            "text", requested_content_type, requested_course,
+            requested_lesson, requested_topic
+        ))
+    if requested_lesson:
+        priority_filters.append(build_scope_filter(
+            "text", requested_content_type, requested_course,
+            requested_lesson, None
+        ))
+    if requested_topic:
+        priority_filters.append(build_scope_filter(
+            "text", requested_content_type, requested_course,
+            None, requested_topic
+        ))
+
+    for idx_priority, pf in enumerate(priority_filters):
+        try:
+            candidate = query_text_matches(pf)
+            usable = [
+                m for m in candidate.matches
+                if str((m.metadata or {}).get("text", (m.metadata or {}).get("content", "")) or "").strip()
+                and str((m.metadata or {}).get("record_type") or "").strip().lower() != "image"
+            ]
+            if usable:
+                result = candidate
+                print(
+                    "[RAG priority] metadata match "
+                    f"level={idx_priority + 1} lesson={requested_lesson!r} "
+                    f"topic={requested_topic!r} chunks={len(usable)}"
+                )
+                break
+        except Exception as exc:
+            print("[RAG priority] query failed:", type(exc).__name__, str(exc))
+
+    # No named lesson/topic match: use semantic text retrieval within the
+    # explicit content scope. This is the normal fallback.
+    if result is None:
+        result = query_text_matches()
 
     # IMPORTANT: retrieve TEXT first. Images are NOT searched independently.
     # They are resolved later from the exact text chunks that actually enter the
     # RAG context. This is the chunk-locked text↔image rule.
-    result = query_text_matches()
 
     # Compatibility fallback for older Pinecone records:
     # some documents uploaded by previous baselines do not contain
