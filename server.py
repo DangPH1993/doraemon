@@ -340,22 +340,65 @@ def history(limit: int = 100, authorization: Optional[str] = Header(default=None
 
 @app.post("/admin-chat/send")
 def user_send_admin(data: dict, authorization: Optional[str] = Header(default=None)):
+    """
+    Persist a user->admin chat message with client-side idempotency.
+
+    The desktop client may retry the same request after a timeout or network
+    outage. `client_message_id` makes those retries safe: the same logical
+    message is inserted into admin_messages at most once and subsequent retries
+    return the original row.
+    """
     user = current_user(bearer(authorization))
     msg = str(data.get("message", "")).strip()
+    client_message_id = str(data.get("client_message_id", "")).strip()[:128]
     if not msg:
         raise HTTPException(400, "Tin nhắn trống.")
+    if not client_message_id:
+        raise HTTPException(400, "client_message_id là bắt buộc.")
+
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS admin_message_dedup (
+                    client_message_id VARCHAR(128) PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    admin_message_id INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+
+            cur.execute("""
+                SELECT admin_message_id
+                FROM admin_message_dedup
+                WHERE client_message_id=%s AND user_id=%s
+                LIMIT 1
+            """, (client_message_id, user["id"]))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("""
+                    SELECT id,user_id,sender,message,created_at,is_read
+                    FROM admin_messages WHERE id=%s LIMIT 1
+                """, (existing["admin_message_id"],))
+                row = dict(cur.fetchone())
+                conn.commit()
+                return {"message": row, "duplicate": True}
+
             cur.execute("""INSERT INTO admin_messages(user_id,sender,message)
                            VALUES(%s,'user',%s)
                            RETURNING id,user_id,sender,message,created_at,is_read""",
                         (user["id"], msg))
             row = dict(cur.fetchone())
+            cur.execute("""INSERT INTO admin_message_dedup(client_message_id,user_id,admin_message_id)
+                           VALUES(%s,%s,%s)""",
+                        (client_message_id, user["id"], row["id"]))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    return {"message": row}
+    return {"message": row, "duplicate": False}
 
 async def send_json(ws, data):
     try:
