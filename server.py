@@ -1191,15 +1191,20 @@ def _normalize_chunk_text_for_match(value):
 
 def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     """
-    Strict chunk lock with legacy-safe matching.
+    Strict text-chunk -> image-chunk association.
 
-    Preferred:
-      source_file + page + chunk_index
+    Priority:
+      1) exact source_file + page + chunk_index;
+      2) legacy records with no chunk_index: exact OCR/associated text;
+      3) legacy vocabulary records: exact source_file + page + lesson and
+         exact reading/term/meaning identity.
 
-    Legacy fallback:
-      source_file + page + associated_text/text matching the selected text
-      chunk. This is still chunk-level, not lesson-level or semantic-image
-      matching.
+    IMPORTANT:
+      We never use page-only, lesson-only, or vector similarity to attach an
+      image. The vocabulary identity fallback exists because the older
+      Pinecone uploader stored image records without chunk_index. For example,
+      a Bộ Vi image can have reading="Vi", meaning="Vây quanh", lesson="Bộ thủ"
+      while the corresponding text chunk has the same identity.
     """
     sf, page, chunk_index = _chunk_identity(chunk_md)
     img_sf = str(md.get("source_file") or "").strip()
@@ -1208,45 +1213,75 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     if not sf or not page or img_sf != sf or img_page != page:
         return False
 
-    if chunk_index is not None:
-        raw_img_chunk = md.get("chunk_index")
-        if raw_img_chunk not in (None, ""):
-            try:
-                img_chunk = int(raw_img_chunk)
-            except Exception:
-                img_chunk = str(raw_img_chunk).strip()
-            return img_chunk == chunk_index
+    raw_img_chunk = md.get("chunk_index")
+    img_chunk_index = None
+    if raw_img_chunk not in (None, ""):
+        try:
+            img_chunk_index = int(raw_img_chunk)
+        except Exception:
+            img_chunk_index = str(raw_img_chunk).strip()
 
-        # Legacy image record has no chunk_index: only accept it when its own
-        # OCR/associated text identifies the same chunk.
-        img_text = _normalize_chunk_text_for_match(
-            md.get("associated_text") or md.get("text") or md.get("content")
-        )
-        chunk_norm = _normalize_chunk_text_for_match(chunk_text)
-        if not img_text or not chunk_norm:
-            return False
-        if img_text == chunk_norm:
-            return True
-        # Safe containment for OCR variants. Require a substantial shared span.
-        if len(img_text) >= 20 and len(chunk_norm) >= 20:
-            shorter, longer = sorted((img_text, chunk_norm), key=len)
-            if shorter in longer and len(shorter) / len(longer) >= 0.65:
-                return True
+    # Strongest identity: both sides have chunk_index and it is identical.
+    if chunk_index is not None:
+        if img_chunk_index is not None:
+            return img_chunk_index == chunk_index
+    elif img_chunk_index is not None:
+        # A chunked image cannot be attached to an unchunked text record.
         return False
 
-    # Legacy text chunk without chunk_index: image must also identify the same
-    # chunk by its associated text. Page-only matching is forbidden.
+    # Legacy exact text identity.
     img_text = _normalize_chunk_text_for_match(
         md.get("associated_text") or md.get("text") or md.get("content")
     )
     chunk_norm = _normalize_chunk_text_for_match(chunk_text)
-    if not img_text or not chunk_norm:
+    if img_text and chunk_norm:
+        if img_text == chunk_norm:
+            return True
+
+        # OCR can differ in whitespace/punctuation. Keep this conservative:
+        # only accept a substantial containment relationship.
+        if len(img_text) >= 20 and len(chunk_norm) >= 20:
+            shorter, longer = sorted((img_text, chunk_norm), key=len)
+            if shorter in longer and len(shorter) / len(longer) >= 0.65:
+                return True
+
+    # Legacy vocabulary identity. This is the missing case for records such
+    # as Bộ Vi where image records have no chunk_index.
+    def norm_field(value):
+        return _normalize_chunk_text_for_match(value)
+
+    img_lesson = norm_field(md.get("lesson"))
+    chunk_lesson = norm_field(chunk_md.get("lesson"))
+    if img_lesson and chunk_lesson and img_lesson != chunk_lesson:
         return False
-    if img_text == chunk_norm:
+
+    identity_pairs = [
+        ("reading", "reading"),
+        ("term", "term"),
+        ("meaning", "meaning"),
+    ]
+
+    matched = 0
+    available = 0
+    for img_field, chunk_field in identity_pairs:
+        img_value = norm_field(md.get(img_field))
+        chunk_value = norm_field(chunk_md.get(chunk_field))
+        if not img_value or not chunk_value:
+            continue
+        available += 1
+        if img_value == chunk_value:
+            matched += 1
+
+    # At least one exact vocabulary identity must match, and when both
+    # reading+meaning (or term+reading) exist they must not conflict.
+    if matched >= 1:
+        for img_field, chunk_field in identity_pairs:
+            img_value = norm_field(md.get(img_field))
+            chunk_value = norm_field(chunk_md.get(chunk_field))
+            if img_value and chunk_value and img_value != chunk_value:
+                return False
         return True
-    if len(img_text) >= 20 and len(chunk_norm) >= 20:
-        shorter, longer = sorted((img_text, chunk_norm), key=len)
-        return shorter in longer and len(shorter) / len(longer) >= 0.65
+
     return False
 
 def _same_chunk_image(md, chunk_md):
@@ -1338,9 +1373,14 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         if direct_keys:
             direct_md = dict(md)
             direct_md["image_key"] = direct_keys
-            results.extend(_image_payload_from_metadata(
+            direct_payload = _image_payload_from_metadata(
                 direct_md, chunk.get("score", 0), order, chunk_text
-            ))
+            )
+            print(
+                "[IMAGE direct] "
+                f"order={order} keys={len(direct_keys)} urls={len(direct_payload)}"
+            )
+            results.extend(direct_payload)
             continue
 
         sf, page, chunk_index = _chunk_identity(md)
@@ -1356,6 +1396,16 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         }
         if chunk_index is not None:
             filt["chunk_index"] = {"$eq": chunk_index}
+
+        # Legacy vocabulary image records often have no chunk_index but do have
+        # reading/term/meaning. Add only exact metadata filters when the text
+        # chunk contains those same fields. This makes the lookup deterministic
+        # for Bộ Vi/Kanji without ever doing a semantic image search.
+        for field in ("reading", "term", "meaning", "lesson"):
+            value = str(chunk["metadata"].get(field) or "").strip()
+            if value and field not in filt:
+                filt[field] = {"$eq": value}
+
         try:
             res = index.query(
                 vector=query_vector,
@@ -1365,13 +1415,22 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
                 filter=filt,
             )
             found = []
+            rejected = 0
             for m in res.matches:
                 md = m.metadata or {}
                 if not _image_belongs_to_text_chunk(md, chunk["metadata"], chunk["text"]):
+                    rejected += 1
                     continue
-                found.extend(_image_payload_from_metadata(
+                payload = _image_payload_from_metadata(
                     md, getattr(m, "score", 0), order, chunk["text"]
-                ))
+                )
+                found.extend(payload)
+
+            print(
+                "[IMAGE chunk-exact] "
+                f"order={order} source={sf!r} page={page!r} chunk_index={chunk_index!r} "
+                f"candidates={len(res.matches)} accepted={len(found)} rejected={rejected}"
+            )
             return found
         except Exception as exc:
             print("[IMAGE chunk-exact] failed:", sf, page, chunk_index, type(exc).__name__, str(exc))
