@@ -1397,15 +1397,11 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         if chunk_index is not None:
             filt["chunk_index"] = {"$eq": chunk_index}
 
-        # Legacy vocabulary image records often have no chunk_index but do have
-        # reading/term/meaning. Add only exact metadata filters when the text
-        # chunk contains those same fields. This makes the lookup deterministic
-        # for Bộ Vi/Kanji without ever doing a semantic image search.
-        for field in ("reading", "term", "meaning", "lesson"):
-            value = str(chunk["metadata"].get(field) or "").strip()
-            if value and field not in filt:
-                filt[field] = {"$eq": value}
-
+        # IMPORTANT: do not add reading/term/meaning as Pinecone filter fields
+        # here. Older image records are not schema-identical to text records
+        # (some omit term or chunk_index). Query the exact source/page and let
+        # _image_belongs_to_text_chunk perform the strict identity check in
+        # Python. This avoids false zero-result filters for Bộ Vi/Kanji.
         try:
             res = index.query(
                 vector=query_vector,
@@ -1414,6 +1410,20 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
                 namespace=namespace,
                 filter=filt,
             )
+            # Legacy image records may not have record_type="image". Retry the
+            # exact same source/page identity without record_type.
+            if not res.matches:
+                legacy_filt = {
+                    "source_file": {"$eq": sf},
+                    "page": {"$eq": int(page) if str(page).isdigit() else page},
+                }
+                res = index.query(
+                    vector=query_vector,
+                    top_k=20,
+                    include_metadata=True,
+                    namespace=namespace,
+                    filter=legacy_filt,
+                )
             found = []
             rejected = 0
             for m in res.matches:
@@ -1853,6 +1863,18 @@ def proxy_chat(
     else:
         requested_scope = _select_active_scope(low, [], catalog)
 
+    # Generic vocabulary identity routing for names such as "Bộ Vi" where the
+    # catalog stores lesson="Bộ thủ" but does not store the individual term as
+    # topic. The lesson is still authoritative; the actual term is left in the
+    # semantic text query so the text chunk is selected inside that lesson.
+    if not named_lesson_topic:
+        if re.search(r"\bbộ\s+[^\s]+", low, flags=re.UNICODE):
+            requested_scope["content_type"] = "Từ vựng"
+            requested_scope["lesson"] = "Bộ thủ"
+        elif re.search(r"\bkanji\s+[^\s]+", low, flags=re.UNICODE):
+            requested_scope["content_type"] = "Từ vựng"
+            requested_scope["lesson"] = "Kanji"
+
     requested_content_type = requested_scope.get("content_type")
     requested_course = requested_scope.get("course")
     requested_lesson = requested_scope.get("lesson")
@@ -1954,30 +1976,91 @@ def proxy_chat(
     result = None
     priority_filters = []
 
-    if requested_lesson and requested_topic:
+    # Metadata identity is authoritative. We progressively relax ONLY the
+    # metadata filter, never the lesson/topic intent:
+    #   1) lesson + topic + content_type (+ course when available)
+    #   2) lesson + content_type
+    #   3) topic + content_type
+    #   4) lesson
+    #   5) topic
+    #   6) content_type
+    # Then, and only then, semantic text retrieval is used inside the best
+    # available lesson/topic scope.
+    def add_priority_filter(content_type=None, course=None, lesson=None, topic=None):
+        if not any(x is not None and x != "" for x in (content_type, course, lesson, topic)):
+            return
         priority_filters.append(build_scope_filter(
-            "text", requested_content_type, requested_course,
-            requested_lesson, requested_topic
+            "text", content_type, course, lesson, topic
         ))
+
+    add_priority_filter(requested_content_type, requested_course, requested_lesson, requested_topic)
     if requested_lesson:
-        priority_filters.append(build_scope_filter(
-            "text", requested_content_type, requested_course,
-            requested_lesson, None
-        ))
+        add_priority_filter(requested_content_type, None, requested_lesson, None)
+        add_priority_filter(None, None, requested_lesson, None)
     if requested_topic:
-        priority_filters.append(build_scope_filter(
-            "text", requested_content_type, requested_course,
-            None, requested_topic
-        ))
+        add_priority_filter(requested_content_type, None, None, requested_topic)
+        add_priority_filter(None, None, None, requested_topic)
+    if requested_content_type:
+        add_priority_filter(requested_content_type, None, None, None)
+
+    # Remove duplicate filters while preserving priority.
+    unique_filters = []
+    seen_filter_repr = set()
+    for pf in priority_filters:
+        marker = repr(sorted(pf.items()))
+        if marker not in seen_filter_repr:
+            seen_filter_repr.add(marker)
+            unique_filters.append(pf)
+    priority_filters = unique_filters
+
+    def _usable_matches(matches):
+        usable = []
+        for m in matches or []:
+            md = m.metadata or {}
+            rt = str(md.get("record_type") or "").strip().lower()
+            txt = str(md.get("text", md.get("content", "")) or "").strip()
+            associated = str(md.get("associated_text") or "").strip()
+
+            if rt != "image":
+                if txt:
+                    usable.append(m)
+                continue
+
+            # Legacy schema: an image record can itself be the complete
+            # text+image chunk (text + image_key on the same Pinecone record).
+            image_keys = _parse_image_keys(md.get("image_key"))
+            if not image_keys:
+                image_keys = _parse_image_keys(md.get("image_keys"))
+            if (txt or associated) and image_keys:
+                usable.append(m)
+
+        return usable
 
     for idx_priority, pf in enumerate(priority_filters):
         try:
             candidate = query_text_matches(pf)
-            usable = [
-                m for m in candidate.matches
-                if str((m.metadata or {}).get("text", (m.metadata or {}).get("content", "")) or "").strip()
-                and str((m.metadata or {}).get("record_type") or "").strip().lower() != "image"
-            ]
+            usable = _usable_matches(candidate.matches)
+
+            # Legacy records may omit record_type. Retry the same metadata
+            # identity without record_type before relaxing lesson/topic.
+            if not usable:
+                legacy_filter = dict(pf)
+                legacy_filter.pop("record_type", None)
+                legacy_candidate = index.query(
+                    vector=query_vector,
+                    top_k=retrieval_k,
+                    include_metadata=True,
+                    namespace=namespace,
+                    filter=legacy_filter,
+                )
+                usable = _usable_matches(legacy_candidate.matches)
+                if usable:
+                    candidate = legacy_candidate
+                    print(
+                        "[RAG priority-legacy] metadata match "
+                        f"level={idx_priority + 1} chunks={len(usable)}"
+                    )
+
             if usable:
                 result = candidate
                 print(
@@ -1989,10 +2072,41 @@ def proxy_chat(
         except Exception as exc:
             print("[RAG priority] query failed:", type(exc).__name__, str(exc))
 
-    # No named lesson/topic match: use semantic text retrieval within the
-    # explicit content scope. This is the normal fallback.
+    # If exact metadata identity did not find a chunk, do semantic text search
+    # INSIDE the identified lesson/topic/content scope. This is the requested
+    # order: lesson/topic first, text similarity second.
     if result is None:
-        result = query_text_matches()
+        scoped_semantic_filter = build_scope_filter(
+            "text",
+            requested_content_type,
+            None,  # course is deliberately relaxed first
+            requested_lesson,
+            requested_topic,
+        ) if (requested_content_type or requested_lesson or requested_topic) else None
+
+        try:
+            candidate = query_text_matches(scoped_semantic_filter)
+            if _usable_matches(candidate.matches):
+                result = candidate
+                print(
+                    "[RAG semantic-scoped] "
+                    f"content_type={requested_content_type!r} "
+                    f"lesson={requested_lesson!r} topic={requested_topic!r} "
+                    f"chunks={len(_usable_matches(candidate.matches))}"
+                )
+        except Exception as exc:
+            print("[RAG semantic-scoped] query failed:", type(exc).__name__, str(exc))
+
+    # Last semantic fallback only when no lesson/topic scope can be identified.
+    if result is None:
+        result = query_text_matches(
+            build_scope_filter("text", requested_content_type, None, None, None)
+            if requested_content_type else None
+        )
+        print(
+            "[RAG semantic-fallback] "
+            f"content_type={requested_content_type!r} chunks={len(_usable_matches(result.matches))}"
+        )
 
     # IMPORTANT: retrieve TEXT first. Images are NOT searched independently.
     # They are resolved later from the exact text chunks that actually enter the
@@ -2015,13 +2129,19 @@ def proxy_chat(
             md = m.metadata or {}
             rt = str(md.get("record_type") or "").strip().lower()
             txt = str(md.get("text", md.get("content", "")) or "").strip()
-            if rt == "image":
-                # Legacy story OCR can still be a text-bearing image record;
-                # it will be considered below only when there are no normal
-                # text chunks.
+            associated = str(md.get("associated_text") or "").strip()
+
+            if rt != "image":
+                if txt:
+                    usable.append(m)
                 continue
-            if txt:
+
+            image_keys = _parse_image_keys(md.get("image_key"))
+            if not image_keys:
+                image_keys = _parse_image_keys(md.get("image_keys"))
+            if (txt or associated) and image_keys:
                 usable.append(m)
+
         return usable
 
     usable_initial = _usable_text_matches(result.matches)
@@ -2124,29 +2244,45 @@ def proxy_chat(
             "topic": active_topic,
         }
 
-    # Select the exact text chunks that will be sent to Gemini. These are the
-    # ONLY chunks allowed to contribute images.
+    # Select the exact chunks that will be sent to Gemini. These are the ONLY
+    # chunks allowed to contribute images.
+    #
+    # Normal schema:
+    #   record_type=text -> text chunk
+    #
+    # Legacy schema used by some vocabulary uploads:
+    #   record_type=image + text/associated_text + image_key
+    #   -> this ONE Pinecone record is itself the complete text+image chunk.
+    #
+    # For example, the supplied Bộ Vi record has:
+    #   content_type=Từ vựng
+    #   lesson=Bộ thủ
+    #   reading=Vi
+    #   meaning=Vây quanh
+    #   text=...
+    #   image_key=images/b_th_pdf/page_0001/img_07.jpg
+    # Therefore we must use its text AND its image together.
     text_chunks = []
     for m in result.matches:
         md = m.metadata or {}
         record_type = str(md.get("record_type") or "").strip().lower()
         txt = str(md.get("text", md.get("content", "")) or "").strip()
+        associated = str(md.get("associated_text") or "").strip()
 
-        if not txt:
+        if record_type == "image":
+            image_keys = _parse_image_keys(md.get("image_key"))
+            if not image_keys:
+                image_keys = _parse_image_keys(md.get("image_keys"))
+
+            if (txt or associated) and image_keys:
+                text_chunks.append({
+                    "text": txt or associated,
+                    "metadata": md,
+                    "score": float(getattr(m, "score", 0) or 0),
+                })
             continue
 
-        # Image records are not treated as an independent RAG source. They may
-        # only participate when they themselves are the text-bearing chunk
-        # selected by a future/legacy OCR schema.
-        if record_type == "image":
-            if active_content_type in {"Truyện đọc", "Bài tập"}:
-                ocr_txt = str(md.get("associated_text") or txt).strip()
-                if ocr_txt:
-                    text_chunks.append({
-                        "text": ocr_txt,
-                        "metadata": md,
-                        "score": float(getattr(m, "score", 0) or 0),
-                    })
+        if not txt:
             continue
 
         text_chunks.append({
@@ -2158,31 +2294,20 @@ def proxy_chat(
         if len(text_chunks) >= 6:
             break
 
-    # Legacy compatibility: an older story/exercise uploader may have stored
-    # OCR text only on an image record. If no normal text chunk survived, use
-    # that exact retrieved image record as the text-bearing chunk. Its own
-    # image_key then becomes the only allowed image for that chunk.
-    if not text_chunks and active_content_type in {"Truyện đọc", "Bài tập"}:
-        for m in result.matches:
-            md = m.metadata or {}
-            rt = str(md.get("record_type") or "").strip().lower()
-            if rt != "image":
-                continue
-            ocr_txt = str(
-                md.get("associated_text")
-                or md.get("text")
-                or md.get("content")
-                or ""
-            ).strip()
-            if not ocr_txt:
-                continue
-            text_chunks.append({
-                "text": ocr_txt,
-                "metadata": md,
-                "score": float(getattr(m, "score", 0) or 0),
-            })
-            if len(text_chunks) >= 6:
-                break
+    chunk_debug = []
+    for c in text_chunks[:6]:
+        md = c["metadata"]
+        chunk_debug.append({
+            "record_type": md.get("record_type"),
+            "lesson": md.get("lesson"),
+            "topic": md.get("topic"),
+            "reading": md.get("reading"),
+            "source_file": md.get("source_file"),
+            "page": md.get("page"),
+            "image_keys": len(_parse_image_keys(md.get("image_key"))),
+        })
+    print("[RAG chunks]", chunk_debug)
+
 
     # Resolve images ONLY for these exact text chunks.
     rich_images = _retrieve_images_for_text_chunks(
@@ -2328,8 +2453,8 @@ TIN NHẮN HIỆN TẠI:
             perf_gen - perf_rag,
             perf_blocks - perf_gen,
             perf_total_done - perf_total,
-            len(result.matches),
-            len(image_result.matches),
+            len(text_chunks),
+            len(rich_images),
             len(prompt_catalog),
             1 if active_learning else 0,
         )
