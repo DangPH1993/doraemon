@@ -784,6 +784,102 @@ def _explicit_lesson_topic(query_text, catalog):
     return candidates[0][1]
 
 
+
+def _focus_metadata_matches(matches, query_text, lesson=None, topic=None,
+                            content_type=None):
+    """
+    Content-type-aware second-stage selection.
+
+    The first stage scopes by lesson/topic. The second stage behaves differently:
+      - Vocabulary with a specific item (reading/term/meaning such as "Bộ Vi"):
+        narrow to that item.
+      - Reading/Grammar/Exercise: keep all chunks belonging to the identified
+        lesson/topic. These are multi-chunk learning materials and must not be
+        collapsed to one chunk merely because one word appears in the query.
+
+    Images remain locked to the selected chunk later in the pipeline.
+    """
+    if not matches:
+        return []
+
+    ct = _clean_scope_value(content_type)
+    # "Từ vựng" is the only content type where lesson names such as Bộ thủ or
+    # Kanji represent individual vocabulary items.
+    is_vocabulary = ct in {"từ vựng", "tu vung", "vocabulary"}
+
+    if not is_vocabulary:
+        return list(matches)
+
+    q = _clean_scope_value(query_text)
+
+    generic = {
+        "bộ thủ", "kanji", "từ vựng", "từ mới", "học", "học về", "cho tôi biết",
+        "giải thích", "là gì", "nghĩa là gì", "ý nghĩa", "thông tin",
+        "có nghĩa gì", "hãy dạy", "dạy", "về", "của", "cho", "biết",
+    }
+    q_tokens = [
+        t for t in re.findall(r"[\wÀ-ỹ一-龥ぁ-んァ-ンー]+", q)
+        if t not in generic
+    ]
+
+    scored = []
+    for idx, m in enumerate(matches):
+        md = m.metadata or {}
+
+        fields = {
+            "topic": _clean_scope_value(md.get("topic")),
+            "reading": _clean_scope_value(md.get("reading")),
+            "term": _clean_scope_value(md.get("term")),
+            "meaning": _clean_scope_value(md.get("meaning")),
+            "associated_text": _clean_scope_value(md.get("associated_text")),
+        }
+
+        item_fields = [
+            fields["topic"], fields["reading"], fields["term"],
+            fields["meaning"], fields["associated_text"]
+        ]
+
+        score = 0
+        exact_hits = 0
+
+        for value in item_fields:
+            if not value:
+                continue
+            if value in q or q in value:
+                exact_hits += 1
+                score = max(score, 1000 + len(value))
+
+        for token in q_tokens:
+            if len(token) < 2:
+                continue
+            for value in item_fields:
+                if value and (token == value or token in value):
+                    exact_hits += 1
+                    score = max(score, 900 + len(token))
+
+        if exact_hits:
+            score += exact_hits * 50
+
+        scored.append((score, float(getattr(m, "score", 0) or 0), idx, m))
+
+    strong = [x for x in scored if x[0] >= 900]
+    if not strong:
+        return list(matches)
+
+    strong.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_score = strong[0][0]
+    focused = [x[3] for x in strong if x[0] == best_score]
+
+    print(
+        "[RAG item-focus] "
+        f"content_type={content_type!r} lesson={lesson!r} topic={topic!r} "
+        f"query={query_text!r} candidates={len(matches)} "
+        f"selected={len(focused)} best_score={best_score}"
+    )
+    return focused
+
+
+
 def _select_active_scope(query_text, text_matches, catalog):
     """
     Determine the active learning scope in strict order:
@@ -2072,6 +2168,20 @@ def proxy_chat(
         except Exception as exc:
             print("[RAG priority] query failed:", type(exc).__name__, str(exc))
 
+    # The metadata filter intentionally selects the lesson/topic first.
+    # Now, if the user's question names a specific item inside that lesson
+    # (e.g. "Bộ Vi"), reduce the lesson-wide result to that exact chunk.
+    if result is not None and (requested_lesson or requested_topic):
+        focused_matches = _focus_metadata_matches(
+            result.matches,
+            user_message,
+            requested_lesson,
+            requested_topic,
+            requested_content_type,
+        )
+        if focused_matches:
+            result.matches = focused_matches
+
     # If exact metadata identity did not find a chunk, do semantic text search
     # INSIDE the identified lesson/topic/content scope. This is the requested
     # order: lesson/topic first, text similarity second.
@@ -2087,6 +2197,13 @@ def proxy_chat(
         try:
             candidate = query_text_matches(scoped_semantic_filter)
             if _usable_matches(candidate.matches):
+                focused_matches = _focus_metadata_matches(
+                    _usable_matches(candidate.matches),
+                    user_message,
+                    requested_lesson,
+                    requested_topic,
+                )
+                candidate.matches = focused_matches or _usable_matches(candidate.matches)
                 result = candidate
                 print(
                     "[RAG semantic-scoped] "
