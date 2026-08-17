@@ -61,7 +61,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.3-calendar-month-vn-time"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.4-payment-packages"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -146,6 +146,19 @@ def init_db():
                 question_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, usage_date)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS payment_packages (
+                months INTEGER PRIMARY KEY,
+                plan_name VARCHAR(50) NOT NULL,
+                price_vnd BIGINT NOT NULL DEFAULT 0,
+                qr_key TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""INSERT INTO payment_packages(months,plan_name,price_vnd,qr_key)
+                           VALUES
+                           (1,'1 tháng',0,NULL),
+                           (3,'3 tháng',0,NULL),
+                           (6,'6 tháng',0,NULL)
+                           ON CONFLICT(months) DO NOTHING;""")
 
             # Safe migrations for databases created by previous versions.
             for sql in [
@@ -368,6 +381,32 @@ def enforce_question_limit(user_id):
     info["used_today"] = used
     info["remaining_today"] = max(0, 5-used)
     return info
+
+
+@app.get("/payments/packages")
+def payment_packages(authorization: Optional[str] = Header(default=None)):
+    """Return admin-configured purchase options for the logged-in user."""
+    user = current_user(bearer(authorization))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT months,plan_name,price_vnd,qr_key,updated_at FROM payment_packages WHERE months IN (1,3,6) ORDER BY months")
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    by_months = {int(r["months"]): r for r in rows}
+    out = []
+    for months in (1,3,6):
+        r = by_months.get(months, {"months":months,"plan_name":f"{months} tháng","price_vnd":0,"qr_key":None,"updated_at":None})
+        out.append({
+            "months": months,
+            "plan_name": r.get("plan_name") or f"{months} tháng",
+            "price_vnd": int(r.get("price_vnd") or 0),
+            "price_display": f"{int(r.get('price_vnd') or 0):,}".replace(",", ".") + " đ" if int(r.get("price_vnd") or 0) > 0 else "Liên hệ Admin",
+            "qr_url": b2_url(r.get("qr_key")) if r.get("qr_key") else None,
+            "payment_content": f"{user['phone']}_mua gói {r.get('plan_name') or f'{months} tháng'}"
+        })
+    return {"timezone":"Asia/Ho_Chi_Minh","packages":out}
 
 
 @app.post("/auth/register")
@@ -3057,6 +3096,12 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 </div>
 
 <div class="card">
+<h3>💳 Cấu hình gói thanh toán</h3>
+<div class="small" style="margin-bottom:10px">Thiết lập giá và QR code cho 1 tháng / 3 tháng / 6 tháng. Sau khi user chuyển khoản, Admin xác nhận rồi cấp gói tương ứng.</div>
+<div id="paymentPackagesAdmin"></div>
+</div>
+
+<div class="card">
 <button onclick="loadUsers()">🔄 Làm mới</button>
 <span id="count" class="small"></span>
 <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
@@ -3098,6 +3143,7 @@ async function login(){
     document.getElementById("panel").style.display="block";
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadUsers();
+    await loadPaymentPackages();
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
@@ -3159,6 +3205,38 @@ async function uploadKnowledge(event){
     document.getElementById("pdfFile").value="";
   }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
   finally{btn.disabled=false}
+}
+
+async function loadPaymentPackages(){
+  try{
+    const d=await api("/admin/api/payment-packages?password="+encodeURIComponent(pw));
+    document.getElementById("paymentPackagesAdmin").innerHTML=d.packages.map(p=>{
+      const preview=p.qr_url?`<img src="${esc(p.qr_url)}" style="width:110px;height:110px;object-fit:contain;border:1px solid #ddd;border-radius:6px;margin-top:7px">`:`<div class="small" style="margin-top:7px;color:#999">Chưa có QR</div>`;
+      return `<div style="display:grid;grid-template-columns:90px 160px 1fr 130px;gap:10px;align-items:center;border-top:1px solid #eee;padding:10px 0">
+        <b>${esc(p.plan_name)}</b>
+        <input id="price-${p.months}" type="number" min="0" step="1000" value="${Number(p.price_vnd||0)}" placeholder="Giá VNĐ">
+        <div>${preview}<div class="small">${esc(p.qr_key||"")}</div></div>
+        <div>
+          <input id="qr-${p.months}" type="file" accept="image/png,image/jpeg,image/webp" style="width:100%">
+          <button style="margin-top:6px" onclick="savePaymentPackage(${p.months})">Lưu</button>
+        </div>
+      </div>`;
+    }).join("");
+  }catch(e){ document.getElementById("paymentPackagesAdmin").textContent="Không tải được cấu hình thanh toán: "+e.message; }
+}
+async function savePaymentPackage(months){
+  const fd=new FormData();
+  fd.append("password",pw);
+  fd.append("price_vnd",document.getElementById("price-"+months).value||0);
+  const file=document.getElementById("qr-"+months).files[0];
+  if(file) fd.append("qr_file",file);
+  try{
+    const r=await fetch("/admin/api/payment-packages/"+months,{method:"POST",body:fd});
+    const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}}
+    if(!r.ok)throw Error(d.detail||("HTTP "+r.status));
+    alert("Đã lưu cấu hình "+months+" tháng.");
+    loadPaymentPackages();
+  }catch(e){alert("Không lưu được: "+e.message);}
 }
 
 async function loadUsers(){
@@ -3819,6 +3897,61 @@ def admin_knowledge_images(password: str, source_file: str = ""):
     for row in rows:
         row["url"]=b2_url(row.get("image_key"))
     return {"success":True,"images":rows}
+
+@app.get("/admin/api/payment-packages")
+def admin_payment_packages(password: str):
+    check_admin(password)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT months,plan_name,price_vnd,qr_key,updated_at FROM payment_packages WHERE months IN (1,3,6) ORDER BY months")
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"packages":[{
+        "months": int(r["months"]),
+        "plan_name": r["plan_name"],
+        "price_vnd": int(r["price_vnd"] or 0),
+        "qr_key": r.get("qr_key"),
+        "qr_url": b2_url(r.get("qr_key")) if r.get("qr_key") else None,
+        "updated_at": r.get("updated_at")
+    } for r in rows]}
+
+
+@app.post("/admin/api/payment-packages/{months}")
+async def admin_payment_package(months: int, password: str = Form(...), price_vnd: int = Form(0), qr_file: UploadFile | None = File(None)):
+    check_admin(password)
+    if months not in (1,3,6):
+        raise HTTPException(400, "Chỉ hỗ trợ gói 1, 3 hoặc 6 tháng.")
+    if price_vnd < 0:
+        raise HTTPException(400, "Giá gói không được âm.")
+    qr_key = None
+    if qr_file is not None and qr_file.filename:
+        content_type = (qr_file.content_type or "").lower()
+        if content_type not in {"image/png","image/jpeg","image/webp"}:
+            raise HTTPException(400, "QR code phải là PNG, JPG hoặc WEBP.")
+        data = await qr_file.read()
+        if len(data) > 5 * 1024 * 1024:
+            raise HTTPException(400, "Ảnh QR tối đa 5MB.")
+        if not b2_ready():
+            raise HTTPException(500, "Backblaze B2 chưa được cấu hình nên chưa thể lưu QR.")
+        ext = {"image/png":"png","image/jpeg":"jpg","image/webp":"webp"}.get(content_type, "png")
+        qr_key = f"payments/qr_{months}_month.{ext}"
+        b2_put_bytes(qr_key, data, content_type)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            if qr_key:
+                cur.execute("UPDATE payment_packages SET price_vnd=%s,qr_key=%s,updated_at=NOW() WHERE months=%s", (price_vnd,qr_key,months))
+            else:
+                cur.execute("UPDATE payment_packages SET price_vnd=%s,updated_at=NOW() WHERE months=%s", (price_vnd,months))
+            if cur.rowcount == 0:
+                cur.execute("INSERT INTO payment_packages(months,plan_name,price_vnd,qr_key) VALUES(%s,%s,%s,%s)", (months,f"{months} tháng",price_vnd,qr_key))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"success":True,"months":months,"price_vnd":price_vnd,"qr_key":qr_key}
+
 
 @app.get("/admin/api/users")
 def admin_users(password: str):
