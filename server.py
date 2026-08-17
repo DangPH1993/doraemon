@@ -60,7 +60,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.1-free-reset-vn-time"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.2-free-reset-authoritative-vn-time"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3918,24 +3918,65 @@ def admin_ws_token(password: str):
 
 @app.post("/admin/api/users/{user_id}/reset-free")
 def admin_reset_free(user_id:int,data:dict):
+    """Return a user to a clean Free plan immediately.
+
+    The operation is authoritative: any existing paid subscription rows are
+    marked EXPIRED, then a fresh Free subscription row is inserted.
+    Today's Free quota is also reset to 0 so the user gets a fresh 5/5 today.
+    Learning progress and admin chat are intentionally preserved.
+    """
     check_admin(str(data.get("password","")))
     now = _now_local()
-    conn=db()
+    today = now.date()
+    conn = db()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
             if not cur.fetchone():
                 raise HTTPException(404,"Không tìm thấy user.")
-            cur.execute("""SELECT id FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1""", (user_id,))
-            old=cur.fetchone()
-            if old:
-                cur.execute("""UPDATE subscriptions SET plan='Free', started_at=%s, expires_at=NULL, status='ACTIVE' WHERE id=%s""", (now, old["id"]))
-            else:
-                cur.execute("""INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,'Free',%s,NULL,'ACTIVE')""", (user_id, now))
+
+            # Close every older subscription so there is no ambiguity about
+            # which package is active. Keep rows for audit/history.
+            cur.execute(
+                "UPDATE subscriptions SET status='EXPIRED', expires_at=COALESCE(expires_at,%s) WHERE user_id=%s AND status <> 'EXPIRED'",
+                (now, user_id)
+            )
+
+            # Insert a new authoritative Free subscription as the latest row.
+            cur.execute(
+                """INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status)
+                   VALUES(%s,'Free',%s,NULL,'ACTIVE')
+                   RETURNING id,plan,started_at,expires_at,status""",
+                (user_id, now)
+            )
+            sub_row = cur.fetchone()
+
+            # A reset-to-Free should start the current Vietnam day with the
+            # full 5 questions available. Do not touch learning progress/chat.
+            cur.execute(
+                """INSERT INTO daily_question_usage(user_id,usage_date,question_count)
+                   VALUES(%s,%s,0)
+                   ON CONFLICT(user_id,usage_date) DO UPDATE
+                   SET question_count=0""",
+                (user_id, today)
+            )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    return {"success":True,"plan":"Free","expires_at":None,"timezone":"Asia/Ho_Chi_Minh"}
+
+    return {
+        "success": True,
+        "plan": "Free",
+        "daily_limit": 5,
+        "used_today": 0,
+        "remaining_today": 5,
+        "expires_at": None,
+        "timezone": "Asia/Ho_Chi_Minh",
+        "subscription_id": sub_row[0] if sub_row else None,
+    }
 
 
 @app.post("/admin/api/users/{user_id}/status")
