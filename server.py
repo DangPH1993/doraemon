@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
+import calendar
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -60,7 +61,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.2-free-reset-authoritative-vn-time"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.3-calendar-month-vn-time"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -275,6 +276,34 @@ def _now_local():
     # All package expiry and daily Free quota boundaries use Vietnam time (GMT+7).
     return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
 
+
+def _as_vn(dt):
+    """Return a timezone-aware datetime in Vietnam time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo("Asia/Ho_Chi_Minh"))
+
+
+def _add_calendar_months(dt, months):
+    """Add calendar months, not a fixed 30-day period, preserving local wall-clock time.
+
+    Example: 17/08 11:18 + 1 month = 17/09 11:18.
+    End-of-month dates are clamped to the last valid day of the target month.
+    """
+    local = _as_vn(dt)
+    month_index = local.month - 1 + int(months)
+    year = local.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(local.day, calendar.monthrange(year, month)[1])
+    return local.replace(year=year, month=month, day=day)
+
+
+def _vn_display(dt):
+    local = _as_vn(dt)
+    return local.strftime("%d/%m/%Y %H:%M GMT+7") if local else None
+
 def _package_info(user_id):
     conn = db()
     try:
@@ -298,13 +327,13 @@ def _package_info(user_id):
     if active_paid:
         return {
             "id": sub.get("id"), "plan": plan, "started_at": sub.get("started_at"),
-            "expires_at": expires_at, "status": "ACTIVE",
+            "expires_at": expires_at, "expires_at_vn": _vn_display(expires_at), "status": "ACTIVE",
             "daily_limit": None, "used_today": used, "remaining_today": None, "unlimited": True
         }
 
     return {
         "id": sub.get("id"), "plan": "Free", "started_at": sub.get("started_at"),
-        "expires_at": None, "status": "ACTIVE",
+        "expires_at": None, "expires_at_vn": None, "status": "ACTIVE",
         "daily_limit": 5, "used_today": used, "remaining_today": max(0, 5-used), "unlimited": False
     }
 
@@ -3821,6 +3850,7 @@ def admin_users(password: str):
                 "plan": plan,
                 "started_at": r["started_at"] if paid_active else None,
                 "expires_at": raw_exp if paid_active else None,
+                "expires_at_vn": _vn_display(raw_exp) if paid_active else None,
                 "status": "ACTIVE",
                 "used_today": int(r["used_today"] or 0),
                 "daily_limit": None if paid_active else 5
@@ -3841,7 +3871,7 @@ def admin_activate(user_id:int,data:dict):
             old=cur.fetchone(); now=_now_local()
             old_plan = str(old.get("plan") or "Free") if old else "Free"
             start = old["expires_at"] if old and old_plan != "Free" and old["expires_at"] and old["expires_at"]>now else now
-            exp=start+timedelta(days=30*months)
+            exp=_add_calendar_months(start, months)
             plan_name=f"{months} tháng"
             if old:
                 cur.execute("UPDATE subscriptions SET plan=%s,started_at=%s,expires_at=%s,status='ACTIVE' WHERE id=%s",
@@ -3852,7 +3882,7 @@ def admin_activate(user_id:int,data:dict):
             cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
         conn.commit()
     finally: conn.close()
-    return {"success":True,"expires_at":exp}
+    return {"success":True,"expires_at":exp,"expires_at_vn":_vn_display(exp),"timezone":"Asia/Ho_Chi_Minh"}
 
 
 
