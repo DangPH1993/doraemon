@@ -61,7 +61,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.8-modern-menu-no-client-token"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.10-gemini-timeout-robust"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2126,7 +2126,9 @@ def proxy_chat(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ):
+    request_id = uuid.uuid4().hex[:12]
     perf_total = time.perf_counter()
+    print(f"[CHAT START] request={request_id} message={data.text[:120]!r}")
     user = require_active_user(authorization)
     perf_auth = time.perf_counter()
 
@@ -2874,6 +2876,7 @@ TIN NHẮN HIỆN TẠI:
     )
     reply = response.text or ""
     perf_gen = time.perf_counter()
+    print(f"[CHAT GEMINI] request={request_id} elapsed={perf_gen-gen_started:.3f}s reply_chars={len(reply)}")
 
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
@@ -2914,6 +2917,7 @@ TIN NHẮN HIỆN TẠI:
         )
     )
 
+    print(f"[CHAT END] request={request_id} total={perf_total_done-perf_total:.3f}s")
     return {
         "reply": reply,
         "model": GEMINI_MODEL,
