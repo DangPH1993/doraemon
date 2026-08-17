@@ -48,6 +48,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_RENDER")
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
 GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_THINKING_LEVEL = "low"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
 # Optional Backblaze B2 object storage for original PDFs and extracted images.
@@ -61,7 +62,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.10-gemini-timeout-robust"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.11-gemini-low-thinking"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -229,7 +230,7 @@ def startup():
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
-    print("Gemini model:", GEMINI_MODEL)
+    print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
 
 class RegisterRequest(BaseModel):
     phone: str
@@ -2872,7 +2873,9 @@ TIN NHẮN HIỆN TẠI:
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.2),
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL)
+        ),
     )
     reply = response.text or ""
     perf_gen = time.perf_counter()
