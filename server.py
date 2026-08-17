@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -59,7 +60,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-16-doraemon-baseline-v5-curriculum-content-type"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7-packages-free-limit"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -138,6 +139,12 @@ def init_db():
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS daily_question_usage (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                usage_date DATE NOT NULL,
+                question_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, usage_date)
+            );""")
 
             # Safe migrations for databases created by previous versions.
             for sql in [
@@ -174,6 +181,11 @@ def init_db():
                            ON learning_progress(user_id,last_studied_at DESC);""")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_content
                            ON learning_progress(user_id,content_type,content_id,last_studied_at DESC);""")
+            # New accounts (and legacy accounts without a subscription row) receive Free access.
+            cur.execute("""INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status)
+                           SELECT u.id,'Free',u.created_at,NULL,'ACTIVE'
+                           FROM users u
+                           WHERE NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id=u.id)""")
         conn.commit()
     finally:
         conn.close()
@@ -259,22 +271,74 @@ def current_user(token):
         raise HTTPException(401, "Tài khoản không tồn tại.")
     return dict(user)
 
-def subscription_status(user_id):
+def _now_local():
+    return datetime.now(ZoneInfo(os.getenv("DAILY_USAGE_TIMEZONE", "Asia/Ho_Chi_Minh")))
+
+def _package_info(user_id):
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT id,plan,started_at,expires_at,status FROM subscriptions
                            WHERE user_id=%s ORDER BY id DESC LIMIT 1""", (user_id,))
             sub = cur.fetchone()
+            if not sub:
+                # Defensive fallback for legacy records before the migration runs.
+                sub = {"id": None, "plan": "Free", "started_at": None, "expires_at": None, "status": "ACTIVE"}
+            cur.execute("""SELECT question_count FROM daily_question_usage
+                           WHERE user_id=%s AND usage_date=%s""", (user_id, _now_local().date()))
+            row = cur.fetchone()
+            used = int(row["question_count"]) if row else 0
     finally:
         conn.close()
-    if not sub:
-        return None, "Tài khoản chưa được Admin kích hoạt."
-    if sub["status"] != "ACTIVE":
-        return dict(sub), "Tài khoản chưa được Admin kích hoạt."
-    if not sub["expires_at"] or sub["expires_at"] <= datetime.now(timezone.utc):
-        return dict(sub), "Gói sử dụng đã hết hạn."
-    return dict(sub), None
+
+    plan = str(sub.get("plan") or "Free")
+    expires_at = sub.get("expires_at")
+    active_paid = plan != "Free" and str(sub.get("status") or "").upper() == "ACTIVE" and expires_at and expires_at > datetime.now(timezone.utc)
+    if active_paid:
+        return {
+            "id": sub.get("id"), "plan": plan, "started_at": sub.get("started_at"),
+            "expires_at": expires_at, "status": "ACTIVE",
+            "daily_limit": None, "used_today": used, "remaining_today": None, "unlimited": True
+        }
+
+    return {
+        "id": sub.get("id"), "plan": "Free", "started_at": sub.get("started_at"),
+        "expires_at": None, "status": "ACTIVE",
+        "daily_limit": 5, "used_today": used, "remaining_today": max(0, 5-used), "unlimited": False
+    }
+
+def subscription_status(user_id):
+    info = _package_info(user_id)
+    return {k: info.get(k) for k in ("id","plan","started_at","expires_at","status")}, None
+
+def enforce_question_limit(user_id):
+    info = _package_info(user_id)
+    if info.get("unlimited"):
+        return info
+    today = _now_local().date()
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO daily_question_usage(user_id,usage_date,question_count)
+                           VALUES(%s,%s,1)
+                           ON CONFLICT(user_id,usage_date) DO UPDATE
+                           SET question_count=daily_question_usage.question_count+1
+                           RETURNING question_count""", (user_id, today))
+            used = int(cur.fetchone()["question_count"])
+            if used > 5:
+                conn.rollback()
+                raise HTTPException(429, detail={
+                    "code": "FREE_DAILY_LIMIT",
+                    "message": "Gói Free đã dùng hết 5 lượt hỏi hôm nay. Vui lòng thử lại vào ngày mai hoặc nâng cấp gói.",
+                    "plan": "Free", "daily_limit": 5, "used_today": 5, "remaining_today": 0
+                })
+        conn.commit()
+    finally:
+        conn.close()
+    info["used_today"] = used
+    info["remaining_today"] = max(0, 5-used)
+    return info
+
 
 @app.post("/auth/register")
 def register(data: RegisterRequest):
@@ -290,14 +354,17 @@ def register(data: RegisterRequest):
             if cur.fetchone():
                 raise HTTPException(409, "Số điện thoại đã được đăng ký.")
             cur.execute("""INSERT INTO users(phone,nickname,password_hash,status)
-                           VALUES(%s,%s,%s,'PENDING') RETURNING id""",
+                           VALUES(%s,%s,%s,'ACTIVE') RETURNING id""",
                         (phone, nickname, hash_password(password)))
             uid = cur.fetchone()[0]
+            cur.execute("""INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status)
+                           VALUES(%s,'Free',NOW(),NULL,'ACTIVE')""", (uid,))
         conn.commit()
     finally:
         conn.close()
-    return {"success": True, "user_id": uid, "status": "PENDING",
-            "message": "Đăng ký thành công. Tài khoản đang chờ Admin kích hoạt."}
+    return {"success": True, "user_id": uid, "status": "ACTIVE",
+            "subscription": _package_info(uid),
+            "message": "Đăng ký thành công. Bạn đang sử dụng gói Free (5 lượt hỏi/ngày)."}
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
@@ -315,13 +382,13 @@ def login(data: LoginRequest):
     sub, msg = subscription_status(user["id"])
     return {"success": True, "access_token": token, "token_type": "bearer",
             "user": {k: user[k] for k in ("id","phone","nickname","status")},
-            "subscription": sub, "subscription_message": msg}
+            "subscription": _package_info(user["id"]), "subscription_message": msg}
 
 @app.get("/auth/me")
 def me(authorization: Optional[str] = Header(default=None)):
     user = current_user(bearer(authorization))
     sub, msg = subscription_status(user["id"])
-    return {"user": user, "subscription": sub, "subscription_message": msg}
+    return {"user": user, "subscription": _package_info(user["id"]), "subscription_message": msg}
 
 @app.get("/admin-chat/history")
 def history(limit: int = 100, authorization: Optional[str] = Header(default=None)):
@@ -583,8 +650,7 @@ def _save_learning_event_background(user_id, user_text, reply, catalog, learning
 
 def require_active_user(authorization):
     user = current_user(bearer(authorization))
-    sub, msg = subscription_status(user["id"])
-    if msg: raise HTTPException(403, msg)
+    info = _package_info(user["id"])
     return user
 
 def embed_text(text):
@@ -2002,6 +2068,11 @@ def proxy_chat(
     if not data.text:
         raise HTTPException(400, "Tin nhắn không được để trống.")
 
+    # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
+    # Standalone greetings are onboarding actions and do not consume a question.
+    if not _is_pure_greeting(data.text):
+        enforce_question_limit(user["id"])
+
     # A standalone greeting is a session/onboarding action, NOT a knowledge
     # question. Do not send "Chào" through embedding/Pinecone/Gemini, because
     # generic RAG similarity can accidentally make Doraemon start teaching a
@@ -3068,12 +3139,12 @@ async function loadUsers(){
     const ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
       <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
-      <div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||"-")} · hết hạn: ${ex}</div>
+      <div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>${esc(s.plan||"Free")}</b> · ${s.plan==='Free' ? `đã hỏi hôm nay: ${Number(s.used_today||0)}/5` : `hết hạn: ${ex}`}</div>
       <div class="small">Bấm để xem lịch sử và chat</div>
       <div style="margin-top:7px">
         <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
         <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
-        <button onclick="event.stopPropagation();act(${u.id},12)">12 tháng</button>
+
         <button class="red" onclick="event.stopPropagation();lock(${u.id})">Khóa</button>
       </div>
     </div>`;
@@ -3720,37 +3791,57 @@ def admin_users(password: str):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
-                    s.id subscription_id,s.plan,s.started_at,s.expires_at,s.status subscription_status
+                    s.id subscription_id,s.plan,s.started_at,s.expires_at,s.status subscription_status,
+                    COALESCE(dq.question_count,0) AS used_today
                     FROM users u LEFT JOIN LATERAL
                     (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
-                    ORDER BY u.id DESC""")
+                    LEFT JOIN daily_question_usage dq ON dq.user_id=u.id AND dq.usage_date=%s
+                    ORDER BY u.id DESC""", (_now_local().date(),))
             rows=cur.fetchall()
     finally: conn.close()
-    return {"users":[{"id":r["id"],"phone":r["phone"],"nickname":r["nickname"],"status":r["status"],
-        "created_at":r["created_at"],
-        "subscription":None if r["subscription_id"] is None else
-        {"id":r["subscription_id"],"plan":r["plan"],"started_at":r["started_at"],
-         "expires_at":r["expires_at"],"status":r["subscription_status"]}} for r in rows]}
+    now = datetime.now(timezone.utc)
+    users_out = []
+    for r in rows:
+        raw_plan = str(r["plan"] or "Free")
+        raw_exp = r["expires_at"]
+        paid_active = raw_plan != "Free" and str(r["subscription_status"] or "").upper() == "ACTIVE" and raw_exp and raw_exp > now
+        plan = raw_plan if paid_active else "Free"
+        users_out.append({
+            "id": r["id"], "phone": r["phone"], "nickname": r["nickname"], "status": r["status"],
+            "created_at": r["created_at"],
+            "subscription": {
+                "id": r["subscription_id"],
+                "plan": plan,
+                "started_at": r["started_at"] if paid_active else None,
+                "expires_at": raw_exp if paid_active else None,
+                "status": "ACTIVE",
+                "used_today": int(r["used_today"] or 0),
+                "daily_limit": None if paid_active else 5
+            }
+        })
+    return {"users": users_out}
 
 @app.post("/admin/api/users/{user_id}/activate")
 def admin_activate(user_id:int,data:dict):
     check_admin(str(data.get("password",""))); months=int(data.get("months",1))
-    if months not in (1,3,6,12): raise HTTPException(400,"Thời hạn phải 1, 3, 6 hoặc 12 tháng.")
+    if months not in (1,3,6): raise HTTPException(400,"Thời hạn phải 1, 3 hoặc 6 tháng.")
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
             if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
-            cur.execute("SELECT id,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
+            cur.execute("SELECT id,plan,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
             old=cur.fetchone(); now=datetime.now(timezone.utc)
-            start=old["expires_at"] if old and old["expires_at"] and old["expires_at"]>now else now
+            old_plan = str(old.get("plan") or "Free") if old else "Free"
+            start = old["expires_at"] if old and old_plan != "Free" and old["expires_at"] and old["expires_at"]>now else now
             exp=start+timedelta(days=30*months)
+            plan_name=f"{months} tháng"
             if old:
-                cur.execute("UPDATE subscriptions SET plan=%s,started_at=COALESCE(started_at,%s),expires_at=%s,status='ACTIVE' WHERE id=%s",
-                            ("N5",now,exp,old["id"]))
+                cur.execute("UPDATE subscriptions SET plan=%s,started_at=%s,expires_at=%s,status='ACTIVE' WHERE id=%s",
+                            (plan_name,start,exp,old["id"]))
             else:
-                cur.execute("INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,'N5',%s,%s,'ACTIVE')",
-                            (user_id,now,exp))
+                cur.execute("INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,%s,%s,%s,'ACTIVE')",
+                            (user_id,plan_name,start,exp))
             cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
         conn.commit()
     finally: conn.close()
