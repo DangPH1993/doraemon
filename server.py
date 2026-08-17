@@ -60,7 +60,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7-packages-free-limit"
+SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.1-free-reset-vn-time"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -272,7 +272,8 @@ def current_user(token):
     return dict(user)
 
 def _now_local():
-    return datetime.now(ZoneInfo(os.getenv("DAILY_USAGE_TIMEZONE", "Asia/Ho_Chi_Minh")))
+    # All package expiry and daily Free quota boundaries use Vietnam time (GMT+7).
+    return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
 
 def _package_info(user_id):
     conn = db()
@@ -293,7 +294,7 @@ def _package_info(user_id):
 
     plan = str(sub.get("plan") or "Free")
     expires_at = sub.get("expires_at")
-    active_paid = plan != "Free" and str(sub.get("status") or "").upper() == "ACTIVE" and expires_at and expires_at > datetime.now(timezone.utc)
+    active_paid = plan != "Free" and str(sub.get("status") or "").upper() == "ACTIVE" and expires_at and expires_at > _now_local()
     if active_paid:
         return {
             "id": sub.get("id"), "plan": plan, "started_at": sub.get("started_at"),
@@ -3136,7 +3137,7 @@ async function loadUsers(){
   document.getElementById("count").textContent="  Tổng: "+d.users.length;
   document.getElementById("users").innerHTML=d.users.map(u=>{
     const s=u.subscription||{}, st=u.status||"PENDING";
-    const ex=s.expires_at?new Date(s.expires_at).toLocaleString("vi-VN"):"-";
+    const ex=s.expires_at?new Intl.DateTimeFormat("vi-VN",{dateStyle:"short",timeStyle:"short",timeZone:"Asia/Ho_Chi_Minh"}).format(new Date(s.expires_at)):"-";
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
       <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
       <div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>${esc(s.plan||"Free")}</b> · ${s.plan==='Free' ? `đã hỏi hôm nay: ${Number(s.used_today||0)}/5` : `hết hạn: ${ex}`}</div>
@@ -3144,7 +3145,8 @@ async function loadUsers(){
       <div style="margin-top:7px">
         <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
         <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
-
+        <button onclick="event.stopPropagation();act(${u.id},6)">6 tháng</button>
+        <button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Gói Free</button>
         <button class="red" onclick="event.stopPropagation();lock(${u.id})">Khóa</button>
       </div>
     </div>`;
@@ -3231,6 +3233,11 @@ async function sendAdminMessage(){
 async function act(id,m){
   if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;
   await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});
+  loadUsers();
+}
+async function resetFree(id){
+  if(!confirm("Đưa user này về gói Free (5 lượt hỏi/ngày)?"))return;
+  await api("/admin/api/users/"+id+"/reset-free",{method:"POST",body:JSON.stringify({password:pw})});
   loadUsers();
 }
 async function lock(id){
@@ -3831,7 +3838,7 @@ def admin_activate(user_id:int,data:dict):
             cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
             if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
             cur.execute("SELECT id,plan,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
-            old=cur.fetchone(); now=datetime.now(timezone.utc)
+            old=cur.fetchone(); now=_now_local()
             old_plan = str(old.get("plan") or "Free") if old else "Free"
             start = old["expires_at"] if old and old_plan != "Free" and old["expires_at"] and old["expires_at"]>now else now
             exp=start+timedelta(days=30*months)
@@ -3908,6 +3915,28 @@ def admin_ws_token(password: str):
     if not ADMIN_WS_TOKEN:
         raise HTTPException(500, "ADMIN_WS_TOKEN chưa được cấu hình trên Render.")
     return {"token": ADMIN_WS_TOKEN}
+
+@app.post("/admin/api/users/{user_id}/reset-free")
+def admin_reset_free(user_id:int,data:dict):
+    check_admin(str(data.get("password","")))
+    now = _now_local()
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s", (user_id,))
+            if not cur.fetchone():
+                raise HTTPException(404,"Không tìm thấy user.")
+            cur.execute("""SELECT id FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1""", (user_id,))
+            old=cur.fetchone()
+            if old:
+                cur.execute("""UPDATE subscriptions SET plan='Free', started_at=%s, expires_at=NULL, status='ACTIVE' WHERE id=%s""", (now, old["id"]))
+            else:
+                cur.execute("""INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,'Free',%s,NULL,'ACTIVE')""", (user_id, now))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"success":True,"plan":"Free","expires_at":None,"timezone":"Asia/Ho_Chi_Minh"}
+
 
 @app.post("/admin/api/users/{user_id}/status")
 def admin_status(user_id:int,data:dict):
