@@ -1,3 +1,4 @@
+BASELINE_VERSION = "13.2"
 import os
 import ast
 import io
@@ -62,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-17-doraemon-baseline-v7.11-gemini-low-thinking"
+SERVER_VERSION = "2026-08-18-doraemon-baseline-v13.2-study-plan"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -141,6 +142,22 @@ def init_db():
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS study_plans (
+                id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                version INTEGER NOT NULL DEFAULT 1, status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+                goal_name TEXT NOT NULL, content_type VARCHAR(30) NOT NULL DEFAULT 'Giáo trình',
+                scope TEXT NOT NULL DEFAULT '', start_date DATE NOT NULL, target_date DATE,
+                units_per_day NUMERIC(8,3), days_per_unit INTEGER,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), confirmed_at TIMESTAMPTZ, superseded_at TIMESTAMPTZ
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS study_plan_items (
+                id BIGSERIAL PRIMARY KEY, study_plan_id BIGINT NOT NULL REFERENCES study_plans(id) ON DELETE CASCADE,
+                plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
+                target TEXT NOT NULL DEFAULT '', status VARCHAR(20) NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ
+            );""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
+
             cur.execute("""CREATE TABLE IF NOT EXISTS daily_question_usage (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 usage_date DATE NOT NULL,
@@ -250,6 +267,7 @@ class ChatRequest(BaseModel):
     use_knowledge_base: bool = True
     knowledge_namespace: str = "default"
     top_k: int = 8
+    proactive: bool = False
 
     @property
     def text(self) -> str:
@@ -854,11 +872,26 @@ def record_learning_event(user_id, event):
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
             row = dict(cur.fetchone())
         conn.commit()
+        _sync_active_plan_completion(user_id, row)
         return row
     finally:
         conn.close()
 
 
+
+
+def _sync_active_plan_completion(user_id, row):
+    if not row or str(row.get('status') or '').lower() != 'completed':
+        return
+    lesson=str(row.get('lesson') or '').strip()
+    if not lesson:
+        return
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()\n                FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'\n                AND lower(i.lesson)=lower(%s) AND i.status<>'completed'""",(user_id,lesson))
+        conn.commit()
+    finally: conn.close()
 
 def _clean_scope_value(value):
     """Normalize course/content/lesson/topic metadata for matching."""
@@ -1941,6 +1974,197 @@ _GREETING_EXACT = {
     "doraemon ơi", "doraemon ơi chào",
 }
 
+
+def _get_learning_profile(user_id):
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT learning_mode,onboarding_completed FROM user_learning_state WHERE user_id=%s""", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else {"learning_mode": None, "onboarding_completed": False}
+    finally:
+        conn.close()
+
+
+def _set_learning_profile(user_id, mode, completed=True):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,updated_at)\n                VALUES(%s,TRUE,0,%s,%s,NOW())\n                ON CONFLICT(user_id) DO UPDATE SET learning_mode=%s,onboarding_completed=%s,updated_at=NOW()""",
+                (user_id, mode, completed, mode, completed))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
+    catalog = _load_catalog_cached()
+    rows=[]; seen=set(); q=_clean_scope_value(scope_query)
+    for item in catalog:
+        if _normalize_content_type(item.get('content_type')) != content_type:
+            continue
+        lesson=str(item.get('lesson') or '').strip()
+        if not lesson:
+            continue
+        if q and q not in _clean_scope_value(str(item.get('subject') or '')) and q not in _clean_scope_value(lesson):
+            continue
+        key=lesson.casefold()
+        if key in seen: continue
+        seen.add(key); rows.append(lesson)
+    return rows
+
+
+def _parse_plan_request(text):
+    q=str(text or '').strip()
+    ql=q.casefold()
+    target_date=None
+    m=re.search(r'(?:đến|tới|trước|trong)\s*\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', ql)
+    if m:
+        day=int(m.group(1)); month=int(m.group(2)); year=int(m.group(3) or _now_local().year)
+        try: target_date=date(year,month,day)
+        except: target_date=None
+    months=None; days=None
+    m=re.search(r'(\d+)\s*tháng', ql)
+    if m: months=int(m.group(1))
+    m=re.search(r'(\d+)\s*(?:ngày|day)', ql)
+    if m and 'mỗi' not in ql: days=int(m.group(1))
+    units_per_day=None; days_per_unit=None
+    m=re.search(r'(?:mỗi ngày|mỗi hôm)\s*(?:học\s*)?(\d+(?:\.\d+)?)\s*(?:bài|lesson)', ql)
+    if m: units_per_day=float(m.group(1))
+    m=re.search(r'(\d+)\s*ngày\s*(?:một|1)\s*bài', ql)
+    if m: days_per_unit=int(m.group(1))
+    if target_date is None:
+        if months: target_date=_now_local().date()+timedelta(days=round(months*30))
+        elif days: target_date=_now_local().date()+timedelta(days=days)
+    scope='N5' if 'n5' in ql else ''
+    if 'giáo trình' in ql or 'n5' in ql: content_type='Giáo trình'
+    else: content_type='Giáo trình'
+    goal=q.strip()
+    return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type}
+
+
+def _build_plan_preview(user_id, req, existing_plan_id=None):
+    lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(req.get('content_type') or 'Giáo trình', req.get('scope') or '')
+    if not lessons:
+        # fall back to all curriculum lessons from the selected type
+        lessons=_unique_lessons_for_scope(req.get('content_type') or 'Giáo trình','')
+    if not lessons:
+        return None, "Doraemon chưa tìm thấy danh sách bài phù hợp trong kho giáo trình để lập lộ trình."
+    start=_now_local().date()
+    target=req.get('target_date')
+    if not target:
+        units_per_day=req.get('units_per_day') or 1.0
+        days_per_unit=req.get('days_per_unit') or 0
+        if days_per_unit:
+            target=start+timedelta(days=max(1, int(days_per_unit*len(lessons))-1))
+        else:
+            target=start+timedelta(days=max(0, int((len(lessons)/units_per_day))-1))
+    total_days=max(1,(target-start).days+1)
+    units_per_day=req.get('units_per_day')
+    days_per_unit=req.get('days_per_unit')
+    if not units_per_day and not days_per_unit:
+        units_per_day=round(len(lessons)/total_days,3)
+        if units_per_day < 1: days_per_unit=max(1, round(total_days/len(lessons)))
+    # Generate one plan item per lesson, distributing sequentially across dates.
+    items=[]
+    if days_per_unit:
+        for i,lesson in enumerate(lessons,1):
+            d=start+timedelta(days=(i-1)*int(days_per_unit))
+            if d>target: break
+            items.append((d,i,lesson))
+    else:
+        upd=max(float(units_per_day or 1),0.01)
+        # Greedy pack rounded daily slots.
+        day=start; idx=0
+        while idx<len(lessons) and day<=target:
+            quota=max(1,int(round(upd))) if upd>=1 else 1
+            for _ in range(quota):
+                if idx>=len(lessons): break
+                items.append((day,idx+1,lessons[idx])); idx+=1
+            day+=timedelta(days=1)
+    if len(items)<len(lessons) and not days_per_unit:
+        # If target is too aggressive, compress remaining lessons on target date.
+        d=target
+        for lesson in lessons[len(items):]:
+            items.append((d,len(items)+1,lesson))
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 FROM study_plans WHERE user_id=%s",(user_id,))
+            version=int(cur.fetchone()[0])
+            cur.execute("""INSERT INTO study_plans(user_id,version,status,goal_name,content_type,scope,start_date,target_date,units_per_day,days_per_unit)\n                VALUES(%s,%s,'DRAFT',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (user_id,version,req.get('goal') or 'Lộ trình học',req.get('content_type') or 'Giáo trình',req.get('scope') or '',start,target,units_per_day,days_per_unit))
+            plan_id=int(cur.fetchone()[0])
+            for d,i,lesson in items:
+                cur.execute("INSERT INTO study_plan_items(study_plan_id,plan_date,unit_index,lesson,target,status) VALUES(%s,%s,%s,%s,%s,'pending')",
+                            (plan_id,d,i,lesson,'Hoàn thành bài học và xác nhận với Doraemon'))
+        conn.commit()
+    finally: conn.close()
+    preview="🤖 Doraemon đã tính thử lộ trình mới:\n\n"
+    preview += f"🎯 {req.get('goal') or 'Lộ trình học'}\n📅 Từ {start.strftime('%d/%m/%Y')} đến {target.strftime('%d/%m/%Y')}\n📚 {len(items)} bài\n"
+    preview += "\n".join(f"• {d.strftime('%d/%m')}: {lesson}" for d,i,lesson in items[:12])
+    if len(items)>12: preview += f"\n• ... và {len(items)-12} bài tiếp theo"
+    preview += "\n\nCậu có muốn áp dụng lộ trình này không? Hãy trả lời 'Có' để xác nhận hoặc 'Không' để giữ nguyên lộ trình hiện tại."
+    return plan_id, preview
+
+
+def _active_plan(user_id):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='ACTIVE' ORDER BY version DESC LIMIT 1",(user_id,))
+            p=cur.fetchone()
+            if not p: return None
+            plan=dict(p)
+            cur.execute("SELECT id,plan_date,unit_index,lesson,target,status,completed_at FROM study_plan_items WHERE study_plan_id=%s ORDER BY unit_index",(plan['id'],))
+            plan['items']=[dict(x) for x in cur.fetchall()]
+            return plan
+    finally: conn.close()
+
+
+def _latest_draft(user_id):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            row=cur.fetchone(); return dict(row) if row else None
+    finally: conn.close()
+
+
+def _confirm_latest_draft(user_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            row=cur.fetchone()
+            if not row: return None
+            pid=int(row[0])
+            cur.execute("UPDATE study_plans SET status='SUPERSEDED',superseded_at=NOW() WHERE user_id=%s AND status='ACTIVE'",(user_id,))
+            cur.execute("UPDATE study_plans SET status='ACTIVE',confirmed_at=NOW() WHERE id=%s RETURNING *",(pid,))
+            plan=cur.fetchone()
+        conn.commit(); return dict(plan) if plan else None
+    finally: conn.close()
+
+
+def _study_plan_brief_for_auto_chat(user_id):
+    plan=_active_plan(user_id)
+    if not plan: return ""
+    today=_now_local().date()
+    items=plan.get('items') or []
+    todays=[x for x in items if x['plan_date']==today]
+    completed=[x for x in items if str(x.get('status')).lower()=='completed' and x['plan_date']<=today]
+    overdue=[x for x in items if x['plan_date']<today and str(x.get('status')).lower()!='completed']
+    if todays:
+        if all(str(x.get('status')).lower()=='completed' for x in todays): state='ON_TRACK'
+        elif completed or overdue: state='BEHIND'
+        else: state='NO_ACTIVITY'
+    else:
+        state='BEHIND' if overdue else 'ON_TRACK'
+    target=', '.join(x['lesson'] for x in todays[:4]) or 'không có bài mới'
+    return (f"Study Plan status={state}; hôm nay={today.isoformat()}; mục tiêu hôm nay={target}; "
+            f"đã hoàn thành trước hôm nay={len(completed)}; bài quá hạn chưa hoàn thành={len(overdue)}. "
+            "Hãy viết 1 câu ngắn, thân thiện bằng tiếng Việt để động viên/nhắc/chúc mừng phù hợp; không được tạo bài học mới.")
+
 def _is_pure_greeting(text: str) -> bool:
     """True only for a standalone greeting, not for a greeting + request."""
     low = str(text or "").strip().casefold()
@@ -2026,6 +2250,12 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
         conn.close()
 
     nickname = user.get("nickname") or "bạn"
+    profile = _get_learning_profile(user["id"])
+    if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
+        message = (f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ "
+                   "lập lộ trình học theo mục tiêu cho cậu, hay cậu muốn học tự do?\n\n"
+                   "👉 Trả lời 'học theo lộ trình' hoặc 'học tự do'.")
+        return {"success":True,"mode":"plan_choice","message":message,"learning_history":unfinished_rows}
 
     curriculum = (
         "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
@@ -2142,13 +2372,77 @@ def proxy_chat(
 
     # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
     # Standalone greetings are onboarding actions and do not consume a question.
-    if not _is_pure_greeting(data.text):
+    if not _is_pure_greeting(data.text) and not data.proactive:
         enforce_question_limit(user["id"])
 
     # A standalone greeting is a session/onboarding action, NOT a knowledge
     # question. Do not send "Chào" through embedding/Pinecone/Gemini, because
     # generic RAG similarity can accidentally make Doraemon start teaching a
     # random lesson (for example Bài tập) immediately after saying hello.
+    profile=_get_learning_profile(user["id"])
+    low0=data.text.casefold().strip()
+    # One-time learning-mode choice.
+    if not profile.get("onboarding_completed") and not profile.get("learning_mode") and not _is_pure_greeting(data.text):
+        if any(k in low0 for k in ["học tự do","tự do","không cần lộ trình","không cần lịch trình"]):
+            _set_learning_profile(user["id"],"free",True)
+            return {"reply":"Được nhé! 🤖 Từ giờ cậu cứ học tự do theo nhu cầu. Khi nào muốn có lộ trình, hãy nói với Doraemon là cậu muốn học theo lộ trình nhé.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Từ giờ cậu cứ học tự do theo nhu cầu. Khi nào muốn có lộ trình, hãy nói với Doraemon là cậu muốn học theo lộ trình nhé."}],"learning_progress":None}
+        if any(k in low0 for k in ["học theo lộ trình","muốn lộ trình","cần lộ trình","có lộ trình"]):
+            _set_learning_profile(user["id"],"planned",True)
+            return {"reply":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu."}],"learning_progress":None}
+
+    # Planned-user confirmations and plan creation/update requests happen before RAG.
+    if profile.get("learning_mode")=="planned":
+        active_plan=_active_plan(user["id"])
+        completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
+        if active_plan and any(w in low0 for w in completion_words):
+            upcoming=[x for x in active_plan.get('items',[]) if str(x.get('status')).lower()!='completed']
+            if upcoming:
+                item=upcoming[0]
+                record_learning_event(user["id"], {"content_type":active_plan.get('content_type') or 'Giáo trình',"subject":"Tiếng Nhật","lesson":item.get('lesson'),"topic":"","item_key":item.get('lesson'),"status":"completed","completed":True})
+                conn=db()
+                try:
+                    with conn.cursor() as cur: cur.execute("UPDATE study_plan_items SET status='completed',completed_at=NOW() WHERE id=%s",(item['id'],))
+                    conn.commit()
+                finally: conn.close()
+                next_item=next((x for x in active_plan.get('items',[]) if int(x.get('unit_index') or 0)>int(item.get('unit_index') or 0) and str(x.get('status')).lower()!='completed'),None)
+                nxt=f" Bài tiếp theo theo lộ trình là {next_item.get('lesson')}." if next_item else " Cậu đã hoàn thành toàn bộ lộ trình hiện tại rồi! 🎉"
+                msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
+        draft=_latest_draft(user["id"])
+        if draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
+            plan=_confirm_latest_draft(user["id"])
+            return {"reply":"Đã áp dụng lộ trình mới rồi nhé! 🤖 Từ giờ Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Đã áp dụng lộ trình mới rồi nhé! 🤖 Từ giờ Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này."}],"learning_progress":None,"study_plan":plan}
+        if draft and low0 in {"không","không nhé","giữ nguyên","chưa","hủy"}:
+            conn=db();
+            try:
+                with conn.cursor() as cur: cur.execute("UPDATE study_plans SET status='CANCELLED' WHERE id=%s",(draft['id'],))
+                conn.commit()
+            finally: conn.close()
+            return {"reply":"Được nhé, Doraemon giữ nguyên lộ trình hiện tại.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé, Doraemon giữ nguyên lộ trình hiện tại."}],"learning_progress":None}
+        if any(k in low0 for k in ["sửa lộ trình","đổi lộ trình","thay đổi lộ trình","sửa lại lộ trình","đổi mục tiêu"]):
+            req=_parse_plan_request(data.text)
+            if not req.get('target_date') and not req.get('units_per_day') and not req.get('days_per_unit'):
+                msg="🤖 Cậu muốn sửa lộ trình như thế nào? Hãy nói rõ ngày mục tiêu mới hoặc tốc độ học, ví dụ: 'đổi mục tiêu sang 15/09' hoặc 'từ ngày 01/09, mỗi 2 ngày học 1 bài'."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            oldplan=_active_plan(user["id"]);
+            if oldplan:
+                # Rebuild from the remaining lessons, preserving completed history.
+                done={x['lesson'] for x in oldplan['items'] if str(x.get('status')).lower()=='completed'}
+                lessons=[x for x in _unique_lessons_for_scope(oldplan.get('content_type') or 'Giáo trình', oldplan.get('scope') or '') if x not in done]
+                req['content_type']=oldplan.get('content_type') or 'Giáo trình'; req['scope']=oldplan.get('scope') or ''; req['goal']=data.text
+                req['_lessons_override']=lessons; req['target_date']=req.get('target_date') or oldplan.get('target_date')
+                # Simplified rebuild: create a draft using remaining lessons by temporarily using helper's catalog selection.
+                # For consistency, if override exists we build the same plan shape manually below.
+                req['override_done']=done
+            pid,preview=_build_plan_preview(user["id"],req)
+            return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview}],"learning_progress":None,"study_plan_draft_id":pid}
+        # Initial planned goal if there is no active plan and no draft.
+        if not _active_plan(user["id"]) and not draft:
+            req=_parse_plan_request(data.text)
+            if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit') or 'giáo trình' in low0 or 'n5' in low0:
+                pid,preview=_build_plan_preview(user["id"],req)
+                return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview}],"learning_progress":None,"study_plan_draft_id":pid}
+
     if _is_pure_greeting(data.text):
         welcome = _build_welcome_for_user(user, mark_seen=False)
         return {
@@ -2165,6 +2459,10 @@ def proxy_chat(
 
     namespace = data.knowledge_namespace or "__default__"
     query_text = data.text
+    if data.proactive:
+        plan_hint = _study_plan_brief_for_auto_chat(user["id"])
+        if plan_hint:
+            query_text = plan_hint
 
     # Keep enough history for continuity, but do not send 100 rows to Gemini.
     # The full learning state remains in PostgreSQL; this is only the prompt view.
@@ -2850,6 +3148,7 @@ NGUYÊN TẮC:
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
+- Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
 - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh chỉ thuộc về đúng CHUNK có ảnh tương ứng trong RAG.
 - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
 {image_marker_rule}
@@ -2954,15 +3253,18 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM learning_progress WHERE user_id=%s", (user["id"],))
             deleted = cur.rowcount
+            cur.execute("DELETE FROM study_plans WHERE user_id=%s", (user["id"],))
 
             # Mark the account as a fresh learner. The next /session/welcome
             # therefore returns the same onboarding flow as a brand-new user.
             cur.execute("""
-                INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,updated_at)
-                VALUES(%s,FALSE,1,NOW())
+                INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,updated_at)
+                VALUES(%s,FALSE,1,NULL,FALSE,NOW())
                 ON CONFLICT (user_id) DO UPDATE SET
                     welcome_seen=FALSE,
                     reset_count=user_learning_state.reset_count + 1,
+                    learning_mode=NULL,
+                    onboarding_completed=FALSE,
                     updated_at=NOW()
             """, (user["id"],))
         conn.commit()
@@ -2997,6 +3299,24 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
         payload.pop("wrong_count",None)
     row=record_learning_event(user["id"],payload)
     return {"success":True,"progress":row}
+
+
+@app.get("/learning/plan")
+def get_learning_plan(authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    profile=_get_learning_profile(user["id"])
+    plan=_active_plan(user["id"])
+    draft=_latest_draft(user["id"])
+    return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"draft":draft}
+
+@app.post("/learning/plan/confirm")
+def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    plan=_confirm_latest_draft(user["id"])
+    if not plan:
+        raise HTTPException(404,"Không có lộ trình nháp để xác nhận.")
+    _set_learning_profile(user["id"],"planned",True)
+    return {"success":True,"plan":_active_plan(user["id"])}
 
 @app.get("/learning/summary")
 def learning_summary(authorization: Optional[str] = Header(default=None)):
