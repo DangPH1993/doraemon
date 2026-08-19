@@ -2313,9 +2313,11 @@ def _build_plan_choice_blocks(user_id: int, include_header: bool = True):
             "Hôm nay cậu có muốn học tiếp theo lộ trình này không? 😊"
         )
         blocks.append({"type":"text","text":msg})
-        blocks.append({"type":"choice","id":f"plan_today_{int(plan['id'])}","options":[
-            {"label":"Có","action":f"plan_today_yes:{int(plan['id'])}"},
-            {"label":"Không","action":f"plan_today_no:{int(plan['id'])}"}
+        plan_id = int(plan['id'])
+        plan_title = str(plan.get('goal_name') or 'Lộ trình học').strip()
+        blocks.append({"type":"choice","id":f"plan_today_{plan_id}","options":[
+            {"label":"Có","display_label":f"Có — {plan_title}","action":f"plan_today_yes:{plan_id}"},
+            {"label":"Không","display_label":f"Không — {plan_title}","action":f"plan_today_no:{plan_id}"}
         ]})
     return plans, blocks
 
@@ -2564,6 +2566,8 @@ def proxy_chat(
     ui_action_raw = (str(data.action or "").strip() or None)
     ui_action = (ui_action_raw.split(":",1)[0].casefold() if ui_action_raw else None)
     action_plan_id = (ui_action_raw.split(":",1)[1] if ui_action_raw and ":" in ui_action_raw else None)
+    if ui_action:
+        print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
     plan_start_action = None
     if ui_action:
         if ui_action == "onboarding_planned":
@@ -2582,6 +2586,8 @@ def proxy_chat(
                     "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
         elif ui_action == "plan_today_yes":
+            # The selected plan is identified by action suffix: plan_today_yes:<plan_id>.
+            # This avoids ambiguity when several plans show identical Có/Không buttons.
             profile = _get_learning_profile(user["id"])
             active_plan = _active_plan(user["id"], action_plan_id) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items", [])
@@ -2595,6 +2601,7 @@ def proxy_chat(
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
 
         elif ui_action == "plan_today_no":
+            # The selected plan is identified by action suffix: plan_today_no:<plan_id>.
             msg = "Được nhé! 🤖 Hôm nay cậu có thể học tự do theo nhu cầu. Lộ trình này vẫn được giữ nguyên."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
