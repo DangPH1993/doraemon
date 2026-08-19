@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.2"
+BASELINE_VERSION = "13.3"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-18-doraemon-baseline-v13.2-study-plan"
+SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.3-study-plan-welcome"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2251,6 +2251,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
 
     nickname = user.get("nickname") or "bạn"
     profile = _get_learning_profile(user["id"])
+    active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
     if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
         message = (f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ "
                    "lập lộ trình học theo mục tiêu cho cậu, hay cậu muốn học tự do?\n\n"
@@ -2279,6 +2280,55 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
             "mode": "new",
             "message": message,
             "learning_history": [],
+        }
+
+    # Planned users should receive plan-aware guidance immediately on login/return.
+    # This is computed directly from PostgreSQL; no Gemini/Pinecone call is needed.
+    if active_plan:
+        today = _now_local().date()
+        items = active_plan.get("items") or []
+        todays = [x for x in items if x.get("plan_date") == today]
+        completed_items = [x for x in items if str(x.get("status") or "").lower() == "completed" and x.get("plan_date") <= today]
+        overdue_items = [x for x in items if x.get("plan_date") < today and str(x.get("status") or "").lower() != "completed"]
+        current_item = next((x for x in items if str(x.get("status") or "").lower() != "completed" and x.get("plan_date") >= today), None)
+        if todays:
+            if all(str(x.get("status") or "").lower() == "completed" for x in todays):
+                plan_state = "đã hoàn thành mục tiêu hôm nay 🎉"
+                plan_action = "Cậu đã xong phần hôm nay rồi. Nếu muốn, mình có thể học trước phần tiếp theo."
+            elif overdue_items:
+                plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
+                plan_action = "Mình nên ưu tiên phần còn thiếu để kéo lại tiến độ nhé."
+            else:
+                plan_state = "đang đúng tiến độ ✅"
+                plan_action = "Mình cùng học phần hôm nay nhé."
+        elif overdue_items:
+            plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
+            plan_action = "Mình cùng bắt đầu phần còn thiếu hôm nay nhé."
+        else:
+            plan_state = "chưa có mục tiêu mới cho hôm nay"
+            plan_action = "Cậu muốn học tiếp bài gần nhất hay chọn phần khác?"
+
+        target_today = ", ".join(str(x.get("lesson") or "").strip() for x in todays if x.get("lesson"))
+        if not target_today and current_item:
+            target_today = str(current_item.get("lesson") or "").strip()
+        target_today = target_today or "chưa xác định"
+
+        plan_message = (
+            f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
+            f"{curriculum}\n\n"
+            f"🎯 Lộ trình hiện tại: {active_plan.get('goal_name') or 'Lộ trình học'}\n"
+            f"📅 Hôm nay: {today.strftime('%d/%m/%Y')}\n"
+            f"📚 Mục tiêu hôm nay: {target_today}\n"
+            f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
+            f"📌 Tình trạng: {plan_state}\n\n"
+            f"{plan_action}"
+        )
+        return {
+            "success": True,
+            "mode": "planned_returning",
+            "message": plan_message,
+            "learning_history": unfinished_rows,
+            "study_plan": active_plan,
         }
 
     parts = []
