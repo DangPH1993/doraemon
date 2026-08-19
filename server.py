@@ -1,4 +1,4 @@
-BASELINE_VERSION = "15.8"
+BASELINE_VERSION = "14.9"
 import os
 import ast
 import io
@@ -1865,218 +1865,114 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
     return unique
 
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
-    """Build ordered text/image blocks while preserving readable interleaving.
-
-    Priority:
-      1) Explicit [[IMG_CHUNK_N]] markers.
-      2) Metadata anchors (reading/term/meaning/chunk text).
-      3) Sentence/paragraph distribution for unmarked exercise images.
-
-    Safety invariant: visible model text is never dropped.
     """
-    raw_reply = str(reply or "")
-    if not raw_reply:
+    Insert images only for the RAG chunks that supplied the answer.
+
+    Gemini receives an internal marker instruction such as [[IMG_CHUNK_2]].
+    The marker is removed before returning the reply and becomes the exact
+    insertion point for images belonging to that chunk.
+
+    If Gemini omits a marker, that chunk's image is appended after the nearest
+    answer text rather than being attached to a different chunk.
+    """
+    reply = reply or ""
+    if not reply:
         return []
 
     marker_re = re.compile(r"\[\[IMG_CHUNK_(\d+)\]\]")
     chunks = {}
-    for item in (image_items or []):
+    for item in image_items:
         order = item.get("_chunk_order")
         if order is None:
             continue
-        try:
-            order = int(order)
-        except Exception:
-            continue
-        chunks.setdefault(order, []).append(item)
+        chunks.setdefault(int(order), []).append(item)
 
-    def image_block(item):
-        return {
-            "type": "image",
-            "key": item.get("key"),
-            "url": item.get("url"),
-            "term": item.get("term", ""),
-            "reading": item.get("reading", ""),
-            "meaning": item.get("meaning", ""),
-            "page": item.get("page"),
-        }
+    # First use explicit markers. This is deterministic and does not depend on
+    # term/meaning words accidentally appearing in the answer.
+    marker_positions = []
+    for m in marker_re.finditer(reply):
+        marker_positions.append((m.start(), int(m.group(1)), m.end()))
 
-    def append_images(blocks, items, inserted):
-        for item in items:
-            key = item.get("key")
-            if not key or key in inserted:
-                continue
-            blocks.append(image_block(item))
-            inserted.add(key)
+    # Remove markers from user-visible text.
+    clean_reply = marker_re.sub("", reply)
 
-    marker_matches = list(marker_re.finditer(raw_reply))
-    clean_reply = marker_re.sub("", raw_reply)
     blocks = []
-    inserted = set()
+    cursor = 0
+    inserted_keys = set()
 
-    # 1) Explicit marker path.
-    if marker_matches:
-        cursor = 0
-        removed = 0
-        for m in marker_matches:
-            pos, order, end_pos = m.start(), int(m.group(1)), m.end()
-            clean_pos = pos - removed
-            if clean_pos > cursor:
-                blocks.append({"type": "text", "text": clean_reply[cursor:clean_pos]})
-            append_images(blocks, chunks.get(order, []), inserted)
-            cursor = clean_pos
-            removed += end_pos - pos
-        if cursor < len(clean_reply):
-            blocks.append({"type": "text", "text": clean_reply[cursor:]})
+    # Convert positions from original reply to clean-reply positions.
+    removed_before = 0
+    for pos, chunk_order, marker_end in marker_positions:
+        clean_pos = pos - removed_before
+        removed_before += marker_end - pos
+
+        if clean_pos > cursor:
+            blocks.append({"type": "text", "text": clean_reply[cursor:clean_pos]})
+
+        for item in chunks.get(chunk_order, []):
+            key = item.get("key")
+            if not key or key in inserted_keys:
+                continue
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            inserted_keys.add(key)
+        cursor = clean_pos
+
+    # If Gemini did not emit a marker, fall back to chunk-order placement:
+    # put each unmarked chunk's images after the answer text, in the same order
+    # as the retrieved chunks. Never borrow an image from another chunk.
+    if not marker_positions:
+        if clean_reply:
+            blocks.append({"type": "text", "text": clean_reply})
         for order in sorted(chunks):
-            append_images(blocks, chunks[order], inserted)
-        print(
-            f"[RICH BLOCKS] marker_mode=1 reply_chars={len(raw_reply)} "
-            f"blocks={len(blocks)} text_chars={sum(len(str(b.get('text') or '')) for b in blocks if b.get('type')=='text')} "
-            f"images={sum(1 for b in blocks if b.get('type')=='image')}"
-        )
+            for item in chunks[order]:
+                key = item.get("key")
+                if not key or key in inserted_keys:
+                    continue
+                blocks.append({
+                    "type": "image",
+                    "key": key,
+                    "url": item.get("url"),
+                    "term": item.get("term", ""),
+                    "reading": item.get("reading", ""),
+                    "meaning": item.get("meaning", ""),
+                    "page": item.get("page"),
+                })
+                inserted_keys.add(key)
         return blocks
 
-    # Normalize text for anchor matching.
-    def normalize(s):
-        s = str(s or "").lower()
-        s = re.sub(r"\s+", " ", s)
-        s = re.sub(r"[^0-9a-zA-ZÀ-ỹぁ-んァ-ヶ一-龥]+", " ", s)
-        return s.strip()
+    if cursor < len(clean_reply):
+        blocks.append({"type": "text", "text": clean_reply[cursor:]})
 
-    clean_norm = normalize(clean_reply)
-
-    # 2) Try image metadata anchors first. This is particularly useful for
-    # exercise sheets where image records have readings/terms but no text chunk
-    # of their own.
-    anchor_candidates = []
+    # If some image chunks were not marked, append only those exact chunk images.
+    marked_orders = {order for _, order, _ in marker_positions}
     for order in sorted(chunks):
-        best = None
-        for item in chunks[order]:
-            candidates = [
-                item.get("reading"),
-                item.get("term"),
-                item.get("meaning"),
-            ]
-            for raw in candidates:
-                anchor = normalize(raw)
-                if len(anchor) < 2:
-                    continue
-                idx = clean_norm.find(anchor)
-                if idx >= 0:
-                    end_idx = idx + len(anchor)
-                    score = len(anchor)
-                    if best is None or score > best[0]:
-                        best = (score, idx, end_idx)
-        if best is not None:
-            # Map normalized offset back into the original reply approximately.
-            pos = min(len(clean_reply), int(best[2] / max(1, len(clean_norm)) * len(clean_reply)))
-            anchor_candidates.append((pos, order))
-
-    # Add source-text anchors only when they actually occur in the reply.
-    for order in sorted(chunks):
-        if any(o == order for _, o in anchor_candidates):
+        if order in marked_orders:
             continue
-        source_text = str(chunks[order][0].get("_chunk_text") or "")
-        sentences = [
-            p.strip() for p in re.split(r"(?<=[。！？.!?])\s+|\n+", source_text)
-            if len(p.strip()) >= 12
-        ]
-        sentences.sort(key=len, reverse=True)
-        for sentence in sentences[:10]:
-            anchor = normalize(sentence)
-            if len(anchor) < 12:
+        for item in chunks[order]:
+            key = item.get("key")
+            if not key or key in inserted_keys:
                 continue
-            idx = clean_norm.find(anchor)
-            if idx >= 0:
-                pos = min(len(clean_reply), int((idx + len(anchor)) / max(1, len(clean_norm)) * len(clean_reply)))
-                anchor_candidates.append((pos, order))
-                break
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            inserted_keys.add(key)
 
-    if anchor_candidates:
-        # Keep only non-colliding placements, sorted in answer order.
-        anchor_candidates.sort()
-        deduped = []
-        used_orders = set()
-        for pos, order in anchor_candidates:
-            if order in used_orders:
-                continue
-            used_orders.add(order)
-            deduped.append((pos, order))
-        anchor_candidates = deduped
-
-        cursor = 0
-        for pos, order in anchor_candidates:
-            pos = max(cursor, min(len(clean_reply), pos))
-            if pos > cursor:
-                blocks.append({"type": "text", "text": clean_reply[cursor:pos]})
-            append_images(blocks, chunks[order], inserted)
-            cursor = pos
-        if cursor < len(clean_reply):
-            blocks.append({"type": "text", "text": clean_reply[cursor:]})
-        for order in sorted(chunks):
-            append_images(blocks, chunks[order], inserted)
-
-        # If anchors only covered the last few images, avoid a huge image tail:
-        # distribute the still-unplaced image groups across sentence boundaries.
-        remaining = [o for o in sorted(chunks) if any(x.get("key") not in inserted for x in chunks[o])]
-        if remaining:
-            # Rebuild more naturally below using sentence distribution.
-            blocks = []
-            inserted = set()
-        else:
-            print(
-                f"[RICH BLOCKS] anchor_mode=1 reply_chars={len(raw_reply)} "
-                f"blocks={len(blocks)} text_chars={sum(len(str(b.get('text') or '')) for b in blocks if b.get('type')=='text')} "
-                f"images={sum(1 for b in blocks if b.get('type')=='image')}"
-            )
-            return blocks
-
-    # 3) Unmarked fallback: split by sentences OR lines, then distribute image
-    # groups across the text. This is the crucial path for image-heavy exercises
-    # whose images are separate IMAGE records and whose answer has no markers.
-    sentence_parts = [p for p in re.split(r'(?<=[。！？.!?])\s+|\n+', clean_reply) if p]
-    if len(sentence_parts) <= 1:
-        # For prose without punctuation, make stable word-count slices instead
-        # of leaving every image at the very end.
-        words = clean_reply.split()
-        if len(words) > 12:
-            target = max(1, (len(words) + max(1, len(chunks)) - 1) // max(1, len(chunks)))
-            sentence_parts = []
-            for i in range(0, len(words), target):
-                sentence_parts.append(" ".join(words[i:i + target]))
-        else:
-            sentence_parts = [clean_reply]
-
-    orders = sorted(chunks)
-    part_count = len(sentence_parts)
-    if not sentence_parts:
-        return [{"type": "text", "text": clean_reply}]
-
-    # Place one image-group after successive text segments. If there are more
-    # image groups than text segments, multiple groups share the final segments.
-    assigned = {i: [] for i in range(part_count)}
-    for g_idx, order in enumerate(orders):
-        idx = min(part_count - 1, int((g_idx + 1) * part_count / max(1, len(orders))) - 1)
-        assigned[idx].append(order)
-
-    for idx, piece in enumerate(sentence_parts):
-        if piece:
-            blocks.append({"type": "text", "text": piece})
-        for order in assigned.get(idx, []):
-            append_images(blocks, chunks[order], inserted)
-
-    # Never duplicate and never lose any image group.
-    for order in orders:
-        append_images(blocks, chunks[order], inserted)
-
-    print(
-        f"[RICH BLOCKS] fallback_interleave=1 reply_chars={len(raw_reply)} "
-        f"parts={len(sentence_parts)} blocks={len(blocks)} "
-        f"text_chars={sum(len(str(b.get('text') or '')) for b in blocks if b.get('type')=='text')} "
-        f"images={sum(1 for b in blocks if b.get('type')=='image')}"
-    )
     return blocks
+
 
 _GREETING_EXACT = {
     "chào", "chào bạn", "chào cậu", "chào doraemon",
@@ -2085,6 +1981,7 @@ _GREETING_EXACT = {
     "hey", "hey doraemon", "alo", "alo doraemon",
     "doraemon ơi", "doraemon ơi chào",
 }
+
 
 def _get_learning_profile(user_id):
     conn = db()
