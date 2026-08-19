@@ -1866,14 +1866,15 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
 
 def build_rich_content_blocks(reply: str, image_items: list) -> list:
     """
-    Insert images only for the RAG chunks that supplied the answer.
+    Build text/image blocks in the intended teaching order.
 
-    Gemini receives an internal marker instruction such as [[IMG_CHUNK_2]].
-    The marker is removed before returning the reply and becomes the exact
-    insertion point for images belonging to that chunk.
-
-    If Gemini omits a marker, that chunk's image is appended after the nearest
-    answer text rather than being attached to a different chunk.
+    Gemini is asked to emit explicit [[IMG_CHUNK_N]] markers. When markers are
+    present we use them verbatim. When Gemini omits them (which can happen on
+    some responses), do NOT dump every image at the very end. Instead, place
+    each image group after the best matching chunk anchor; if no exact anchor
+    can be found, distribute image groups across logical answer paragraphs in
+    the same chunk order. This keeps multi-image lessons such as exercises
+    readable while remaining deterministic.
     """
     reply = reply or ""
     if not reply:
@@ -1887,101 +1888,137 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
             continue
         chunks.setdefault(int(order), []).append(item)
 
-    # First use explicit markers. This is deterministic and does not depend on
-    # term/meaning words accidentally appearing in the answer.
-    marker_positions = []
-    for m in marker_re.finditer(reply):
-        marker_positions.append((m.start(), int(m.group(1)), m.end()))
+    def append_images(blocks, items, inserted_keys):
+        for item in items:
+            key = item.get("key")
+            if not key or key in inserted_keys:
+                continue
+            blocks.append({
+                "type": "image",
+                "key": key,
+                "url": item.get("url"),
+                "term": item.get("term", ""),
+                "reading": item.get("reading", ""),
+                "meaning": item.get("meaning", ""),
+                "page": item.get("page"),
+            })
+            inserted_keys.add(key)
 
-    # Remove markers from user-visible text.
+    marker_positions = [
+        (m.start(), int(m.group(1)), m.end())
+        for m in marker_re.finditer(reply)
+    ]
     clean_reply = marker_re.sub("", reply)
 
     blocks = []
-    cursor = 0
     inserted_keys = set()
 
-    # Convert positions from original reply to clean-reply positions.
-    removed_before = 0
-    for pos, chunk_order, marker_end in marker_positions:
-        clean_pos = pos - removed_before
-        removed_before += marker_end - pos
-
-        if clean_pos > cursor:
-            blocks.append({"type": "text", "text": clean_reply[cursor:clean_pos]})
-
-        for item in chunks.get(chunk_order, []):
-            key = item.get("key")
-            if not key or key in inserted_keys:
-                continue
-            blocks.append({
-                "type": "image",
-                "key": key,
-                "url": item.get("url"),
-                "term": item.get("term", ""),
-                "reading": item.get("reading", ""),
-                "meaning": item.get("meaning", ""),
-                "page": item.get("page"),
-            })
-            inserted_keys.add(key)
-        cursor = clean_pos
-
-    # If Gemini did not emit a marker, fall back to chunk-order placement:
-    # put each unmarked chunk's images after the answer text, in the same order
-    # as the retrieved chunks. Never borrow an image from another chunk.
-    if not marker_positions:
-        if clean_reply:
-            blocks.append({"type": "text", "text": clean_reply})
+    # Preferred path: Gemini supplied exact insertion markers.
+    if marker_positions:
+        cursor = 0
+        removed_before = 0
+        for pos, chunk_order, marker_end in marker_positions:
+            clean_pos = pos - removed_before
+            removed_before += marker_end - pos
+            if clean_pos > cursor:
+                blocks.append({"type": "text", "text": clean_reply[cursor:clean_pos]})
+            append_images(blocks, chunks.get(chunk_order, []), inserted_keys)
+            cursor = clean_pos
+        if cursor < len(clean_reply):
+            blocks.append({"type": "text", "text": clean_reply[cursor:]})
+        # Any image chunk whose marker was omitted should still appear, but do it
+        # after the nearest already-rendered content rather than losing it.
         for order in sorted(chunks):
-            for item in chunks[order]:
-                key = item.get("key")
-                if not key or key in inserted_keys:
-                    continue
-                blocks.append({
-                    "type": "image",
-                    "key": key,
-                    "url": item.get("url"),
-                    "term": item.get("term", ""),
-                    "reading": item.get("reading", ""),
-                    "meaning": item.get("meaning", ""),
-                    "page": item.get("page"),
-                })
-                inserted_keys.add(key)
+            append_images(blocks, chunks[order], inserted_keys)
         return blocks
 
-    if cursor < len(clean_reply):
-        blocks.append({"type": "text", "text": clean_reply[cursor:]})
+    # Fallback path: no markers. Try exact chunk-text anchors first.
+    def normalize_for_match(s):
+        s = str(s or "").lower()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[^0-9a-zA-ZÀ-ỹぁ-んァ-ヶ一-龥]+", " ", s)
+        return s.strip()
 
-    # If some image chunks were not marked, append only those exact chunk images.
-    marked_orders = {order for _, order, _ in marker_positions}
+    clean_norm = normalize_for_match(clean_reply)
+    placements = []
     for order in sorted(chunks):
-        if order in marked_orders:
-            continue
-        for item in chunks[order]:
-            key = item.get("key")
-            if not key or key in inserted_keys:
+        # Prefer the most distinctive non-trivial sentence from the source
+        # chunk. Exact matching is conservative: if it is not present, we do
+        # not fabricate a semantic placement.
+        source_text = str(chunks[order][0].get("_chunk_text") or "")
+        source_sentences = [
+            s.strip() for s in re.split(r"(?<=[。！？.!?])\s+|\n+", source_text)
+            if len(s.strip()) >= 18
+        ]
+        source_sentences.sort(key=len, reverse=True)
+        anchor = None
+        anchor_pos = None
+        for sentence in source_sentences[:5]:
+            sn = normalize_for_match(sentence)
+            if len(sn) < 18:
                 continue
-            blocks.append({
-                "type": "image",
-                "key": key,
-                "url": item.get("url"),
-                "term": item.get("term", ""),
-                "reading": item.get("reading", ""),
-                "meaning": item.get("meaning", ""),
-                "page": item.get("page"),
-            })
-            inserted_keys.add(key)
+            idx = clean_norm.find(sn)
+            if idx >= 0:
+                anchor = sn
+                anchor_pos = idx + len(sn)
+                break
 
+        if anchor_pos is not None:
+            # Map normalized character position back approximately to the
+            # original reply. This only controls an insertion point; visible
+            # text itself is never rewritten.
+            prefix_norm = clean_norm[:anchor_pos]
+            original_pos = 0
+            norm_seen = 0
+            for original_pos, ch in enumerate(clean_reply):
+                test = normalize_for_match(clean_reply[:original_pos + 1])
+                if len(test) >= len(prefix_norm):
+                    original_pos += 1
+                    break
+            placements.append((original_pos, order))
+
+    if placements:
+        placements.sort()
+        cursor = 0
+        for pos, order in placements:
+            pos = max(cursor, min(len(clean_reply), pos))
+            if pos > cursor:
+                blocks.append({"type": "text", "text": clean_reply[cursor:pos]})
+            append_images(blocks, chunks[order], inserted_keys)
+            cursor = pos
+        if cursor < len(clean_reply):
+            blocks.append({"type": "text", "text": clean_reply[cursor:]})
+        for order in sorted(chunks):
+            append_images(blocks, chunks[order], inserted_keys)
+        return blocks
+
+    # Last deterministic fallback: split on paragraphs/speaker sections and
+    # distribute image groups in chunk order instead of putting every image at
+    # the very end. This is especially useful for multi-question exercises.
+    text_parts = [p for p in re.split(r"(?<=\n)", clean_reply) if p]
+    if not text_parts:
+        blocks.append({"type": "text", "text": clean_reply})
+        for order in sorted(chunks):
+            append_images(blocks, chunks[order], inserted_keys)
+        return blocks
+
+    group_orders = sorted(chunks)
+    group_count = len(group_orders)
+    part_count = len(text_parts)
+    for idx, piece in enumerate(text_parts):
+        blocks.append({"type": "text", "text": piece})
+        # Roughly map chunk 0..N-1 to the corresponding answer section.
+        target_groups = []
+        for g_idx, order in enumerate(group_orders):
+            boundary = int(((g_idx + 1) * part_count) / max(1, group_count)) - 1
+            if boundary == idx:
+                target_groups.append(order)
+        for order in target_groups:
+            append_images(blocks, chunks[order], inserted_keys)
+
+    for order in group_orders:
+        append_images(blocks, chunks[order], inserted_keys)
     return blocks
-
-
-_GREETING_EXACT = {
-    "chào", "chào bạn", "chào cậu", "chào doraemon",
-    "xin chào", "xin chào bạn", "xin chào doraemon",
-    "hello", "hello doraemon", "hi", "hi doraemon",
-    "hey", "hey doraemon", "alo", "alo doraemon",
-    "doraemon ơi", "doraemon ơi chào",
-}
-
 
 def _get_learning_profile(user_id):
     conn = db()
