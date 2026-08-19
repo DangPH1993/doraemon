@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.9"
+BASELINE_VERSION = "15.8"
 import os
 import ast
 import io
@@ -2019,6 +2019,15 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
     for order in group_orders:
         append_images(blocks, chunks[order], inserted_keys)
     return blocks
+
+
+_GREETING_EXACT = {
+    "chào", "chào bạn", "chào cậu", "chào doraemon",
+    "xin chào", "xin chào bạn", "xin chào doraemon",
+    "hello", "hello doraemon", "hi", "hi doraemon",
+    "hey", "hey doraemon", "alo", "alo doraemon",
+    "doraemon ơi", "doraemon ơi chào",
+}
 
 def _get_learning_profile(user_id):
     conn = db()
