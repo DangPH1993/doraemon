@@ -158,6 +158,9 @@ def init_db():
             );""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_scope VARCHAR(255);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_created_at TIMESTAMPTZ;""")
 
             cur.execute("""CREATE TABLE IF NOT EXISTS daily_question_usage (
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2031,17 +2034,25 @@ def _parse_plan_request(text):
     months=None; days=None
     m=re.search(r'(\d+)\s*tháng', ql)
     if m: months=int(m.group(1))
-    m=re.search(r'(\d+)\s*(?:ngày|day)', ql)
-    if m and 'mỗi' not in ql: days=int(m.group(1))
-    units_per_day=None; days_per_unit=None
-    m=re.search(r'(?:mỗi ngày|mỗi hôm)\s*(?:học\s*)?(\d+(?:\.\d+)?)\s*(?:bài|lesson)', ql)
-    if m: units_per_day=float(m.group(1))
+    m=re.search(r'(?:trong|for)\s*(\d+)\s*(?:ngày|day)', ql)
+    if m: days=int(m.group(1))
+    if days is None:
+        m=re.search(r'(\d+)\s*(?:ngày|day)', ql)
+        if m and 'mỗi ngày' not in ql: days=int(m.group(1))
+    units_per_day=None; days_per_unit=None; unit_label=None
+    m=re.search(r'(?:mỗi ngày|mỗi hôm)\s*(?:học\s*)?(\d+(?:\.\d+)?)\s*(bài|lesson|từ|từ vựng|mục|câu)', ql)
+    if m:
+        units_per_day=float(m.group(1)); unit_label=m.group(2)
     m=re.search(r'(\d+)\s*ngày\s*(?:một|1)\s*bài', ql)
     if m: days_per_unit=int(m.group(1))
     if target_date is None:
         if months: target_date=_now_local().date()+timedelta(days=round(months*30)-1)
         elif days: target_date=_now_local().date()+timedelta(days=max(0, days-1))
     scope='N5' if 'n5' in ql else ''
+    if 'bộ thủ' in ql or 'bo thu' in ql:
+        scope='Bộ thủ'
+    elif 'kanji' in ql:
+        scope='Kanji'
     if any(k in ql for k in ['giáo trình','giáo trinh']):
         content_type='Giáo trình'
     elif any(k in ql for k in ['ngữ pháp','ngu phap','grammar']):
@@ -2055,8 +2066,36 @@ def _parse_plan_request(text):
     else:
         content_type='Giáo trình'
     goal=q.strip()
-    return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type}
+    return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type,"unit_label":unit_label}
 
+
+def _set_pending_plan_request(user_id, content_type=None, scope=None):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=%s,pending_plan_scope=%s,pending_plan_created_at=NOW(),updated_at=NOW() WHERE user_id=%s""",(content_type,scope,user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _get_pending_plan_request(user_id):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT pending_plan_content_type,pending_plan_scope,pending_plan_created_at FROM user_learning_state WHERE user_id=%s",(user_id,))
+            r=cur.fetchone()
+            return dict(r) if r else None
+    finally:
+        conn.close()
+
+def _clear_pending_plan_request(user_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=NULL,pending_plan_scope=NULL,pending_plan_created_at=NULL,updated_at=NOW() WHERE user_id=%s""",(user_id,))
+        conn.commit()
+    finally:
+        conn.close()
 
 def _build_plan_preview(user_id, req, existing_plan_id=None):
     lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(req.get('content_type') or 'Giáo trình', req.get('scope') or '')
@@ -2080,28 +2119,38 @@ def _build_plan_preview(user_id, req, existing_plan_id=None):
     if not units_per_day and not days_per_unit:
         units_per_day=round(len(lessons)/total_days,3)
         if units_per_day < 1: days_per_unit=max(1, round(total_days/len(lessons)))
-    # Generate one plan item per lesson, distributing sequentially across dates.
+    # Generate plan items. For vocabulary/"Bộ thủ" style goals expressed as a daily count,
+    # create one daily target item rather than treating the whole lesson as one unit.
     items=[]
-    if days_per_unit:
-        for i,lesson in enumerate(lessons,1):
-            d=start+timedelta(days=(i-1)*int(days_per_unit))
-            if d>target: break
-            items.append((d,i,lesson))
+    if req.get('units_per_day') and req.get('unit_label') and req.get('content_type') == 'Từ vựng' and req.get('target_date'):
+        day=start
+        idx=1
+        label=req.get('scope') or 'Từ vựng'
+        while day <= target:
+            items.append((day, idx, label, f"{req.get('units_per_day'):g} {req.get('unit_label')}/ngày"))
+            idx += 1
+            day += timedelta(days=1)
     else:
-        upd=max(float(units_per_day or 1),0.01)
-        # Greedy pack rounded daily slots.
-        day=start; idx=0
-        while idx<len(lessons) and day<=target:
-            quota=max(1,int(round(upd))) if upd>=1 else 1
-            for _ in range(quota):
-                if idx>=len(lessons): break
-                items.append((day,idx+1,lessons[idx])); idx+=1
-            day+=timedelta(days=1)
-    if len(items)<len(lessons) and not days_per_unit:
-        # If target is too aggressive, compress remaining lessons on target date.
-        d=target
-        for lesson in lessons[len(items):]:
-            items.append((d,len(items)+1,lesson))
+        items=[]
+    if not items:
+        if days_per_unit:
+            for i,lesson in enumerate(lessons,1):
+                d=start+timedelta(days=(i-1)*int(days_per_unit))
+                if d>target: break
+                items.append((d,i,lesson,''))
+        else:
+            upd=max(float(units_per_day or 1),0.01)
+            day=start; idx=0
+            while idx<len(lessons) and day<=target:
+                quota=max(1,int(round(upd))) if upd>=1 else 1
+                for _ in range(quota):
+                    if idx>=len(lessons): break
+                    items.append((day,idx+1,lessons[idx],'')); idx+=1
+                day+=timedelta(days=1)
+        if len(items)<len(lessons) and not days_per_unit:
+            d=target
+            for lesson in lessons[len(items):]:
+                items.append((d,len(items)+1,lesson,''))
     conn=db()
     try:
         with conn.cursor() as cur:
@@ -2110,14 +2159,14 @@ def _build_plan_preview(user_id, req, existing_plan_id=None):
             cur.execute("""INSERT INTO study_plans(user_id,version,status,goal_name,content_type,scope,start_date,target_date,units_per_day,days_per_unit)\n                VALUES(%s,%s,'DRAFT',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                 (user_id,version,req.get('goal') or 'Lộ trình học',req.get('content_type') or 'Giáo trình',req.get('scope') or '',start,target,units_per_day,days_per_unit))
             plan_id=int(cur.fetchone()[0])
-            for d,i,lesson in items:
+            for d,i,lesson,target_text in items:
                 cur.execute("INSERT INTO study_plan_items(study_plan_id,plan_date,unit_index,lesson,target,status) VALUES(%s,%s,%s,%s,%s,'pending')",
-                            (plan_id,d,i,lesson,'Hoàn thành bài học và xác nhận với Doraemon'))
+                            (plan_id,d,i,lesson,target_text or 'Hoàn thành bài học và xác nhận với Doraemon'))
         conn.commit()
     finally: conn.close()
     preview="🤖 Doraemon đã tính thử lộ trình mới:\n\n"
     preview += f"🎯 {req.get('goal') or 'Lộ trình học'}\n📅 Từ {start.strftime('%d/%m/%Y')} đến {target.strftime('%d/%m/%Y')}\n📚 {len(items)} bài\n"
-    preview += "\n".join(f"• {d.strftime('%d/%m')}: {lesson}" for d,i,lesson in items[:12])
+    preview += "\n".join(f"• {d.strftime('%d/%m')}: {lesson}{(" – "+target_text) if target_text else ""}" for d,i,lesson,target_text in items[:12])
     if len(items)>12: preview += f"\n• ... và {len(items)-12} bài tiếp theo"
     preview += "\n\nCậu có muốn áp dụng lộ trình này không? Hãy trả lời 'Có' để xác nhận hoặc 'Không' để giữ nguyên lộ trình hiện tại."
     return plan_id, preview
@@ -2528,6 +2577,7 @@ def proxy_chat(
             if not plan:
                 msg = "🤖 Doraemon không thể áp dụng lộ trình lúc này. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            _clear_pending_plan_request(user["id"])
             msg = ("🎯 Lộ trình đã được áp dụng rồi nhé! 🤖\n\n"
                    "Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này từ hôm nay.\n\n"
                    "Cậu có muốn học luôn bài đầu tiên theo lộ trình không? 😊")
@@ -2545,6 +2595,7 @@ def proxy_chat(
                     conn.commit()
                 finally:
                     conn.close()
+            _clear_pending_plan_request(user["id"])
             msg="Được nhé! 🤖 Doraemon giữ nguyên lộ trình hiện tại."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
@@ -2615,6 +2666,27 @@ def proxy_chat(
         active_plan = plan_start_action["plan"]
         planned_start_item = next((x for x in active_plan.get("items",[]) if str(x.get("status")).lower() != "completed" and str(x.get("lesson") or "").strip() == plan_start_action["lesson"]), None)
 
+    # If a previous message requested a NEW plan and asked the user for the target,
+    # consume the next concrete target message here before any RAG. This prevents the
+    # target sentence (e.g. "mỗi ngày 10 từ bộ thủ") from being mistaken for a lesson.
+    pending = _get_pending_plan_request(user["id"]) if profile.get("learning_mode") == "planned" else None
+    if pending and pending.get('pending_plan_created_at') and not data.action:
+        pending_type = pending.get('pending_plan_content_type') or 'Giáo trình'
+        pending_scope = pending.get('pending_plan_scope') or ''
+        probe = _parse_plan_request(data.text)
+        has_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
+        if has_target:
+            probe['content_type'] = pending_type
+            probe['scope'] = pending_scope or probe.get('scope') or ''
+            # A daily count without a finite horizon needs one more piece of information.
+            if probe.get('units_per_day') and not probe.get('target_date') and not probe.get('days_per_unit'):
+                msg=(f"🤖 Doraemon đã ghi nhận mục tiêu {probe.get('units_per_day'):g} {probe.get('unit_label') or 'mục'}/ngày cho {pending_scope or pending_type}. "
+                     "Để tính lộ trình cụ thể, cậu cho Doraemon biết muốn duy trì mục tiêu này trong bao nhiêu ngày nhé.")
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            _clear_pending_plan_request(user["id"])
+            pid,preview=_build_plan_preview(user["id"],probe)
+            blocks=[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}]
+            return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan_draft_id":pid}
     # Planned-user confirmations and plan creation/update requests happen before RAG.
     # A short affirmative response after the "học luôn bài đầu tiên" prompt is a
     # structured command to start the FIRST ACTIVE plan item; it must never fall
@@ -2762,8 +2834,11 @@ def proxy_chat(
             has_target = bool(req_probe.get('target_date') or req_probe.get('units_per_day') or req_probe.get('days_per_unit'))
             if not has_target:
                 requested_type = req_probe.get('content_type') or 'Giáo trình'
+                requested_type = requested_type or 'Giáo trình'
+                scope_hint = req_probe.get('scope') or ''
+                _set_pending_plan_request(user["id"], requested_type, scope_hint)
                 msg=("Được nhé! 🤖 Doraemon sẽ tạo một lộ trình mới riêng cho cậu.\n\n"
-                     f"Cậu muốn đặt mục tiêu cho **{requested_type}** như thế nào? Ví dụ: \"Mỗi ngày 1 bài\", \"2 ngày học 1 bài\" hoặc \"hoàn thành trong 10 ngày\".\n\n"
+                     f"Cậu muốn đặt mục tiêu cho **{requested_type}** như thế nào? Ví dụ: \"Mỗi ngày 1 bài\", \"2 ngày học 1 bài\", \"mỗi ngày 10 từ bộ thủ trong 7 ngày\" hoặc \"hoàn thành trong 10 ngày\".\n\n"
                      "Lộ trình hiện tại vẫn được giữ nguyên. Sau khi Doraemon tính xong, cậu sẽ xem và xác nhận trước khi áp dụng.")
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             if profile.get("learning_mode") != "planned":
@@ -2781,10 +2856,12 @@ def proxy_chat(
                 if not has_target:
                     if profile.get("learning_mode") != "planned":
                         _set_learning_profile(user["id"], "planned", True)
+                    req_type=req_probe.get('content_type') or 'Giáo trình'
+                    _set_pending_plan_request(user["id"], req_type, req_probe.get('scope') or '')
                     msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
                          "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
                          "'Mình muốn học hết giáo trình N5 trong 1 tháng', "
-                         "'Mỗi ngày 1 bài', '2 ngày học 1 bài' hoặc 'mình muốn có lộ trình ngữ pháp 1 bài/ngày'. "
+                         "'Mỗi ngày 1 bài', '2 ngày học 1 bài', 'mỗi ngày 10 từ bộ thủ trong 7 ngày' hoặc 'mình muốn có lộ trình ngữ pháp 1 bài/ngày'. "
                          "Doraemon sẽ tính lộ trình để cậu xem và xác nhận trước khi áp dụng.")
                     return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             req=_parse_plan_request(data.text)
