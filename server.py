@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.2"
+BASELINE_VERSION = "14.3"
 import os
 import ast
 import io
@@ -2655,7 +2655,20 @@ def proxy_chat(
             pid,preview=_build_plan_preview(user["id"],req)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
         # Initial planned goal if there is no active plan and no draft.
+        # IMPORTANT: saying "mình muốn học theo lộ trình" is itself a mode/plan
+        # request and MUST NEVER fall through to RAG. Ask for the actual goal
+        # first; only create a draft once the user provides a concrete target.
         if not _active_plan(user["id"]) and not draft:
+            if plan_intent and not _is_pure_greeting(data.text):
+                if profile.get("learning_mode") != "planned":
+                    _set_learning_profile(user["id"], "planned", True)
+                msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
+                     "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
+                     "'Mình muốn học hết giáo trình N5 trong 1 tháng', "
+                     "'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. "
+                     "Doraemon sẽ tính lộ trình để cậu xem và xác nhận trước khi áp dụng.")
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
+                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             req=_parse_plan_request(data.text)
             if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit') or 'giáo trình' in low0 or 'n5' in low0:
                 pid,preview=_build_plan_preview(user["id"],req)
