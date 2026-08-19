@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.1"
+BASELINE_VERSION = "14.2"
 import os
 import ast
 import io
@@ -2262,8 +2262,15 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
         message = (f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ "
                    "lập lộ trình học theo mục tiêu cho cậu, hay cậu muốn học tự do?\n\n"
-                   "👉 Trả lời 'học theo lộ trình' hoặc 'học tự do'.")
-        return {"success":True,"mode":"plan_choice","message":message,"learning_history":unfinished_rows}
+                   "Hãy chọn một trong hai lựa chọn bên dưới nhé.")
+        blocks = [
+            {"type":"text","text":message},
+            {"type":"choice","id":"plan_choice","options":[
+                {"label":"Học theo lộ trình","action":"onboarding_planned"},
+                {"label":"Học tự do","action":"onboarding_free"}
+            ]}
+        ]
+        return {"success":True,"mode":"plan_choice","message":message,"content_blocks":blocks,"learning_history":unfinished_rows}
 
     curriculum = (
         "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
@@ -2443,7 +2450,22 @@ def proxy_chat(
     ui_action = (str(data.action or "").strip().casefold() or None)
     plan_start_action = None
     if ui_action:
-        if ui_action == "plan_today_yes":
+        if ui_action == "onboarding_planned":
+            _set_learning_profile(user["id"], "planned", True)
+            msg = ("Tuyệt! 🤖 Cậu muốn Doraemon lập lộ trình cho mình.\n\n"
+                   "Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', "
+                   "'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình để cậu xem và xác nhận trước khi áp dụng.")
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
+                    "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+        elif ui_action == "onboarding_free":
+            _set_learning_profile(user["id"], "free", True)
+            msg = ("Được nhé! 🤖 Từ giờ cậu cứ học tự do theo nhu cầu.\n\n"
+                   "Khi nào muốn có lộ trình, cậu chỉ cần nói với Doraemon nhé.")
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
+                    "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+        elif ui_action == "plan_today_yes":
             profile = _get_learning_profile(user["id"])
             active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items", [])
