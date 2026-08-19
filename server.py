@@ -2572,7 +2572,21 @@ def proxy_chat(
         "cần lộ trình",
         "có lộ trình",
         "lộ trình học",
-        "theo lộ trình"
+        "theo lộ trình",
+        "tạo lộ trình",
+        "lập lộ trình",
+        "thêm lộ trình",
+        "tạo một lộ trình",
+        "lập một lộ trình"
+    ])
+    # Explicitly creating a NEW plan must take precedence over the default
+    # "continue an existing plan" behavior. This allows a user who already
+    # has Grammar plan to say e.g. "mình muốn tạo lộ trình học Bộ thủ" and
+    # start a separate Vocabulary plan instead of being routed to Grammar.
+    new_plan_intent = any(k in low0 for k in [
+        "tạo lộ trình", "lập lộ trình", "thêm lộ trình",
+        "tạo một lộ trình", "lập một lộ trình", "tạo thêm lộ trình",
+        "lập thêm lộ trình"
     ])
     free_intent = any(k in low0 for k in ["học tự do","tự do","không cần lộ trình","không cần lịch trình"])
 
@@ -2614,44 +2628,49 @@ def proxy_chat(
         # a generic knowledge question. Handle this before RAG so it can never
         # drift to an unrelated lesson such as Ngữ pháp Bài 1.
         if active_plan and plan_intent and not draft:
-            # A generic "học theo lộ trình" means continue an existing plan.
-            # If the message contains an explicit target/date/rate, it is a request
-            # to create a NEW plan and must continue to the plan-creation branch below.
-            probe = _parse_plan_request(data.text)
-            has_concrete_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
-            if has_concrete_target:
+            # Explicit NEW-plan requests must never be hijacked by an existing plan.
+            # Example: "mình muốn tạo lộ trình học bộ thủ" while a Grammar plan is active.
+            if new_plan_intent:
                 pass
             else:
-                # If the user explicitly names a content type, choose that plan; otherwise
-                # use the first unfinished plan. Never send this intent to generic RAG.
-                requested_type = probe.get("content_type")
-                candidates = _active_plans(user["id"])
-                chosen = None
-                # Only use the named type when it was explicitly present in the user's text.
-                named_type = next((ct for ct, kws in {
-                    'Giáo trình':['giáo trình','giáo trinh'],
-                    'Ngữ pháp':['ngữ pháp','ngu phap'],
-                    'Bài tập':['bài tập','bai tap'],
-                    'Từ vựng':['từ vựng','tu vung','kanji','bộ thủ'],
-                    'Truyện đọc':['truyện đọc','truyen doc','đọc truyện','doc truyen']
-                }.items() if any(k in low0 for k in kws)), None)
-                if named_type:
-                    for cand in candidates:
-                        if _normalize_content_type(cand.get('content_type') or '') == _normalize_content_type(named_type):
-                            chosen = cand; break
-                chosen = chosen or active_plan
-                planned_start_item = next((x for x in chosen.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
-            if planned_start_item:
-                lesson = str(planned_start_item.get("lesson") or "").strip()
-                ct = _normalize_content_type(chosen.get("content_type") or "Giáo trình")
-                msg = (f"🎯 Cậu đang theo lộ trình: {chosen.get('goal_name') or 'Lộ trình học'}.\n\n"
-                       f"📚 Bài tiếp theo theo lộ trình là **{lesson}** ({ct}).\n\n"
-                       "Cậu có muốn học luôn bài này không? 😊")
-                blocks=[{"type":"text","text":msg},{"type":"choice","id":f"plan_start_{int(chosen['id'])}","options":[{"label":"Có","action":f"plan_start:{int(chosen['id'])}"},{"label":"Không","action":f"plan_start_cancel:{int(chosen['id'])}"}]}]
-                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":chosen}
-            else:
-                msg="🎉 Lộ trình này đã hoàn thành toàn bộ nội dung hiện có rồi nhé!"
-                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":chosen}
+                # A generic "học theo lộ trình" means continue an existing plan.
+                # If the message contains an explicit target/date/rate, it is a request
+                # to create a NEW plan and must continue to the plan-creation branch below.
+                probe = _parse_plan_request(data.text)
+                has_concrete_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
+                if has_concrete_target:
+                    pass
+                else:
+                    # If the user explicitly names a content type, choose that plan; otherwise
+                    # use the first unfinished plan. Never send this intent to generic RAG.
+                    requested_type = probe.get("content_type")
+                    candidates = _active_plans(user["id"])
+                    chosen = None
+                    # Only use the named type when it was explicitly present in the user's text.
+                    named_type = next((ct for ct, kws in {
+                        'Giáo trình':['giáo trình','giáo trinh'],
+                        'Ngữ pháp':['ngữ pháp','ngu phap'],
+                        'Bài tập':['bài tập','bai tap'],
+                        'Từ vựng':['từ vựng','tu vung','kanji','bộ thủ'],
+                        'Truyện đọc':['truyện đọc','truyen doc','đọc truyện','doc truyen']
+                    }.items() if any(k in low0 for k in kws)), None)
+                    if named_type:
+                        for cand in candidates:
+                            if _normalize_content_type(cand.get('content_type') or '') == _normalize_content_type(named_type):
+                                chosen = cand; break
+                    chosen = chosen or active_plan
+                    planned_start_item = next((x for x in chosen.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
+                if planned_start_item:
+                    lesson = str(planned_start_item.get("lesson") or "").strip()
+                    ct = _normalize_content_type(chosen.get("content_type") or "Giáo trình")
+                    msg = (f"🎯 Cậu đang theo lộ trình: {chosen.get('goal_name') or 'Lộ trình học'}.\n\n"
+                           f"📚 Bài tiếp theo theo lộ trình là **{lesson}** ({ct}).\n\n"
+                           "Cậu có muốn học luôn bài này không? 😊")
+                    blocks=[{"type":"text","text":msg},{"type":"choice","id":f"plan_start_{int(chosen['id'])}","options":[{"label":"Có","action":f"plan_start:{int(chosen['id'])}"},{"label":"Không","action":f"plan_start_cancel:{int(chosen['id'])}"}]}]
+                    return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":chosen}
+                else:
+                    msg="🎉 Lộ trình này đã hoàn thành toàn bộ nội dung hiện có rồi nhé!"
+                    return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":chosen}
 
         completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
         if any(w in low0 for w in completion_words):
@@ -2735,6 +2754,23 @@ def proxy_chat(
                 req['override_done']=done; req['parent_plan_id']=oldplan.get('id')
             pid,preview=_build_plan_preview(user["id"],req)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
+        # Plan creation. Existing active plans do not block a new independent plan.
+        # Explicit NEW-plan requests always create a separate draft, even when
+        # another plan of a different content type is already active.
+        if new_plan_intent and not _is_pure_greeting(data.text):
+            req_probe = _parse_plan_request(data.text)
+            has_target = bool(req_probe.get('target_date') or req_probe.get('units_per_day') or req_probe.get('days_per_unit'))
+            if not has_target:
+                requested_type = req_probe.get('content_type') or 'Giáo trình'
+                msg=("Được nhé! 🤖 Doraemon sẽ tạo một lộ trình mới riêng cho cậu.\n\n"
+                     f"Cậu muốn đặt mục tiêu cho **{requested_type}** như thế nào? Ví dụ: \"Mỗi ngày 1 bài\", \"2 ngày học 1 bài\" hoặc \"hoàn thành trong 10 ngày\".\n\n"
+                     "Lộ trình hiện tại vẫn được giữ nguyên. Sau khi Doraemon tính xong, cậu sẽ xem và xác nhận trước khi áp dụng.")
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            if profile.get("learning_mode") != "planned":
+                _set_learning_profile(user["id"], "planned", True)
+            pid,preview=_build_plan_preview(user["id"],req_probe)
+            return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
+
         # Plan creation. Existing active plans do not block a new independent plan.
         # Only explicit plan intent or concrete plan parameters trigger this branch.
         if not draft:
