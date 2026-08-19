@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.3-study-plan-welcome"
+SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.6-study-plan-start-routing"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2035,7 +2035,7 @@ def _parse_plan_request(text):
     if m: days_per_unit=int(m.group(1))
     if target_date is None:
         if months: target_date=_now_local().date()+timedelta(days=round(months*30))
-        elif days: target_date=_now_local().date()+timedelta(days=days)
+        elif days: target_date=_now_local().date()+timedelta(days=max(0, days-1))
     scope='N5' if 'n5' in ql else ''
     if 'giáo trình' in ql or 'n5' in ql: content_type='Giáo trình'
     else: content_type='Giáo trình'
@@ -2458,6 +2458,10 @@ def proxy_chat(
         return {"reply":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng."}],"learning_progress":None}
 
     # Planned-user confirmations and plan creation/update requests happen before RAG.
+    # A short affirmative response after the "học luôn bài đầu tiên" prompt is a
+    # structured command to start the FIRST ACTIVE plan item; it must never fall
+    # through to generic RAG (which can select an unrelated lesson such as Ngữ pháp Bài 1).
+    planned_start_item = None
     if profile.get("learning_mode")=="planned":
         active_plan=_active_plan(user["id"])
         completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
@@ -2476,6 +2480,30 @@ def proxy_chat(
                 msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
         draft=_latest_draft(user["id"])
+        # Detect the explicit follow-up "Có" to the plan-start question by looking
+        # at the immediately preceding model turn in the client chat history.
+        if active_plan and low0 in {"có","ok","đồng ý","xác nhận","được","ừ","ừ được"} and not draft:
+            hist = data.chat_history or []
+            prev_model = ""
+            for h in reversed(hist):
+                if not isinstance(h, dict):
+                    continue
+                role = str(h.get("role") or "").lower()
+                parts = h.get("parts")
+                txt = ""
+                if isinstance(parts, list):
+                    txt = " ".join(str(x.get("text")) for x in parts if isinstance(x, dict) and x.get("text")).strip()
+                elif h.get("text"):
+                    txt = str(h.get("text")).strip()
+                elif h.get("content"):
+                    txt = str(h.get("content")).strip()
+                if role in {"model","assistant"} and txt:
+                    prev_model = txt
+                    break
+            if "có muốn học luôn bài đầu tiên theo lộ trình" in prev_model.casefold():
+                planned_start_item = next((x for x in active_plan.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
+                if planned_start_item:
+                    print(f"[STUDY PLAN] start first planned item user={user['id']} lesson={planned_start_item.get('lesson')!r} content_type={active_plan.get('content_type')!r}")
         if draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
             try:
                 plan=_confirm_latest_draft(user["id"])
@@ -2561,6 +2589,24 @@ def proxy_chat(
     catalog = _load_catalog_cached()
     perf_state = time.perf_counter()
 
+    # Force retrieval to the exact unit from the ACTIVE Study Plan when the
+    # user just confirmed "Có" to start learning. This keeps the old RAG flow
+    # intact for all other questions while preventing accidental lesson drift.
+    forced_plan_scope = None
+    if planned_start_item:
+        forced_plan_scope = {
+            "course": None,
+            "content_type": _normalize_content_type(active_plan.get("content_type") or "Giáo trình"),
+            "lesson": str(planned_start_item.get("lesson") or "").strip() or None,
+            "topic": None,
+        }
+        query_text = (
+            f"Hãy bắt đầu dạy đúng bài đầu tiên trong lộ trình: {forced_plan_scope['lesson']}. "
+            f"Loại nội dung: {forced_plan_scope['content_type']}. "
+            "Không chuyển sang lesson hoặc content type khác. "
+            "Dạy theo đúng nội dung có trong kho kiến thức của bài này."
+        )
+
     low = query_text.strip().lower()
 
     # Conversational memory: keep the recent turns so short follow-ups such as
@@ -2606,6 +2652,9 @@ def proxy_chat(
         }
     else:
         requested_scope = _select_active_scope(low, [], catalog)
+
+    if forced_plan_scope:
+        requested_scope = forced_plan_scope.copy()
 
     # Generic vocabulary identity routing for names such as "Bộ Vi" where the
     # catalog stores lesson="Bộ thủ" but does not store the individual term as
