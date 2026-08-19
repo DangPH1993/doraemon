@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.4"
+BASELINE_VERSION = "13.5"
 import os
 import ast
 import io
@@ -2134,16 +2134,22 @@ def _latest_draft(user_id):
 def _confirm_latest_draft(user_id):
     conn=db()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
             row=cur.fetchone()
-            if not row: return None
-            pid=int(row[0])
+            if not row:
+                return None
+            pid=int(row['id'])
             cur.execute("UPDATE study_plans SET status='SUPERSEDED',superseded_at=NOW() WHERE user_id=%s AND status='ACTIVE'",(user_id,))
             cur.execute("UPDATE study_plans SET status='ACTIVE',confirmed_at=NOW() WHERE id=%s RETURNING *",(pid,))
             plan=cur.fetchone()
-        conn.commit(); return dict(plan) if plan else None
-    finally: conn.close()
+        conn.commit()
+        return dict(plan) if plan else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _study_plan_brief_for_auto_chat(user_id):
@@ -2471,8 +2477,19 @@ def proxy_chat(
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
         draft=_latest_draft(user["id"])
         if draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
-            plan=_confirm_latest_draft(user["id"])
-            return {"reply":"Đã áp dụng lộ trình mới rồi nhé! 🤖 Từ giờ Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Đã áp dụng lộ trình mới rồi nhé! 🤖 Từ giờ Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này."}],"learning_progress":None,"study_plan":plan}
+            try:
+                plan=_confirm_latest_draft(user["id"])
+            except Exception as exc:
+                print(f"[STUDY PLAN] confirm draft error user={user['id']}: {exc}")
+                msg="🤖 Doraemon chưa áp dụng được lộ trình lúc này. Cậu thử bấm xác nhận thêm một lần nữa nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            if not plan:
+                msg="🤖 Doraemon không còn thấy bản lộ trình chờ xác nhận. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            msg=("🎯 Lộ trình đã được áp dụng rồi nhé! 🤖\n\n"
+                 "Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này từ hôm nay. "
+                 "Cậu có muốn học luôn bài đầu tiên theo lộ trình không? 😊")
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":plan}
         if draft and low0 in {"không","không nhé","giữ nguyên","chưa","hủy"}:
             conn=db();
             try:
