@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.0"
+BASELINE_VERSION = "14.1"
 import os
 import ast
 import io
@@ -2289,36 +2289,27 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
             "learning_history": [],
         }
 
-    # Planned users should receive plan-aware guidance immediately on login/return.
-    # This is computed directly from PostgreSQL; no Gemini/Pinecone call is needed.
+    # Planned users should be asked explicitly at login/return whether to follow
+    # today's Study Plan. This is a UI decision, not a RAG/Gemini decision.
     if active_plan:
         today = _now_local().date()
         items = active_plan.get("items") or []
         todays = [x for x in items if x.get("plan_date") == today]
         completed_items = [x for x in items if str(x.get("status") or "").lower() == "completed" and x.get("plan_date") <= today]
         overdue_items = [x for x in items if x.get("plan_date") < today and str(x.get("status") or "").lower() != "completed"]
-        current_item = next((x for x in items if str(x.get("status") or "").lower() != "completed" and x.get("plan_date") >= today), None)
-        if todays:
-            if all(str(x.get("status") or "").lower() == "completed" for x in todays):
-                plan_state = "đã hoàn thành mục tiêu hôm nay 🎉"
-                plan_action = "Cậu đã xong phần hôm nay rồi. Nếu muốn, mình có thể học trước phần tiếp theo."
-            elif overdue_items:
-                plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
-                plan_action = "Mình nên ưu tiên phần còn thiếu để kéo lại tiến độ nhé."
-            else:
-                plan_state = "đang đúng tiến độ ✅"
-                plan_action = "Mình cùng học phần hôm nay nhé."
-        elif overdue_items:
-            plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
-            plan_action = "Mình cùng bắt đầu phần còn thiếu hôm nay nhé."
-        else:
-            plan_state = "chưa có mục tiêu mới cho hôm nay"
-            plan_action = "Cậu muốn học tiếp bài gần nhất hay chọn phần khác?"
+        next_item = next((x for x in items if str(x.get("status") or "").lower() != "completed"), None)
 
         target_today = ", ".join(str(x.get("lesson") or "").strip() for x in todays if x.get("lesson"))
-        if not target_today and current_item:
-            target_today = str(current_item.get("lesson") or "").strip()
-        target_today = target_today or "chưa xác định"
+        if not target_today and next_item:
+            target_today = str(next_item.get("lesson") or "").strip()
+        target_today = target_today or "đã hoàn thành toàn bộ nội dung hiện có"
+
+        if todays and all(str(x.get("status") or "").lower() == "completed" for x in todays):
+            plan_state = "đã hoàn thành mục tiêu hôm nay 🎉"
+        elif overdue_items:
+            plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
+        else:
+            plan_state = "đang đúng tiến độ ✅"
 
         plan_message = (
             f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
@@ -2328,12 +2319,20 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
             f"📚 Mục tiêu hôm nay: {target_today}\n"
             f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
             f"📌 Tình trạng: {plan_state}\n\n"
-            f"{plan_action}"
+            "Hôm nay cậu có muốn học tiếp theo lộ trình không? 😊"
         )
+        blocks = [
+            {"type":"text","text":plan_message},
+            {"type":"choice","id":"plan_today","options":[
+                {"label":"Có","action":"plan_today_yes"},
+                {"label":"Không","action":"plan_today_no"}
+            ]}
+        ]
         return {
             "success": True,
             "mode": "planned_returning",
             "message": plan_message,
+            "content_blocks": blocks,
             "learning_history": unfinished_rows,
             "study_plan": active_plan,
         }
@@ -2444,7 +2443,25 @@ def proxy_chat(
     ui_action = (str(data.action or "").strip().casefold() or None)
     plan_start_action = None
     if ui_action:
-        if ui_action == "plan_apply_draft":
+        if ui_action == "plan_today_yes":
+            profile = _get_learning_profile(user["id"])
+            active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
+            planned_start_item = next((x for x in (active_plan or {}).get("items", [])
+                                       if str(x.get("status") or "").lower() != "completed"), None)
+            if not planned_start_item:
+                msg = "🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình rồi nhé!"
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":active_plan}
+            forced_content_type = _normalize_content_type((active_plan or {}).get("content_type") or "Giáo trình")
+            forced_lesson = str(planned_start_item.get("lesson") or "").strip()
+            print(f"[STUDY PLAN] today_yes user={user['id']} lesson={forced_lesson!r} content_type={forced_content_type!r}")
+            plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
+            # Fall through to the dedicated exact-plan retrieval branch below.
+
+        elif ui_action == "plan_today_no":
+            msg = "Được nhé! 🤖 Hôm nay cậu có thể học tự do theo nhu cầu. Lộ trình vẫn được giữ nguyên, khi nào muốn quay lại chỉ cần chọn 'Có'."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+        elif ui_action == "plan_apply_draft":
             draft = _latest_draft(user["id"])
             if not draft:
                 msg = "🤖 Doraemon không còn thấy lộ trình chờ xác nhận. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
@@ -2576,7 +2593,8 @@ def proxy_chat(
                 msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
         # Plan-start confirmation is now handled exclusively by the UI buttons.
-        if draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
+        # Draft confirmation is UI-only in v14.1; do not interpret free text as a confirmation command.
+        if False and draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
             try:
                 plan=_confirm_latest_draft(user["id"])
             except Exception as exc:
