@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.7"
+BASELINE_VERSION = "14.9"
 import os
 import ast
 import io
@@ -2263,12 +2263,61 @@ def _study_plan_brief_for_auto_chat(user_id):
 
 
 def _is_pure_greeting(text: str) -> bool:
-    """True only for a standalone greeting, not for a greeting + request."""
+    """True for a standalone greeting (including common variants), not a greeting + request."""
     low = str(text or "").strip().casefold()
     if not low:
         return False
     normalized = re.sub(r"[\W_]+", " ", low, flags=re.UNICODE).strip()
-    return normalized in _GREETING_EXACT
+    if normalized in _GREETING_EXACT:
+        return True
+    patterns = [
+        r"^(?:xin\s+)?chào(?:\s+(?:cậu|bạn|doraemon|nhé|nha))?$",
+        r"^(?:hi|hello|hey|alo)(?:\s+(?:cậu|bạn|doraemon|nhé|nha))?$",
+        r"^chào\s+buổi\s+(?:sáng|trưa|chiều|tối)$",
+        r"^(?:xin\s+)?chao(?:\s+(?:cau|ban|doraemon|nhe|nha))?$",
+        r"^chao\s+buoi\s+(?:sang|trua|chieu|toi)$",
+    ]
+    return any(re.fullmatch(pattern, normalized, flags=re.UNICODE) for pattern in patterns)
+
+
+def _build_plan_choice_blocks(user_id: int, include_header: bool = True):
+    """Build all active Study Plans with one inline Yes/No choice per plan."""
+    plans = _active_plans(user_id)
+    today = _now_local().date()
+    blocks = []
+    if include_header:
+        blocks.append({"type":"text","text":"🎯 Doraemon đang theo dõi các lộ trình học của cậu.\n\n"})
+    for plan in plans:
+        items = plan.get("items") or []
+        todays = [x for x in items if x.get("plan_date") == today and str(x.get("status") or "").lower() != "completed"]
+        completed_items = [x for x in items if str(x.get("status") or "").lower() == "completed" and x.get("plan_date") <= today]
+        overdue_items = [x for x in items if x.get("plan_date") < today and str(x.get("status") or "").lower() != "completed"]
+        next_item = next((x for x in items if str(x.get("status") or "").lower() != "completed"), None)
+        target_today = ", ".join(str(x.get("lesson") or "").strip() for x in todays if x.get("lesson"))
+        if not target_today and next_item:
+            target_today = str(next_item.get("lesson") or "").strip()
+        target_today = target_today or "chưa xác định"
+        if todays and not overdue_items:
+            plan_state = "đang đúng tiến độ ✅"
+        elif overdue_items:
+            plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
+        else:
+            plan_state = "chưa có mục tiêu mới cho hôm nay"
+        msg = (
+            f"🎯 Lộ trình: {plan.get('goal_name') or 'Lộ trình học'}\n"
+            f"🗂 Nội dung: {plan.get('content_type') or 'Giáo trình'}\n"
+            f"📅 Hôm nay: {today.strftime('%d/%m/%Y')}\n"
+            f"📚 Mục tiêu hôm nay: {target_today}\n"
+            f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
+            f"📌 Tình trạng: {plan_state}\n\n"
+            "Hôm nay cậu có muốn học tiếp theo lộ trình này không? 😊"
+        )
+        blocks.append({"type":"text","text":msg})
+        blocks.append({"type":"choice","id":f"plan_today_{int(plan['id'])}","options":[
+            {"label":"Có","action":f"plan_today_yes:{int(plan['id'])}"},
+            {"label":"Không","action":f"plan_today_no:{int(plan['id'])}"}
+        ]})
+    return plans, blocks
 
 
 def _build_welcome_for_user(user, mark_seen: bool = False):
@@ -2389,42 +2438,10 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     # Planned users with one or more unfinished plans are asked per plan whether
     # they want to follow that plan today. Fully completed plans are hidden.
     if profile.get("learning_mode") == "planned":
-        active_plans = _active_plans(user["id"])
+        active_plans, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False)
         if active_plans:
-            today = _now_local().date()
             header=(f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n{curriculum}\n\n")
-            blocks=[{"type":"text","text":header.rstrip()}]
-            for plan in active_plans:
-                items=plan.get("items") or []
-                todays=[x for x in items if x.get('plan_date')==today and str(x.get('status') or '').lower()!='completed']
-                completed_items=[x for x in items if str(x.get('status') or '').lower()=='completed' and x.get('plan_date')<=today]
-                overdue_items=[x for x in items if x.get('plan_date')<today and str(x.get('status') or '').lower()!='completed']
-                next_item=next((x for x in items if str(x.get('status') or '').lower()!='completed'),None)
-                target_today=", ".join(str(x.get('lesson') or '').strip() for x in todays if x.get('lesson'))
-                if not target_today and next_item: target_today=str(next_item.get('lesson') or '').strip()
-                target_today=target_today or 'chưa xác định'
-                if todays and not overdue_items:
-                    plan_state='đang đúng tiến độ ✅'
-                elif overdue_items:
-                    plan_state=f'đang chậm {len(overdue_items)} bài so với lộ trình ⏰'
-                else:
-                    plan_state='chưa có mục tiêu mới cho hôm nay'
-                msg=(f"🎯 Lộ trình: {plan.get('goal_name') or 'Lộ trình học'}\n"
-                     f"🗂 Nội dung: {plan.get('content_type') or 'Giáo trình'}\n"
-                     f"📅 Hôm nay: {today.strftime('%d/%m/%Y')}\n"
-                     f"📚 Mục tiêu hôm nay: {target_today}\n"
-                     f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
-                     f"📌 Tình trạng: {plan_state}\n\n"
-                     "Hôm nay cậu có muốn học tiếp theo lộ trình này không? 😊")
-                blocks.append({"type":"text","text":msg})
-                blocks.append({"type":"choice","id":f"plan_today_{int(plan['id'])}","options":[
-                    {"label":"Có","action":f"plan_today_yes:{int(plan['id'])}"},
-                    {"label":"Không","action":f"plan_today_no:{int(plan['id'])}"}
-                ]})
-
-            # Keep the older learning-progress summary visible as well. Study plans
-            # are an additional layer and must not hide unfinished material tracked
-            # by earlier baselines (for example Bộ thủ, Bài tập, or Ngữ pháp).
+            blocks=[{"type":"text","text":header.rstrip()}] + plan_blocks
             if unfinished_rows:
                 seen_old=set(); parts_old=[]
                 for row in unfinished_rows:
@@ -2438,12 +2455,8 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
                     parts_old.append(f"• {label}: {detail or 'nội dung'} – {state_text}")
                     if len(parts_old)>=8: break
                 if parts_old:
-                    blocks.append({
-                        "type":"text",
-                        "text":"📖 Những phần cậu đang học dở/cần ôn từ các phiên học trước:\n" + "\n".join(parts_old)
-                    })
-
-            return {"success":True,"mode":"planned_returning","message":header,"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
+                    blocks.append({"type":"text","text":"📖 Những phần cậu đang học dở/cần ôn từ các phiên học trước:\n" + "\n".join(parts_old)})
+            return {"success":True,"mode":"planned_returning","message":header.rstrip(),"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
 
     parts = []
     seen = set()
@@ -2722,49 +2735,22 @@ def proxy_chat(
         # a generic knowledge question. Handle this before RAG so it can never
         # drift to an unrelated lesson such as Ngữ pháp Bài 1.
         if active_plan and plan_intent and not draft:
-            # Explicit NEW-plan requests must never be hijacked by an existing plan.
-            # Example: "mình muốn tạo lộ trình học bộ thủ" while a Grammar plan is active.
+            # Explicit NEW-plan requests are handled by the dedicated creation flow.
+            # A generic request to "học theo lộ trình" should show ALL current plans
+            # and let the user choose which one to follow today. Never send this to RAG.
             if new_plan_intent:
                 pass
             else:
-                # A generic "học theo lộ trình" means continue an existing plan.
-                # If the message contains an explicit target/date/rate, it is a request
-                # to create a NEW plan and must continue to the plan-creation branch below.
                 probe = _parse_plan_request(data.text)
                 has_concrete_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
                 if has_concrete_target:
                     pass
                 else:
-                    # If the user explicitly names a content type, choose that plan; otherwise
-                    # use the first unfinished plan. Never send this intent to generic RAG.
-                    requested_type = probe.get("content_type")
-                    candidates = _active_plans(user["id"])
-                    chosen = None
-                    # Only use the named type when it was explicitly present in the user's text.
-                    named_type = next((ct for ct, kws in {
-                        'Giáo trình':['giáo trình','giáo trinh'],
-                        'Ngữ pháp':['ngữ pháp','ngu phap'],
-                        'Bài tập':['bài tập','bai tap'],
-                        'Từ vựng':['từ vựng','tu vung','kanji','bộ thủ'],
-                        'Truyện đọc':['truyện đọc','truyen doc','đọc truyện','doc truyen']
-                    }.items() if any(k in low0 for k in kws)), None)
-                    if named_type:
-                        for cand in candidates:
-                            if _normalize_content_type(cand.get('content_type') or '') == _normalize_content_type(named_type):
-                                chosen = cand; break
-                    chosen = chosen or active_plan
-                    planned_start_item = next((x for x in chosen.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
-                if planned_start_item:
-                    lesson = str(planned_start_item.get("lesson") or "").strip()
-                    ct = _normalize_content_type(chosen.get("content_type") or "Giáo trình")
-                    msg = (f"🎯 Cậu đang theo lộ trình: {chosen.get('goal_name') or 'Lộ trình học'}.\n\n"
-                           f"📚 Bài tiếp theo theo lộ trình là **{lesson}** ({ct}).\n\n"
-                           "Cậu có muốn học luôn bài này không? 😊")
-                    blocks=[{"type":"text","text":msg},{"type":"choice","id":f"plan_start_{int(chosen['id'])}","options":[{"label":"Có","action":f"plan_start:{int(chosen['id'])}"},{"label":"Không","action":f"plan_start_cancel:{int(chosen['id'])}"}]}]
-                    return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":chosen}
-                else:
-                    msg="🎉 Lộ trình này đã hoàn thành toàn bộ nội dung hiện có rồi nhé!"
-                    return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":chosen}
+                    plans_all, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False)
+                    if plans_all:
+                        msg="🎯 Cậu đang có các lộ trình học đang theo dõi. Hôm nay cậu muốn tiếp tục lộ trình nào?"
+                        blocks=[{"type":"text","text":msg}] + plan_blocks
+                        return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plans":plans_all}
 
         completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
         if any(w in low0 for w in completion_words):
@@ -2900,7 +2886,8 @@ def proxy_chat(
             "model": GEMINI_MODEL,
             "sources": [],
             "images": [],
-            "content_blocks": [{"type": "text", "text": welcome["message"]}],
+            "content_blocks": welcome.get("content_blocks") or [{"type":"text","text":welcome["message"]}],
+            "study_plans": welcome.get("study_plans") or [],
             "learning_history_count": len(welcome.get("learning_history") or []),
             "learning_progress": None,
             "welcome": True,
