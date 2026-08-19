@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.5"
+BASELINE_VERSION = "13.7"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.6-study-plan-start-routing"
+SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.7-study-plan-intent-routing"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2464,6 +2464,29 @@ def proxy_chat(
     planned_start_item = None
     if profile.get("learning_mode")=="planned":
         active_plan=_active_plan(user["id"])
+        draft=_latest_draft(user["id"])
+        # IMPORTANT: once a user already has an ACTIVE Study Plan, phrases such as
+        # "mình muốn học theo lộ trình" mean "start/continue my plan" rather than
+        # a generic knowledge question. Handle this before RAG so it can never drift
+        # to an unrelated lesson such as Ngữ pháp Bài 1.
+        if active_plan and plan_intent and not draft:
+            planned_start_item = next((x for x in active_plan.get("items",[])
+                                       if str(x.get("status")).lower() != "completed"), None)
+            if planned_start_item:
+                lesson = str(planned_start_item.get("lesson") or "").strip()
+                ct = _normalize_content_type(active_plan.get("content_type") or "Giáo trình")
+                msg = (f"🎯 Cậu đang theo lộ trình: {active_plan.get('goal_name') or 'Lộ trình học'}.\n\n"
+                       f"📚 Bài tiếp theo theo lộ trình là **{lesson}** ({ct}).\n\n"
+                       "Cậu có muốn học luôn bài này không? 😊")
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
+                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None,
+                        "study_plan":active_plan}
+            else:
+                msg="🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình. Khi có nội dung mới, Doraemon sẽ cập nhật để học tiếp cùng cậu nhé!"
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
+                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None,
+                        "study_plan":active_plan}
+
         completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
         if active_plan and any(w in low0 for w in completion_words):
             upcoming=[x for x in active_plan.get('items',[]) if str(x.get('status')).lower()!='completed']
@@ -2479,7 +2502,6 @@ def proxy_chat(
                 nxt=f" Bài tiếp theo theo lộ trình là {next_item.get('lesson')}." if next_item else " Cậu đã hoàn thành toàn bộ lộ trình hiện tại rồi! 🎉"
                 msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
-        draft=_latest_draft(user["id"])
         # Detect the explicit follow-up "Có" to the plan-start question by looking
         # at the immediately preceding model turn in the client chat history.
         if active_plan and low0 in {"có","ok","đồng ý","xác nhận","được","ừ","ừ được"} and not draft:
