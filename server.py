@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.7"
+BASELINE_VERSION = "13.8"
 import os
 import ast
 import io
@@ -2438,7 +2438,15 @@ def proxy_chat(
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
     # Learning-mode onboarding and explicit mode switch.
-    plan_intent = any(k in low0 for k in ["học theo lộ trình","muốn lộ trình","cần lộ trình","có lộ trình"])
+    plan_intent = any(k in low0 for k in [
+        "học theo lộ trình",
+        "học lộ trình",
+        "muốn lộ trình",
+        "cần lộ trình",
+        "có lộ trình",
+        "lộ trình học",
+        "theo lộ trình"
+    ])
     free_intent = any(k in low0 for k in ["học tự do","tự do","không cần lộ trình","không cần lịch trình"])
 
     # Brand-new learner: choose a mode once.
@@ -2451,8 +2459,9 @@ def proxy_chat(
             return {"reply":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu."}],"learning_progress":None}
 
     # A user who previously chose Free can explicitly switch to Planned later.
-    # This must be handled before RAG, otherwise the phrase is mistaken for a
-    # generic learning request and Pinecone/Gemini starts teaching a lesson.
+    # Any explicit plan-intent phrase (including shorthand such as "học lộ trình")
+    # must be handled before RAG, otherwise it can be mistaken for a generic
+    # learning request and Pinecone/Gemini may start teaching an unrelated lesson.
     if profile.get("learning_mode") == "free" and plan_intent and not _is_pure_greeting(data.text):
         _set_learning_profile(user["id"],"planned",True)
         return {"reply":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng."}],"learning_progress":None}
@@ -2465,10 +2474,11 @@ def proxy_chat(
     if profile.get("learning_mode")=="planned":
         active_plan=_active_plan(user["id"])
         draft=_latest_draft(user["id"])
-        # IMPORTANT: once a user already has an ACTIVE Study Plan, phrases such as
-        # "mình muốn học theo lộ trình" mean "start/continue my plan" rather than
-        # a generic knowledge question. Handle this before RAG so it can never drift
-        # to an unrelated lesson such as Ngữ pháp Bài 1.
+        # IMPORTANT: once a user already has an ACTIVE Study Plan, any explicit
+        # plan-intent phrase such as "mình muốn học theo lộ trình" or
+        # "mình muốn học lộ trình" means "start/continue my plan" rather than
+        # a generic knowledge question. Handle this before RAG so it can never
+        # drift to an unrelated lesson such as Ngữ pháp Bài 1.
         if active_plan and plan_intent and not draft:
             planned_start_item = next((x for x in active_plan.get("items",[])
                                        if str(x.get("status")).lower() != "completed"), None)
