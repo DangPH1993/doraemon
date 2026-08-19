@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.4"
+BASELINE_VERSION = "14.7"
 import os
 import ast
 import io
@@ -2421,6 +2421,28 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
                     {"label":"Có","action":f"plan_today_yes:{int(plan['id'])}"},
                     {"label":"Không","action":f"plan_today_no:{int(plan['id'])}"}
                 ]})
+
+            # Keep the older learning-progress summary visible as well. Study plans
+            # are an additional layer and must not hide unfinished material tracked
+            # by earlier baselines (for example Bộ thủ, Bài tập, or Ngữ pháp).
+            if unfinished_rows:
+                seen_old=set(); parts_old=[]
+                for row in unfinished_rows:
+                    key=(row.get('content_type'),row.get('lesson'),row.get('topic'))
+                    if key in seen_old: continue
+                    seen_old.add(key)
+                    label=str(row.get('content_type') or 'Nội dung')
+                    detail=' '.join(str(x).strip() for x in (row.get('lesson'),row.get('topic')) if x and str(x).strip())
+                    state=str(row.get('status') or '').strip().lower()
+                    state_text='đang học dở' if state in {'in_progress','active'} else 'cần ôn'
+                    parts_old.append(f"• {label}: {detail or 'nội dung'} – {state_text}")
+                    if len(parts_old)>=8: break
+                if parts_old:
+                    blocks.append({
+                        "type":"text",
+                        "text":"📖 Những phần cậu đang học dở/cần ôn từ các phiên học trước:\n" + "\n".join(parts_old)
+                    })
+
             return {"success":True,"mode":"planned_returning","message":header,"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
 
     parts = []
