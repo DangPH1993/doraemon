@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.3"
+BASELINE_VERSION = "13.4"
 import os
 import ast
 import io
@@ -2431,14 +2431,25 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
-    # One-time learning-mode choice.
-    if not profile.get("onboarding_completed") and not profile.get("learning_mode") and not _is_pure_greeting(data.text):
-        if any(k in low0 for k in ["học tự do","tự do","không cần lộ trình","không cần lịch trình"]):
+    # Learning-mode onboarding and explicit mode switch.
+    plan_intent = any(k in low0 for k in ["học theo lộ trình","muốn lộ trình","cần lộ trình","có lộ trình"])
+    free_intent = any(k in low0 for k in ["học tự do","tự do","không cần lộ trình","không cần lịch trình"])
+
+    # Brand-new learner: choose a mode once.
+    if not profile.get("learning_mode") and not _is_pure_greeting(data.text):
+        if free_intent:
             _set_learning_profile(user["id"],"free",True)
             return {"reply":"Được nhé! 🤖 Từ giờ cậu cứ học tự do theo nhu cầu. Khi nào muốn có lộ trình, hãy nói với Doraemon là cậu muốn học theo lộ trình nhé.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Từ giờ cậu cứ học tự do theo nhu cầu. Khi nào muốn có lộ trình, hãy nói với Doraemon là cậu muốn học theo lộ trình nhé."}],"learning_progress":None}
-        if any(k in low0 for k in ["học theo lộ trình","muốn lộ trình","cần lộ trình","có lộ trình"]):
+        if plan_intent:
             _set_learning_profile(user["id"],"planned",True)
             return {"reply":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Tuyệt! 🤖 Cậu cho Doraemon biết mục tiêu nhé. Ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng' hoặc 'Mỗi ngày 1 bài'. Doraemon sẽ tính lộ trình cho cậu."}],"learning_progress":None}
+
+    # A user who previously chose Free can explicitly switch to Planned later.
+    # This must be handled before RAG, otherwise the phrase is mistaken for a
+    # generic learning request and Pinecone/Gemini starts teaching a lesson.
+    if profile.get("learning_mode") == "free" and plan_intent and not _is_pure_greeting(data.text):
+        _set_learning_profile(user["id"],"planned",True)
+        return {"reply":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng."}],"learning_progress":None}
 
     # Planned-user confirmations and plan creation/update requests happen before RAG.
     if profile.get("learning_mode")=="planned":
