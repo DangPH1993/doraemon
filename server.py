@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.3"
+BASELINE_VERSION = "14.4"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-19-doraemon-baseline-v13.7-study-plan-intent-routing"
+SERVER_VERSION = "2026-08-19-doraemon-baseline-v14.4-study-plan-multi"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -150,6 +150,7 @@ def init_db():
                 units_per_day NUMERIC(8,3), days_per_unit INTEGER,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), confirmed_at TIMESTAMPTZ, superseded_at TIMESTAMPTZ
             );""")
+            cur.execute("""ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS parent_plan_id BIGINT REFERENCES study_plans(id) ON DELETE SET NULL;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plan_items (
                 id BIGSERIAL PRIMARY KEY, study_plan_id BIGINT NOT NULL REFERENCES study_plans(id) ON DELETE CASCADE,
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
@@ -890,7 +891,10 @@ def _sync_active_plan_completion(user_id, row):
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()\n                FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'\n                AND lower(i.lesson)=lower(%s) AND i.status<>'completed'""",(user_id,lesson))
+            cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()
+                FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'
+                AND lower(i.lesson)=lower(%s) AND lower(coalesce(p.content_type,''))=lower(coalesce(%s,''))
+                AND i.status<>'completed'""",(user_id,lesson,row.get('content_type') or ''))
         conn.commit()
     finally: conn.close()
 
@@ -2019,7 +2023,7 @@ def _parse_plan_request(text):
     q=str(text or '').strip()
     ql=q.casefold()
     target_date=None
-    m=re.search(r'(?:đến|tới|trước|trong)\s*\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', ql)
+    m=re.search(r'(?:đến|tới|trước|trong)\s*(\d{1,2})[/-](\d{1,2})(?:[/-](\d{4}))?', ql)
     if m:
         day=int(m.group(1)); month=int(m.group(2)); year=int(m.group(3) or _now_local().year)
         try: target_date=date(year,month,day)
@@ -2035,11 +2039,21 @@ def _parse_plan_request(text):
     m=re.search(r'(\d+)\s*ngày\s*(?:một|1)\s*bài', ql)
     if m: days_per_unit=int(m.group(1))
     if target_date is None:
-        if months: target_date=_now_local().date()+timedelta(days=round(months*30))
+        if months: target_date=_now_local().date()+timedelta(days=round(months*30)-1)
         elif days: target_date=_now_local().date()+timedelta(days=max(0, days-1))
     scope='N5' if 'n5' in ql else ''
-    if 'giáo trình' in ql or 'n5' in ql: content_type='Giáo trình'
-    else: content_type='Giáo trình'
+    if any(k in ql for k in ['giáo trình','giáo trinh']):
+        content_type='Giáo trình'
+    elif any(k in ql for k in ['ngữ pháp','ngu phap','grammar']):
+        content_type='Ngữ pháp'
+    elif any(k in ql for k in ['bài tập','bai tap','luyện tập','luyen tap','exercise']):
+        content_type='Bài tập'
+    elif any(k in ql for k in ['từ vựng','tu vung','vocabulary','từ mới','tu moi','bộ thủ','bộ khẩu','kanji']):
+        content_type='Từ vựng'
+    elif any(k in ql for k in ['truyện đọc','truyen doc','đọc truyện','doc truyen','reading','story']):
+        content_type='Truyện đọc'
+    else:
+        content_type='Giáo trình'
     goal=q.strip()
     return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type}
 
@@ -2109,19 +2123,45 @@ def _build_plan_preview(user_id, req, existing_plan_id=None):
     return plan_id, preview
 
 
-def _active_plan(user_id):
+def _finalize_completed_active_plans(user_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE study_plans p SET status='COMPLETED',superseded_at=NOW()
+                           WHERE p.user_id=%s AND p.status='ACTIVE'
+                             AND NOT EXISTS (SELECT 1 FROM study_plan_items i WHERE i.study_plan_id=p.id AND i.status<>'completed')""",(user_id,))
+        conn.commit()
+    finally: conn.close()
+
+def _active_plans(user_id, include_completed=False):
+    _finalize_completed_active_plans(user_id)
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='ACTIVE' ORDER BY version DESC LIMIT 1",(user_id,))
-            p=cur.fetchone()
-            if not p: return None
-            plan=dict(p)
-            cur.execute("SELECT id,plan_date,unit_index,lesson,target,status,completed_at FROM study_plan_items WHERE study_plan_id=%s ORDER BY unit_index",(plan['id'],))
-            plan['items']=[dict(x) for x in cur.fetchall()]
-            return plan
+            status_clause="status='ACTIVE'" if not include_completed else "status IN ('ACTIVE','COMPLETED')"
+            cur.execute(f"SELECT * FROM study_plans WHERE user_id=%s AND {status_clause} ORDER BY start_date, id",(user_id,))
+            plans=[]
+            for row in cur.fetchall():
+                p=dict(row)
+                cur.execute("SELECT id,plan_date,unit_index,lesson,target,status,completed_at FROM study_plan_items WHERE study_plan_id=%s ORDER BY unit_index",(p['id'],))
+                p['items']=[dict(x) for x in cur.fetchall()]
+                if include_completed or any(str(x.get('status') or '').lower()!='completed' for x in p['items']):
+                    plans.append(p)
+            return plans
     finally: conn.close()
 
+def _active_plan(user_id, plan_id=None):
+    plans=_active_plans(user_id)
+    if plan_id is not None:
+        try:
+            pid=int(plan_id)
+        except Exception:
+            pid=None
+        if pid is not None:
+            for p in plans:
+                if int(p.get('id'))==pid:
+                    return p
+    return plans[0] if plans else None
 
 def _latest_draft(user_id):
     conn=db()
@@ -2131,46 +2171,47 @@ def _latest_draft(user_id):
             row=cur.fetchone(); return dict(row) if row else None
     finally: conn.close()
 
-
 def _confirm_latest_draft(user_id):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
             row=cur.fetchone()
             if not row:
                 return None
             pid=int(row['id'])
-            cur.execute("UPDATE study_plans SET status='SUPERSEDED',superseded_at=NOW() WHERE user_id=%s AND status='ACTIVE'",(user_id,))
+            parent_id=row.get('parent_plan_id')
+            if parent_id:
+                cur.execute("UPDATE study_plans SET status='SUPERSEDED',superseded_at=NOW() WHERE id=%s AND status='ACTIVE'",(int(parent_id),))
             cur.execute("UPDATE study_plans SET status='ACTIVE',confirmed_at=NOW() WHERE id=%s RETURNING *",(pid,))
             plan=cur.fetchone()
         conn.commit()
         return dict(plan) if plan else None
     except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        conn.rollback(); raise
+    finally: conn.close()
 
 
 def _study_plan_brief_for_auto_chat(user_id):
-    plan=_active_plan(user_id)
-    if not plan: return ""
+    plans=_active_plans(user_id)
+    if not plans: return ""
     today=_now_local().date()
-    items=plan.get('items') or []
-    todays=[x for x in items if x['plan_date']==today]
-    completed=[x for x in items if str(x.get('status')).lower()=='completed' and x['plan_date']<=today]
-    overdue=[x for x in items if x['plan_date']<today and str(x.get('status')).lower()!='completed']
-    if todays:
-        if all(str(x.get('status')).lower()=='completed' for x in todays): state='ON_TRACK'
-        elif completed or overdue: state='BEHIND'
-        else: state='NO_ACTIVITY'
-    else:
-        state='BEHIND' if overdue else 'ON_TRACK'
-    target=', '.join(x['lesson'] for x in todays[:4]) or 'không có bài mới'
-    return (f"Study Plan status={state}; hôm nay={today.isoformat()}; mục tiêu hôm nay={target}; "
-            f"đã hoàn thành trước hôm nay={len(completed)}; bài quá hạn chưa hoàn thành={len(overdue)}. "
-            "Hãy viết 1 câu ngắn, thân thiện bằng tiếng Việt để động viên/nhắc/chúc mừng phù hợp; không được tạo bài học mới.")
+    summaries=[]
+    for plan in plans[:5]:
+        items=plan.get('items') or []
+        todays=[x for x in items if x['plan_date']==today and str(x.get('status') or '').lower()!='completed']
+        completed=[x for x in items if str(x.get('status')).lower()=='completed' and x['plan_date']<=today]
+        overdue=[x for x in items if x['plan_date']<today and str(x.get('status')).lower()!='completed']
+        if todays:
+            if not overdue and not any(str(x.get('status') or '').lower()!='completed' for x in todays): state='ON_TRACK'
+            elif overdue: state='BEHIND'
+            else: state='NO_ACTIVITY'
+        else:
+            state='BEHIND' if overdue else 'ON_TRACK'
+        target=', '.join(x['lesson'] for x in todays[:4]) or 'không có bài mới hôm nay'
+        summaries.append(f"[{plan.get('content_type')}] {plan.get('goal_name')}; status={state}; mục tiêu hôm nay={target}; đã hoàn thành={len(completed)}; quá hạn={len(overdue)}")
+    return (f"Hôm nay={today.isoformat()}; " + " | ".join(summaries) + " Hãy viết 1 câu ngắn, thân thiện bằng tiếng Việt để động viên/nhắc/chúc mừng phù hợp; không được tạo bài học mới.")
+
 
 def _is_pure_greeting(text: str) -> bool:
     """True only for a standalone greeting, not for a greeting + request."""
@@ -2296,53 +2337,42 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
             "learning_history": [],
         }
 
-    # Planned users should be asked explicitly at login/return whether to follow
-    # today's Study Plan. This is a UI decision, not a RAG/Gemini decision.
-    if active_plan:
-        today = _now_local().date()
-        items = active_plan.get("items") or []
-        todays = [x for x in items if x.get("plan_date") == today]
-        completed_items = [x for x in items if str(x.get("status") or "").lower() == "completed" and x.get("plan_date") <= today]
-        overdue_items = [x for x in items if x.get("plan_date") < today and str(x.get("status") or "").lower() != "completed"]
-        next_item = next((x for x in items if str(x.get("status") or "").lower() != "completed"), None)
-
-        target_today = ", ".join(str(x.get("lesson") or "").strip() for x in todays if x.get("lesson"))
-        if not target_today and next_item:
-            target_today = str(next_item.get("lesson") or "").strip()
-        target_today = target_today or "đã hoàn thành toàn bộ nội dung hiện có"
-
-        if todays and all(str(x.get("status") or "").lower() == "completed" for x in todays):
-            plan_state = "đã hoàn thành mục tiêu hôm nay 🎉"
-        elif overdue_items:
-            plan_state = f"đang chậm {len(overdue_items)} bài so với lộ trình ⏰"
-        else:
-            plan_state = "đang đúng tiến độ ✅"
-
-        plan_message = (
-            f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
-            f"{curriculum}\n\n"
-            f"🎯 Lộ trình hiện tại: {active_plan.get('goal_name') or 'Lộ trình học'}\n"
-            f"📅 Hôm nay: {today.strftime('%d/%m/%Y')}\n"
-            f"📚 Mục tiêu hôm nay: {target_today}\n"
-            f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
-            f"📌 Tình trạng: {plan_state}\n\n"
-            "Hôm nay cậu có muốn học tiếp theo lộ trình không? 😊"
-        )
-        blocks = [
-            {"type":"text","text":plan_message},
-            {"type":"choice","id":"plan_today","options":[
-                {"label":"Có","action":"plan_today_yes"},
-                {"label":"Không","action":"plan_today_no"}
-            ]}
-        ]
-        return {
-            "success": True,
-            "mode": "planned_returning",
-            "message": plan_message,
-            "content_blocks": blocks,
-            "learning_history": unfinished_rows,
-            "study_plan": active_plan,
-        }
+    # Planned users with one or more unfinished plans are asked per plan whether
+    # they want to follow that plan today. Fully completed plans are hidden.
+    if profile.get("learning_mode") == "planned":
+        active_plans = _active_plans(user["id"])
+        if active_plans:
+            today = _now_local().date()
+            header=(f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n{curriculum}\n\n")
+            blocks=[{"type":"text","text":header.rstrip()}]
+            for plan in active_plans:
+                items=plan.get("items") or []
+                todays=[x for x in items if x.get('plan_date')==today and str(x.get('status') or '').lower()!='completed']
+                completed_items=[x for x in items if str(x.get('status') or '').lower()=='completed' and x.get('plan_date')<=today]
+                overdue_items=[x for x in items if x.get('plan_date')<today and str(x.get('status') or '').lower()!='completed']
+                next_item=next((x for x in items if str(x.get('status') or '').lower()!='completed'),None)
+                target_today=", ".join(str(x.get('lesson') or '').strip() for x in todays if x.get('lesson'))
+                if not target_today and next_item: target_today=str(next_item.get('lesson') or '').strip()
+                target_today=target_today or 'chưa xác định'
+                if todays and not overdue_items:
+                    plan_state='đang đúng tiến độ ✅'
+                elif overdue_items:
+                    plan_state=f'đang chậm {len(overdue_items)} bài so với lộ trình ⏰'
+                else:
+                    plan_state='chưa có mục tiêu mới cho hôm nay'
+                msg=(f"🎯 Lộ trình: {plan.get('goal_name') or 'Lộ trình học'}\n"
+                     f"🗂 Nội dung: {plan.get('content_type') or 'Giáo trình'}\n"
+                     f"📅 Hôm nay: {today.strftime('%d/%m/%Y')}\n"
+                     f"📚 Mục tiêu hôm nay: {target_today}\n"
+                     f"✅ Đã hoàn thành: {len(completed_items)} bài\n"
+                     f"📌 Tình trạng: {plan_state}\n\n"
+                     "Hôm nay cậu có muốn học tiếp theo lộ trình này không? 😊")
+                blocks.append({"type":"text","text":msg})
+                blocks.append({"type":"choice","id":f"plan_today_{int(plan['id'])}","options":[
+                    {"label":"Có","action":f"plan_today_yes:{int(plan['id'])}"},
+                    {"label":"Không","action":f"plan_today_no:{int(plan['id'])}"}
+                ]})
+            return {"success":True,"mode":"planned_returning","message":header,"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
 
     parts = []
     seen = set()
@@ -2447,7 +2477,9 @@ def proxy_chat(
 
     # Structured UI actions from the Study Plan confirmation buttons.
     # These actions bypass text intent parsing and RAG completely.
-    ui_action = (str(data.action or "").strip().casefold() or None)
+    ui_action_raw = (str(data.action or "").strip() or None)
+    ui_action = (ui_action_raw.split(":",1)[0].casefold() if ui_action_raw else None)
+    action_plan_id = (ui_action_raw.split(":",1)[1] if ui_action_raw and ":" in ui_action_raw else None)
     plan_start_action = None
     if ui_action:
         if ui_action == "onboarding_planned":
@@ -2467,20 +2499,19 @@ def proxy_chat(
 
         elif ui_action == "plan_today_yes":
             profile = _get_learning_profile(user["id"])
-            active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
+            active_plan = _active_plan(user["id"], action_plan_id) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items", [])
                                        if str(x.get("status") or "").lower() != "completed"), None)
             if not planned_start_item:
-                msg = "🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình rồi nhé!"
+                msg = "🎉 Lộ trình này đã hoàn thành hoặc không còn bài chưa học hôm nay."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":active_plan}
             forced_content_type = _normalize_content_type((active_plan or {}).get("content_type") or "Giáo trình")
             forced_lesson = str(planned_start_item.get("lesson") or "").strip()
-            print(f"[STUDY PLAN] today_yes user={user['id']} lesson={forced_lesson!r} content_type={forced_content_type!r}")
+            print(f"[STUDY PLAN] today_yes user={user['id']} plan={active_plan.get('id') if active_plan else None} lesson={forced_lesson!r} content_type={forced_content_type!r}")
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            # Fall through to the dedicated exact-plan retrieval branch below.
 
         elif ui_action == "plan_today_no":
-            msg = "Được nhé! 🤖 Hôm nay cậu có thể học tự do theo nhu cầu. Lộ trình vẫn được giữ nguyên, khi nào muốn quay lại chỉ cần chọn 'Có'."
+            msg = "Được nhé! 🤖 Hôm nay cậu có thể học tự do theo nhu cầu. Lộ trình này vẫn được giữ nguyên."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
         elif ui_action == "plan_apply_draft":
@@ -2500,7 +2531,8 @@ def proxy_chat(
             msg = ("🎯 Lộ trình đã được áp dụng rồi nhé! 🤖\n\n"
                    "Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này từ hôm nay.\n\n"
                    "Cậu có muốn học luôn bài đầu tiên theo lộ trình không? 😊")
-            blocks = [{"type":"text","text":msg},{"type":"choice","id":"plan_start","options":[{"label":"Có","action":"plan_start"},{"label":"Không","action":"plan_start_cancel"}]}]
+            blocks = [{"type":"text","text":msg},{"type":"choice","id":"plan_start",
+                     "options":[{"label":"Có","action":f"plan_start:{int(plan.get('id'))}"},{"label":"Không","action":f"plan_start_cancel:{int(plan.get('id'))}"}]}]
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":plan}
 
         if ui_action == "plan_cancel_draft":
@@ -2518,7 +2550,7 @@ def proxy_chat(
 
         if ui_action == "plan_start":
             profile = _get_learning_profile(user["id"])
-            active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
+            active_plan = _active_plan(user["id"], action_plan_id) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items",[]) if str(x.get("status")).lower() != "completed"), None)
             if not planned_start_item:
                 msg="🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình rồi nhé!"
@@ -2582,35 +2614,77 @@ def proxy_chat(
         # a generic knowledge question. Handle this before RAG so it can never
         # drift to an unrelated lesson such as Ngữ pháp Bài 1.
         if active_plan and plan_intent and not draft:
-            planned_start_item = next((x for x in active_plan.get("items",[])
-                                       if str(x.get("status")).lower() != "completed"), None)
+            # A generic "học theo lộ trình" means continue an existing plan.
+            # If the message contains an explicit target/date/rate, it is a request
+            # to create a NEW plan and must continue to the plan-creation branch below.
+            probe = _parse_plan_request(data.text)
+            has_concrete_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
+            if has_concrete_target:
+                pass
+            else:
+                # If the user explicitly names a content type, choose that plan; otherwise
+                # use the first unfinished plan. Never send this intent to generic RAG.
+                requested_type = probe.get("content_type")
+                candidates = _active_plans(user["id"])
+                chosen = None
+                # Only use the named type when it was explicitly present in the user's text.
+                named_type = next((ct for ct, kws in {
+                    'Giáo trình':['giáo trình','giáo trinh'],
+                    'Ngữ pháp':['ngữ pháp','ngu phap'],
+                    'Bài tập':['bài tập','bai tap'],
+                    'Từ vựng':['từ vựng','tu vung','kanji','bộ thủ'],
+                    'Truyện đọc':['truyện đọc','truyen doc','đọc truyện','doc truyen']
+                }.items() if any(k in low0 for k in kws)), None)
+                if named_type:
+                    for cand in candidates:
+                        if _normalize_content_type(cand.get('content_type') or '') == _normalize_content_type(named_type):
+                            chosen = cand; break
+                chosen = chosen or active_plan
+                planned_start_item = next((x for x in chosen.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
             if planned_start_item:
                 lesson = str(planned_start_item.get("lesson") or "").strip()
-                ct = _normalize_content_type(active_plan.get("content_type") or "Giáo trình")
-                msg = (f"🎯 Cậu đang theo lộ trình: {active_plan.get('goal_name') or 'Lộ trình học'}.\n\n"
+                ct = _normalize_content_type(chosen.get("content_type") or "Giáo trình")
+                msg = (f"🎯 Cậu đang theo lộ trình: {chosen.get('goal_name') or 'Lộ trình học'}.\n\n"
                        f"📚 Bài tiếp theo theo lộ trình là **{lesson}** ({ct}).\n\n"
                        "Cậu có muốn học luôn bài này không? 😊")
-                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
-                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None,
-                        "study_plan":active_plan}
+                blocks=[{"type":"text","text":msg},{"type":"choice","id":f"plan_start_{int(chosen['id'])}","options":[{"label":"Có","action":f"plan_start:{int(chosen['id'])}"},{"label":"Không","action":f"plan_start_cancel:{int(chosen['id'])}"}]}]
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":chosen}
             else:
-                msg="🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình. Khi có nội dung mới, Doraemon sẽ cập nhật để học tiếp cùng cậu nhé!"
-                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
-                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None,
-                        "study_plan":active_plan}
+                msg="🎉 Lộ trình này đã hoàn thành toàn bộ nội dung hiện có rồi nhé!"
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":chosen}
 
         completion_words=("đã học xong","học xong rồi","mình học xong","hoàn thành bài này","xong bài này","đã hoàn thành")
-        if active_plan and any(w in low0 for w in completion_words):
-            upcoming=[x for x in active_plan.get('items',[]) if str(x.get('status')).lower()!='completed']
+        if any(w in low0 for w in completion_words):
+            # Match the completion to the most recent in-progress learning record
+            # so completing Grammar Bài 1 cannot complete a separate Vocabulary plan.
+            latest_lp=None
+            try:
+                conn0=db()
+                with conn0.cursor(cursor_factory=RealDictCursor) as cur0:
+                    cur0.execute("SELECT content_type,lesson FROM learning_progress WHERE user_id=%s AND LOWER(COALESCE(status,'')) IN ('in_progress','active','review') ORDER BY last_studied_at DESC LIMIT 1",(user['id'],))
+                    latest_lp=cur0.fetchone()
+            finally:
+                try: conn0.close()
+                except Exception: pass
+            candidates=_active_plans(user["id"])
+            chosen=active_plan
+            if latest_lp:
+                for cand in candidates:
+                    if _normalize_content_type(cand.get('content_type') or '') == _normalize_content_type(latest_lp.get('content_type') or ''):
+                        if any(str(x.get('lesson') or '').casefold()==str(latest_lp.get('lesson') or '').casefold() and str(x.get('status') or '').lower()!='completed' for x in cand.get('items') or []):
+                            chosen=cand; break
+            if chosen:
+                upcoming=[x for x in chosen.get('items',[]) if str(x.get('status')).lower()!='completed']
+            else: upcoming=[]
             if upcoming:
                 item=upcoming[0]
-                record_learning_event(user["id"], {"content_type":active_plan.get('content_type') or 'Giáo trình',"subject":"Tiếng Nhật","lesson":item.get('lesson'),"topic":"","item_key":item.get('lesson'),"status":"completed","completed":True})
+                record_learning_event(user["id"], {"content_type":chosen.get('content_type') or 'Giáo trình',"subject":"Tiếng Nhật","lesson":item.get('lesson'),"topic":"","item_key":item.get('lesson'),"status":"completed","completed":True})
                 conn=db()
                 try:
                     with conn.cursor() as cur: cur.execute("UPDATE study_plan_items SET status='completed',completed_at=NOW() WHERE id=%s",(item['id'],))
                     conn.commit()
                 finally: conn.close()
-                next_item=next((x for x in active_plan.get('items',[]) if int(x.get('unit_index') or 0)>int(item.get('unit_index') or 0) and str(x.get('status')).lower()!='completed'),None)
+                next_item=next((x for x in chosen.get('items',[]) if int(x.get('unit_index') or 0)>int(item.get('unit_index') or 0) and str(x.get('status')).lower()!='completed'),None)
                 nxt=f" Bài tiếp theo theo lộ trình là {next_item.get('lesson')}." if next_item else " Cậu đã hoàn thành toàn bộ lộ trình hiện tại rồi! 🎉"
                 msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
@@ -2642,7 +2716,14 @@ def proxy_chat(
             if not req.get('target_date') and not req.get('units_per_day') and not req.get('days_per_unit'):
                 msg="🤖 Cậu muốn sửa lộ trình như thế nào? Hãy nói rõ ngày mục tiêu mới hoặc tốc độ học, ví dụ: 'đổi mục tiêu sang 15/09' hoặc 'từ ngày 01/09, mỗi 2 ngày học 1 bài'."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-            oldplan=_active_plan(user["id"]);
+            oldplan=None
+            requested_type=_parse_plan_request(data.text).get('content_type')
+            for candidate in _active_plans(user["id"]):
+                if _normalize_content_type(candidate.get('content_type') or '') == _normalize_content_type(requested_type or candidate.get('content_type') or ''):
+                    oldplan=candidate
+                    break
+            if oldplan is None:
+                oldplan=_active_plan(user["id"])
             if oldplan:
                 # Rebuild from the remaining lessons, preserving completed history.
                 done={x['lesson'] for x in oldplan['items'] if str(x.get('status')).lower()=='completed'}
@@ -2651,26 +2732,29 @@ def proxy_chat(
                 req['_lessons_override']=lessons; req['target_date']=req.get('target_date') or oldplan.get('target_date')
                 # Simplified rebuild: create a draft using remaining lessons by temporarily using helper's catalog selection.
                 # For consistency, if override exists we build the same plan shape manually below.
-                req['override_done']=done
+                req['override_done']=done; req['parent_plan_id']=oldplan.get('id')
             pid,preview=_build_plan_preview(user["id"],req)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
-        # Initial planned goal if there is no active plan and no draft.
-        # IMPORTANT: saying "mình muốn học theo lộ trình" is itself a mode/plan
-        # request and MUST NEVER fall through to RAG. Ask for the actual goal
-        # first; only create a draft once the user provides a concrete target.
-        if not _active_plan(user["id"]) and not draft:
+        # Plan creation. Existing active plans do not block a new independent plan.
+        # Only explicit plan intent or concrete plan parameters trigger this branch.
+        if not draft:
             if plan_intent and not _is_pure_greeting(data.text):
+                # If it is only a generic mode request, ask for the target instead of RAG.
+                req_probe=_parse_plan_request(data.text)
+                has_target = bool(req_probe.get('target_date') or req_probe.get('units_per_day') or req_probe.get('days_per_unit'))
+                if not has_target:
+                    if profile.get("learning_mode") != "planned":
+                        _set_learning_profile(user["id"], "planned", True)
+                    msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
+                         "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
+                         "'Mình muốn học hết giáo trình N5 trong 1 tháng', "
+                         "'Mỗi ngày 1 bài', '2 ngày học 1 bài' hoặc 'mình muốn có lộ trình ngữ pháp 1 bài/ngày'. "
+                         "Doraemon sẽ tính lộ trình để cậu xem và xác nhận trước khi áp dụng.")
+                    return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            req=_parse_plan_request(data.text)
+            if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit'):
                 if profile.get("learning_mode") != "planned":
                     _set_learning_profile(user["id"], "planned", True)
-                msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
-                     "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
-                     "'Mình muốn học hết giáo trình N5 trong 1 tháng', "
-                     "'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. "
-                     "Doraemon sẽ tính lộ trình để cậu xem và xác nhận trước khi áp dụng.")
-                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
-                        "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-            req=_parse_plan_request(data.text)
-            if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit') or 'giáo trình' in low0 or 'n5' in low0:
                 pid,preview=_build_plan_preview(user["id"],req)
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
@@ -3557,9 +3641,10 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
 def get_learning_plan(authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
     profile=_get_learning_profile(user["id"])
-    plan=_active_plan(user["id"])
+    plans=_active_plans(user["id"])
+    plan=plans[0] if plans else None
     draft=_latest_draft(user["id"])
-    return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"draft":draft}
+    return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"plans":plans,"draft":draft}
 
 @app.post("/learning/plan/confirm")
 def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
@@ -3568,7 +3653,7 @@ def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
     if not plan:
         raise HTTPException(404,"Không có lộ trình nháp để xác nhận.")
     _set_learning_profile(user["id"],"planned",True)
-    return {"success":True,"plan":_active_plan(user["id"])}
+    return {"success":True,"plan":_active_plan(user["id"]),"plans":_active_plans(user["id"])}
 
 @app.get("/learning/summary")
 def learning_summary(authorization: Optional[str] = Header(default=None)):
