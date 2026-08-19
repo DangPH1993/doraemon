@@ -1,4 +1,4 @@
-BASELINE_VERSION = "13.8"
+BASELINE_VERSION = "14.0"
 import os
 import ast
 import io
@@ -268,6 +268,7 @@ class ChatRequest(BaseModel):
     knowledge_namespace: str = "default"
     top_k: int = 8
     proactive: bool = False
+    action: str | None = None
 
     @property
     def text(self) -> str:
@@ -2423,12 +2424,12 @@ def proxy_chat(
         raise HTTPException(500, "Gemini chưa được khởi tạo.")
     if not index:
         raise HTTPException(500, "Pinecone chưa được khởi tạo.")
-    if not data.text:
+    if not data.text and not data.action:
         raise HTTPException(400, "Tin nhắn không được để trống.")
 
     # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
     # Standalone greetings are onboarding actions and do not consume a question.
-    if not _is_pure_greeting(data.text) and not data.proactive:
+    if not _is_pure_greeting(data.text) and not data.proactive and not data.action:
         enforce_question_limit(user["id"])
 
     # A standalone greeting is a session/onboarding action, NOT a knowledge
@@ -2437,6 +2438,61 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
+
+    # Structured UI actions from the Study Plan confirmation buttons.
+    # These actions bypass text intent parsing and RAG completely.
+    ui_action = (str(data.action or "").strip().casefold() or None)
+    plan_start_action = None
+    if ui_action:
+        if ui_action == "plan_apply_draft":
+            draft = _latest_draft(user["id"])
+            if not draft:
+                msg = "🤖 Doraemon không còn thấy lộ trình chờ xác nhận. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            try:
+                plan = _confirm_latest_draft(user["id"])
+            except Exception as exc:
+                print(f"[STUDY PLAN] UI confirm draft error user={user['id']}: {exc}")
+                msg = "🤖 Doraemon chưa áp dụng được lộ trình lúc này. Cậu thử lại nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            if not plan:
+                msg = "🤖 Doraemon không thể áp dụng lộ trình lúc này. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            msg = ("🎯 Lộ trình đã được áp dụng rồi nhé! 🤖\n\n"
+                   "Doraemon sẽ theo dõi tiến độ của cậu theo lộ trình này từ hôm nay.\n\n"
+                   "Cậu có muốn học luôn bài đầu tiên theo lộ trình không? 😊")
+            blocks = [{"type":"text","text":msg},{"type":"choice","id":"plan_start","options":[{"label":"Có","action":"plan_start"},{"label":"Không","action":"plan_start_cancel"}]}]
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":plan}
+
+        if ui_action == "plan_cancel_draft":
+            draft = _latest_draft(user["id"])
+            if draft:
+                conn=db()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE study_plans SET status='CANCELLED' WHERE id=%s",(draft['id'],))
+                    conn.commit()
+                finally:
+                    conn.close()
+            msg="Được nhé! 🤖 Doraemon giữ nguyên lộ trình hiện tại."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+        if ui_action == "plan_start":
+            profile = _get_learning_profile(user["id"])
+            active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
+            planned_start_item = next((x for x in (active_plan or {}).get("items",[]) if str(x.get("status")).lower() != "completed"), None)
+            if not planned_start_item:
+                msg="🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình rồi nhé!"
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"study_plan":active_plan}
+            # Build a strict scope for the regular RAG pipeline below.
+            forced_content_type = _normalize_content_type((active_plan or {}).get("content_type") or "Giáo trình")
+            forced_lesson = str(planned_start_item.get("lesson") or "").strip()
+            msg = f"🤖 Được nhé! Mình cùng học **{forced_lesson}** theo lộ trình nào.\n"
+            # Do not return here: continue into the existing RAG path, but force the exact plan scope.
+            plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
+        elif ui_action == "plan_start_cancel":
+            msg="Được nhé! 🤖 Khi nào cậu muốn bắt đầu bài đầu tiên theo lộ trình, chỉ cần nói với Doraemon."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
     # Learning-mode onboarding and explicit mode switch.
     plan_intent = any(k in low0 for k in [
         "học theo lộ trình",
@@ -2466,12 +2522,19 @@ def proxy_chat(
         _set_learning_profile(user["id"],"planned",True)
         return {"reply":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng.","model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":"Được nhé! 🤖 Cậu muốn chuyển sang học theo lộ trình. Hãy cho Doraemon biết mục tiêu, ví dụ: 'Mình muốn học hết giáo trình N5 trong 1 tháng', 'Mỗi ngày 1 bài' hoặc '2 ngày học 1 bài'. Doraemon sẽ tính lộ trình mới để cậu xem và xác nhận trước khi áp dụng."}],"learning_progress":None}
 
+    # A structured plan-start button action has already selected the exact item;
+    # skip the text-based confirmation rules and enter the forced RAG path below.
+    planned_start_item = None
+    active_plan = None
+    if plan_start_action:
+        active_plan = plan_start_action["plan"]
+        planned_start_item = next((x for x in active_plan.get("items",[]) if str(x.get("status")).lower() != "completed" and str(x.get("lesson") or "").strip() == plan_start_action["lesson"]), None)
+
     # Planned-user confirmations and plan creation/update requests happen before RAG.
     # A short affirmative response after the "học luôn bài đầu tiên" prompt is a
     # structured command to start the FIRST ACTIVE plan item; it must never fall
     # through to generic RAG (which can select an unrelated lesson such as Ngữ pháp Bài 1).
-    planned_start_item = None
-    if profile.get("learning_mode")=="planned":
+    if profile.get("learning_mode")=="planned" and not plan_start_action:
         active_plan=_active_plan(user["id"])
         draft=_latest_draft(user["id"])
         # IMPORTANT: once a user already has an ACTIVE Study Plan, any explicit
@@ -2512,30 +2575,7 @@ def proxy_chat(
                 nxt=f" Bài tiếp theo theo lộ trình là {next_item.get('lesson')}." if next_item else " Cậu đã hoàn thành toàn bộ lộ trình hiện tại rồi! 🎉"
                 msg=f"🎉 Tuyệt vời! Doraemon đã đánh dấu '{item.get('lesson')}' là hoàn thành.{nxt}"
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":item.get('lesson')}}
-        # Detect the explicit follow-up "Có" to the plan-start question by looking
-        # at the immediately preceding model turn in the client chat history.
-        if active_plan and low0 in {"có","ok","đồng ý","xác nhận","được","ừ","ừ được"} and not draft:
-            hist = data.chat_history or []
-            prev_model = ""
-            for h in reversed(hist):
-                if not isinstance(h, dict):
-                    continue
-                role = str(h.get("role") or "").lower()
-                parts = h.get("parts")
-                txt = ""
-                if isinstance(parts, list):
-                    txt = " ".join(str(x.get("text")) for x in parts if isinstance(x, dict) and x.get("text")).strip()
-                elif h.get("text"):
-                    txt = str(h.get("text")).strip()
-                elif h.get("content"):
-                    txt = str(h.get("content")).strip()
-                if role in {"model","assistant"} and txt:
-                    prev_model = txt
-                    break
-            if "có muốn học luôn bài đầu tiên theo lộ trình" in prev_model.casefold():
-                planned_start_item = next((x for x in active_plan.get("items",[]) if str(x.get("status")).lower() != "completed"), None)
-                if planned_start_item:
-                    print(f"[STUDY PLAN] start first planned item user={user['id']} lesson={planned_start_item.get('lesson')!r} content_type={active_plan.get('content_type')!r}")
+        # Plan-start confirmation is now handled exclusively by the UI buttons.
         if draft and low0 in {"có","ok","đồng ý","xác nhận","áp dụng","được","ừ","ừ được"}:
             try:
                 plan=_confirm_latest_draft(user["id"])
@@ -2573,13 +2613,13 @@ def proxy_chat(
                 # For consistency, if override exists we build the same plan shape manually below.
                 req['override_done']=done
             pid,preview=_build_plan_preview(user["id"],req)
-            return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview}],"learning_progress":None,"study_plan_draft_id":pid}
+            return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
         # Initial planned goal if there is no active plan and no draft.
         if not _active_plan(user["id"]) and not draft:
             req=_parse_plan_request(data.text)
             if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit') or 'giáo trình' in low0 or 'n5' in low0:
                 pid,preview=_build_plan_preview(user["id"],req)
-                return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview}],"learning_progress":None,"study_plan_draft_id":pid}
+                return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
     if _is_pure_greeting(data.text):
         welcome = _build_welcome_for_user(user, mark_seen=False)
