@@ -1721,6 +1721,21 @@ def _same_chunk_image(md, chunk_md):
     # If the text chunk has chunk_index, the image MUST have the same one.
     # This is the core rule: no page-only fallback can leak another chunk's image.
     if chunk_index is not None:
+        raw_indices = md.get("chunk_indices")
+        if raw_indices not in (None, ""):
+            try:
+                parsed = json.loads(raw_indices) if isinstance(raw_indices, str) else raw_indices
+                if isinstance(parsed, list):
+                    normalized = []
+                    for item in parsed:
+                        try:
+                            normalized.append(int(item))
+                        except Exception:
+                            normalized.append(str(item).strip())
+                    if chunk_index in normalized or str(chunk_index) in normalized:
+                        return True
+            except Exception:
+                pass
         raw_img_chunk = md.get("chunk_index")
         if raw_img_chunk in (None, ""):
             return False
@@ -4205,6 +4220,42 @@ async function lock(id){
 # ============================================================
 # Knowledge Base upload from Admin
 # ============================================================
+def _table_explanation_overlaps_chunk(explanation, marker, chunk):
+    """Return True when a chunk contains any meaningful part of one table explanation.
+
+    Table explanations can be longer than one RAG chunk. Matching only the
+    marker therefore attached the table image to chunk 0 while later chunks
+    containing the actual explanation had image_keys=[]. We intentionally map
+    the same table image to every chunk that contains a substantial fragment of
+    that table's Vision explanation.
+    """
+    ch = re.sub(r"\s+", " ", str(chunk or "")).strip()
+    exp = re.sub(r"\s+", " ", str(explanation or "")).strip()
+    mark = re.sub(r"\s+", " ", str(marker or "")).strip()
+    if not ch:
+        return False
+    if mark and mark in ch:
+        return True
+    if not exp:
+        return False
+    if exp in ch:
+        return True
+    # Check several stable 80-character anchors. This catches continuation
+    # chunks without requiring the whole explanation to fit inside one chunk.
+    if len(exp) >= 80:
+        anchors = [exp[:80], exp[len(exp)//2-40:len(exp)//2+40], exp[-80:]]
+        if any(a and a in ch for a in anchors):
+            return True
+    # Final conservative token-window fallback for OCR whitespace differences.
+    tokens = exp.split()
+    if len(tokens) >= 12:
+        for start in (0, max(0, len(tokens)//2 - 6), max(0, len(tokens)-12)):
+            window = " ".join(tokens[start:start+12])
+            if len(window) >= 40 and window in ch:
+                return True
+    return False
+
+
 def kb_chunk_text(text, chunk_size=1200, overlap=200):
     text = re.sub(r"\s+", " ", text or "").strip()
     if not text:
@@ -4653,6 +4704,53 @@ def crop_image_from_page(page_png: bytes, box):
     out = io.BytesIO(); crop.save(out, format="JPEG", quality=88, optimize=True)
     return out.getvalue(), crop.size
 
+def _embedded_image_is_meaningful(doc, page, xref, info, data):
+    """Reject PDF image resources that are masks/backgrounds/blank white assets.
+
+    Some educational PDFs contain many internal image XObjects that are not
+    visible content (white backgrounds, masks, clipping assets, etc.).  The old
+    extractor stored all of them in B2, which made one real table page produce
+    many useless embedded_XX files.
+    """
+    try:
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        if width < 80 or height < 60:
+            return False
+
+        # Ignore resources that have no visible placement on this page.
+        rects = page.get_image_rects(xref) if hasattr(page, "get_image_rects") else []
+        if not rects:
+            return False
+        page_area = max(1.0, float(page.rect.width) * float(page.rect.height))
+        visible_area = max((float(r.width) * float(r.height) for r in rects), default=0.0)
+        if visible_area / page_area < 0.0008:
+            return False
+
+        if Image is None:
+            return True
+
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        im.thumbnail((96, 96), Image.Resampling.BILINEAR)
+        pixels = list(im.getdata())
+        if not pixels:
+            return False
+
+        # A nearly uniform white/transparent resource is not an educational
+        # image. Keep mostly-white images when they contain enough non-white
+        # pixels or visible contrast (e.g. diagrams with white background).
+        nonwhite = sum(1 for r,g,b in pixels if min(r,g,b) < 245) / len(pixels)
+        mean = tuple(sum(px[i] for px in pixels) / len(pixels) for i in range(3))
+        variance = sum(sum((px[i] - mean[i]) ** 2 for i in range(3)) for px in pixels) / (len(pixels) * 3)
+        if nonwhite < 0.003 and variance < 8.0:
+            return False
+        return True
+    except Exception:
+        # Never make extraction fail because a single exotic PDF image cannot
+        # be inspected. Fall back to the legacy size/data checks.
+        return True
+
+
 def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta):
     """Extract native images from non-scan PDFs with PyMuPDF."""
     if fitz is None:
@@ -4673,6 +4771,9 @@ def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subj
             data=info.get("image")
             ext=info.get("ext","png")
             if not data or len(data)<1000:
+                continue
+            if not _embedded_image_is_meaningful(doc, page, xref, info, data):
+                print(f"[EMBEDDED IMAGE skip] page={page_no} xref={xref} size={info.get('width')}x{info.get('height')}")
                 continue
             mime={"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}.get(ext.lower(), "image/png")
             key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/embedded_{idx:02d}.{ext}"
@@ -4704,6 +4805,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
     """
     page_texts = {}
     page_images = {}
+    page_units = {}
     for page_no, page in enumerate(reader.pages, 1):
         page_meta = metadata_for_page(records_meta, page_no)
         extracted = (page.extract_text() or "").strip()
@@ -4787,10 +4889,34 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                 )
                 if table_image:
                     table_image["marker"] = marker
+                    table_image["explanation"] = str(item.get("explanation") or "").strip()
+                    table_image["unit_id"] = f"table:{page_no}:{table_index}"
                     stored.append(table_image)
 
             base_text=(ocr_text or extracted).strip()
-            page_texts[page_no] = ("\n\n".join(table_parts) + ("\n\n" + base_text if base_text else "")).strip()
+            # Provenance-bearing content units. Table explanation and its source
+            # image stay together before chunking; no post-chunk text matching.
+            units=[]
+            for table_image in [x for x in stored if str(x.get("kind") or "") == "table_source"]:
+                explanation=str(table_image.get("explanation") or "").strip()
+                marker=str(table_image.get("marker") or "").strip()
+                key=str(table_image.get("key") or "").strip()
+                if explanation and key:
+                    units.append({
+                        "type":"table",
+                        "unit_id":str(table_image.get("unit_id") or ""),
+                        "text":(marker + "\n" + explanation).strip(),
+                        "image_keys":[key],
+                    })
+            if base_text:
+                units.append({
+                    "type":"normal",
+                    "unit_id":f"page:{page_no}:text",
+                    "text":base_text,
+                    "image_keys":[],
+                })
+            page_units[page_no]=units
+            page_texts[page_no] = "\n\n".join(u["text"] for u in units).strip()
 
             # Preserve V16 embedded images on table pages as well.
             embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
@@ -4870,30 +4996,132 @@ async def admin_knowledge_upload(
 
         for page_no in range(1, len(reader.pages)+1):
             text = page_texts.get(page_no, "")
-            chunks=kb_chunk_text(text,chunk_size,overlap)
             page_meta=metadata_for_page(records_meta,page_no)
             primary=page_meta[0] if page_meta else None
             content_type=primary["content_type"] if primary else (records_meta[0]["content_type"] if records_meta else "Từ vựng")
+            units = page_units.get(page_no) or []
+
+            # Table pages use provenance-bearing units. Each table explanation is
+            # chunked independently and every resulting chunk inherits the exact
+            # table image key. Normal text on the same page remains a separate
+            # unit and does not inherit table images.
+            if units and any(u.get("type") == "table" for u in units):
+                chunk_records=[]
+                for unit in units:
+                    unit_text=str(unit.get("text") or "").strip()
+                    if not unit_text:
+                        continue
+                    unit_chunks=kb_chunk_text(unit_text,chunk_size,overlap)
+                    unit_id=str(unit.get("unit_id") or "")
+                    unit_image_keys=list(dict.fromkeys(str(k).strip() for k in (unit.get("image_keys") or []) if str(k).strip()))
+                    for local_no, chunk in enumerate(unit_chunks):
+                        chunk_records.append({
+                            "chunk_index": len(chunk_records),
+                            "local_index": local_no,
+                            "unit_id": unit_id,
+                            "text": chunk,
+                            "image_keys": unit_image_keys if unit.get("type") == "table" else [],
+                        })
+
+                for rec in chunk_records:
+                    chunk=rec["text"]
+                    md_list=[{
+                        "content_type":r["content_type"],"lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
+                        "topic":r["topic"],"topic_pages":r["topic_pages"],
+                        "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
+                    } for r in page_meta]
+                    md={
+                        "record_type":"text",
+                        "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
+                        "source_file":source_file,"page":page_no,"chunk_index":rec["chunk_index"],
+                        "metadata_records":json.dumps(md_list,ensure_ascii=False),
+                        "image_keys":json.dumps(rec["image_keys"],ensure_ascii=False),
+                        "content_unit_id":rec["unit_id"],
+                    }
+                    if primary:
+                        md.update({
+                            "lesson":primary["lesson"],"lesson_pages":primary["lesson_pages"],
+                            "topic":primary["topic"],"topic_pages":primary["topic_pages"],
+                            "question_pages":primary["question_pages"],"answer_pages":primary["answer_pages"]
+                        })
+                    vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
+                    total+=1
+
+                # Build exact chunk provenance for each image record.
+                unit_chunk_map={}
+                for rec in chunk_records:
+                    unit_chunk_map.setdefault(rec["unit_id"], []).append(int(rec["chunk_index"]))
+
+                for img in page_images.get(page_no, []):
+                    key=str(img.get("key") or "").strip()
+                    if not key:
+                        continue
+                    term=str(img.get("term") or "").strip()
+                    reading=str(img.get("reading") or "").strip()
+                    meaning=str(img.get("meaning") or "").strip()
+                    associated_text=str(img.get("associated_text") or "").strip()
+                    description=str(img.get("description") or "").strip()
+                    unit_id=str(img.get("unit_id") or "")
+                    table_explanation=str(img.get("explanation") or "").strip()
+                    search_text=" | ".join(x for x in [term,reading,meaning,associated_text,description,table_explanation,f"Trang {page_no}"] if x)
+                    if not search_text:
+                        search_text=f"Hình minh họa trang {page_no}"
+
+                    image_md={
+                        "record_type":"image",
+                        "text":search_text,
+                        "course":subject,"subject":subject,"content_type":content_type,
+                        "source_file":source_file,"page":page_no,
+                        "image_key":key,"image_url":b2_url(key),
+                        "term":term,"reading":reading,"meaning":meaning,
+                        "associated_text":associated_text,"description":description,
+                        "bbox":str(img.get("bbox") or ""),
+                        "image_kind":str(img.get("kind") or "educational_image"),
+                    }
+
+                    if unit_id and unit_id in unit_chunk_map:
+                        matched_chunks=unit_chunk_map[unit_id]
+                        if matched_chunks:
+                            image_md["chunk_index"]=int(matched_chunks[0])
+                            image_md["chunk_indices"]=json.dumps(matched_chunks,ensure_ascii=False)
+                            image_md["content_unit_id"]=unit_id
+                    elif len(chunk_records) == 1:
+                        image_md["chunk_index"]=0
+
+                    if img.get("chunk_index") not in (None,""):
+                        try:
+                            image_md["chunk_index"]=int(img.get("chunk_index"))
+                        except Exception:
+                            image_md["chunk_index"]=str(img.get("chunk_index")).strip()
+
+                    if primary:
+                        image_md.update({
+                            "lesson":primary["lesson"],"topic":primary["topic"],
+                            "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
+                        })
+                    vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
+                    image_vectors_total+=1
+
+                if len(vectors)>=50:
+                    index.upsert(vectors=vectors,namespace=namespace)
+                    vectors=[]
+                continue
+
+            # Non-table pages: keep the original V16/V16.3 chunk and image
+            # mapping path unchanged.
+            chunks=kb_chunk_text(text,chunk_size,overlap)
             for chunk_no,chunk in enumerate(chunks):
                 md_list=[{
                     "content_type":r["content_type"],"lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
                     "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
                 } for r in page_meta]
-                table_keys_for_chunk=[]
-                for timg in page_images.get(page_no, []):
-                    if str(timg.get("kind") or "") != "table_source":
-                        continue
-                    marker = str(timg.get("marker") or "").strip()
-                    if marker and marker in chunk:
-                        table_keys_for_chunk.append(str(timg.get("key") or "").strip())
-                table_keys_for_chunk=[k for k in table_keys_for_chunk if k]
                 md={
                     "record_type":"text",
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
-                    "image_keys":json.dumps(table_keys_for_chunk,ensure_ascii=False)
+                    "image_keys":json.dumps([],ensure_ascii=False)
                 }
                 if primary:
                     md.update({
@@ -4904,77 +5132,50 @@ async def admin_knowledge_upload(
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                 total+=1
 
-            # Mỗi ảnh là MỘT Pinecone record độc lập. Không còn nhét toàn bộ
-            # ảnh của trang vào metadata của text chunk.
-            page_chunk_count = len(chunks)
-            table_explanation_chunk = None
-            if any(str(img.get("kind") or "") == "table_source" for img in page_images.get(page_no, [])):
-                marker = f"【GIẢI THÍCH BẢNG TRANG {page_no}】"
-                for ci, ctext in enumerate(chunks):
-                    if marker in ctext:
-                        table_explanation_chunk = ci
-                        break
+            page_chunk_count=len(chunks)
             for img in page_images.get(page_no, []):
-                key = str(img.get("key") or "").strip()
+                key=str(img.get("key") or "").strip()
                 if not key:
                     continue
-                term = str(img.get("term") or "").strip()
-                reading = str(img.get("reading") or "").strip()
-                meaning = str(img.get("meaning") or "").strip()
-                associated_text = str(img.get("associated_text") or "").strip()
-                description = str(img.get("description") or "").strip()
-                table_explanation = ""
-                if str(img.get("kind") or "") == "table_source":
-                    marker = str(img.get("marker") or "").strip()
-                    if marker:
-                        for ctext in chunks:
-                            if marker in ctext:
-                                table_explanation = ctext.split(marker, 1)[1].strip()
-                                break
-                search_text = " | ".join(x for x in [term, reading, meaning, associated_text, description, table_explanation, f"Trang {page_no}"] if x)
+                term=str(img.get("term") or "").strip()
+                reading=str(img.get("reading") or "").strip()
+                meaning=str(img.get("meaning") or "").strip()
+                associated_text=str(img.get("associated_text") or "").strip()
+                description=str(img.get("description") or "").strip()
+                search_text=" | ".join(x for x in [term,reading,meaning,associated_text,description,f"Trang {page_no}"] if x)
                 if not search_text:
-                    search_text = f"Hình minh họa trang {page_no}"
+                    search_text=f"Hình minh họa trang {page_no}"
                 image_md={
-                    "record_type":"image",
-                    "text":search_text,
+                    "record_type":"image","text":search_text,
                     "course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,
                     "image_key":key,"image_url":b2_url(key),
-                    # Strict chunk mapping: if the page contains exactly one
-                    # text chunk, the image belongs unambiguously to chunk 0.
-                    # For multi-chunk pages we leave chunk_index unset unless
-                    # the extractor later supplies an explicit mapping.
                     "term":term,"reading":reading,"meaning":meaning,
                     "associated_text":associated_text,"description":description,
                     "bbox":str(img.get("bbox") or ""),
                     "image_kind":str(img.get("kind") or "educational_image")
                 }
-                if page_chunk_count == 1:
-                    image_md["chunk_index"] = 0
-                elif str(img.get("kind") or "") == "table_source" and table_explanation_chunk is not None:
-                    # The original table image belongs ONLY to the chunk that
-                    # contains its Vision-generated semantic explanation.
-                    image_md["chunk_index"] = int(table_explanation_chunk)
-
-                if img.get("chunk_index") not in (None, ""):
+                if page_chunk_count==1:
+                    image_md["chunk_index"]=0
+                if img.get("chunk_index") not in (None,""):
                     try:
-                        image_md["chunk_index"] = int(img.get("chunk_index"))
+                        image_md["chunk_index"]=int(img.get("chunk_index"))
                     except Exception:
-                        image_md["chunk_index"] = str(img.get("chunk_index")).strip()
-
+                        image_md["chunk_index"]=str(img.get("chunk_index")).strip()
                 if primary:
                     image_md.update({
                         "lesson":primary["lesson"],"topic":primary["topic"],
                         "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
                     })
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
-                image_vectors_total += 1
+                image_vectors_total+=1
 
             if len(vectors)>=50:
                 index.upsert(vectors=vectors,namespace=namespace)
                 vectors=[]
         if vectors:
             index.upsert(vectors=vectors,namespace=namespace)
+
     except Exception as e:
         raise HTTPException(500,f"Lỗi embedding/Pinecone: {e}")
 
