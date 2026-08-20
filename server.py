@@ -4916,10 +4916,10 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         # Scan/low-text pages retain the old Gemini OCR behavior.
         png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
+        ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
 
-        ocr_text = extracted
         stored = []
         if text_len < 30:
             ocr_text, detected = gemini_ocr_page(png, page_no)
