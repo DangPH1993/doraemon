@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.9"
+BASELINE_VERSION = "16.0-table-aware"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-19-doraemon-baseline-v14.4-study-plan-multi"
+SERVER_VERSION = "2026-08-20-doraemon-baseline-v16-table-aware"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -4341,6 +4341,239 @@ def _parse_gemini_json(text: str):
             return json.loads(m.group(0))
         raise ValueError("Gemini OCR không trả về JSON hợp lệ.")
 
+
+def _detect_long_grid_lines(page_png: bytes):
+    """Cheap, local table-grid detector. No Gemini call is made here.
+
+    It looks for long dark horizontal/vertical runs in a low-resolution render.
+    This is intentionally conservative: the goal is only to decide whether a
+    text page should receive the more expensive table-aware Vision OCR pass.
+    """
+    if Image is None:
+        return False
+    try:
+        im = Image.open(io.BytesIO(page_png)).convert("L")
+        max_w = 1100
+        if im.width > max_w:
+            ratio = max_w / float(im.width)
+            im = im.resize((max_w, max(1, int(im.height * ratio))))
+        w, h = im.size
+        # Keep the detector cheap on very large pages.
+        if w < 120 or h < 120:
+            return False
+        px = im.load()
+        threshold = 165
+
+        def horizontal_hits():
+            hits = []
+            min_run = max(45, int(w * 0.28))
+            min_coverage = max(0.22, min(0.65, w / max(1.0, w * 4.5)))
+            for y in range(h):
+                run = 0
+                longest = 0
+                dark = 0
+                for x in range(w):
+                    if px[x, y] < threshold:
+                        run += 1
+                        dark += 1
+                        if run > longest:
+                            longest = run
+                    else:
+                        run = 0
+                if longest >= min_run and (dark / float(w)) >= min_coverage:
+                    hits.append(y)
+            return hits
+
+        def vertical_hits():
+            hits = []
+            min_run = max(45, int(h * 0.25))
+            min_coverage = max(0.18, min(0.65, h / max(1.0, h * 5.0)))
+            for x in range(w):
+                run = 0
+                longest = 0
+                dark = 0
+                for y in range(h):
+                    if px[x, y] < threshold:
+                        run += 1
+                        dark += 1
+                        if run > longest:
+                            longest = run
+                    else:
+                        run = 0
+                if longest >= min_run and (dark / float(h)) >= min_coverage:
+                    hits.append(x)
+            return hits
+
+        def cluster(values, gap=4):
+            if not values:
+                return []
+            out = [[values[0]]]
+            for v in values[1:]:
+                if v - out[-1][-1] <= gap:
+                    out[-1].append(v)
+                else:
+                    out.append([v])
+            return [int(sum(g) / len(g)) for g in out]
+
+        hs = cluster(horizontal_hits())
+        vs = cluster(vertical_hits())
+        # A real table normally has at least two horizontal and two vertical
+        # separators/borders. Allow a few borderless layouts with many rows.
+        return (len(hs) >= 2 and len(vs) >= 2) or (len(hs) >= 4 and len(vs) >= 1)
+    except Exception as exc:
+        print("[TABLE DETECTOR] local detector skipped:", type(exc).__name__, str(exc))
+        return False
+
+
+def _page_has_vector_table_grid(page):
+    """Detect table-like vector lines in PDFs without rendering the page."""
+    try:
+        drawings = page.get_drawings() if hasattr(page, "get_drawings") else []
+        h = v = 0
+        for d in drawings:
+            for item in d.get("items", []):
+                if not item or item[0] != "l" or len(item) < 3:
+                    continue
+                p1, p2 = item[1], item[2]
+                dx = abs(float(p2.x) - float(p1.x))
+                dy = abs(float(p2.y) - float(p1.y))
+                if dx >= 80 and dy <= 2.5:
+                    h += 1
+                elif dy >= 50 and dx <= 2.5:
+                    v += 1
+        return h >= 2 and v >= 2
+    except Exception:
+        return False
+
+
+def _looks_like_table_page(raw_pdf: bytes, page, page_no: int, extracted: str, text_len: int):
+    """Decide whether to spend a Gemini Vision call on table reconstruction.
+
+    Plain text pages keep the old pypdf path. Only pages with a strong local
+    grid signal, or pages that are already scan/OCR pages, get table-aware OCR.
+    """
+    if text_len < 30:
+        return True
+    if _page_has_vector_table_grid(page):
+        return True
+    # Only render a low-resolution preview for text pages. This adds no model
+    # tokens and lets us catch scanned tables that already contain an OCR layer.
+    try:
+        preview = render_pdf_page(raw_pdf, page_no, dpi=90)
+        return _detect_long_grid_lines(preview)
+    except Exception as exc:
+        print(f"[TABLE DETECTOR] page={page_no} preview failed:", type(exc).__name__, str(exc))
+        return False
+
+
+def _normalize_table_cell(cell):
+    if isinstance(cell, dict):
+        text = str(cell.get("text") or cell.get("value") or "").strip()
+        row_span = max(1, int(cell.get("row_span") or 1)) if str(cell.get("row_span") or "1").isdigit() else 1
+        col_span = max(1, int(cell.get("col_span") or 1)) if str(cell.get("col_span") or "1").isdigit() else 1
+        return {"text": text, "row_span": row_span, "col_span": col_span}
+    return {"text": str(cell or "").strip(), "row_span": 1, "col_span": 1}
+
+
+def _serialize_tables_for_rag(tables):
+    """Turn structured tables into search-friendly text without flattening rows."""
+    parts = []
+    for ti, table in enumerate(tables or [], 1):
+        if not isinstance(table, dict):
+            continue
+        title = str(table.get("title") or f"Bảng {ti}").strip()
+        parts.append(f"【BẢNG {ti}: {title}】")
+        columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+        if columns:
+            parts.append("CỘT: " + " | ".join(str(x or "").strip() for x in columns))
+        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+        for ri, row in enumerate(rows, 1):
+            if not isinstance(row, list):
+                continue
+            cells = []
+            for ci, raw_cell in enumerate(row, 1):
+                c = _normalize_table_cell(raw_cell)
+                label = str(columns[ci-1]).strip() if ci <= len(columns) and columns[ci-1] else f"ô {ci}"
+                span = ""
+                if c["row_span"] > 1 or c["col_span"] > 1:
+                    span = f" [span {c['row_span']}x{c['col_span']}]"
+                cells.append(f"{label}: {c['text']}{span}")
+            if cells:
+                parts.append(f"HÀNG {ri}: " + " ; ".join(cells))
+        parts.append("")
+    return "\n".join(parts).strip()
+
+
+def gemini_ocr_table_page(page_png: bytes, page_no: int):
+    """Vision OCR for pages containing tables; preserves row/column structure."""
+    if not gemini:
+        raise RuntimeError("Gemini chưa được khởi tạo.")
+    prompt = f"""Đây là trang {page_no} của giáo trình/sách học tiếng Nhật.
+
+Hãy đọc TRUNG THỰC toàn bộ trang và đặc biệt tái tạo chính xác các BẢNG.
+Mục tiêu không phải chỉ đọc từng chữ, mà phải giữ quan hệ HÀNG/CỘT và các ô
+kéo dài nhiều hàng/cột. Không được biến bảng thành một đoạn văn mất vị trí.
+
+YÊU CẦU:
+1. OCR phần chữ ngoài bảng vào trường text.
+2. Với mỗi bảng, trả về title, columns và rows.
+3. Mỗi ô phải giữ đúng thứ tự cột. Nếu một ô kéo dài nhiều hàng/cột, dùng
+   row_span/col_span thay vì lặp nội dung một cách gây hiểu nhầm.
+4. Giữ nguyên tiếng Nhật như trên trang; không tự sửa chữ chỉ vì đoán nghĩa.
+5. Ký hiệu như ○, △, ×, dấu gạch, thời gian 9:00～12:00 phải được giữ nguyên.
+6. Nếu bảng có tiêu đề ngày/thứ, giữ nguyên từng cột 月/TUE/... đúng vị trí.
+7. Nếu không chắc một ô, để text của ô đó rỗng thay vì bịa.
+8. Nếu trang không có bảng thực sự, tables phải là [].
+
+Chỉ trả JSON đúng schema:
+{{
+  "text":"...",
+  "tables":[
+    {{
+      "title":"...",
+      "columns":["..."],
+      "rows":[
+        [
+          {{"text":"...","row_span":1,"col_span":1}}
+        ]
+      ]
+    }}
+  ]
+}}"""
+    part = types.Part.from_bytes(data=page_png, mime_type="image/png")
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[part, prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            response_mime_type="application/json"
+        )
+    )
+    data = _parse_gemini_json(response.text or "{}")
+    text = str(data.get("text") or "").strip()
+    tables = data.get("tables") if isinstance(data.get("tables"), list) else []
+    # Keep only structurally valid tables; malformed Gemini output should not
+    # break the whole upload.
+    clean_tables = []
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+        clean_rows = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            clean_rows.append([_normalize_table_cell(c) for c in row])
+        clean_tables.append({
+            "title": str(table.get("title") or "").strip(),
+            "columns": [str(x or "").strip() for x in (table.get("columns") or [])] if isinstance(table.get("columns"), list) else [],
+            "rows": clean_rows,
+        })
+    table_text = _serialize_tables_for_rag(clean_tables)
+    if table_text:
+        text = (text + "\n\n" + table_text).strip() if text else table_text
+    return text, clean_tables
+
 def gemini_ocr_page(page_png: bytes, page_no: int):
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
@@ -4455,26 +4688,50 @@ def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subj
     return stored
 
 def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, subject: str):
-    """Extract text/images from normal PDFs and Gemini-OCR scanned pages."""
+    """Extract text/images while preserving tables for RAG.
+
+    Legacy behavior is kept for ordinary text pages. Only pages that look like
+    scans or tables are sent through Gemini Vision, so token cost stays close
+    to the old pipeline for normal pages.
+    """
     page_texts = {}
     page_images = {}
+    table_pages = 0
     for page_no, page in enumerate(reader.pages, 1):
         page_meta = metadata_for_page(records_meta, page_no)
         extracted = (page.extract_text() or "").strip()
         text_len = len(re.sub(r"\s+", "", extracted))
+        is_table = _looks_like_table_page(raw_pdf, page, page_no, extracted, text_len)
 
-        if text_len >= 30:
+        if text_len >= 30 and not is_table:
+            # Original fast path: do not spend Gemini tokens on ordinary text
+            # pages that already have a usable PDF text layer.
             page_texts[page_no] = extracted
             embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
             if embedded:
                 page_images[page_no] = embedded
             continue
 
-        # Scan/image page: render it and let Gemini Vision OCR the page and
-        # identify meaningful educational images by bounding box.
-        png = render_pdf_page(raw_pdf, page_no, dpi=150)
-        ocr_text, detected = gemini_ocr_page(png, page_no)
+        # Scan/image page OR table page: render it and use Vision. For table
+        # pages, preserve row/column structure in the RAG text rather than
+        # flattening the table into an unreadable character stream.
+        png = render_pdf_page(raw_pdf, page_no, dpi=170 if is_table else 150)
+        if is_table:
+            table_pages += 1
+            ocr_text, tables = gemini_ocr_table_page(png, page_no)
+            detected = []
+            # Keep the old embedded-image extraction on text PDFs. Table OCR
+            # changes only text reconstruction; it must not silently remove
+            # existing educational images from the knowledge base.
+            embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
+            if embedded:
+                page_images[page_no] = embedded
+            print(f"[TABLE OCR] page={page_no} tables={len(tables)} text_len={text_len}")
+        else:
+            ocr_text, detected = gemini_ocr_page(png, page_no)
+            tables = []
         page_texts[page_no] = ocr_text
+
         stored = []
         for idx, item in enumerate(detected, 1):
             cropped = crop_image_from_page(png, item.get("box"))
@@ -4504,8 +4761,17 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             stored.append({"key": key, "description": description, "term": term, "reading": reading,
                            "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
         if stored:
-            page_images[page_no] = stored
+            if page_no in page_images:
+                page_images[page_no].extend(stored)
+            else:
+                page_images[page_no] = stored
+
+    # Expose the metric to the upload endpoint without changing its response
+    # contract for existing clients.
+    process_pdf_pages.last_table_pages = table_pages
     return page_texts, page_images
+
+process_pdf_pages.last_table_pages = 0
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
@@ -4671,7 +4937,9 @@ async def admin_knowledge_upload(
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     return {"success":True,"filename":source_file,"subject":subject,
-            "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
+            "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,
+            "table_pages_ocr":int(getattr(process_pdf_pages,"last_table_pages",0) or 0),
+            "chunks":total,"records":len(records_meta),
             "images":image_count,"image_vectors":image_vectors_total,"pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
