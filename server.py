@@ -1230,6 +1230,70 @@ def _is_correction_followup(text):
     return any(p in low for p in phrases)
 
 
+def _extract_thread_scope(recent_history, catalog):
+    """
+    Recover the active lesson/content scope from the OPEN chat thread.
+
+    Priority is intentional:
+      1. explicit scope stated by the student in recent turns
+      2. explicit scope stated by Doraemon in recent turns
+      3. no scope
+
+    This is only conversational context. It is NOT durable learning state and
+    must not leak into a new chatbox because the client sends a fresh history.
+    """
+    if not recent_history:
+        return None
+
+    def as_scope(item):
+        return {
+            "course": str(
+                item.get("course") or item.get("course_name") or ""
+            ).strip() or None,
+            "content_type": _normalize_content_type(item.get("content_type")),
+            "lesson": str(item.get("lesson") or "").strip() or None,
+            "topic": str(item.get("topic") or "").strip() or None,
+        }
+
+    # Student statements are strongest evidence of what the current thread is
+    # about. Search newest -> oldest so a later explicit lesson switch wins.
+    for preferred_role in ("user", "model"):
+        for h in reversed(recent_history):
+            if h.get("role") != preferred_role:
+                continue
+            found = _explicit_lesson_topic(h.get("text") or "", catalog)
+            if found:
+                scope = as_scope(found)
+                if any(scope.values()):
+                    return scope
+
+            # Fall back to explicit content-type/lesson/topic wording in the
+            # same message when the catalog helper cannot find an exact item.
+            candidate = _select_active_scope(h.get("text") or "", [], catalog)
+            if any(candidate.values()):
+                return candidate
+
+    return None
+
+
+def _is_explicit_thread_switch(text):
+    """
+    True only when the current user message clearly asks to move to another
+    lesson/content scope. Ordinary follow-ups/corrections must stay in the
+    current chat thread.
+    """
+    low = str(text or "").strip().casefold()
+    if not low:
+        return False
+    switch_phrases = (
+        "chuyển sang", "đổi sang", "sang bài", "sang phần", "sang lesson",
+        "học bài mới", "học bài khác", "học phần khác", "đổi bài",
+        "muốn học bài", "muốn học phần", "mình muốn học bài",
+        "mình muốn học phần", "bây giờ học bài", "tiếp theo học bài",
+    )
+    return any(p in low for p in switch_phrases)
+
+
 def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None, active_scope=None):
     """Infer only learning progress, never a score. Exercises are scored via /learning/progress."""
     text = (user_text or "").strip()
@@ -3041,12 +3105,16 @@ def proxy_chat(
 
     low = query_text.strip().lower()
 
-    # Conversational memory: keep the recent turns so short follow-ups such as
-    # "A", "câu tiếp theo", "giải thích câu này" still have their real context.
-    # The client already sends chat_history; this is deliberately kept compact
-    # to control latency while preserving the current exercise/lesson context.
+    # Conversational memory / CURRENT CHAT THREAD:
+    # The open chatbox is the primary conversational context. Keep at most
+    # 10 recent exchanges (up to 20 messages: user+model) from the history
+    # supplied by the current chatbox. A new chatbox normally starts with an
+    # empty history, so this does not leak the previous chat into a new thread.
+    #
+    # We deliberately keep more than the old 4-message window because a short
+    # correction often refers to something said several turns earlier.
     recent_history = []
-    for item in (data.chat_history or [])[-4:]:
+    for item in (data.chat_history or [])[-20:]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
@@ -3064,10 +3132,34 @@ def proxy_chat(
             text = str(item.get("content")).strip()
         if role in {"user", "model", "assistant"} and text:
             role = "model" if role == "assistant" else role
-            recent_history.append({"role": role, "text": text[-900:]})
+            # Per-message cap prevents an old long answer from dominating the
+            # current prompt while retaining enough detail for references.
+            recent_history.append({"role": role, "text": text[-1200:]})
+
+    # A single compact text view is used for routing/embedding. The full
+    # normalized 20-message window is still available to Gemini below.
+    thread_history_for_rag = recent_history[-20:]
+    thread_history_text = "\n".join(
+        f"{h['role']}: {h['text']}" for h in thread_history_for_rag
+    )
+    if len(thread_history_text) > 9000:
+        thread_history_text = thread_history_text[-9000:]
 
     # Resolve explicit intent before semantic retrieval. Kanji/Bộ thủ are
     # lessons under Từ vựng, never standalone content types.
+    #
+    # IMPORTANT: when this boxchat is still open, its recent history is the
+    # primary context. Durable PostgreSQL progress is only a fallback. A clear
+    # "chuyển sang..." request is the explicit exception that allows switching.
+    thread_scope = _extract_thread_scope(recent_history, catalog)
+    thread_switch_requested = _is_explicit_thread_switch(query_text)
+    if thread_scope:
+        print(
+            "[CHAT THREAD] "
+            f"history_messages={len(recent_history)} "
+            f"scope={thread_scope} "
+            f"switch_requested={thread_switch_requested}"
+        )
     named_lesson_topic = _explicit_lesson_topic(low, catalog)
     if named_lesson_topic:
         requested_scope = {
@@ -3129,7 +3221,25 @@ def proxy_chat(
     # request. Prefer durable active state over accidental keyword matches in
     # the correction sentence (e.g. "Bài 1" appearing in an old reply).
     correction_followup = _is_correction_followup(query_text) and bool(recent_history)
-    if correction_followup and active_learning:
+
+    # Current-thread context wins unless the student explicitly asks to switch
+    # to another lesson/section. A correction always wins over any accidental
+    # lesson keyword in the current sentence.
+    thread_scope_locked = bool(
+        thread_scope
+        and not thread_switch_requested
+        and not named_lesson_topic
+    )
+    if correction_followup and thread_scope:
+        thread_scope_locked = True
+    if thread_scope_locked:
+        requested_scope = dict(thread_scope)
+        requested_content_type = requested_scope.get("content_type")
+        requested_course = requested_scope.get("course")
+        requested_lesson = requested_scope.get("lesson")
+        requested_topic = requested_scope.get("topic")
+
+    if correction_followup and active_learning and not thread_scope_locked:
         requested_content_type = _normalize_content_type(active_learning.get("content_type")) or requested_content_type
         requested_course = str(active_learning.get("subject") or "").strip() or requested_course
         requested_lesson = str(active_learning.get("lesson") or "").strip() or requested_lesson
@@ -3163,8 +3273,23 @@ def proxy_chat(
     # active scope/state plus the new user message is needed. For a genuinely
     # unscoped query, use at most the two latest chat turns as a fallback hint.
     rag_query_text = query_text
-    if correction_followup and recent_history:
-        history_tail = recent_history[-3:]
+    if thread_scope_locked and recent_history:
+        scope_parts = [
+            str(thread_scope.get("content_type") or ""),
+            str(thread_scope.get("course") or ""),
+            str(thread_scope.get("lesson") or ""),
+            str(thread_scope.get("topic") or ""),
+        ]
+        scope_label = " / ".join(x for x in scope_parts if x)
+        rag_query_text = (
+            "NGỮ CẢNH CHÍNH CỦA BOXCHAT ĐANG MỞ. Ưu tiên đúng luồng hội thoại này; "
+            "không chuyển sang lesson/content type khác trừ khi học sinh yêu cầu rõ ràng.\n"
+            f"Phạm vi hiện tại: {scope_label}\n"
+            f"Lịch sử gần nhất của luồng (tối đa 10 lượt):\n{thread_history_text}\n"
+            f"Tin nhắn hiện tại: {query_text}"
+        )
+    elif correction_followup and recent_history:
+        history_tail = recent_history[-6:]
         history_context = "\n".join(f"{h['role']}: {h['text'][-1200:]}" for h in history_tail)
         rag_query_text = (
             "ĐÂY LÀ PHẢN HỒI/SỬA LẠI CÂU TRẢ LỜI TRƯỚC. Giữ nguyên bài/lesson đang học; "
@@ -3500,7 +3625,7 @@ def proxy_chat(
         except Exception as exc:
             print("[RAG compat] fallback failed:", type(exc).__name__, str(exc))
 
-    if not explicit_scope:
+    if not explicit_scope and not thread_scope_locked:
         active_scope = _select_active_scope(low, result.matches, catalog)
 
         # If the active scope was inferred from the text result, the text query
@@ -3688,7 +3813,7 @@ def proxy_chat(
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = recent_history[-4:] if recent_history else []
+    prompt_history = recent_history[-20:] if recent_history else []
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
@@ -3751,8 +3876,9 @@ NGUYÊN TẮC:
 - Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
 - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
 - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
-- Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
+- Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
 - Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
+- Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
 - Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
 - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
@@ -3774,8 +3900,11 @@ DANH MỤC (chỉ có khi cần gợi ý):
 RAG CONTEXT:
 {chr(10).join(prompt_contexts)}
 
-RECENT CHAT (chỉ để hiểu câu nói ngắn/đại từ):
+RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
 {json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+- Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
+- Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
+- Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
