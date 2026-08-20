@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-20-doraemon-v16.2-table-visual-followup-fix"
+SERVER_VERSION = "2026-08-20-doraemon-v16.5-table-provenance-text-detect-lesson-images"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1609,6 +1609,15 @@ def _image_belongs_to_text_chunk(md, chunk_md, chunk_text):
     if not sf or not page or img_sf != sf or img_page != page:
         return False
 
+    # Lesson-scope visuals are a deliberate exception to strict chunk locking:
+    # they illustrate the whole lesson/page (e.g. a doctor examining Ken), so
+    # they must not be forced onto either table chunk. They still require exact
+    # source_file + page + lesson identity.
+    if str(md.get("image_scope") or "").strip().lower() == "lesson":
+        img_lesson = _normalize_chunk_text_for_match(md.get("lesson"))
+        chunk_lesson = _normalize_chunk_text_for_match(chunk_md.get("lesson"))
+        return bool(img_lesson and chunk_lesson and img_lesson == chunk_lesson)
+
     raw_img_chunk = md.get("chunk_index")
     img_chunk_index = None
     if raw_img_chunk not in (None, ""):
@@ -1802,6 +1811,7 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
 
     results = []
     jobs = []
+    lesson_jobs = {}
 
     # Direct image keys are strongest and require no Pinecone round trip.
     for order, chunk in enumerate(text_chunks):
@@ -1825,6 +1835,9 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         sf, page, chunk_index = _chunk_identity(md)
         if sf and page:
             jobs.append((order, chunk, sf, page, chunk_index))
+            lesson = str(md.get("lesson") or "").strip()
+            if lesson:
+                lesson_jobs.setdefault((sf, page, lesson), []).append((order, chunk))
 
     def fetch_exact(job):
         order, chunk, sf, page, chunk_index = job
@@ -1893,6 +1906,41 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
             for found in executor.map(fetch_exact, jobs):
+                results.extend(found)
+
+    # Lesson-scope visuals are retrieved separately but only inside the exact
+    # source_file + page + lesson scope of a selected text chunk. They are not
+    # semantic image search and are not allowed to leak across lessons.
+    def fetch_lesson_scope(item):
+        (sf, page, lesson), refs = item
+        order, chunk = refs[0]
+        filt = {
+            "record_type": {"$eq": "image"},
+            "source_file": {"$eq": sf},
+            "page": {"$eq": int(page) if str(page).isdigit() else page},
+            "lesson": {"$eq": lesson},
+            "image_scope": {"$eq": "lesson"},
+        }
+        try:
+            res = index.query(vector=query_vector, top_k=20, include_metadata=True, namespace=namespace, filter=filt)
+            found=[]
+            for m in res.matches:
+                md=m.metadata or {}
+                if str(md.get("image_scope") or "").strip().lower() != "lesson":
+                    continue
+                if not _image_belongs_to_text_chunk(md, chunk["metadata"], chunk["text"]):
+                    continue
+                found.extend(_image_payload_from_metadata(md, getattr(m, "score", 0), order, chunk["text"]))
+            print(f"[IMAGE lesson-scope] source={sf!r} page={page!r} lesson={lesson!r} candidates={len(res.matches)} accepted={len(found)}")
+            return found
+        except Exception as exc:
+            print("[IMAGE lesson-scope] failed:", sf, page, lesson, type(exc).__name__, str(exc))
+            return []
+
+    if lesson_jobs:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(4, len(lesson_jobs))) as executor:
+            for found in executor.map(fetch_lesson_scope, lesson_jobs.items()):
                 results.extend(found)
 
     # Deduplicate only by actual object key, never by page/chunk position.
@@ -3682,7 +3730,8 @@ NGUYÊN TẮC:
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
 - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
-- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh chỉ thuộc về đúng CHUNK có ảnh tương ứng trong RAG.
+- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
+- Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
 - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
 {image_marker_rule}
 
@@ -4556,8 +4605,46 @@ def _detect_long_grid_lines(page_png: bytes):
         return False
 
 
-def _page_has_table_grid(page, page_png=None):
-    """Detect table-like borders without doing table OCR."""
+def _text_looks_like_table(extracted: str) -> bool:
+    """Detect table-like text emitted by PDF text extraction, without OCR.
+
+    Many textbook PDFs expose tables as text/Markdown-like rows even when
+    their vector borders are not detectable at preview DPI. This detector is
+    deliberately conservative: it only decides whether to enter the existing
+    Table Visual pipeline; it never reconstructs rows/columns.
+    """
+    text = str(extracted or "").strip()
+    if not text:
+        return False
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    lines = [x for x in lines if x]
+    if len(lines) < 3:
+        return False
+
+    pipe_lines = sum(1 for x in lines if x.count("|") >= 2)
+    separator_lines = sum(1 for x in lines if re.search(r"\|\s*:?-{2,}:?\s*(?:\||$)", x))
+    # Markdown-like table extraction: several pipe rows plus at least one
+    # separator/header row.
+    if pipe_lines >= 3 and separator_lines >= 1:
+        return True
+
+    # Some PDF extractors drop the pipes but preserve repeated column-like
+    # spacing. Require several rows with multiple numeric/time markers or
+    # repeated short tokens so ordinary paragraphs do not become tables.
+    time_rows = sum(1 for x in lines if re.search(r"\b(?:[0-2]?\d):[0-5]\d\b", x))
+    if time_rows >= 3 and len(lines) >= 5:
+        return True
+    return False
+
+
+def _page_has_table_grid(page, page_png=None, extracted_text: str = ""):
+    """Detect table-like borders without doing table OCR.
+
+    Text structure is checked first because many textbook tables have a valid
+    PDF text layer but their borders disappear at low preview DPI.
+    """
+    if _text_looks_like_table(extracted_text):
+        return True
     try:
         drawings = page.get_drawings() if hasattr(page, "get_drawings") else []
         h = v = 0
@@ -4817,7 +4904,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
             preview = render_pdf_page(raw_pdf, page_no, dpi=90)
-            table_page = _page_has_table_grid(page, preview)
+            table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
                 embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
@@ -4830,7 +4917,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
         # Scan/low-text pages retain the old Gemini OCR behavior.
         png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
         if not table_page:
-            table_page = _page_has_table_grid(page, png)
+            table_page = _page_has_table_grid(page, png, ocr_text or extracted)
 
         ocr_text = extracted
         stored = []
@@ -4921,8 +5008,13 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # Preserve V16 embedded images on table pages as well.
             embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
             if embedded:
+                # These are ordinary illustrations embedded in the same lesson
+                # page, not table-source images. Treat them as lesson-scope
+                # visuals so they are not incorrectly forced onto a table chunk.
+                for emb in embedded:
+                    emb["image_scope"] = "lesson"
                 stored.extend(embedded)
-            print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')}")
+            print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')} lesson_images={sum(1 for x in stored if x.get('image_scope')=='lesson')}")
         else:
             page_texts[page_no] = (ocr_text or extracted).strip()
 
@@ -5077,6 +5169,7 @@ async def admin_knowledge_upload(
                         "associated_text":associated_text,"description":description,
                         "bbox":str(img.get("bbox") or ""),
                         "image_kind":str(img.get("kind") or "educational_image"),
+                        "image_scope":str(img.get("image_scope") or ("table" if img.get("kind") == "table_source" else "chunk")),
                     }
 
                     if unit_id and unit_id in unit_chunk_map:
@@ -5153,7 +5246,8 @@ async def admin_knowledge_upload(
                     "term":term,"reading":reading,"meaning":meaning,
                     "associated_text":associated_text,"description":description,
                     "bbox":str(img.get("bbox") or ""),
-                    "image_kind":str(img.get("kind") or "educational_image")
+                    "image_kind":str(img.get("kind") or "educational_image"),
+                    "image_scope":str(img.get("image_scope") or "chunk"),
                 }
                 if page_chunk_count==1:
                     image_md["chunk_index"]=0
