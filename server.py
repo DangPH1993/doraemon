@@ -4928,7 +4928,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         if stored:
             page_images[page_no] = stored
-    return page_texts, page_images
+    return page_texts, page_images, page_units
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
@@ -4979,7 +4979,7 @@ async def admin_knowledge_upload(
 
     # Extract text normally; scanned/empty pages go through Gemini OCR.
     try:
-        page_texts, page_images = process_pdf_pages(raw, reader, records_meta, source_file, subject)
+        page_texts, page_images, page_units = process_pdf_pages(raw, reader, records_meta, source_file, subject)
     except Exception as e:
         raise HTTPException(500, f"OCR Gemini/xử lý ảnh thất bại: {e}")
 
