@@ -1,4 +1,4 @@
-BASELINE_VERSION = "14.9"
+BASELINE_VERSION = "16.2"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-19-doraemon-baseline-v14.4-study-plan-multi"
+SERVER_VERSION = "2026-08-20-doraemon-v16.2-table-visual-followup-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1208,11 +1208,38 @@ def _select_active_scope(query_text, text_matches, catalog):
     }
 
 
+def _is_correction_followup(text):
+    """Detect a short user message that is correcting/challenging the previous answer.
+
+    This is intentionally conservative: it is for phrases such as
+    "chiều thứ 6 Ken có lịch rồi mà", "cậu nói sai", "không đúng", etc.
+    A correction must stay in the current lesson/conversation instead of being
+    re-routed as a new study request.
+    """
+    low = str(text or "").strip().casefold()
+    if not low:
+        return False
+    phrases = (
+        "không đúng", "sai rồi", "cậu sai", "doraemon sai", "bạn sai",
+        "nhầm rồi", "cậu nhầm", "doraemon nhầm", "không phải",
+        "đã có lịch", "có lịch rồi", "có lịch mà", "đang có lịch",
+        "lịch rồi mà", "đã có lịch mà", "nhưng ken", "ken có lịch",
+        "chiều thứ 6", "chiều thứ sáu", "thứ 6 ken", "thứ sáu ken",
+        "không khớp", "không phải như vậy", "đâu có"
+    )
+    return any(p in low for p in phrases)
+
+
 def infer_learning_event(user_id, user_text, reply, catalog, learning, source_meta=None, active_scope=None):
     """Infer only learning progress, never a score. Exercises are scored via /learning/progress."""
     text = (user_text or "").strip()
     low = text.lower()
     source_meta = source_meta or []
+
+    # A correction of the previous assistant answer is not a new learning event.
+    # Do not let a keyword in the correction sentence overwrite the active lesson.
+    if _is_correction_followup(text):
+        return None
     active_scope = active_scope or {}
     active_content_type = active_scope.get("content_type")
     active_course = active_scope.get("course")
@@ -3031,6 +3058,22 @@ def proxy_chat(
             requested_lesson = str(active_learning.get("lesson") or "").strip() or None
             requested_topic = str(active_learning.get("topic") or "").strip() or None
 
+    # A correction is a continuation of the previous lesson, not a new lesson
+    # request. Prefer durable active state over accidental keyword matches in
+    # the correction sentence (e.g. "Bài 1" appearing in an old reply).
+    correction_followup = _is_correction_followup(query_text) and bool(recent_history)
+    if correction_followup and active_learning:
+        requested_content_type = _normalize_content_type(active_learning.get("content_type")) or requested_content_type
+        requested_course = str(active_learning.get("subject") or "").strip() or requested_course
+        requested_lesson = str(active_learning.get("lesson") or "").strip() or requested_lesson
+        requested_topic = str(active_learning.get("topic") or "").strip() or requested_topic
+        requested_scope = {
+            "course": requested_course or None,
+            "content_type": requested_content_type or None,
+            "lesson": requested_lesson or None,
+            "topic": requested_topic or None,
+        }
+
     def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
         scope_filter = {"record_type": {"$eq": record_type}}
         if content_type:
@@ -3053,7 +3096,15 @@ def proxy_chat(
     # active scope/state plus the new user message is needed. For a genuinely
     # unscoped query, use at most the two latest chat turns as a fallback hint.
     rag_query_text = query_text
-    if active_scope:
+    if correction_followup and recent_history:
+        history_tail = recent_history[-3:]
+        history_context = "\n".join(f"{h['role']}: {h['text'][-1200:]}" for h in history_tail)
+        rag_query_text = (
+            "ĐÂY LÀ PHẢN HỒI/SỬA LẠI CÂU TRẢ LỜI TRƯỚC. Giữ nguyên bài/lesson đang học; "
+            "không chuyển sang bài khác.\n" + history_context + "\n" +
+            "Tin nhắn sửa của học sinh: " + query_text
+        )
+    elif active_scope:
         scope_parts = [
             str(active_scope.get("content_type") or ""),
             str(active_scope.get("course") or ""),
@@ -3610,6 +3661,8 @@ NGUYÊN TẮC:
 - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
 - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
 - Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
+- Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
+- Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
@@ -4478,32 +4531,46 @@ def _page_has_table_grid(page, page_png=None):
 
 
 def gemini_explain_table_page(page_png: bytes, page_no: int, extracted_text: str = ""):
-    """Use Vision to create semantic teaching text for the ORIGINAL table image.
+    """Use Vision to identify each ORIGINAL table region and explain its content.
 
-    This is intentionally NOT table OCR. The image itself remains the source of
-    truth; the returned text is a natural-language explanation for RAG/embedding.
+    This is NOT table OCR/grid reconstruction. Vision only returns a bounding
+    box for each table and natural-language semantic text for that table.
+    The original cropped table image remains the visual source of truth.
     """
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
-    prompt = f"""Đây là trang {page_no} của tài liệu học tiếng Nhật. Trang này có một hoặc nhiều BẢNG.
+    prompt = f"""Đây là trang {page_no} của tài liệu học tiếng Nhật. Trang có thể có một hoặc nhiều BẢNG.
 
-Hãy nhìn trực tiếp vào ẢNH và tạo một phần TEXT GIẢI THÍCH để hệ thống RAG có thể tìm kiếm và Doraemon có thể dạy học sinh.
+Hãy nhìn trực tiếp vào ẢNH và tạo dữ liệu cho TỪNG BẢNG GỐC trên trang để hệ thống RAG có thể tìm kiếm và Doraemon có thể dạy học sinh.
 
-QUY TẮC BẮT BUỘC:
-- ẢNH là nguồn sự thật. Không suy diễn dựa trên kiến thức bên ngoài.
-- Không cố tái tạo bảng thành JSON, không cần đánh số hàng/cột, không cần OCR từng ô theo dạng lưới.
-- Hãy mô tả bảng bằng ngôn ngữ tự nhiên nhưng phải giữ chính xác quan hệ quan trọng: tiêu đề bảng, cột/hàng, ngày, giờ, hoạt động, lựa chọn, dấu ○/×, khoảng thời gian, ô trống và các nhóm ô nếu chúng thể hiện ý nghĩa.
-- Nếu là bảng lịch, phải nói rõ hoạt động nào thuộc ngày nào và khung giờ nào CHỈ KHI nhìn từ ảnh xác định được.
-- Nếu có ô gộp nhiều dòng/cột, diễn giải đúng phạm vi của ô đó thay vì nhân bản nội dung sang các hàng/cột khác.
+ĐÂY KHÔNG PHẢI TABLE OCR. Không tái tạo bảng thành JSON row/column, không suy ra grid, không cần đánh số ô.
+Mỗi bảng chỉ cần:
+- box: vùng bao quanh CHÍNH bảng đó, [ymin, xmin, ymax, xmax] chuẩn hóa 0-1000;
+- explanation: đoạn TEXT giải thích nội dung của CHÍNH bảng đó.
+
+QUY TẮC BẮT BUỘC CHO explanation:
+- ẢNH là nguồn sự thật. Không dùng kiến thức bên ngoài để sửa/đoán dữ liệu.
+- Giữ chính xác các quan hệ quan trọng mà nhìn thấy được: tiêu đề, ngày, giờ, hoạt động, lựa chọn, ký hiệu ○/×, khoảng thời gian, ô trống và các nhóm ô gộp.
+- Với bảng lịch, phải nói rõ hoạt động thuộc ngày và khung giờ nào CHỈ KHI nhìn từ ảnh xác định được.
 - Không tự điền nội dung cho ô trống.
-- Giữ nguyên các từ/cụm tiếng Nhật quan trọng như 月, 火, 水, 木, 金, 土, 日, 9:00, 12:00, 17:00, 大学... rồi có thể giải thích nghĩa tiếng Việt nếu nhìn thấy rõ.
+- Không nhân bản một hoạt động sang ngày/khung giờ khác chỉ vì bố cục hoặc ngữ nghĩa có vẻ hợp lý.
+- Giữ nguyên các từ/cụm tiếng Nhật quan trọng như 月, 火, 水, 木, 金, 土, 日, 9:00, 12:00, 17:00, 大学, アルバイト, コーラスクラブ, テニス nếu nhìn thấy rõ; có thể giải thích nghĩa tiếng Việt.
 - Nếu một chi tiết không đọc chắc, nói "không rõ" hoặc bỏ qua; tuyệt đối không đoán.
-- Text phải đủ cụ thể để trả lời câu hỏi về nội dung bảng, nhưng không viết thành bài giảng dài.
+- Explanation phải đủ cụ thể để trả lời câu hỏi về CHÍNH bảng đó, nhưng không viết thành bài giảng dài.
+- Nếu trang không có bảng rõ ràng, trả về tables=[]; không tự coi toàn bộ trang là một bảng.
 
-TEXT TỪ PDF (chỉ là dữ liệu hỗ trợ, có thể sai vị trí; KHÔNG được ưu tiên hơn ảnh):
+TEXT TỪ PDF (chỉ hỗ trợ tìm chữ; có thể mất vị trí, KHÔNG được ưu tiên hơn ảnh):
 {extracted_text[:6000]}
 
-Chỉ trả về phần text giải thích, không JSON, không markdown code fence."""
+Chỉ trả JSON đúng schema:
+{{
+  "tables": [
+    {{
+      "box": [0,0,1000,1000],
+      "explanation": "..."
+    }}
+  ]
+}}"""
     part = types.Part.from_bytes(data=page_png, mime_type="image/png")
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
@@ -4511,23 +4578,35 @@ Chỉ trả về phần text giải thích, không JSON, không markdown code fe
         config=types.GenerateContentConfig(
             temperature=0.0,
             thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
+            response_mime_type="application/json",
         )
     )
-    return (response.text or "").strip()
+    data = _parse_gemini_json(response.text or "{}")
+    tables = data.get("tables") if isinstance(data.get("tables"), list) else []
+    out=[]
+    for item in tables:
+        if not isinstance(item, dict):
+            continue
+        box=item.get("box")
+        explanation=str(item.get("explanation") or "").strip()
+        if not isinstance(box, (list, tuple)) or len(box)!=4 or not explanation:
+            continue
+        try:
+            vals=[max(0,min(1000,int(float(x)))) for x in box]
+        except Exception:
+            continue
+        if vals[2] <= vals[0] or vals[3] <= vals[1]:
+            continue
+        out.append({"box": vals, "explanation": explanation})
+    return out
 
-
-def _store_table_source_image(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta, page_png: bytes):
-    """Store the original rendered table page as an image record."""
+def _store_table_source_image(source_file: str, subject: str, page_meta, page_no: int, table_index: int, image_bytes: bytes, size):
+    """Store ONE original table image as an independent knowledge image."""
     if not b2_ready():
         return None
     try:
-        im = Image.open(io.BytesIO(page_png)).convert("RGB") if Image is not None else None
-        if im is None:
-            return None
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=92, optimize=True)
-        image_bytes = out.getvalue()
-        key = f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/table_source.jpg"
+        width, height = size
+        key = f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/table_{table_index:02d}.jpg"
         b2_put_bytes(key, image_bytes, "image/jpeg")
         primary = page_meta[0] if page_meta else {}
         conn=db()
@@ -4535,17 +4614,22 @@ def _store_table_source_image(raw_pdf: bytes, page_no: int, source_file: str, su
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO knowledge_images
                     (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (source_file,subject,primary.get("content_type","Từ vựng"),primary.get("lesson"),primary.get("topic"),
-                     page_no,key,b2_url(key),"Ảnh gốc của bảng trong giáo trình",im.width,im.height))
+                     page_no,key,b2_url(key),f"Ảnh gốc bảng {table_index} trong giáo trình",width,height))
             conn.commit()
         finally:
             conn.close()
-        return {"key":key,"description":"Ảnh gốc của bảng trong giáo trình","page":page_no,"kind":"table_source"}
+        return {
+            "key":key,
+            "description":f"Ảnh gốc bảng {table_index} trong giáo trình",
+            "page":page_no,
+            "kind":"table_source",
+            "table_index":table_index,
+        }
     except Exception as exc:
-        print(f"[TABLE IMAGE] page={page_no} skipped:", type(exc).__name__, str(exc))
+        print(f"[TABLE IMAGE] page={page_no} table={table_index} skipped:", type(exc).__name__, str(exc))
         return None
-
 
 def crop_image_from_page(page_png: bytes, box):
     if Image is None:
@@ -4678,26 +4762,41 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                 stored.append({"key": key, "description": description, "term": term, "reading": reading,
                                "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
 
-        # For table pages, KEEP THE ORIGINAL PAGE AS AN IMAGE and add one
-        # semantic Vision explanation to the text that will be embedded.
+        # For table pages, keep EACH ORIGINAL TABLE as its own image and add
+        # one semantic Vision explanation per table to the text that is embedded.
         if table_page:
-            explanation = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted)
-            if explanation:
-                marker = f"【GIẢI THÍCH BẢNG TRANG {page_no}】"
-                page_texts[page_no] = (marker + "\n" + explanation + "\n\n" + (ocr_text or extracted).strip()).strip()
-            else:
-                page_texts[page_no] = (ocr_text or extracted).strip()
+            table_items = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted)
+            table_parts=[]
+            for table_index, item in enumerate(table_items, 1):
+                marker = f"【GIẢI THÍCH BẢNG TRANG {page_no} #{table_index}】"
+                table_parts.append(marker + "\n" + str(item.get("explanation") or "").strip())
+                cropped = crop_image_from_page(png, item.get("box"))
+                if cropped:
+                    image_bytes, size = cropped
+                else:
+                    # If Vision could explain a table but its box is unusable,
+                    # do not lose the table explanation; keep the whole page as
+                    # the visual fallback for that table.
+                    im = Image.open(io.BytesIO(png)).convert("RGB") if Image is not None else None
+                    if im is None:
+                        continue
+                    outbuf=io.BytesIO(); im.save(outbuf, format="JPEG", quality=92, optimize=True)
+                    image_bytes, size = outbuf.getvalue(), im.size
+                table_image = _store_table_source_image(
+                    source_file, subject, page_meta, page_no, table_index, image_bytes, size
+                )
+                if table_image:
+                    table_image["marker"] = marker
+                    stored.append(table_image)
+
+            base_text=(ocr_text or extracted).strip()
+            page_texts[page_no] = ("\n\n".join(table_parts) + ("\n\n" + base_text if base_text else "")).strip()
 
             # Preserve V16 embedded images on table pages as well.
             embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
             if embedded:
                 stored.extend(embedded)
-
-            table_image = _store_table_source_image(raw_pdf, page_no, source_file, subject, page_meta, png)
-            if table_image:
-                # The exact chunk_index is assigned after chunking in the upload loop.
-                stored.append(table_image)
-            print(f"[TABLE VISUAL] page={page_no} explanation={'yes' if explanation else 'no'} source_image={'yes' if table_image else 'no'}")
+            print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')}")
         else:
             page_texts[page_no] = (ocr_text or extracted).strip()
 
@@ -4781,12 +4880,20 @@ async def admin_knowledge_upload(
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
                     "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
                 } for r in page_meta]
+                table_keys_for_chunk=[]
+                for timg in page_images.get(page_no, []):
+                    if str(timg.get("kind") or "") != "table_source":
+                        continue
+                    marker = str(timg.get("marker") or "").strip()
+                    if marker and marker in chunk:
+                        table_keys_for_chunk.append(str(timg.get("key") or "").strip())
+                table_keys_for_chunk=[k for k in table_keys_for_chunk if k]
                 md={
                     "record_type":"text",
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
-                    "image_keys":json.dumps([],ensure_ascii=False)
+                    "image_keys":json.dumps(table_keys_for_chunk,ensure_ascii=False)
                 }
                 if primary:
                     md.update({
@@ -4818,11 +4925,12 @@ async def admin_knowledge_upload(
                 description = str(img.get("description") or "").strip()
                 table_explanation = ""
                 if str(img.get("kind") or "") == "table_source":
-                    marker = f"【GIẢI THÍCH BẢNG TRANG {page_no}】"
-                    for ctext in chunks:
-                        if marker in ctext:
-                            table_explanation = ctext.split(marker, 1)[1].strip()
-                            break
+                    marker = str(img.get("marker") or "").strip()
+                    if marker:
+                        for ctext in chunks:
+                            if marker in ctext:
+                                table_explanation = ctext.split(marker, 1)[1].strip()
+                                break
                 search_text = " | ".join(x for x in [term, reading, meaning, associated_text, description, table_explanation, f"Trang {page_no}"] if x)
                 if not search_text:
                     search_text = f"Hình minh họa trang {page_no}"
