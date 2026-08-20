@@ -1,4 +1,4 @@
-BASELINE_VERSION = "16.2"
+BASELINE_VERSION = "16.6"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-20-doraemon-v16.5-table-provenance-text-detect-lesson-images"
+SERVER_VERSION = "2026-08-20-doraemon-v16.6-table-provenance-exercise-safe-structured-facts"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1836,7 +1836,11 @@ def _retrieve_images_for_text_chunks(text_chunks, index, namespace, query_vector
         if sf and page:
             jobs.append((order, chunk, sf, page, chunk_index))
             lesson = str(md.get("lesson") or "").strip()
-            if lesson:
+            # Lesson-scope visuals are for the general/normal lesson context.
+            # Do not add them to a chunk that already has an exact chunk/table
+            # image; that would make a table chunk look as if its lesson image
+            # belonged to the table itself.
+            if lesson and not direct_keys:
                 lesson_jobs.setdefault((sf, page, lesson), []).append((order, chunk))
 
     def fetch_exact(job):
@@ -3714,6 +3718,30 @@ def proxy_chat(
             "Marker chỉ là kỹ thuật nội bộ, không được giải thích cho học sinh."
         )
 
+    mode_specific_rules = ""
+    if requested_content_type == "Bài tập":
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO BÀI TẬP (BẮT BUỘC):
+- Nếu tin nhắn hiện tại chứa đáp án của học sinh (ví dụ các số, lựa chọn 1)/2)/3), hãy coi đó là bài nộp đáp án và TỰ KIỂM TRA ngay bằng dữ liệu trong RAG.
+- Không được yêu cầu học sinh tự tính lại nếu nguồn đã có đủ dữ kiện để kiểm tra.
+- Với bài tính tiền/gọi món: đọc đúng món và giá từ CHUNK + ẢNH của đúng khách/order, tự cộng và đối chiếu với đáp án học sinh.
+- Trả rõ từng câu: ĐÚNG/SẠI, đáp án đúng và phép tính ngắn gọn; sau đó mới giải thích lỗi nếu sai.
+- Chỉ nói "cậu tự tính" khi học sinh thực sự chưa đưa đáp án hoặc nguồn không đủ dữ kiện để chấm.
+"""
+    elif any(
+        _normalize_chunk_text_for_match(c.get("metadata",{}).get("content_type")) == "giáo trình"
+        and "facts nguồn của bảng" in _normalize_chunk_text_for_match(c.get("text"))
+        for c in text_chunks
+    ):
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
+- FACTS NGUỒN CỦA BẢNG là dữ kiện đã được Vision đọc từ ẢNH gốc. Dùng chúng để suy luận, không chỉ mô tả lại bảng.
+- Khi câu hỏi yêu cầu tìm một thời điểm/ngày/giá trị từ nhiều bảng, hãy thực hiện phép đối chiếu logic giữa các facts rồi đưa ra đáp án nếu dữ kiện đủ.
+- Với bảng lịch, ô trống có thể mang nghĩa "rảnh" nếu chính bố cục bảng thể hiện không có hoạt động ở khung đó; ký hiệu ／ không đồng nghĩa với ô trống/rảnh.
+- Không yêu cầu học sinh tự kiểm tra lại nếu chính các facts nguồn đã đủ để suy ra đáp án.
+- Nếu có nhiều bảng trong cùng bài, giữ đúng quan hệ giữa từng bảng và ảnh của bảng đó.
+"""
+
     prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
 NGUYÊN TẮC:
@@ -3726,7 +3754,7 @@ NGUYÊN TẮC:
 - Ưu tiên ACTIVE LEARNING STATE để tiếp tục đúng bài và vị trí đang học.
 - Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
 - Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
-- Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
+- Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
 - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
@@ -3734,6 +3762,8 @@ NGUYÊN TẮC:
 - Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
 - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
 {image_marker_rule}
+
+{mode_specific_rules}
 
 ACTIVE LEARNING STATE:
 {json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
@@ -4628,12 +4658,10 @@ def _text_looks_like_table(extracted: str) -> bool:
     if pipe_lines >= 3 and separator_lines >= 1:
         return True
 
-    # Some PDF extractors drop the pipes but preserve repeated column-like
-    # spacing. Require several rows with multiple numeric/time markers or
-    # repeated short tokens so ordinary paragraphs do not become tables.
-    time_rows = sum(1 for x in lines if re.search(r"\b(?:[0-2]?\d):[0-5]\d\b", x))
-    if time_rows >= 3 and len(lines) >= 5:
-        return True
+    # Do NOT classify ordinary prose/exercises as a table merely because they
+    # contain several times/prices. For non-pipe text we rely on the visual
+    # grid detector below. This keeps the old non-table exercise pipeline
+    # isolated from the new table pipeline.
     return False
 
 
@@ -4669,33 +4697,37 @@ def _page_has_table_grid(page, page_png=None, extracted_text: str = ""):
 
 
 def gemini_explain_table_page(page_png: bytes, page_no: int, extracted_text: str = ""):
-    """Use Vision to identify each ORIGINAL table region and explain its content.
+    """Vision extraction for original tables.
 
-    This is NOT table OCR/grid reconstruction. Vision only returns a bounding
-    box for each table and natural-language semantic text for that table.
-    The original cropped table image remains the visual source of truth.
+    The table image remains the visual source of truth. Vision also emits
+    structured, source-grounded facts so downstream chat can reason over empty
+    cells and time/day relationships instead of relying on flattened OCR.
     """
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
     prompt = f"""Đây là trang {page_no} của tài liệu học tiếng Nhật. Trang có thể có một hoặc nhiều BẢNG.
 
-Hãy nhìn trực tiếp vào ẢNH và tạo dữ liệu cho TỪNG BẢNG GỐC trên trang để hệ thống RAG có thể tìm kiếm và Doraemon có thể dạy học sinh.
+Hãy nhìn TRỰC TIẾP vào ẢNH và tạo dữ liệu cho TỪNG BẢNG GỐC trên trang để hệ thống RAG có thể tìm kiếm, hiển thị đúng ảnh và để Doraemon có thể suy luận khi học sinh hỏi hoặc làm bài.
 
-ĐÂY KHÔNG PHẢI TABLE OCR. Không tái tạo bảng thành JSON row/column, không suy ra grid, không cần đánh số ô.
-Mỗi bảng chỉ cần:
+ĐÂY KHÔNG PHẢI TABLE OCR. Không tái tạo toàn bộ grid thành JSON row/column. ẢNH là nguồn sự thật.
+
+Mỗi bảng trả về:
 - box: vùng bao quanh CHÍNH bảng đó, [ymin, xmin, ymax, xmax] chuẩn hóa 0-1000;
-- explanation: đoạn TEXT giải thích nội dung của CHÍNH bảng đó.
+- explanation: giải thích ngắn, chính xác nội dung bảng;
+- facts: danh sách các FACT quan trọng đọc được trực tiếp từ bảng. Mỗi fact là một chuỗi độc lập, có đủ chủ thể/ngày/khung giờ/giá trị khi có thể xác định.
 
-QUY TẮC BẮT BUỘC CHO explanation:
-- ẢNH là nguồn sự thật. Không dùng kiến thức bên ngoài để sửa/đoán dữ liệu.
-- Giữ chính xác các quan hệ quan trọng mà nhìn thấy được: tiêu đề, ngày, giờ, hoạt động, lựa chọn, ký hiệu ○/×, khoảng thời gian, ô trống và các nhóm ô gộp.
-- Với bảng lịch, phải nói rõ hoạt động thuộc ngày và khung giờ nào CHỈ KHI nhìn từ ảnh xác định được.
-- Không tự điền nội dung cho ô trống.
-- Không nhân bản một hoạt động sang ngày/khung giờ khác chỉ vì bố cục hoặc ngữ nghĩa có vẻ hợp lý.
-- Giữ nguyên các từ/cụm tiếng Nhật quan trọng như 月, 火, 水, 木, 金, 土, 日, 9:00, 12:00, 17:00, 大学, アルバイト, コーラスクラブ, テニス nếu nhìn thấy rõ; có thể giải thích nghĩa tiếng Việt.
-- Nếu một chi tiết không đọc chắc, nói "không rõ" hoặc bỏ qua; tuyệt đối không đoán.
-- Explanation phải đủ cụ thể để trả lời câu hỏi về CHÍNH bảng đó, nhưng không viết thành bài giảng dài.
-- Nếu trang không có bảng rõ ràng, trả về tables=[]; không tự coi toàn bộ trang là một bảng.
+QUY TẮC BẮT BUỘC:
+1. Không dùng kiến thức bên ngoài để sửa/đoán dữ liệu.
+2. Giữ chính xác quan hệ giữa hàng, cột, ngày, giờ, hoạt động, ký hiệu ○/／ và các ô gộp.
+3. Ô TRỐNG phải được ghi nhận khi nó có ý nghĩa trong ngữ cảnh bảng. Với bảng lịch, hãy diễn đạt rõ "Thứ X, khung giờ Y: trống/không có hoạt động ghi trong bảng" CHỈ KHI nhìn từ bố cục ảnh xác định được.
+4. Không được biến ô "／" thành "trống/rảnh". "／" là ký hiệu nghỉ/không mở hoặc giá trị được thể hiện bằng chính ký hiệu đó.
+5. Không nhân bản một hoạt động sang ngày/khung giờ khác chỉ vì ngữ nghĩa có vẻ hợp lý.
+6. Với bảng lịch, phải gắn hoạt động vào đúng ngày và đúng khung giờ dựa trên vị trí ô; không suy ra chỉ từ thứ tự chữ OCR.
+7. Với bảng giờ mở cửa, giữ nguyên ○ và ／ và nêu rõ ngày/ca tương ứng.
+8. Với bảng giá/bài tập, giữ nguyên từng món, giá, số lượng hoặc lựa chọn nếu nhìn thấy.
+9. Nếu một chi tiết không đọc chắc, ghi "không rõ" hoặc bỏ qua; tuyệt đối không đoán.
+10. facts phải là dữ kiện nguồn, KHÔNG tự tạo đáp án cho câu hỏi của học sinh. Việc suy luận đáp án sẽ do Doraemon thực hiện từ các facts.
+11. Nếu trang không có bảng rõ ràng, trả về tables=[]; không tự coi toàn bộ trang là một bảng.
 
 TEXT TỪ PDF (chỉ hỗ trợ tìm chữ; có thể mất vị trí, KHÔNG được ưu tiên hơn ảnh):
 {extracted_text[:6000]}
@@ -4705,7 +4737,8 @@ Chỉ trả JSON đúng schema:
   "tables": [
     {{
       "box": [0,0,1000,1000],
-      "explanation": "..."
+      "explanation": "...",
+      "facts": ["...", "..."]
     }}
   ]
 }}"""
@@ -4727,6 +4760,8 @@ Chỉ trả JSON đúng schema:
             continue
         box=item.get("box")
         explanation=str(item.get("explanation") or "").strip()
+        facts=item.get("facts") if isinstance(item.get("facts"), list) else []
+        facts=[str(x).strip() for x in facts if str(x).strip()]
         if not isinstance(box, (list, tuple)) or len(box)!=4 or not explanation:
             continue
         try:
@@ -4735,7 +4770,7 @@ Chỉ trả JSON đúng schema:
             continue
         if vals[2] <= vals[0] or vals[3] <= vals[1]:
             continue
-        out.append({"box": vals, "explanation": explanation})
+        out.append({"box": vals, "explanation": explanation, "facts": facts})
     return out
 
 def _store_table_source_image(source_file: str, subject: str, page_meta, page_no: int, table_index: int, image_bytes: bytes, size):
@@ -4977,6 +5012,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                 if table_image:
                     table_image["marker"] = marker
                     table_image["explanation"] = str(item.get("explanation") or "").strip()
+                    table_image["facts"] = list(item.get("facts") or [])
                     table_image["unit_id"] = f"table:{page_no}:{table_index}"
                     stored.append(table_image)
 
@@ -4984,17 +5020,6 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # Provenance-bearing content units. Table explanation and its source
             # image stay together before chunking; no post-chunk text matching.
             units=[]
-            for table_image in [x for x in stored if str(x.get("kind") or "") == "table_source"]:
-                explanation=str(table_image.get("explanation") or "").strip()
-                marker=str(table_image.get("marker") or "").strip()
-                key=str(table_image.get("key") or "").strip()
-                if explanation and key:
-                    units.append({
-                        "type":"table",
-                        "unit_id":str(table_image.get("unit_id") or ""),
-                        "text":(marker + "\n" + explanation).strip(),
-                        "image_keys":[key],
-                    })
             if base_text:
                 units.append({
                     "type":"normal",
@@ -5002,6 +5027,22 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                     "text":base_text,
                     "image_keys":[],
                 })
+            for table_image in [x for x in stored if str(x.get("kind") or "") == "table_source"]:
+                explanation=str(table_image.get("explanation") or "").strip()
+                facts=[str(x).strip() for x in (table_image.get("facts") or []) if str(x).strip()]
+                marker=str(table_image.get("marker") or "").strip()
+                key=str(table_image.get("key") or "").strip()
+                if explanation and key:
+                    fact_text = "\n".join(f"- {x}" for x in facts)
+                    unit_text = marker + "\n" + explanation
+                    if fact_text:
+                        unit_text += "\nFACTS NGUỒN CỦA BẢNG:\n" + fact_text
+                    units.append({
+                        "type":"table",
+                        "unit_id":str(table_image.get("unit_id") or ""),
+                        "text":unit_text.strip(),
+                        "image_keys":[key],
+                    })
             page_units[page_no]=units
             page_texts[page_no] = "\n\n".join(u["text"] for u in units).strip()
 
@@ -5155,7 +5196,8 @@ async def admin_knowledge_upload(
                     description=str(img.get("description") or "").strip()
                     unit_id=str(img.get("unit_id") or "")
                     table_explanation=str(img.get("explanation") or "").strip()
-                    search_text=" | ".join(x for x in [term,reading,meaning,associated_text,description,table_explanation,f"Trang {page_no}"] if x)
+                    table_facts=" | ".join(str(x).strip() for x in (img.get("facts") or []) if str(x).strip())
+                    search_text=" | ".join(x for x in [term,reading,meaning,associated_text,description,table_explanation,table_facts,f"Trang {page_no}"] if x)
                     if not search_text:
                         search_text=f"Hình minh họa trang {page_no}"
 
@@ -5170,6 +5212,7 @@ async def admin_knowledge_upload(
                         "bbox":str(img.get("bbox") or ""),
                         "image_kind":str(img.get("kind") or "educational_image"),
                         "image_scope":str(img.get("image_scope") or ("table" if img.get("kind") == "table_source" else "chunk")),
+                        "table_facts":json.dumps(img.get("facts") or [],ensure_ascii=False),
                     }
 
                     if unit_id and unit_id in unit_chunk_map:
