@@ -4752,7 +4752,7 @@ def _store_table_source_image(source_file: str, subject: str, page_meta, page_no
             with conn.cursor() as cur:
                 cur.execute("""INSERT INTO knowledge_images
                     (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (source_file,subject,primary.get("content_type","Từ vựng"),primary.get("lesson"),primary.get("topic"),
                      page_no,key,b2_url(key),f"Ảnh gốc bảng {table_index} trong giáo trình",width,height))
             conn.commit()
@@ -5178,10 +5178,10 @@ async def admin_knowledge_upload(
                             image_md["chunk_index"]=int(matched_chunks[0])
                             image_md["chunk_indices"]=json.dumps(matched_chunks,ensure_ascii=False)
                             image_md["content_unit_id"]=unit_id
-                    elif len(chunk_records) == 1:
+                    elif len(chunk_records) == 1 and str(img.get("image_scope") or "").strip().lower() != "lesson":
                         image_md["chunk_index"]=0
 
-                    if img.get("chunk_index") not in (None,""):
+                    if img.get("chunk_index") not in (None,"") and str(img.get("image_scope") or "").strip().lower() != "lesson":
                         try:
                             image_md["chunk_index"]=int(img.get("chunk_index"))
                         except Exception:
@@ -5193,6 +5193,13 @@ async def admin_knowledge_upload(
                             "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
                         })
                     vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
+                    if image_md.get("image_scope") == "lesson":
+                        print("[IMAGE UPSERT lesson]", {
+                            "source_file": source_file, "page": page_no,
+                            "lesson": image_md.get("lesson"),
+                            "key": key, "chunk_index": image_md.get("chunk_index"),
+                            "image_scope": image_md.get("image_scope")
+                        })
                     image_vectors_total+=1
 
                 if len(vectors)>=50:
@@ -5249,9 +5256,9 @@ async def admin_knowledge_upload(
                     "image_kind":str(img.get("kind") or "educational_image"),
                     "image_scope":str(img.get("image_scope") or "chunk"),
                 }
-                if page_chunk_count==1:
+                if page_chunk_count==1 and str(img.get("image_scope") or "").strip().lower() != "lesson":
                     image_md["chunk_index"]=0
-                if img.get("chunk_index") not in (None,""):
+                if img.get("chunk_index") not in (None,"") and str(img.get("image_scope") or "").strip().lower() != "lesson":
                     try:
                         image_md["chunk_index"]=int(img.get("chunk_index"))
                     except Exception:
