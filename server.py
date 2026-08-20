@@ -3613,6 +3613,7 @@ NGUYÊN TẮC:
 - Với Bài tập: để học sinh làm trước, chỉ chấm khi có đáp án; tiếp tục câu hiện tại/câu kế tiếp theo tiến độ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
+- Với BẢNG trong RAG: tọa độ R/C, vùng gộp và ô trống là dữ liệu nguồn. Không được tự sắp xếp lại, suy diễn lịch trình, hoặc điền nội dung vào ô không có trong dữ liệu bảng. Nếu cách diễn giải của cậu mâu thuẫn với bảng, phải ưu tiên dữ liệu bảng.
 - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
 - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh chỉ thuộc về đúng CHUNK có ảnh tương ứng trong RAG.
 - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
@@ -4467,16 +4468,40 @@ def _looks_like_table_page(raw_pdf: bytes, page, page_no: int, extracted: str, t
 
 
 def _normalize_table_cell(cell):
+    """Normalize one table cell while preserving its absolute grid position.
+
+    V16.1 uses row_start/col_start instead of relying on the position of a cell
+    inside a JSON row list. This is important for textbooks whose tables use
+    merged cells (rowspan/colspan), because a simple list loses the real column
+    coordinate as soon as a cell spans or omits a column.
+    """
     if isinstance(cell, dict):
         text = str(cell.get("text") or cell.get("value") or "").strip()
-        row_span = max(1, int(cell.get("row_span") or 1)) if str(cell.get("row_span") or "1").isdigit() else 1
-        col_span = max(1, int(cell.get("col_span") or 1)) if str(cell.get("col_span") or "1").isdigit() else 1
-        return {"text": text, "row_span": row_span, "col_span": col_span}
-    return {"text": str(cell or "").strip(), "row_span": 1, "col_span": 1}
+        def _int(name, default):
+            try:
+                return max(0, int(cell.get(name, default)))
+            except Exception:
+                return default
+        row_start = _int("row_start", cell.get("row", 0))
+        col_start = _int("col_start", cell.get("col", 0))
+        row_span = max(1, _int("row_span", 1))
+        col_span = max(1, _int("col_span", 1))
+        return {
+            "text": text,
+            "row_start": row_start,
+            "col_start": col_start,
+            "row_span": row_span,
+            "col_span": col_span,
+        }
+    return {"text": str(cell or "").strip(), "row_start": 0, "col_start": 0, "row_span": 1, "col_span": 1}
 
 
 def _serialize_tables_for_rag(tables):
-    """Turn structured tables into search-friendly text without flattening rows."""
+    """Serialize tables using absolute grid coordinates, never list position.
+
+    The resulting text is deliberately verbose about coordinates so Gemini can
+    answer questions from the table without reconstructing layout from prose.
+    """
     parts = []
     for ti, table in enumerate(tables or [], 1):
         if not isinstance(table, dict):
@@ -4484,46 +4509,79 @@ def _serialize_tables_for_rag(tables):
         title = str(table.get("title") or f"Bảng {ti}").strip()
         parts.append(f"【BẢNG {ti}: {title}】")
         columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+        rows_count = int(table.get("row_count") or 0) if str(table.get("row_count") or "0").isdigit() else 0
+        cols_count = int(table.get("column_count") or 0) if str(table.get("column_count") or "0").isdigit() else 0
         if columns:
-            parts.append("CỘT: " + " | ".join(str(x or "").strip() for x in columns))
-        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
-        for ri, row in enumerate(rows, 1):
-            if not isinstance(row, list):
-                continue
-            cells = []
-            for ci, raw_cell in enumerate(row, 1):
-                c = _normalize_table_cell(raw_cell)
-                label = str(columns[ci-1]).strip() if ci <= len(columns) and columns[ci-1] else f"ô {ci}"
-                span = ""
-                if c["row_span"] > 1 or c["col_span"] > 1:
-                    span = f" [span {c['row_span']}x{c['col_span']}]"
-                cells.append(f"{label}: {c['text']}{span}")
-            if cells:
-                parts.append(f"HÀNG {ri}: " + " ; ".join(cells))
+            parts.append("CỘT THEO THỨ TỰ: " + " | ".join(f"C{idx}={str(x or '').strip()}" for idx, x in enumerate(columns)))
+        if rows_count:
+            parts.append(f"SỐ HÀNG: {rows_count}")
+        if cols_count:
+            parts.append(f"SỐ CỘT: {cols_count}")
+
+        cells = table.get("cells") if isinstance(table.get("cells"), list) else []
+        clean_cells = [_normalize_table_cell(c) for c in cells if isinstance(c, dict)]
+        # Backward compatibility with an older V16 OCR result that still has rows.
+        if not clean_cells:
+            rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+            for ri, row in enumerate(rows):
+                if not isinstance(row, list):
+                    continue
+                for ci, raw_cell in enumerate(row):
+                    c = _normalize_table_cell(raw_cell)
+                    c["row_start"] = ri
+                    c["col_start"] = ci
+                    clean_cells.append(c)
+
+        # Stable coordinate order is critical for retrieval and for human audit.
+        clean_cells.sort(key=lambda c: (c["row_start"], c["col_start"]))
+        for c in clean_cells:
+            r0, c0 = c["row_start"], c["col_start"]
+            r1 = r0 + c["row_span"] - 1
+            c1 = c0 + c["col_span"] - 1
+            coord = f"R{r0}C{c0}"
+            span = f" (gộp R{r0}-R{r1}, C{c0}-C{c1})" if c["row_span"] > 1 or c["col_span"] > 1 else ""
+            parts.append(f"Ô {coord}{span}: {c['text']}")
         parts.append("")
     return "\n".join(parts).strip()
 
 
 def gemini_ocr_table_page(page_png: bytes, page_no: int):
-    """Vision OCR for pages containing tables; preserves row/column structure."""
+    """Vision OCR for tables using absolute grid coordinates.
+
+    V16's previous rows[] representation was still ambiguous for merged cells:
+    a model could return the right words in the wrong columns. The new schema
+    forces every cell to carry its visual row/column coordinate.
+    """
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
     prompt = f"""Đây là trang {page_no} của giáo trình/sách học tiếng Nhật.
 
-Hãy đọc TRUNG THỰC toàn bộ trang và đặc biệt tái tạo chính xác các BẢNG.
-Mục tiêu không phải chỉ đọc từng chữ, mà phải giữ quan hệ HÀNG/CỘT và các ô
-kéo dài nhiều hàng/cột. Không được biến bảng thành một đoạn văn mất vị trí.
+NHIỆM VỤ QUAN TRỌNG NHẤT: đọc BẢNG ĐÚNG THEO VỊ TRÍ THỊ GIÁC TRÊN ẢNH.
+Không được suy diễn lịch trình từ nghĩa của từ. Không được sắp xếp lại nội dung
+cho "hợp lý". Ảnh nguồn là nguồn sự thật duy nhất.
 
-YÊU CẦU:
-1. OCR phần chữ ngoài bảng vào trường text.
-2. Với mỗi bảng, trả về title, columns và rows.
-3. Mỗi ô phải giữ đúng thứ tự cột. Nếu một ô kéo dài nhiều hàng/cột, dùng
-   row_span/col_span thay vì lặp nội dung một cách gây hiểu nhầm.
-4. Giữ nguyên tiếng Nhật như trên trang; không tự sửa chữ chỉ vì đoán nghĩa.
-5. Ký hiệu như ○, △, ×, dấu gạch, thời gian 9:00～12:00 phải được giữ nguyên.
-6. Nếu bảng có tiêu đề ngày/thứ, giữ nguyên từng cột 月/TUE/... đúng vị trí.
-7. Nếu không chắc một ô, để text của ô đó rỗng thay vì bịa.
-8. Nếu trang không có bảng thực sự, tables phải là [].
+Với MỖI bảng:
+1. Đếm các cột theo các đường dọc nhìn thấy và các hàng theo các đường ngang.
+2. Đánh số hàng và cột từ 0, bắt đầu tại góc trên-trái của vùng bảng.
+3. Mỗi ô phải có row_start và col_start là tọa độ THỰC của ô trên lưới, không
+   phải vị trí của ô trong một JSON list.
+4. Nếu ô kéo dài nhiều hàng/cột, giữ row_span/col_span. KHÔNG lặp nội dung sang
+   ô khác và KHÔNG dịch ô sang cột kế bên.
+5. Nếu có ô trống nhưng đường lưới cho thấy nó tồn tại, vẫn giữ tọa độ của ô
+   và text="".
+6. Giữ nguyên tiếng Nhật và ký hiệu trên ảnh: 月, 火, 水, 木, 金, 土, 日,
+   MON/TUE/WED/THU/FRI/SAT/SUN, 9:00, 12:00, 17:00, ○, ×, ～...
+7. Không tự sửa chữ vì đoán nghĩa. Nếu chữ không đọc chắc, giữ nguyên những
+   nét/chữ đọc được hoặc để text="" thay vì bịa.
+8. Với bảng lịch, KHÔNG biến "9:00 / 12:00 / 17:00" thành các khoảng thời gian
+   mới. Chỉ ghi hoạt động vào đúng ô/vùng mà nó thực sự nằm trên ảnh.
+9. OCR phần chữ ngoài bảng vào text.
+
+ĐẶC BIỆT VỚI Ô GỘP:
+- Một chữ "大学" nằm trong vùng R0C1 và kéo dài 4 hàng phải được biểu diễn
+  đúng bằng row_start=0,col_start=1,row_span=4,col_span=1.
+- Không được biến ô gộp thành nhiều bản sao ở các hàng bên dưới.
+- Không được đoán hoạt động cho ô trống.
 
 Chỉ trả JSON đúng schema:
 {{
@@ -4531,11 +4589,11 @@ Chỉ trả JSON đúng schema:
   "tables":[
     {{
       "title":"...",
+      "row_count":0,
+      "column_count":0,
       "columns":["..."],
-      "rows":[
-        [
-          {{"text":"...","row_span":1,"col_span":1}}
-        ]
+      "cells":[
+        {{"text":"...","row_start":0,"col_start":0,"row_span":1,"col_span":1}}
       ]
     }}
   ]
@@ -4552,23 +4610,49 @@ Chỉ trả JSON đúng schema:
     data = _parse_gemini_json(response.text or "{}")
     text = str(data.get("text") or "").strip()
     tables = data.get("tables") if isinstance(data.get("tables"), list) else []
-    # Keep only structurally valid tables; malformed Gemini output should not
-    # break the whole upload.
+
     clean_tables = []
     for table in tables:
         if not isinstance(table, dict):
             continue
-        rows = table.get("rows") if isinstance(table.get("rows"), list) else []
-        clean_rows = []
-        for row in rows:
-            if not isinstance(row, list):
-                continue
-            clean_rows.append([_normalize_table_cell(c) for c in row])
+        raw_cells = table.get("cells") if isinstance(table.get("cells"), list) else []
+        clean_cells = []
+        for raw_cell in raw_cells:
+            if isinstance(raw_cell, dict):
+                clean_cells.append(_normalize_table_cell(raw_cell))
+
+        # Accept old rows[] output only as a compatibility fallback.
+        if not clean_cells:
+            rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+            for ri, row in enumerate(rows):
+                if not isinstance(row, list):
+                    continue
+                for ci, raw_cell in enumerate(row):
+                    c = _normalize_table_cell(raw_cell)
+                    c["row_start"] = ri
+                    c["col_start"] = ci
+                    clean_cells.append(c)
+
+        def _num(name):
+            try:
+                return max(0, int(table.get(name) or 0))
+            except Exception:
+                return 0
+
+        row_count = _num("row_count")
+        col_count = _num("column_count")
+        if clean_cells:
+            row_count = max(row_count, max(c["row_start"] + c["row_span"] for c in clean_cells))
+            col_count = max(col_count, max(c["col_start"] + c["col_span"] for c in clean_cells))
+
         clean_tables.append({
             "title": str(table.get("title") or "").strip(),
+            "row_count": row_count,
+            "column_count": col_count,
             "columns": [str(x or "").strip() for x in (table.get("columns") or [])] if isinstance(table.get("columns"), list) else [],
-            "rows": clean_rows,
+            "cells": clean_cells,
         })
+
     table_text = _serialize_tables_for_rag(clean_tables)
     if table_text:
         text = (text + "\n\n" + table_text).strip() if text else table_text
@@ -4715,7 +4799,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
         # Scan/image page OR table page: render it and use Vision. For table
         # pages, preserve row/column structure in the RAG text rather than
         # flattening the table into an unreadable character stream.
-        png = render_pdf_page(raw_pdf, page_no, dpi=170 if is_table else 150)
+        png = render_pdf_page(raw_pdf, page_no, dpi=220 if is_table else 150)
         if is_table:
             table_pages += 1
             ocr_text, tables = gemini_ocr_table_page(png, page_no)
