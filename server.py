@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v16.6.7-no-image-on-ambiguous-study"
+SERVER_VERSION = "2026-08-21-doraemon-v16.6.8-no-image-on-ambiguous-or-lesson-intro"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3196,6 +3196,22 @@ def proxy_chat(
             f"switch_requested={thread_switch_requested}"
         )
     named_lesson_topic = _explicit_lesson_topic(low, catalog)
+
+    # A lesson-selection request is an INTRO/ROUTING turn. Even when the
+    # learner names a concrete lesson (e.g. "mình muốn học bài alphav1"),
+    # Doraemon should introduce/confirm the lesson without attaching lesson
+    # or exercise images. Images are reserved for the subsequent teaching
+    # turn after the learner has entered the lesson content.
+    #
+    # This is intentionally separate from ambiguous_study_request: an
+    # explicit lesson can be fully resolved while still being only a
+    # selection/introduction turn.
+    lesson_intro_request = bool(
+        not ambiguous_study_request
+        and thread_switch_requested
+        and (named_lesson_topic or _explicit_lesson_topic(low, catalog))
+        and not _is_correction_followup(query_text)
+    )
     if ambiguous_study_request:
         requested_scope = {"course": None, "content_type": None, "lesson": None, "topic": None}
     elif named_lesson_topic:
@@ -3818,9 +3834,12 @@ def proxy_chat(
     # a study direction. This is intentionally enforced here as a hard guard,
     # immediately before image retrieval, so future retrieval changes cannot
     # accidentally re-introduce unrelated images into the clarification turn.
-    if ambiguous_study_request:
+    if ambiguous_study_request or lesson_intro_request:
         rich_images = []
-        print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
+        if ambiguous_study_request:
+            print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
+        else:
+            print("[IMAGE SKIP] lesson introduction/selection turn: no image retrieval/attachment")
     else:
         rich_images = _retrieve_images_for_text_chunks(
             text_chunks, index, namespace, query_vector
@@ -3887,7 +3906,7 @@ def proxy_chat(
                 break
 
     image_marker_rule = ""
-    if ambiguous_study_request:
+    if ambiguous_study_request or lesson_intro_request:
         image_orders = []
     if image_orders:
         markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
@@ -3899,7 +3918,15 @@ def proxy_chat(
             "Marker chỉ là kỹ thuật nội bộ, không được giải thích cho học sinh."
         )
 
-    if ambiguous_study_request:
+    if lesson_intro_request:
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO LƯỢT GIỚI THIỆU/CHỌN BÀI (BẮT BUỘC):
+- Người học vừa yêu cầu mở một bài/chủ đề cụ thể. Đây là lượt giới thiệu/chuyển vào bài, chưa phải lượt dạy chi tiết.
+- Giới thiệu ngắn gọn bài/chủ đề đã chọn và hỏi người học muốn bắt đầu phần nào nếu cần.
+- TUYỆT ĐỐI KHÔNG chèn marker ảnh và không yêu cầu/đính kèm ảnh trong lượt này.
+- Không lấy ảnh chỉ vì RAG có image_keys; ảnh sẽ được lấy ở lượt học nội dung tiếp theo.
+"""
+    elif ambiguous_study_request:
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO YÊU CẦU HỌC CHƯA RÕ Ý (BẮT BUỘC):
 - Người học đang nói rằng họ muốn học nhưng CHƯA xác định học theo cách nào hoặc học nội dung nào.
