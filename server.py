@@ -5218,17 +5218,36 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # image stay together before chunking; no post-chunk text matching.
             units=[]
             # Ordinary lesson illustrations on a table page belong to the
-            # normal page/lesson context, not to any individual table. Keep
-            # their keys on the normal text unit so the resulting Pinecone
-            # text chunk can directly carry the lesson-image provenance.
-            # Table units below keep ONLY their own table image keys.
+            # normal page/lesson context, not to any individual table.
+            # Build this list from BOTH the in-memory extraction result and
+            # the persisted knowledge_images rows. The latter is an important
+            # recovery path when the same PDF/source_file was uploaded before
+            # and the B2 object already exists. Presence in B2 alone must not
+            # be treated as provenance; the DB row is the authoritative key.
             lesson_image_keys = [
                 str(x.get("key") or "").strip()
                 for x in stored
                 if str(x.get("image_scope") or "").strip().lower() == "lesson"
                 and str(x.get("key") or "").strip()
             ]
+            try:
+                conn=db()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""SELECT image_key FROM knowledge_images
+                            WHERE source_file=%s AND page=%s
+                              AND description='Embedded PDF image'""",
+                            (source_file, page_no))
+                        for row in cur.fetchall() or []:
+                            key=str(row[0] or "").strip()
+                            if key:
+                                lesson_image_keys.append(key)
+                finally:
+                    conn.close()
+            except Exception as e:
+                print(f"[LESSON IMAGE DB RECOVERY skip] page={page_no}: {e}")
             lesson_image_keys = list(dict.fromkeys(lesson_image_keys))
+            print(f"[LESSON IMAGE LINK] page={page_no} keys={lesson_image_keys}")
             if base_text:
                 units.append({
                     "type":"normal",
@@ -5347,6 +5366,18 @@ async def admin_knowledge_upload(
                     unit_chunks=kb_chunk_text(unit_text,chunk_size,overlap)
                     unit_id=str(unit.get("unit_id") or "")
                     unit_image_keys=list(dict.fromkeys(str(k).strip() for k in (unit.get("image_keys") or []) if str(k).strip()))
+                    # Hard fallback for the normal text unit on mixed pages:
+                    # if page_units was serialized without lesson keys, derive
+                    # them again from the page image records before embedding.
+                    if str(unit.get("type") or "").strip().lower() == "normal" and not unit_image_keys:
+                        unit_image_keys = list(dict.fromkeys(
+                            str(x.get("key") or "").strip()
+                            for x in (page_images.get(page_no, []) or [])
+                            if str(x.get("image_scope") or "").strip().lower() == "lesson"
+                            and str(x.get("key") or "").strip()
+                        ))
+                        if unit_image_keys:
+                            print(f"[LESSON IMAGE CHUNK FALLBACK] page={page_no} keys={unit_image_keys}")
                     for local_no, chunk in enumerate(unit_chunks):
                         chunk_records.append({
                             "chunk_index": len(chunk_records),
@@ -5377,6 +5408,8 @@ async def admin_knowledge_upload(
                             "topic":primary["topic"],"topic_pages":primary["topic_pages"],
                             "question_pages":primary["question_pages"],"answer_pages":primary["answer_pages"]
                         })
+                    if rec["unit_id"].startswith("page:"):
+                        print(f"[PINECONE PAGE CHUNK] page={page_no} chunk={rec['chunk_index']} image_keys={rec['image_keys']}")
                     vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                     total+=1
 
