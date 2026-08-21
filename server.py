@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
+import base64
 import calendar
 from zoneinfo import ZoneInfo
 
@@ -1118,6 +1119,69 @@ def _focus_metadata_matches(matches, query_text, lesson=None, topic=None,
     )
     return focused
 
+
+
+def _encode_lesson_confirm_scope(scope):
+    payload = {
+        "course": scope.get("course"),
+        "content_type": scope.get("content_type"),
+        "lesson": scope.get("lesson"),
+        "topic": scope.get("topic"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_lesson_confirm_scope(value):
+    try:
+        raw = str(value or "")
+        raw += "=" * (-len(raw) % 4)
+        data = json.loads(base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8"))
+        return {
+            "course": str(data.get("course") or "").strip() or None,
+            "content_type": _normalize_content_type(data.get("content_type")) if data.get("content_type") else None,
+            "lesson": str(data.get("lesson") or "").strip() or None,
+            "topic": str(data.get("topic") or "").strip() or None,
+        }
+    except Exception as exc:
+        print("[LESSON CONFIRM] decode failed:", type(exc).__name__, str(exc))
+        return None
+
+
+def _is_specific_lesson_request(text: str) -> bool:
+    q = str(text or "").strip().casefold()
+    if not q:
+        return False
+    markers = (
+        "muốn học bài", "muon hoc bai", "muốn dạy bài", "muon day bai",
+        "dạy mình bài", "day minh bai", "học bài ", "hoc bai ",
+        "học giáo trình", "hoc giao trinh", "học ngữ pháp", "hoc ngu phap",
+        "học bài tập", "hoc bai tap", "học từ vựng", "hoc tu vung",
+        "học truyện", "hoc truyen", "học kanji", "hoc kanji",
+    )
+    return any(m in q for m in markers) and bool(re.search(r"\bbài\s*\S+|\btopic\b|\bkanji\b|\bbộ thủ\b", q))
+
+
+def _lesson_suggestions(catalog, content_type=None, limit=5):
+    rows = []
+    seen = set()
+    for item in catalog or []:
+        ct = _normalize_content_type(item.get("content_type"))
+        if content_type and ct != content_type:
+            continue
+        lesson = str(item.get("lesson") or "").strip()
+        topic = str(item.get("topic") or "").strip()
+        if not lesson:
+            continue
+        key = (ct.casefold(), lesson.casefold(), topic.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        label = lesson + (f" – {topic}" if topic else "")
+        rows.append((ct, lesson, topic, label))
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 def _select_active_scope(query_text, text_matches, catalog):
@@ -3075,6 +3139,20 @@ def proxy_chat(
     action_plan_id = (ui_action_raw.split(":",1)[1] if ui_action_raw and ":" in ui_action_raw else None)
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
+
+    # Lesson confirmation actions are explicit intent confirmation.
+    # They bypass routing/RAG only when YES; NO simply cancels the pending lesson open.
+    lesson_confirmed_scope = None
+    if ui_action in {"lesson_confirm_yes", "lesson_confirm_no"} and action_plan_id:
+        decoded = _decode_lesson_confirm_scope(action_plan_id)
+        if decoded and decoded.get("lesson"):
+            if ui_action == "lesson_confirm_no":
+                lesson_label = decoded.get("lesson") or "bài này"
+                msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            lesson_confirmed_scope = decoded
+            print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}")
+
     plan_start_action = None
     if ui_action:
         if ui_action == "onboarding_planned":
@@ -3532,21 +3610,6 @@ Câu hỏi của người dùng:
         )
     named_lesson_topic = _explicit_lesson_topic(low, catalog)
 
-    # A lesson-selection request is an INTRO/ROUTING turn. Even when the
-    # learner names a concrete lesson (e.g. "mình muốn học bài alphav1"),
-    # Doraemon should introduce/confirm the lesson without attaching lesson
-    # or exercise images. Images are reserved for the subsequent teaching
-    # turn after the learner has entered the lesson content.
-    #
-    # This is intentionally separate from ambiguous_study_request: an
-    # explicit lesson can be fully resolved while still being only a
-    # selection/introduction turn.
-    lesson_intro_request = bool(
-        not ambiguous_study_request
-        and thread_switch_requested
-        and (named_lesson_topic or _explicit_lesson_topic(low, catalog))
-        and not _is_correction_followup(query_text)
-    )
     if ambiguous_study_request:
         requested_scope = {"course": None, "content_type": None, "lesson": None, "topic": None}
     elif named_lesson_topic:
@@ -3588,6 +3651,30 @@ Câu hỏi của người dùng:
     requested_lesson = requested_scope.get("lesson")
     requested_topic = requested_scope.get("topic")
 
+    # A fully specified exercise lesson is an actual teaching turn once the
+    # learner has explicitly confirmed it; before confirmation the hard lesson
+    # confirmation gate below takes precedence.
+    requested_ct_norm = _normalize_content_type(requested_content_type or "")
+    specific_exercise_lesson_request = bool(
+        requested_ct_norm == "Bài tập"
+        and (requested_lesson or named_lesson_topic)
+        and not ambiguous_study_request
+        and not _is_correction_followup(query_text)
+        and not (data.action and lesson_confirmed_scope)
+    )
+
+    lesson_intro_request = bool(
+        not ambiguous_study_request
+        and not data.action
+        and thread_switch_requested
+        and (named_lesson_topic or requested_lesson)
+        and not specific_exercise_lesson_request
+        and not _is_correction_followup(query_text)
+    )
+
+    if specific_exercise_lesson_request:
+        print("[CHAT ROUTING] specific exercise lesson request: keep lesson images")
+
     # A request that explicitly chooses only a content type (e.g.
     # "mình muốn học giáo trình") is a ROUTING turn, not a lesson-teaching turn.
     # Do not let RAG/previous progress choose an arbitrary lesson or introduce a
@@ -3621,6 +3708,65 @@ Câu hỏi của người dùng:
             "content_blocks": [{"type": "text", "text": msg}],
             "learning_progress": None,
         }
+
+    # ------------------------------------------------------------------
+    # HARD LESSON INTENT CONFIRMATION
+    # Before Doraemon teaches any concrete lesson, confirm the resolved
+    # lesson with an inline Có/Không choice. This prevents RAG from
+    # silently selecting a neighbouring lesson and prevents images from
+    # being attached before the learner confirms the target.
+    # A confirmed UI action (lesson_confirm_yes) bypasses this gate.
+    # ------------------------------------------------------------------
+    lesson_confirmation_scope = lesson_confirmed_scope
+    if lesson_confirmation_scope is None and next_lesson_scope:
+        lesson_confirmation_scope = {
+            "course": str(next_lesson_scope.get("course") or next_lesson_scope.get("course_name") or "").strip() or None,
+            "content_type": _normalize_content_type(next_lesson_scope.get("content_type")),
+            "lesson": str(next_lesson_scope.get("lesson") or "").strip() or None,
+            "topic": str(next_lesson_scope.get("topic") or "").strip() or None,
+        }
+
+    # Explicit current-message lesson target should be confirmed before RAG.
+    if lesson_confirmation_scope is None and (named_lesson_topic or _is_specific_lesson_request(query_text)) and not forced_plan_scope and not data.action:
+        if named_lesson_topic:
+            lesson_confirmation_scope = {
+                "course": str(named_lesson_topic.get("course") or named_lesson_topic.get("course_name") or "").strip() or None,
+                "content_type": _normalize_content_type(named_lesson_topic.get("content_type")),
+                "lesson": str(named_lesson_topic.get("lesson") or "").strip() or None,
+                "topic": str(named_lesson_topic.get("topic") or "").strip() or None,
+            }
+        else:
+            # The user clearly asked for a specific lesson, but catalog routing
+            # could not resolve it. Never fall into generic RAG; suggest nearby
+            # known lessons instead.
+            requested_ct_hint = _select_active_scope(low, [], catalog).get("content_type")
+            suggestions = _lesson_suggestions(catalog, requested_ct_hint, limit=5)
+            if suggestions:
+                lines = ["🤖 Doraemon chưa tìm thấy đúng bài cậu muốn học.", "\nCậu có thể thử một trong các bài sau:"]
+                for ct, lesson, topic, label in suggestions:
+                    lines.append(f"• {label} ({ct})")
+                lines.append("\nCậu nói lại tên bài cụ thể, Doraemon sẽ xác nhận trước khi bắt đầu học nhé.")
+                msg = "\n".join(lines)
+            else:
+                msg = "🤖 Doraemon chưa tìm thấy đúng bài cậu muốn học trong kho tài liệu hiện tại. Cậu nói tên bài khác để Doraemon kiểm tra nhé."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+    if lesson_confirmation_scope is not None and not forced_plan_scope and lesson_confirmed_scope is None and not data.action:
+        lesson_label = lesson_confirmation_scope.get("lesson") or "bài này"
+        ct_label = lesson_confirmation_scope.get("content_type") or "nội dung"
+        topic_label = lesson_confirmation_scope.get("topic")
+        detail = f" ({topic_label})" if topic_label else ""
+        msg = (
+            f"🎯 Doraemon hiểu là cậu muốn học **{lesson_label}**{detail} thuộc **{ct_label}**.\n\n"
+            f"Có phải cậu muốn học bài này không? 😊"
+        )
+        token = _encode_lesson_confirm_scope(lesson_confirmation_scope)
+        blocks = [{"type":"text","text":msg},{"type":"choice","id":"lesson_confirm",
+                  "options":[
+                      {"label":"Có","display_label":f"Có — {lesson_label}","action":f"lesson_confirm_yes:{token}"},
+                      {"label":"Không","display_label":f"Không — {lesson_label}","action":f"lesson_confirm_no:{token}"}
+                  ]}]
+        return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
     # Continue the most recent in-progress lesson for short follow-ups. This
     # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
@@ -3735,6 +3881,14 @@ Câu hỏi của người dùng:
             "lesson": requested_lesson or None,
             "topic": requested_topic or None,
         }
+
+    if lesson_confirmed_scope:
+        requested_scope = dict(lesson_confirmed_scope)
+        requested_content_type = requested_scope.get("content_type")
+        requested_course = requested_scope.get("course")
+        requested_lesson = requested_scope.get("lesson")
+        requested_topic = requested_scope.get("topic")
+        thread_scope_locked = False
 
     def build_scope_filter(record_type, content_type=None, course=None, lesson=None, topic=None):
         scope_filter = {"record_type": {"$eq": record_type}}
