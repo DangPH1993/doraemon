@@ -77,7 +77,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v18-dual-llm"
+SERVER_VERSION = "2026-08-21-doraemon-server-v18.1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1228,6 +1228,42 @@ def _select_active_scope(query_text, text_matches, catalog):
         "lesson": lesson,
         "topic": topic,
     }
+
+
+def _is_general_non_learning_request(text: str) -> bool:
+    """Detect ordinary/non-learning questions that must not fall into study RAG."""
+    q = str(text or "").strip().casefold()
+    if not q:
+        return False
+    # Explicit study intent always wins.
+    study_markers = (
+        "học", "bài", "giáo trình", "ngữ pháp", "từ vựng", "bộ thủ", "kanji",
+        "bài tập", "truyện đọc", "lộ trình", "ôn", "luyện", "giải thích",
+    )
+    if any(m in q for m in study_markers):
+        return False
+    weather_markers = (
+        "thời tiết", "thoi tiet", "nhiệt độ", "nhiet do", "mưa không", "mưa không",
+        "trời mưa", "trời nắng", "dự báo thời tiết", "du bao thoi tiet",
+    )
+    time_markers = ("mấy giờ", "may gio", "bây giờ là mấy giờ", "gio hien tai")
+    date_markers = ("hôm nay ngày mấy", "hom nay ngay may", "hôm nay là ngày", "ngày hôm nay")
+    if any(m in q for m in weather_markers + time_markers + date_markers):
+        return True
+    return False
+
+
+def _is_exercise_suggestion_only_request(text: str) -> bool:
+    """A learning recommendation for exercises: no lesson-image attachment."""
+    q = str(text or "").strip().casefold()
+    if not q:
+        return False
+    markers = (
+        "gợi ý bài tập", "goi y bai tap", "đề xuất bài tập", "de xuat bai tap",
+        "bài tập nào", "bai tap nao", "cho mình bài tập", "cho minh bai tap",
+        "gợi ý một bài tập", "goi y mot bai tap",
+    )
+    return any(m in q for m in markers)
 
 def _is_ambiguous_study_request(text):
     """Return True when the user asks to study but gives no target/mode.
@@ -3353,6 +3389,19 @@ def proxy_chat(
 
     low = query_text.strip().lower()
     ambiguous_study_request = _is_ambiguous_study_request(query_text)
+    general_non_learning_request = _is_general_non_learning_request(query_text)
+    exercise_suggestion_only_request = _is_exercise_suggestion_only_request(query_text)
+    if general_non_learning_request:
+        print("[CHAT ROUTING] general non-learning request: bypass study RAG/images/suggestions")
+        minimal_prompt = f"""Bạn là Doraemon. Đây là câu hỏi đời thường, không phải yêu cầu học tiếng Nhật.
+Trả lời trực tiếp, ngắn gọn và thân thiện. Không giới thiệu bài học, không gợi ý bài tập, không nhắc lộ trình, không đính kèm ảnh học tập.
+Nếu câu hỏi yêu cầu dữ liệu thời gian thực mà hệ thống không có công cụ truy cập dữ liệu đó, hãy nói rõ bạn chưa có dữ liệu thời gian thực thay vì đoán.
+
+Câu hỏi của người dùng:
+{query_text}"""
+        gen_started = time.perf_counter()
+        reply, model_used, _ = _generate_chat_reply(minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started)
+        return {"reply": reply, "model": model_used, "sources": [], "images": [], "content_blocks": [{"type":"text","text":reply}], "learning_progress": None}
 
     # Conversational memory / CURRENT CHAT THREAD:
     # The open chatbox is the primary conversational context. Keep at most
@@ -4124,7 +4173,7 @@ def proxy_chat(
     # a study direction. This is intentionally enforced here as a hard guard,
     # immediately before image retrieval, so future retrieval changes cannot
     # accidentally re-introduce unrelated images into the clarification turn.
-    if ambiguous_study_request or lesson_intro_request or recommendation_only_request:
+    if ambiguous_study_request or lesson_intro_request or recommendation_only_request or exercise_suggestion_only_request:
         rich_images = []
         if ambiguous_study_request:
             print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
@@ -4229,7 +4278,7 @@ def proxy_chat(
                 break
 
     image_marker_rule = ""
-    if ambiguous_study_request or lesson_intro_request or recommendation_only_request:
+    if ambiguous_study_request or lesson_intro_request or recommendation_only_request or exercise_suggestion_only_request:
         image_orders = []
     if image_orders:
         markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
@@ -4263,6 +4312,15 @@ QUY TẮC RIÊNG CHO YÊU CẦU HỌC CHƯA RÕ Ý (BẮT BUỘC):
 """
     else:
         mode_specific_rules = ""
+
+    if exercise_suggestion_only_request:
+        mode_specific_rules = """QUY TẮC RIÊNG CHO LƯỢT GỢI Ý BÀI TẬP (BẮT BUỘC):
+- Người học chỉ đang xin gợi ý bài tập, chưa yêu cầu mở/giải một bài cụ thể.
+- Có thể giới thiệu 1-3 dạng/bài tập phù hợp dựa trên RAG nếu nguồn đủ dữ liệu.
+- Không được tự chuyển sang dạy bài mới.
+- Tuyệt đối không đính kèm ảnh ở lượt gợi ý này; ảnh chỉ xuất hiện khi người học chọn/mở bài tập cụ thể và hệ thống xác định đúng chunk ảnh.
+- Không yêu cầu người học học một bài khác nếu họ chỉ xin gợi ý bài tập.
+"""
 
     # Content-type-specific teacher behavior. These rules are intentionally
     # explicit so Gemini follows a consistent teaching workflow rather than
