@@ -1208,6 +1208,40 @@ def _select_active_scope(query_text, text_matches, catalog):
     }
 
 
+def _is_ambiguous_study_request(text):
+    """Return True when the user asks to study but gives no target/mode.
+
+    Examples: "tôi muốn học", "mình muốn học", "tôi muốn học nhé".
+    These requests must NOT fall back to the top RAG hit or durable learning
+    state, because that can silently open an arbitrary lesson such as Grammar 1.
+    The assistant should ask the learner to choose: follow the roadmap, continue
+    the unfinished lesson, or name a specific lesson/topic.
+    """
+    low = str(text or "").strip().casefold()
+    if not low:
+        return False
+
+    # A concrete target/mode makes the request explicit and therefore not ambiguous.
+    concrete_markers = (
+        "học bài ", "học phần ", "học lesson ", "bài ", "phần ",
+        "ngữ pháp", "từ vựng", "từ mới", "kanji", "bộ thủ",
+        "giáo trình", "truyện đọc", "bài tập", "quiz",
+        "theo lộ trình", "lộ trình", "tiếp tục", "học tiếp",
+        "bài đang dở", "đang học", "ôn lại", "review",
+    )
+    if any(m in low for m in concrete_markers):
+        return False
+
+    generic_patterns = (
+        "tôi muốn học", "mình muốn học", "minh muon hoc",
+        "tôi muốn học nhé", "mình muốn học nhé",
+        "muốn học", "muon hoc",
+    )
+    return any(low == p or low.startswith(p + " ") or low.startswith(p + ",")
+               or low.startswith(p + ".") or low.startswith(p + "!")
+               for p in generic_patterns)
+
+
 def _is_correction_followup(text):
     """Detect a short user message that is correcting/challenging the previous answer.
 
@@ -3104,6 +3138,7 @@ def proxy_chat(
         )
 
     low = query_text.strip().lower()
+    ambiguous_study_request = _is_ambiguous_study_request(query_text)
 
     # Conversational memory / CURRENT CHAT THREAD:
     # The open chatbox is the primary conversational context. Keep at most
@@ -3161,7 +3196,9 @@ def proxy_chat(
             f"switch_requested={thread_switch_requested}"
         )
     named_lesson_topic = _explicit_lesson_topic(low, catalog)
-    if named_lesson_topic:
+    if ambiguous_study_request:
+        requested_scope = {"course": None, "content_type": None, "lesson": None, "topic": None}
+    elif named_lesson_topic:
         requested_scope = {
             "course": str(
                 named_lesson_topic.get("course")
@@ -3201,7 +3238,7 @@ def proxy_chat(
     # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
     # PostgreSQL is the durable state; chat history is only the conversational hint.
     recommendation_words = ("học gì", "học gì hôm nay", "gợi ý", "đề xuất", "chọn bài", "nên học")
-    wants_recommendation = any(w in low for w in recommendation_words)
+    wants_recommendation = any(w in low for w in recommendation_words) or ambiguous_study_request
     active_learning = None
     if not (requested_content_type or requested_course or requested_lesson or requested_topic) and not wants_recommendation:
         for lp in learning:
@@ -3229,6 +3266,7 @@ def proxy_chat(
         thread_scope
         and not thread_switch_requested
         and not named_lesson_topic
+        and not ambiguous_study_request
     )
     if correction_followup and thread_scope:
         thread_scope_locked = True
@@ -3625,7 +3663,13 @@ def proxy_chat(
         except Exception as exc:
             print("[RAG compat] fallback failed:", type(exc).__name__, str(exc))
 
-    if not explicit_scope and not thread_scope_locked:
+    if ambiguous_study_request:
+        # Never let semantic RAG ranking decide what the learner wants to study.
+        # The top hit is often Grammar 1 and is not an intent signal.
+        result.matches = []
+        active_scope = None
+        print("[CHAT ROUTING] ambiguous study request: no lesson/content scope inferred")
+    elif not explicit_scope and not thread_scope_locked:
         active_scope = _select_active_scope(low, result.matches, catalog)
 
         # If the active scope was inferred from the text result, the text query
@@ -3843,7 +3887,20 @@ def proxy_chat(
             "Marker chỉ là kỹ thuật nội bộ, không được giải thích cho học sinh."
         )
 
-    mode_specific_rules = ""
+    if ambiguous_study_request:
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO YÊU CẦU HỌC CHƯA RÕ Ý (BẮT BUỘC):
+- Người học đang nói rằng họ muốn học nhưng CHƯA xác định học theo cách nào hoặc học nội dung nào.
+- KHÔNG tự mở Ngữ pháp Bài 1, Bài tập Bài 1, hay bất kỳ lesson nào chỉ vì đó là kết quả RAG đứng đầu hoặc là tiến độ cũ.
+- Hãy hỏi ngắn gọn và thân thiện để người học chọn một trong 3 hướng:
+  1) Học theo lộ trình từ đầu/tiếp theo,
+  2) Học tiếp hoặc ôn lại bài đang dở,
+  3) Học một bài/chủ đề cụ thể — người học chỉ cần nói tên bài/chủ đề.
+- Nếu có tiến độ cũ, có thể nhắc rằng Doraemon đang có một bài đang dở, nhưng KHÔNG tự động mở bài đó; phải để người học chọn.
+- Không trình bày nội dung của một lesson cụ thể ở lượt này.
+"""
+    else:
+        mode_specific_rules = ""
     if requested_content_type == "Bài tập":
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO BÀI TẬP (BẮT BUỘC):
@@ -3871,6 +3928,7 @@ QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
 
 NGUYÊN TẮC:
 - Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
+- Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
 - Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
 - Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
 - Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
