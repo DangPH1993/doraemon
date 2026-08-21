@@ -4305,6 +4305,48 @@ def get_learning_plan(authorization: Optional[str] = Header(default=None)):
     draft=_latest_draft(user["id"])
     return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"plans":plans,"draft":draft}
 
+@app.delete("/learning/plan/{plan_id}")
+def delete_learning_plan(plan_id: int, authorization: Optional[str] = Header(default=None)):
+    """Soft-delete one active Study Plan owned by the current user.
+
+    The plan and its items remain in PostgreSQL for historical/audit purposes,
+    but it is no longer ACTIVE, so _active_plans(), auto-chat and plan routing
+    will stop selecting or teaching from it.
+    """
+    user=require_active_user(authorization)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,goal_name,content_type,status FROM study_plans WHERE id=%s AND user_id=%s FOR UPDATE",(int(plan_id),user["id"]))
+            plan=cur.fetchone()
+            if not plan:
+                raise HTTPException(404,"Không tìm thấy lộ trình này.")
+            if str(plan.get("status") or "").upper() != "ACTIVE":
+                raise HTTPException(409,"Lộ trình này không còn đang hoạt động.")
+
+            cur.execute("UPDATE study_plans SET status='DELETED', superseded_at=NOW() WHERE id=%s AND user_id=%s AND status='ACTIVE'",(int(plan_id),user["id"]))
+
+            # If this was the last active plan, keep onboarding completed but
+            # move the learner back to free study so deleted plans cannot be
+            # selected by future chat routing. Other active plans keep planned mode.
+            cur.execute("SELECT COUNT(*) AS n FROM study_plans WHERE user_id=%s AND status='ACTIVE'",(user["id"],))
+            active_count=int(cur.fetchone()["n"] or 0)
+            if active_count == 0:
+                cur.execute("UPDATE user_learning_state SET learning_mode='free', updated_at=NOW() WHERE user_id=%s",(user["id"],))
+
+        conn.commit()
+        plans=_active_plans(user["id"])
+        return {"success":True,"deleted_plan_id":int(plan_id),"plan":dict(plan),"plans":plans,"remaining_plan_count":len(plans)}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback()
+        print(f"[STUDY PLAN] delete error user={user['id']} plan={plan_id}: {exc}")
+        raise HTTPException(500,"Không thể xoá lộ trình lúc này.")
+    finally:
+        conn.close()
+
+
 @app.post("/learning/plan/confirm")
 def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
