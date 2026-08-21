@@ -5175,7 +5175,17 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         # For table pages, keep EACH ORIGINAL TABLE as its own image and add
         # one semantic Vision explanation per table to the text that is embedded.
+        # IMPORTANT: native embedded lesson illustrations must be extracted
+        # BEFORE building page_units. V16.6.3 computed lesson_image_keys first
+        # and only then appended embedded images, so the normal text unit got
+        # image_keys=[] even though the images were already stored in B2.
         if table_page:
+            embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
+            if embedded:
+                for emb in embedded:
+                    emb["image_scope"] = "lesson"
+                stored.extend(embedded)
+
             table_items = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted)
             table_parts=[]
             for table_index, item in enumerate(table_items, 1):
@@ -5245,15 +5255,6 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             page_units[page_no]=units
             page_texts[page_no] = "\n\n".join(u["text"] for u in units).strip()
 
-            # Preserve V16 embedded images on table pages as well.
-            embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
-            if embedded:
-                # These are ordinary illustrations embedded in the same lesson
-                # page, not table-source images. Treat them as lesson-scope
-                # visuals so they are not incorrectly forced onto a table chunk.
-                for emb in embedded:
-                    emb["image_scope"] = "lesson"
-                stored.extend(embedded)
             print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')} lesson_images={sum(1 for x in stored if x.get('image_scope')=='lesson')} lesson_image_keys={lesson_image_keys}")
         else:
             page_texts[page_no] = (ocr_text or extracted).strip()
