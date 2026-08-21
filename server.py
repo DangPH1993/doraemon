@@ -2004,6 +2004,15 @@ def _image_payload_from_metadata(md, score=0.0, chunk_order=None, chunk_text="")
             "term": str(md.get("term") or "").strip(),
             "reading": str(md.get("reading") or "").strip(),
             "meaning": str(md.get("meaning") or "").strip(),
+            # Preserve the exact text-chunk scope on direct-image payloads.
+            # Without these fields, the later lesson/thread image guard sees
+            # lesson/topic as None and incorrectly rejects valid images even
+            # when image_key is attached directly to the selected text chunk.
+            "content_type": str(md.get("content_type") or "").strip(),
+            "subject": str(md.get("subject") or md.get("course") or "").strip(),
+            "course": str(md.get("course") or "").strip(),
+            "lesson": str(md.get("lesson") or "").strip(),
+            "topic": str(md.get("topic") or "").strip(),
             "page": md.get("page"),
             "source_file": str(md.get("source_file") or "").strip(),
             "score": float(score or 0),
