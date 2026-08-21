@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v16.6.3-table-plus-lesson-images"
+SERVER_VERSION = "2026-08-21-doraemon-v16.6.7-no-image-on-ambiguous-study"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3812,9 +3812,19 @@ def proxy_chat(
 
 
     # Resolve images ONLY for these exact text chunks.
-    rich_images = _retrieve_images_for_text_chunks(
-        text_chunks, index, namespace, query_vector
-    )
+    # IMPORTANT: an ambiguous "I want to study" request is a routing/clarification
+    # turn, not a lesson turn. Never attach images from the active lesson, RAG
+    # ranking, or previous chat while Doraemon is asking the learner to choose
+    # a study direction. This is intentionally enforced here as a hard guard,
+    # immediately before image retrieval, so future retrieval changes cannot
+    # accidentally re-introduce unrelated images into the clarification turn.
+    if ambiguous_study_request:
+        rich_images = []
+        print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
+    else:
+        rich_images = _retrieve_images_for_text_chunks(
+            text_chunks, index, namespace, query_vector
+        )
 
     contexts = []
     source_meta = []
@@ -3877,6 +3887,8 @@ def proxy_chat(
                 break
 
     image_marker_rule = ""
+    if ambiguous_study_request:
+        image_orders = []
     if image_orders:
         markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
         image_marker_rule = (
