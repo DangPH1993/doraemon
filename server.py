@@ -1,4 +1,4 @@
-BASELINE_VERSION = "16.6"
+BASELINE_VERSION = "16.6.3"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-20-doraemon-v16.6-table-provenance-exercise-safe-structured-facts"
+SERVER_VERSION = "2026-08-21-doraemon-v16.6.3-table-plus-lesson-images"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5207,12 +5207,24 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # Provenance-bearing content units. Table explanation and its source
             # image stay together before chunking; no post-chunk text matching.
             units=[]
+            # Ordinary lesson illustrations on a table page belong to the
+            # normal page/lesson context, not to any individual table. Keep
+            # their keys on the normal text unit so the resulting Pinecone
+            # text chunk can directly carry the lesson-image provenance.
+            # Table units below keep ONLY their own table image keys.
+            lesson_image_keys = [
+                str(x.get("key") or "").strip()
+                for x in stored
+                if str(x.get("image_scope") or "").strip().lower() == "lesson"
+                and str(x.get("key") or "").strip()
+            ]
+            lesson_image_keys = list(dict.fromkeys(lesson_image_keys))
             if base_text:
                 units.append({
                     "type":"normal",
                     "unit_id":f"page:{page_no}:text",
                     "text":base_text,
-                    "image_keys":[],
+                    "image_keys":lesson_image_keys,
                 })
             for table_image in [x for x in stored if str(x.get("kind") or "") == "table_source"]:
                 explanation=str(table_image.get("explanation") or "").strip()
@@ -5242,7 +5254,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                 for emb in embedded:
                     emb["image_scope"] = "lesson"
                 stored.extend(embedded)
-            print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')} lesson_images={sum(1 for x in stored if x.get('image_scope')=='lesson')}")
+            print(f"[TABLE VISUAL] page={page_no} tables={len(table_items)} source_images={sum(1 for x in stored if x.get('kind')=='table_source')} lesson_images={sum(1 for x in stored if x.get('image_scope')=='lesson')} lesson_image_keys={lesson_image_keys}")
         else:
             page_texts[page_no] = (ocr_text or extracted).strip()
 
@@ -5340,7 +5352,7 @@ async def admin_knowledge_upload(
                             "local_index": local_no,
                             "unit_id": unit_id,
                             "text": chunk,
-                            "image_keys": unit_image_keys if unit.get("type") == "table" else [],
+                            "image_keys": unit_image_keys,
                         })
 
                 for rec in chunk_records:
