@@ -3289,22 +3289,46 @@ def proxy_chat(
     # Continue the most recent in-progress lesson for short follow-ups. This
     # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
     # PostgreSQL is the durable state; chat history is only the conversational hint.
-    recommendation_words = ("học gì", "học gì hôm nay", "gợi ý", "đề xuất", "chọn bài", "nên học")
+    recommendation_words = (
+        "học gì", "học gì hôm nay", "hôm nay học gì",
+        "gợi ý", "đề xuất", "chọn bài", "nên học",
+        "có gì để dạy", "có gì để học", "dạy gì", "học được gì"
+    )
     wants_recommendation = any(w in low for w in recommendation_words) or ambiguous_study_request
 
-    # Recommendation / "what can you teach?" is a routing turn, not a lesson turn.
-    # Do not let semantic RAG ranking or active lesson state pull arbitrary lesson
-    # text/images into the answer before the learner chooses a content type/lesson.
+    # Recommendation / "what can you teach?" is ALWAYS a routing turn.
+    # A currently-open lesson/chat thread must NOT override this intent.
+    # Only disable the routing path when the user's current message itself
+    # contains a concrete lesson/content target, an action, a plan scope, or is
+    # clearly a correction/follow-up.
+    current_message_has_concrete_target = bool(
+        named_lesson_topic
+        or re.search(r"\b(?:bài|lesson|phần)\s*[\wÀ-ỹà-ỹ0-9_-]+", low, flags=re.UNICODE)
+        or any(x in low for x in (
+            "giáo trình", "ngữ pháp", "bài tập", "từ vựng", "truyện đọc",
+            "kanji", "bộ thủ", "theo lộ trình", "lộ trình",
+        ))
+    )
     recommendation_only_request = bool(
         wants_recommendation
-        and not requested_content_type
-        and not requested_course
-        and not requested_lesson
-        and not requested_topic
+        and not current_message_has_concrete_target
         and not forced_plan_scope
         and not data.action
         and not _is_correction_followup(query_text)
     )
+
+    if recommendation_only_request:
+        # Hard reset any inherited thread scope BEFORE RAG routing. This is the
+        # critical guard that prevents a prior lesson (e.g. Giáo trình alphav1)
+        # from supplying text/images to a generic "cậu có gì để dạy?" request.
+        requested_scope = {"course": None, "content_type": None, "lesson": None, "topic": None}
+        requested_content_type = None
+        requested_course = None
+        requested_lesson = None
+        requested_topic = None
+        thread_scope_locked = False
+        active_scope = None
+        print("[CHAT ROUTING] recommendation-only request: ignore current thread/active lesson")
     if recommendation_only_request and not ambiguous_study_request:
         msg = (
             "📚 Doraemon có thể đồng hành cùng cậu ở 5 loại nội dung:\n\n"
@@ -3326,7 +3350,7 @@ def proxy_chat(
         }
 
     active_learning = None
-    if not (requested_content_type or requested_course or requested_lesson or requested_topic) and not wants_recommendation:
+    if not recommendation_only_request and not (requested_content_type or requested_course or requested_lesson or requested_topic) and not wants_recommendation:
         for lp in learning:
             if str(lp.get("status") or "").strip().lower() in {"in_progress", "review", "active"}:
                 active_learning = lp
@@ -3353,6 +3377,7 @@ def proxy_chat(
         and not thread_switch_requested
         and not named_lesson_topic
         and not ambiguous_study_request
+        and not recommendation_only_request
     )
     if correction_followup and thread_scope:
         thread_scope_locked = True
@@ -3749,12 +3774,15 @@ def proxy_chat(
         except Exception as exc:
             print("[RAG compat] fallback failed:", type(exc).__name__, str(exc))
 
-    if ambiguous_study_request:
+    if ambiguous_study_request or recommendation_only_request:
         # Never let semantic RAG ranking decide what the learner wants to study.
         # The top hit is often Grammar 1 and is not an intent signal.
         result.matches = []
         active_scope = None
-        print("[CHAT ROUTING] ambiguous study request: no lesson/content scope inferred")
+        if recommendation_only_request:
+            print("[CHAT ROUTING] recommendation-only request: no lesson/content scope inferred")
+        else:
+            print("[CHAT ROUTING] ambiguous study request: no lesson/content scope inferred")
     elif not explicit_scope and not thread_scope_locked:
         active_scope = _select_active_scope(low, result.matches, catalog)
 
