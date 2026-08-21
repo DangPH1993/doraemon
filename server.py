@@ -1,4 +1,4 @@
-BASELINE_VERSION = "17.7"
+BASELINE_VERSION = "17.8"
 import os
 import ast
 import io
@@ -2278,9 +2278,34 @@ def _parse_plan_request(text):
     elif 'kanji' in ql:
         scope='Kanji'
     detected_type = _plan_content_type_from_text(ql)
-    content_type = detected_type or 'Giáo trình'
+    # Do not silently default a plan request to Giáo trình when the current
+    # message contains only a duration/speed. The caller may already have a
+    # pending plan subtype (e.g. Ngữ pháp) or can infer it from the preceding
+    # user message. A silent default here was the root cause of requests such
+    # as "tạo lộ trình học ngữ pháp" -> "mình muốn học trong 5 ngày"
+    # falling back to Giáo trình.
+    content_type = detected_type
     goal=q.strip()
     return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type,"unit_label":unit_label}
+
+
+def _infer_plan_content_type_from_history(recent_history):
+    """Infer a pending plan subtype from the most recent explicit user request.
+
+    This is only a fallback for a follow-up target message such as
+    "mình muốn học trong 5 ngày". It never uses assistant text, catalog ranking,
+    RAG, or active learning state to invent a plan subtype.
+    """
+    for item in reversed(recent_history or []):
+        if str(item.get('role') or '').strip().lower() != 'user':
+            continue
+        txt = str(item.get('text') or '').strip()
+        if not txt:
+            continue
+        detected = _plan_content_type_from_text(txt)
+        if detected:
+            return detected
+    return None
 
 
 def _set_pending_plan_request(user_id, content_type=None, scope=None):
@@ -2312,12 +2337,16 @@ def _clear_pending_plan_request(user_id):
         conn.close()
 
 def _build_plan_preview(user_id, req, existing_plan_id=None):
-    lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(req.get('content_type') or 'Giáo trình', req.get('scope') or '')
+    requested_type = req.get('content_type') or 'Giáo trình'
+    requested_type = _normalize_content_type(requested_type) if requested_type in CONTENT_TYPES else requested_type
+    req['content_type'] = requested_type
+    print(f"[STUDY PLAN LESSONS] content_type={requested_type!r} scope={req.get('scope') or ''!r} source={req.get('goal') or ''!r}")
+    lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(requested_type, req.get('scope') or '')
     if not lessons:
         # fall back to all curriculum lessons from the selected type
-        lessons=_unique_lessons_for_scope(req.get('content_type') or 'Giáo trình','')
+        lessons=_unique_lessons_for_scope(requested_type, '')
     if not lessons:
-        return None, "Doraemon chưa tìm thấy danh sách bài phù hợp trong kho giáo trình để lập lộ trình."
+        return None, f"Doraemon chưa tìm thấy danh sách bài phù hợp cho loại nội dung **{requested_type}** để lập lộ trình."
     start=_now_local().date()
     target=req.get('target_date')
     if not target:
@@ -2927,14 +2956,16 @@ def proxy_chat(
     # target sentence (e.g. "mỗi ngày 10 từ bộ thủ") from being mistaken for a lesson.
     pending = _get_pending_plan_request(user["id"]) if profile.get("learning_mode") == "planned" else None
     if pending and pending.get('pending_plan_created_at') and not data.action:
-        pending_type = pending.get('pending_plan_content_type') or 'Giáo trình'
+        pending_type = pending.get('pending_plan_content_type') or _infer_plan_content_type_from_history(recent_history)
         pending_scope = pending.get('pending_plan_scope') or ''
         probe = _parse_plan_request(data.text)
         has_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
         if has_target:
+            if not pending_type:
+                pending_type = probe.get('content_type') or 'Giáo trình'
             probe['content_type'] = pending_type
             probe['scope'] = pending_scope or probe.get('scope') or ''
-            print(f"[STUDY PLAN] pending lock content_type={pending_type!r} scope={probe['scope']!r} goal={data.text!r}")
+            print(f"[STUDY PLAN] pending lock content_type={pending_type!r} scope={probe['scope']!r} parsed_type={probe.get('content_type')!r} goal={data.text!r}")
             # A daily count without a finite horizon needs one more piece of information.
             if probe.get('units_per_day') and not probe.get('target_date') and not probe.get('days_per_unit'):
                 msg=(f"🤖 Doraemon đã ghi nhận mục tiêu {probe.get('units_per_day'):g} {probe.get('unit_label') or 'mục'}/ngày cho {pending_scope or pending_type}. "
@@ -3072,7 +3103,8 @@ def proxy_chat(
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             if profile.get("learning_mode") != "planned":
                 _set_learning_profile(user["id"], "planned", True)
-            req_probe['content_type'] = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or 'Giáo trình'
+            req_probe['content_type'] = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
+            print(f"[STUDY PLAN] new-plan target content_type={req_probe['content_type']!r} source=current/history")
             pid,preview=_build_plan_preview(user["id"],req_probe)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
@@ -3086,7 +3118,8 @@ def proxy_chat(
                 if not has_target:
                     if profile.get("learning_mode") != "planned":
                         _set_learning_profile(user["id"], "planned", True)
-                    req_type=req_probe.get('content_type') or 'Giáo trình'
+                    req_type = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
+                    print(f"[STUDY PLAN] create request lock content_type={req_type!r} source=current/history")
                     _set_pending_plan_request(user["id"], req_type, req_probe.get('scope') or '')
                     msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
                          "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
@@ -3098,7 +3131,8 @@ def proxy_chat(
             if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit'):
                 if profile.get("learning_mode") != "planned":
                     _set_learning_profile(user["id"], "planned", True)
-                req['content_type'] = _plan_content_type_from_text(data.text) or req.get('content_type') or 'Giáo trình'
+                req['content_type'] = _plan_content_type_from_text(data.text) or req.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
+                print(f"[STUDY PLAN] concrete target content_type={req['content_type']!r} source=current/history")
                 pid,preview=_build_plan_preview(user["id"],req)
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
