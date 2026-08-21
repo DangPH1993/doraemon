@@ -1,4 +1,4 @@
-BASELINE_VERSION = "17.3"
+BASELINE_VERSION = "17.7"
 import os
 import ast
 import io
@@ -2199,11 +2199,39 @@ def _set_learning_profile(user_id, mode, completed=True):
         conn.close()
 
 
+def _plan_content_type_from_text(text):
+    q = str(text or '').casefold()
+    # Prefer the explicit study subtype over the generic word "giáo trình".
+    # This prevents requests such as "tạo lộ trình học ngữ pháp" from being
+    # interpreted as a curriculum plan simply because a curriculum source is
+    # mentioned elsewhere in the sentence/context.
+    patterns = [
+        ("Ngữ pháp", ("ngữ pháp", "ngu phap", "grammar")),
+        ("Bài tập", ("bài tập", "bai tap", "luyện tập", "luyen tap", "exercise", "quiz")),
+        ("Từ vựng", ("từ vựng", "tu vung", "từ mới", "tu moi", "vocabulary", "bộ thủ", "bo thu", "kanji")),
+        ("Truyện đọc", ("truyện đọc", "truyen doc", "đọc truyện", "doc truyen", "reading", "story")),
+        ("Giáo trình", ("giáo trình", "giao trinh", "học theo giáo trình", "theo giáo trình")),
+    ]
+    for content_type, keys in patterns:
+        if any(k in q for k in keys):
+            return content_type
+    return None
+
+
 def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
+    """Return lessons strictly from the requested plan content type.
+
+    Plan generation must never fall back from a requested type (e.g. Ngữ pháp)
+    to generic curriculum lessons. The catalog cache is used only as a source,
+    but matching is strict and case-insensitive.
+    """
+    wanted = str(content_type or 'Giáo trình').strip()
     catalog = _load_catalog_cached()
     rows=[]; seen=set(); q=_clean_scope_value(scope_query)
     for item in catalog:
-        if _normalize_content_type(item.get('content_type')) != content_type:
+        raw_type = str(item.get('content_type') or '').strip()
+        normalized = _normalize_content_type(raw_type)
+        if normalized.casefold() != wanted.casefold():
             continue
         lesson=str(item.get('lesson') or '').strip()
         if not lesson:
@@ -2211,8 +2239,10 @@ def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
         if q and q not in _clean_scope_value(str(item.get('subject') or '')) and q not in _clean_scope_value(lesson):
             continue
         key=lesson.casefold()
-        if key in seen: continue
+        if key in seen:
+            continue
         seen.add(key); rows.append(lesson)
+    print(f"[STUDY PLAN LESSONS] content_type={wanted!r} scope={scope_query!r} lessons={len(rows)}")
     return rows
 
 
@@ -2247,18 +2277,8 @@ def _parse_plan_request(text):
         scope='Bộ thủ'
     elif 'kanji' in ql:
         scope='Kanji'
-    if any(k in ql for k in ['giáo trình','giáo trinh']):
-        content_type='Giáo trình'
-    elif any(k in ql for k in ['ngữ pháp','ngu phap','grammar']):
-        content_type='Ngữ pháp'
-    elif any(k in ql for k in ['bài tập','bai tap','luyện tập','luyen tap','exercise']):
-        content_type='Bài tập'
-    elif any(k in ql for k in ['từ vựng','tu vung','vocabulary','từ mới','tu moi','bộ thủ','bộ khẩu','kanji']):
-        content_type='Từ vựng'
-    elif any(k in ql for k in ['truyện đọc','truyen doc','đọc truyện','doc truyen','reading','story']):
-        content_type='Truyện đọc'
-    else:
-        content_type='Giáo trình'
+    detected_type = _plan_content_type_from_text(ql)
+    content_type = detected_type or 'Giáo trình'
     goal=q.strip()
     return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type,"unit_label":unit_label}
 
@@ -2914,6 +2934,7 @@ def proxy_chat(
         if has_target:
             probe['content_type'] = pending_type
             probe['scope'] = pending_scope or probe.get('scope') or ''
+            print(f"[STUDY PLAN] pending lock content_type={pending_type!r} scope={probe['scope']!r} goal={data.text!r}")
             # A daily count without a finite horizon needs one more piece of information.
             if probe.get('units_per_day') and not probe.get('target_date') and not probe.get('days_per_unit'):
                 msg=(f"🤖 Doraemon đã ghi nhận mục tiêu {probe.get('units_per_day'):g} {probe.get('unit_label') or 'mục'}/ngày cho {pending_scope or pending_type}. "
@@ -3042,8 +3063,7 @@ def proxy_chat(
             req_probe = _parse_plan_request(data.text)
             has_target = bool(req_probe.get('target_date') or req_probe.get('units_per_day') or req_probe.get('days_per_unit'))
             if not has_target:
-                requested_type = req_probe.get('content_type') or 'Giáo trình'
-                requested_type = requested_type or 'Giáo trình'
+                requested_type = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or 'Giáo trình'
                 scope_hint = req_probe.get('scope') or ''
                 _set_pending_plan_request(user["id"], requested_type, scope_hint)
                 msg=("Được nhé! 🤖 Doraemon sẽ tạo một lộ trình mới riêng cho cậu.\n\n"
@@ -3052,6 +3072,7 @@ def proxy_chat(
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             if profile.get("learning_mode") != "planned":
                 _set_learning_profile(user["id"], "planned", True)
+            req_probe['content_type'] = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or 'Giáo trình'
             pid,preview=_build_plan_preview(user["id"],req_probe)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
@@ -3077,6 +3098,7 @@ def proxy_chat(
             if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit'):
                 if profile.get("learning_mode") != "planned":
                     _set_learning_profile(user["id"], "planned", True)
+                req['content_type'] = _plan_content_type_from_text(data.text) or req.get('content_type') or 'Giáo trình'
                 pid,preview=_build_plan_preview(user["id"],req)
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
