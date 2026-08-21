@@ -3945,6 +3945,37 @@ def proxy_chat(
             text_chunks, index, namespace, query_vector
         )
 
+        # When the current boxchat is still inside an active lesson and the
+        # learner has NOT explicitly switched lesson/content type, images must
+        # belong to that same active lesson. This prevents a "wrap up / next
+        # lesson suggestion" turn from accidentally attaching visuals from the
+        # next lesson merely because RAG surfaced them. The text answer may still
+        # mention the next lesson as a suggestion, but its images are deferred
+        # until the learner explicitly starts that lesson.
+        if thread_scope_locked and thread_scope:
+            scope_content_type = _normalize_content_type(thread_scope.get("content_type")) or None
+            scope_lesson = str(thread_scope.get("lesson") or "").strip() or None
+            scope_topic = str(thread_scope.get("topic") or "").strip() or None
+            filtered_images = []
+            for item in rich_images:
+                same_type = True
+                item_type = _normalize_content_type(item.get("content_type")) or None
+                if scope_content_type and item_type and item_type != scope_content_type:
+                    same_type = False
+                item_lesson = str(item.get("lesson") or "").strip() or None
+                item_topic = str(item.get("topic") or "").strip() or None
+                same_lesson = (not scope_lesson or not item_lesson or item_lesson == scope_lesson)
+                same_topic = (not scope_topic or not item_topic or item_topic == scope_topic)
+                if same_type and same_lesson and same_topic:
+                    filtered_images.append(item)
+                else:
+                    print(
+                        f"[IMAGE SKIP] outside active thread scope: "
+                        f"item_lesson={item_lesson!r} item_topic={item_topic!r} "
+                        f"scope_lesson={scope_lesson!r} scope_topic={scope_topic!r}"
+                    )
+            rich_images = filtered_images
+
     contexts = []
     source_meta = []
     for order, chunk in enumerate(text_chunks):
@@ -4096,6 +4127,7 @@ NGUYÊN TẮC:
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
 - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
+- Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
 - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
 - Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
 - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
