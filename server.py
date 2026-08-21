@@ -1154,6 +1154,14 @@ def _select_active_scope(query_text, text_matches, catalog):
             explicit_type = typ
             break
 
+    # Always initialize lesson/topic before any alias/catalog matching.
+    # Short conversational turns such as "hôm nay hơi mệt nhưng sẽ cố học" are
+    # valid thread messages but may contain no lesson name. Initializing these
+    # variables prevents thread-scope extraction from crashing with
+    # UnboundLocalError.
+    lesson = None
+    topic = None
+
     # Find a lesson/topic ONLY when its actual name appears in the query.
     named_candidates = []
     for item in catalog or []:
@@ -4003,8 +4011,10 @@ Câu hỏi của người dùng:
         except Exception as exc:
             print("[RAG semantic-scoped] query failed:", type(exc).__name__, str(exc))
 
-    # Last semantic fallback only when no lesson/topic scope can be identified.
-    if result is None:
+    # Last semantic fallback is allowed only when no lesson/topic is known.
+    # Once the learner has explicitly selected a lesson, NEVER fall back to the
+    # whole content type: that is how Bài 4 can leak into a Bài 3 lesson.
+    if result is None and not requested_lesson and not requested_topic:
         result = query_text_matches(
             build_scope_filter("text", requested_content_type, None, None, None)
             if requested_content_type else None
@@ -4013,6 +4023,17 @@ Câu hỏi của người dùng:
             "[RAG semantic-fallback] "
             f"content_type={requested_content_type!r} chunks={len(_usable_matches(result.matches))}"
         )
+
+    if result is None and (requested_lesson or requested_topic):
+        print(
+            "[RAG scoped-miss] no text found inside requested lesson/topic; "
+            f"lesson={requested_lesson!r} topic={requested_topic!r} "
+            "no cross-lesson fallback"
+        )
+        # Preserve the result shape expected by the downstream pipeline.
+        class _EmptyResult:
+            matches = []
+        result = _EmptyResult()
 
     # IMPORTANT: retrieve TEXT first. Images are NOT searched independently.
     # They are resolved later from the exact text chunks that actually enter the
@@ -4279,10 +4300,11 @@ Câu hỏi của người dùng:
         # next lesson merely because RAG surfaced them. The text answer may still
         # mention the next lesson as a suggestion, but its images are deferred
         # until the learner explicitly starts that lesson.
-        if thread_scope_locked and thread_scope:
-            scope_content_type = _normalize_content_type(thread_scope.get("content_type")) or None
-            scope_lesson = str(thread_scope.get("lesson") or "").strip() or None
-            scope_topic = str(thread_scope.get("topic") or "").strip() or None
+        if (thread_scope_locked and thread_scope) or requested_lesson or requested_topic:
+            source_scope = thread_scope if (thread_scope_locked and thread_scope) else requested_scope
+            scope_content_type = _normalize_content_type(source_scope.get("content_type")) or None
+            scope_lesson = str(source_scope.get("lesson") or "").strip() or None
+            scope_topic = str(source_scope.get("topic") or "").strip() or None
             filtered_images = []
             for item in rich_images:
                 same_type = True
