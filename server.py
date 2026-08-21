@@ -1,4 +1,4 @@
-BASELINE_VERSION = "17.8"
+BASELINE_VERSION = "18.0"
 import os
 import ast
 import io
@@ -25,6 +25,11 @@ from google.genai import types
 from pypdf import PdfReader
 
 try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
     import fitz  # PyMuPDF - render scanned PDF pages
 except Exception:
     fitz = None
@@ -48,6 +53,15 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_RENDER")
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
+# LLM provider for chat generation only. RAG embeddings / PDF vision ingestion remain
+# on the existing Gemini pipeline so the current Pinecone index and knowledge base
+# stay fully compatible.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL_LOW = os.getenv("OPENAI_MODEL_LOW", "gpt-4.1-mini")
+OPENAI_MODEL_MEDIUM = os.getenv("OPENAI_MODEL_MEDIUM", "gpt-5-mini")
+OPENAI_REASONING_MEDIUM = os.getenv("OPENAI_REASONING_MEDIUM", "medium")
+
 GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_THINKING_LEVEL = "low"
 EMBEDDING_MODEL = "gemini-embedding-001"
@@ -63,11 +77,12 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v17.3-content-type-routing-fix"
+SERVER_VERSION = "2026-08-21-doraemon-v18-dual-llm"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
 gemini = None
+openai_client = None
 connected_users = {}
 admin_connections = set()
 
@@ -228,12 +243,14 @@ def init_db():
 
 @app.on_event("startup")
 def startup():
-    global pc, index, gemini, b2
+    global pc, index, gemini, openai_client, b2
     if PINECONE_API_KEY:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX)
     if GEMINI_API_KEY:
         gemini = genai.Client(api_key=GEMINI_API_KEY)
+    if OPENAI_API_KEY and OpenAI is not None:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
     if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
         b2 = boto3.client(
             "s3",
@@ -251,6 +268,8 @@ def startup():
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
+    print("LLM provider:", LLM_PROVIDER)
+    print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning:", OPENAI_REASONING_MEDIUM)
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
 
 class RegisterRequest(BaseModel):
@@ -2805,6 +2824,95 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     }
 
 
+
+def _chat_model_for_content(content_type: Optional[str], provider: Optional[str] = None):
+    """Resolve the chat model without changing routing/RAG decisions."""
+    provider = (provider or LLM_PROVIDER).strip().lower()
+    if provider == "openai":
+        if content_type in {"Bài tập", "Giáo trình"}:
+            return OPENAI_MODEL_MEDIUM
+        return OPENAI_MODEL_LOW
+    return GEMINI_MODEL
+
+
+def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float):
+    """
+    Provider-neutral chat adapter.
+    Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
+    for the same final prompt so RAG, Study Plan, chat history, routing and
+    content_blocks stay unchanged.
+    """
+    provider = LLM_PROVIDER
+    thinking_level = (
+        "medium" if content_type in {"Bài tập", "Giáo trình"}
+        else GEMINI_THINKING_LEVEL
+    )
+
+    if provider == "openai":
+        if openai_client is None:
+            raise HTTPException(
+                500,
+                "LLM_PROVIDER=openai nhưng OPENAI_API_KEY chưa được cấu hình "
+                "hoặc package openai chưa được cài."
+            )
+        model = _chat_model_for_content(content_type, "openai")
+        print(
+            f"[CHAT THINKING] request={request_id} provider='openai' "
+            f"content_type={content_type!r} model={model!r} "
+            f"reasoning={OPENAI_REASONING_MEDIUM if content_type in {'Bài tập','Giáo trình'} else 'none'!r}"
+        )
+        kwargs = {
+            "model": model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ],
+        }
+        if model.startswith("gpt-5"):
+            kwargs["reasoning"] = {
+                "effort": OPENAI_REASONING_MEDIUM if content_type in {"Bài tập", "Giáo trình"} else "none"
+            }
+        response = openai_client.responses.create(**kwargs)
+        reply = getattr(response, "output_text", "") or ""
+        elapsed = time.perf_counter() - gen_started
+        print(
+            f"[CHAT OPENAI] request={request_id} model={model!r} "
+            f"elapsed={elapsed:.3f}s reply_chars={len(reply)}"
+        )
+        return reply, model, elapsed
+
+    if provider != "gemini":
+        raise HTTPException(
+            500,
+            f"LLM_PROVIDER không hợp lệ: {provider!r}. "
+            "Chọn 'gemini' hoặc 'openai'."
+        )
+
+    if gemini is None:
+        raise HTTPException(500, "LLM_PROVIDER=gemini nhưng GEMINI_API_KEY chưa được cấu hình.")
+
+    print(
+        f"[CHAT THINKING] request={request_id} provider='gemini' "
+        f"content_type={content_type!r} level={thinking_level!r}"
+    )
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
+        ),
+    )
+    reply = response.text or ""
+    elapsed = time.perf_counter() - gen_started
+    print(
+        f"[CHAT GEMINI] request={request_id} model={GEMINI_MODEL!r} "
+        f"elapsed={elapsed:.3f}s reply_chars={len(reply)}"
+    )
+    return reply, GEMINI_MODEL, elapsed
+
+
 @app.post("/api/proxy-chat")
 def proxy_chat(
     data: ChatRequest,
@@ -4238,26 +4346,13 @@ TIN NHẮN HIỆN TẠI:
 {query_text}"""
 
     gen_started = time.perf_counter()
-    # Use deeper reasoning only for the teacher-like content types requested
-    # by the product design. Other content stays on the baseline low level.
-    response_thinking_level = (
-        "medium" if requested_content_type in {"Bài tập", "Giáo trình"}
-        else GEMINI_THINKING_LEVEL
+    reply, response_model, gen_elapsed = _generate_chat_reply(
+        prompt,
+        content_type=requested_content_type,
+        request_id=request_id,
+        gen_started=gen_started,
     )
-    print(
-        f"[CHAT THINKING] request={request_id} content_type={requested_content_type!r} "
-        f"level={response_thinking_level!r}"
-    )
-    response = gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=response_thinking_level)
-        ),
-    )
-    reply = response.text or ""
     perf_gen = time.perf_counter()
-    print(f"[CHAT GEMINI] request={request_id} elapsed={perf_gen-gen_started:.3f}s reply_chars={len(reply)}")
 
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
@@ -4281,11 +4376,13 @@ TIN NHẮN HIỆN TẠI:
 
     perf_total_done = time.perf_counter()
     print(
-        "[PERF proxy_chat] auth=%.3fs state=%.3fs embed=%.3fs rag=%.3fs "
-        "gemini=%.3fs blocks=%.3fs total=%.3fs text_k=%d image_k=%d prompt_catalog=%d prompt_active_state=%d"
+        "[PERF proxy_chat] provider=%s auth=%.3fs state=%.3fs embed=%.3fs rag=%.3fs "
+        "llm=%.3fs blocks=%.3fs total=%.3fs text_k=%d image_k=%d prompt_catalog=%d prompt_active_state=%d"
         % (
+            LLM_PROVIDER,
             perf_auth - perf_total,
             perf_state - perf_auth,
+
             perf_embed - perf_state,
             perf_rag - perf_embed,
             perf_gen - perf_rag,
@@ -4301,7 +4398,7 @@ TIN NHẮN HIỆN TẠI:
     print(f"[CHAT END] request={request_id} total={perf_total_done-perf_total:.3f}s")
     return {
         "reply": reply,
-        "model": GEMINI_MODEL,
+        "model": response_model,
         "sources": source_meta[:10],
         "images": images,
         "content_blocks": content_blocks,
@@ -6244,5 +6341,16 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status":"ok","pinecone":index is not None,"gemini":gemini is not None,
-            "database":bool(DATABASE_URL),"learning_engine":True,"content_types":sorted(CONTENT_TYPES),"gemini_model":GEMINI_MODEL}
+    return {
+        "status": "ok",
+        "pinecone": index is not None,
+        "gemini": gemini is not None,
+        "openai": openai_client is not None,
+        "llm_provider": LLM_PROVIDER,
+        "database": bool(DATABASE_URL),
+        "learning_engine": True,
+        "content_types": sorted(CONTENT_TYPES),
+        "gemini_model": GEMINI_MODEL,
+        "openai_model_low": OPENAI_MODEL_LOW,
+        "openai_model_medium": OPENAI_MODEL_MEDIUM,
+    }
