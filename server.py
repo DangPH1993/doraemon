@@ -1,4 +1,4 @@
-BASELINE_VERSION = "17.1"
+BASELINE_VERSION = "17.2"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v17.1-teaching-modes"
+SERVER_VERSION = "2026-08-21-doraemon-v17.2-content-type-routing-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1104,14 +1104,16 @@ def _focus_metadata_matches(matches, query_text, lesson=None, topic=None,
 def _select_active_scope(query_text, text_matches, catalog):
     """
     Determine the active learning scope in strict order:
-    Course -> content type -> lesson -> topic.
+    explicit content type -> explicitly named lesson/topic -> supporting course.
 
-    Kanji and Bộ thủ are LESSONS under content_type="Từ vựng",
-    not content types themselves.
+    IMPORTANT:
+    A content type mention such as "mình muốn học giáo trình" must NEVER
+    inherit an arbitrary lesson from the first catalog row. Lesson/topic are
+    only populated when the learner actually names them. Otherwise the request
+    stays at content-type level and can be handled as a routing/selection turn.
     """
     q = _clean_scope_value(query_text)
 
-    # Course
     course = None
     for item in catalog or []:
         c = str(item.get("course") or item.get("course_name") or "").strip()
@@ -1119,8 +1121,7 @@ def _select_active_scope(query_text, text_matches, catalog):
             course = c
             break
 
-    # Content type: five peer content types.
-    explicit_type = None
+    # Content type is explicit and authoritative.
     explicit_patterns = [
         ("Giáo trình", ["giáo trình", "học theo giáo trình", "học giáo trình", "theo giáo trình", "trong giáo trình"]),
         ("Truyện đọc", ["truyện đọc", "đọc truyện", "câu chuyện", "học truyện"]),
@@ -1128,64 +1129,66 @@ def _select_active_scope(query_text, text_matches, catalog):
         ("Ngữ pháp", ["ngữ pháp", "học ngữ pháp", "ôn ngữ pháp", "grammar"]),
         ("Từ vựng", ["từ vựng", "học từ vựng", "từ mới", "học từ mới", "vocabulary"]),
     ]
+    explicit_type = None
     for typ, keys in explicit_patterns:
         if any(k in q for k in keys):
             explicit_type = typ
             break
 
-    # Lesson/topic from catalog.
-    # "Kanji" / "Bộ thủ" are matched here as lesson values.
-    lesson = None
-    topic = None
-    best_score = -1
+    # Find a lesson/topic ONLY when its actual name appears in the query.
+    named_candidates = []
     for item in catalog or []:
         item_course = str(item.get("course") or item.get("course_name") or "").strip()
         item_type = _normalize_content_type(item.get("content_type"))
         item_lesson = str(item.get("lesson") or "").strip()
         item_topic = str(item.get("topic") or "").strip()
 
+        if explicit_type and item_type != explicit_type:
+            continue
+        if course and item_course and item_course != course:
+            continue
+
+        lesson_n = _clean_scope_value(item_lesson)
+        topic_n = _clean_scope_value(item_topic)
+        lesson_hit = bool(lesson_n and lesson_n in q)
+        topic_hit = bool(topic_n and topic_n in q)
+
+        if not lesson_hit and not topic_hit:
+            continue
+
         score = 0
-        if item_course and _clean_scope_value(item_course) in q:
-            score += 10
-
-        if explicit_type and item_type == explicit_type:
-            score += 20
-
-        if item_lesson and _clean_scope_value(item_lesson) in q:
-            score += 40
-            # A named lesson is authoritative. If it is Kanji/Bộ thủ,
-            # its content type must come from the catalog and therefore be Từ vựng.
-            if not explicit_type:
-                explicit_type = item_type
-
-        if item_topic and _clean_scope_value(item_topic) in q:
+        if topic_hit:
+            score += 1000 + len(topic_n) * 10
+        if lesson_hit:
+            score += 500 + len(lesson_n) * 5
+        if item_course and course:
             score += 50
-            if not explicit_type:
-                explicit_type = item_type
 
-        if score > best_score:
-            best_score = score
-            lesson = item_lesson or lesson
-            topic = item_topic or topic
-            if score > 0:
-                if item_course and not course:
-                    course = item_course
-                if item_type and not explicit_type:
-                    explicit_type = item_type
+        named_candidates.append((score, item))
 
-    # If the user explicitly names Kanji/Bộ thủ but the catalog has not
-    # provided a matching lesson row, still route them as Từ vựng lessons.
-    # This prevents RAG similarity from selecting another content type.
+    lesson = None
+    topic = None
+    if named_candidates:
+        named_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_item = named_candidates[0][1]
+        lesson = str(best_item.get("lesson") or "").strip() or None
+        topic = str(best_item.get("topic") or "").strip() or None
+        if not explicit_type:
+            explicit_type = _normalize_content_type(best_item.get("content_type"))
+
+    # Kanji/Bộ thủ are vocabulary lessons, never standalone content types.
     if any(k in q for k in ["kanji", "học kanji"]):
+        explicit_type = "Từ vựng"
         if not lesson:
             lesson = "Kanji"
-        explicit_type = "Từ vựng"
     elif any(k in q for k in ["bộ thủ", "học bộ thủ", "radical"]):
+        explicit_type = "Từ vựng"
         if not lesson:
             lesson = "Bộ thủ"
-        explicit_type = "Từ vựng"
 
-    # If no explicit routing was possible, use top RAG metadata as fallback.
+    # Only use top RAG metadata when there is NO explicit content-type signal.
+    # This prevents "mình muốn học giáo trình" from inheriting an unrelated
+    # grammar/exercise lesson merely because of catalog ordering or similarity.
     if not explicit_type:
         for m in text_matches or []:
             md = m.metadata or {}
@@ -1206,7 +1209,6 @@ def _select_active_scope(query_text, text_matches, catalog):
         "lesson": lesson,
         "topic": topic,
     }
-
 
 def _is_ambiguous_study_request(text):
     """Return True when the user asks to study but gives no target/mode.
@@ -3249,6 +3251,40 @@ def proxy_chat(
     requested_course = requested_scope.get("course")
     requested_lesson = requested_scope.get("lesson")
     requested_topic = requested_scope.get("topic")
+
+    # A request that explicitly chooses only a content type (e.g.
+    # "mình muốn học giáo trình") is a ROUTING turn, not a lesson-teaching turn.
+    # Do not let RAG/previous progress choose an arbitrary lesson or introduce a
+    # different content type. Ask the learner for the lesson/topic next.
+    content_type_only_request = bool(
+        requested_content_type
+        and not requested_lesson
+        and not requested_topic
+        and not forced_plan_scope
+        and not data.action
+        and not ambiguous_study_request
+        and not _is_correction_followup(query_text)
+    )
+    if content_type_only_request:
+        examples = {
+            "Giáo trình": "Ví dụ: 'Bài 3' hoặc 'Bài 3 giáo trình'.",
+            "Ngữ pháp": "Ví dụ: 'Bài 3 ngữ pháp'.",
+            "Bài tập": "Ví dụ: 'Bài 3 bài tập'.",
+            "Từ vựng": "Ví dụ: 'Bộ thủ' hoặc 'Kanji'.",
+            "Truyện đọc": "Ví dụ: tên bài/truyện cậu muốn đọc.",
+        }
+        msg = (
+            f"📚 Doraemon đã xác định cậu muốn học **{requested_content_type}**.\n\n"
+            f"Cậu muốn học bài/chủ đề nào? {examples.get(requested_content_type, '')}"
+        )
+        return {
+            "reply": msg,
+            "model": GEMINI_MODEL,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": msg}],
+            "learning_progress": None,
+        }
 
     # Continue the most recent in-progress lesson for short follow-ups. This
     # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
