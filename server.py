@@ -1185,8 +1185,35 @@ def _select_active_scope(query_text, text_matches, catalog):
 
         named_candidates.append((score, item))
 
-    lesson = None
-    topic = None
+    # Numeric lesson alias support: users naturally say "Bài 3", while
+    # imported catalogs can contain identifiers such as "Bài 3v4".
+    # Resolve the numeric lesson against the catalog ONLY when the user
+    # explicitly names a lesson number, and keep the selected content type.
+    numeric_match = re.search(r"\bbài\s*(\d+)\b", q, flags=re.IGNORECASE)
+    if numeric_match and not named_candidates:
+        lesson_no = numeric_match.group(1)
+        numeric_candidates = []
+        for item in catalog or []:
+            item_type = _normalize_content_type(item.get("content_type"))
+            item_lesson = str(item.get("lesson") or "").strip()
+            if explicit_type and item_type != explicit_type:
+                continue
+            m_item = re.search(r"\bbài\s*(\d+)\b", _clean_scope_value(item_lesson), flags=re.IGNORECASE)
+            if m_item and m_item.group(1) == lesson_no:
+                numeric_candidates.append(item)
+        if numeric_candidates:
+            # Prefer the cleanest canonical-looking lesson name, then the
+            # first catalog item for deterministic behavior.
+            numeric_candidates.sort(key=lambda item: (
+                len(str(item.get("lesson") or "")),
+                str(item.get("lesson") or "").casefold(),
+            ))
+            best = numeric_candidates[0]
+            lesson = str(best.get("lesson") or "").strip() or None
+            topic = None
+            if not explicit_type:
+                explicit_type = _normalize_content_type(best.get("content_type"))
+
     if named_candidates:
         named_candidates.sort(key=lambda x: x[0], reverse=True)
         best_item = named_candidates[0][1]
@@ -1367,6 +1394,41 @@ def _extract_thread_scope(recent_history, catalog):
     return None
 
 
+def _catalog_next_lesson(catalog, content_type, current_lesson):
+    """Return the next lesson by numeric lesson number for the active type."""
+    if not current_lesson:
+        return None
+    ct = _normalize_content_type(content_type) if content_type else None
+    m_cur = re.search(r"\bbài\s*(\d+)\b", _clean_scope_value(current_lesson), flags=re.IGNORECASE)
+    if not m_cur:
+        return None
+    cur_no = int(m_cur.group(1))
+    candidates = []
+    for item in catalog or []:
+        if ct and _normalize_content_type(item.get("content_type")) != ct:
+            continue
+        lesson = str(item.get("lesson") or "").strip()
+        m = re.search(r"\bbài\s*(\d+)\b", _clean_scope_value(lesson), flags=re.IGNORECASE)
+        if not m:
+            continue
+        no = int(m.group(1))
+        if no == cur_no + 1:
+            candidates.append(item)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (
+        len(str(item.get("lesson") or "")),
+        str(item.get("lesson") or "").casefold(),
+    ))
+    item = candidates[0]
+    return {
+        "course": str(item.get("course") or item.get("course_name") or "").strip() or None,
+        "content_type": _normalize_content_type(item.get("content_type")),
+        "lesson": str(item.get("lesson") or "").strip() or None,
+        "topic": str(item.get("topic") or "").strip() or None,
+    }
+
+
 def _is_explicit_thread_switch(text):
     """
     True only when the current user message clearly asks to move to another
@@ -1381,6 +1443,7 @@ def _is_explicit_thread_switch(text):
         "học bài mới", "học bài khác", "học phần khác", "đổi bài",
         "muốn học bài", "muốn học phần", "mình muốn học bài",
         "mình muốn học phần", "bây giờ học bài", "tiếp theo học bài",
+        "học bài tiếp", "học bài tiếp theo", "học tiếp bài", "bài tiếp theo",
     )
     return any(p in low for p in switch_phrases)
 
@@ -3431,6 +3494,18 @@ Câu hỏi của người dùng:
     # "chuyển sang..." request is the explicit exception that allows switching.
     thread_scope = _extract_thread_scope(recent_history, catalog)
     thread_switch_requested = _is_explicit_thread_switch(query_text)
+    next_lesson_scope = None
+    if thread_switch_requested and thread_scope and any(
+        phrase in low for phrase in ("học bài tiếp", "học bài tiếp theo", "học tiếp bài", "bài tiếp theo")
+    ):
+        next_lesson_scope = _catalog_next_lesson(
+            catalog, thread_scope.get("content_type"), thread_scope.get("lesson")
+        )
+        if next_lesson_scope:
+            print(
+                "[CHAT THREAD] next-lesson switch "
+                f"from={thread_scope.get('lesson')!r} to={next_lesson_scope.get('lesson')!r}"
+            )
     if thread_scope:
         print(
             "[CHAT THREAD] "
@@ -3472,6 +3547,9 @@ Câu hỏi của người dùng:
         }
     else:
         requested_scope = _select_active_scope(low, [], catalog)
+
+    if next_lesson_scope:
+        requested_scope = next_lesson_scope.copy()
 
     if forced_plan_scope:
         requested_scope = forced_plan_scope.copy()
@@ -3760,12 +3838,20 @@ Câu hỏi của người dùng:
 
     add_priority_filter(requested_content_type, requested_course, requested_lesson, requested_topic)
     if requested_lesson:
+        # Lesson is a hard retrieval boundary once explicitly identified.
+        # Never relax to content_type-only because that could surface the next
+        # lesson (e.g. Bài 4) when the user asked for Bài 3.
         add_priority_filter(requested_content_type, None, requested_lesson, None)
         add_priority_filter(None, None, requested_lesson, None)
-    if requested_topic:
+        if requested_topic:
+            add_priority_filter(requested_content_type, None, requested_lesson, requested_topic)
+            add_priority_filter(None, None, requested_lesson, requested_topic)
+    elif requested_topic:
         add_priority_filter(requested_content_type, None, None, requested_topic)
         add_priority_filter(None, None, None, requested_topic)
-    if requested_content_type:
+        if requested_content_type:
+            add_priority_filter(requested_content_type, None, None, None)
+    elif requested_content_type:
         add_priority_filter(requested_content_type, None, None, None)
 
     # Remove duplicate filters while preserving priority.
