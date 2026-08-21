@@ -5013,13 +5013,13 @@ def crop_image_from_page(page_png: bytes, box):
     out = io.BytesIO(); crop.save(out, format="JPEG", quality=88, optimize=True)
     return out.getvalue(), crop.size
 
-def _embedded_image_is_meaningful(doc, page, xref, info, data):
+def _lesson_image_is_meaningful(doc, page, xref, info, data):
     """Reject PDF image resources that are masks/backgrounds/blank white assets.
 
     Some educational PDFs contain many internal image XObjects that are not
     visible content (white backgrounds, masks, clipping assets, etc.).  The old
     extractor stored all of them in B2, which made one real table page produce
-    many useless embedded_XX files.
+    many useless unused internal PDF image objects.
     """
     try:
         width = int(info.get("width") or 0)
@@ -5060,8 +5060,14 @@ def _embedded_image_is_meaningful(doc, page, xref, info, data):
         return True
 
 
-def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta):
-    """Extract native images from non-scan PDFs with PyMuPDF."""
+def extract_lesson_images(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta, exclude_boxes=None):
+    """Extract meaningful native lesson images as img_XX.jpg (never embedded_XX.*).
+
+    Native PDF image resources are still used because they preserve the original
+    lesson illustration quality, but they are stored under the normal img_XX.jpg
+    naming convention. On table pages, exclude_boxes contains Vision-detected
+    table regions so table source images are left to the table pipeline.
+    """
     if fitz is None:
         return []
     if not b2_ready():
@@ -5071,6 +5077,7 @@ def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subj
     try:
         page=doc.load_page(page_no-1)
         seen=set()
+        lesson_idx=0
         for idx, img in enumerate(page.get_images(full=True), 1):
             xref=img[0]
             if xref in seen:
@@ -5081,12 +5088,60 @@ def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subj
             ext=info.get("ext","png")
             if not data or len(data)<1000:
                 continue
-            if not _embedded_image_is_meaningful(doc, page, xref, info, data):
-                print(f"[EMBEDDED IMAGE skip] page={page_no} xref={xref} size={info.get('width')}x{info.get('height')}")
+
+            # If this native image lies inside a detected table box, do not
+            # store it here. The table pipeline owns that image as table_XX.jpg.
+            if exclude_boxes:
+                try:
+                    rects = page.get_image_rects(xref) if hasattr(page, "get_image_rects") else []
+                    excluded = False
+                    for rect in rects or []:
+                        if float(rect.width) <= 0 or float(rect.height) <= 0:
+                            continue
+                        rb = [
+                            max(0, min(1000, int(round(1000 * float(rect.y0) / float(page.rect.height))))),
+                            max(0, min(1000, int(round(1000 * float(rect.x0) / float(page.rect.width))))),
+                            max(0, min(1000, int(round(1000 * float(rect.y1) / float(page.rect.height))))),
+                            max(0, min(1000, int(round(1000 * float(rect.x1) / float(page.rect.width))))) ,
+                        ]
+                        for box in exclude_boxes:
+                            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                                continue
+                            ymin, xmin, ymax, xmax = [max(0, min(1000, float(v))) for v in box]
+                            inter_w = max(0.0, min(rb[3], xmax) - max(rb[1], xmin))
+                            inter_h = max(0.0, min(rb[2], ymax) - max(rb[0], ymin))
+                            inter = inter_w * inter_h
+                            img_area = max(1.0, (rb[3]-rb[1]) * (rb[2]-rb[0]))
+                            if inter / img_area >= 0.45:
+                                excluded = True
+                                break
+                        if excluded:
+                            break
+                    if excluded:
+                        print(f"[LESSON IMAGE skip-table] page={page_no} xref={xref}")
+                        continue
+                except Exception as exc:
+                    print(f"[LESSON IMAGE bbox skip] page={page_no} xref={xref}: {type(exc).__name__} {exc}")
+
+            if not _lesson_image_is_meaningful(doc, page, xref, info, data):
+                print(f"[LESSON IMAGE skip] page={page_no} xref={xref} size={info.get('width')}x{info.get('height')}")
                 continue
-            mime={"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png","webp":"image/webp"}.get(ext.lower(), "image/png")
-            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/embedded_{idx:02d}.{ext}"
-            b2_put_bytes(key,data,mime)
+
+            # Normalize every lesson illustration to JPEG. We deliberately do
+            # not create any embedded_XX.* objects.
+            width, height = int(info.get("width") or 0), int(info.get("height") or 0)
+            if Image is not None:
+                try:
+                    im = Image.open(io.BytesIO(data)).convert("RGB")
+                    out = io.BytesIO()
+                    im.save(out, format="JPEG", quality=92, optimize=True)
+                    data = out.getvalue()
+                    width, height = im.size
+                except Exception:
+                    pass
+            lesson_idx += 1
+            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{lesson_idx:02d}.jpg"
+            b2_put_bytes(key,data,"image/jpeg")
             primary=page_meta[0] if page_meta else {}
             conn=db()
             try:
@@ -5095,11 +5150,11 @@ def extract_embedded_images(raw_pdf: bytes, page_no: int, source_file: str, subj
                         (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,width,height)
                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                         (source_file,subject,primary.get("content_type","Từ vựng"),primary.get("lesson"),primary.get("topic"),
-                         page_no,key,b2_url(key),"Embedded PDF image",info.get("width"),info.get("height")))
+                         page_no,key,b2_url(key),"Lesson image",width,height))
                 conn.commit()
             finally:
                 conn.close()
-            stored.append({"key":key,"description":"Embedded PDF image","page":page_no})
+            stored.append({"key":key,"description":"Lesson image","page":page_no,"width":width,"height":height})
     finally:
         doc.close()
     return stored
@@ -5129,9 +5184,9 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
-                embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
-                if embedded:
-                    page_images[page_no] = embedded
+                lesson_images = extract_lesson_images(raw_pdf, page_no, source_file, subject, page_meta)
+                if lesson_images:
+                    page_images[page_no] = lesson_images
                 continue
         else:
             table_page = False
@@ -5174,19 +5229,26 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                                "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
 
         # For table pages, keep EACH ORIGINAL TABLE as its own image and add
-        # one semantic Vision explanation per table to the text that is embedded.
-        # IMPORTANT: native embedded lesson illustrations must be extracted
+        # one semantic Vision explanation per table to the text that is embedded in the RAG chunk.
+        # IMPORTANT: native lesson illustrations must be extracted
         # BEFORE building page_units. V16.6.3 computed lesson_image_keys first
-        # and only then appended embedded images, so the normal text unit got
+        # and only then appended lesson images, so the normal text unit got
         # image_keys=[] even though the images were already stored in B2.
         if table_page:
-            embedded = extract_embedded_images(raw_pdf, page_no, source_file, subject, page_meta)
-            if embedded:
-                for emb in embedded:
-                    emb["image_scope"] = "lesson"
-                stored.extend(embedded)
-
             table_items = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted)
+
+            # Extract only non-table native illustrations as normal lesson images.
+            # Table regions are excluded by their Vision boxes; table images are
+            # created separately by _store_table_source_image below.
+            table_boxes = [item.get("box") for item in table_items if isinstance(item, dict) and isinstance(item.get("box"), (list, tuple))]
+            lesson_images = extract_lesson_images(
+                raw_pdf, page_no, source_file, subject, page_meta, exclude_boxes=table_boxes
+            )
+            if lesson_images:
+                for emb in lesson_images:
+                    emb["image_scope"] = "lesson"
+                stored.extend(lesson_images)
+
             table_parts=[]
             for table_index, item in enumerate(table_items, 1):
                 marker = f"【GIẢI THÍCH BẢNG TRANG {page_no} #{table_index}】"
@@ -5236,8 +5298,8 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                     with conn.cursor() as cur:
                         cur.execute("""SELECT image_key FROM knowledge_images
                             WHERE source_file=%s AND page=%s
-                              AND description='Embedded PDF image'""",
-                            (source_file, page_no))
+                              AND (description='Lesson image' OR image_key LIKE %s)""",
+                            (source_file, page_no, f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_%%"))
                         for row in cur.fetchall() or []:
                             key=str(row[0] or "").strip()
                             if key:
