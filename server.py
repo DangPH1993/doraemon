@@ -1,4 +1,4 @@
-BASELINE_VERSION = "17.2"
+BASELINE_VERSION = "17.3"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v17.2-content-type-routing-fix"
+SERVER_VERSION = "2026-08-21-doraemon-v17.3-content-type-routing-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3291,6 +3291,40 @@ def proxy_chat(
     # PostgreSQL is the durable state; chat history is only the conversational hint.
     recommendation_words = ("học gì", "học gì hôm nay", "gợi ý", "đề xuất", "chọn bài", "nên học")
     wants_recommendation = any(w in low for w in recommendation_words) or ambiguous_study_request
+
+    # Recommendation / "what can you teach?" is a routing turn, not a lesson turn.
+    # Do not let semantic RAG ranking or active lesson state pull arbitrary lesson
+    # text/images into the answer before the learner chooses a content type/lesson.
+    recommendation_only_request = bool(
+        wants_recommendation
+        and not requested_content_type
+        and not requested_course
+        and not requested_lesson
+        and not requested_topic
+        and not forced_plan_scope
+        and not data.action
+        and not _is_correction_followup(query_text)
+    )
+    if recommendation_only_request and not ambiguous_study_request:
+        msg = (
+            "📚 Doraemon có thể đồng hành cùng cậu ở 5 loại nội dung:\n\n"
+            "1. **Giáo trình** – học bài theo đúng giáo trình, giải thích từng phần.\n"
+            "2. **Ngữ pháp** – học các mẫu câu và điểm ngữ pháp.\n"
+            "3. **Bài tập** – làm bài, Doraemon ra đề, gợi ý, chấm và giải chi tiết.\n"
+            "4. **Từ vựng** – học từ vựng theo chủ đề, bao gồm **Kanji** và **Bộ thủ**.\n"
+            "5. **Truyện đọc** – luyện đọc hiểu qua các bài/truyện tiếng Nhật.\n\n"
+            "Cậu muốn học loại nào? Có thể nói luôn tên bài, ví dụ: **Bài 3 giáo trình** hoặc **Bài 3 bài tập** nhé. 😊"
+        )
+        print("[CHAT ROUTING] recommendation-only request: no RAG/images")
+        return {
+            "reply": msg,
+            "model": GEMINI_MODEL,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": msg}],
+            "learning_progress": None,
+        }
+
     active_learning = None
     if not (requested_content_type or requested_course or requested_lesson or requested_topic) and not wants_recommendation:
         for lp in learning:
@@ -3870,10 +3904,12 @@ def proxy_chat(
     # a study direction. This is intentionally enforced here as a hard guard,
     # immediately before image retrieval, so future retrieval changes cannot
     # accidentally re-introduce unrelated images into the clarification turn.
-    if ambiguous_study_request or lesson_intro_request:
+    if ambiguous_study_request or lesson_intro_request or recommendation_only_request:
         rich_images = []
         if ambiguous_study_request:
             print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
+        elif recommendation_only_request:
+            print("[IMAGE SKIP] recommendation-only request: no image retrieval/attachment")
         else:
             print("[IMAGE SKIP] lesson introduction/selection turn: no image retrieval/attachment")
     else:
@@ -3942,7 +3978,7 @@ def proxy_chat(
                 break
 
     image_marker_rule = ""
-    if ambiguous_study_request or lesson_intro_request:
+    if ambiguous_study_request or lesson_intro_request or recommendation_only_request:
         image_orders = []
     if image_orders:
         markers = ", ".join(f"[[IMG_CHUNK_{n}]]" for n in image_orders)
