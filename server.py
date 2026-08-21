@@ -1,4 +1,4 @@
-BASELINE_VERSION = "16.6.3"
+BASELINE_VERSION = "17.1"
 import os
 import ast
 import io
@@ -63,7 +63,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-v16.6.8-no-image-on-ambiguous-or-lesson-intro"
+SERVER_VERSION = "2026-08-21-doraemon-v17.1-teaching-modes"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3940,14 +3940,29 @@ QUY TẮC RIÊNG CHO YÊU CẦU HỌC CHƯA RÕ Ý (BẮT BUỘC):
 """
     else:
         mode_specific_rules = ""
+
+    # Content-type-specific teacher behavior. These rules are intentionally
+    # explicit so Gemini follows a consistent teaching workflow rather than
+    # merely summarizing retrieved material.
     if requested_content_type == "Bài tập":
         mode_specific_rules = """
-QUY TẮC RIÊNG CHO BÀI TẬP (BẮT BUỘC):
-- Nếu tin nhắn hiện tại chứa đáp án của học sinh (ví dụ các số, lựa chọn 1)/2)/3), hãy coi đó là bài nộp đáp án và TỰ KIỂM TRA ngay bằng dữ liệu trong RAG.
-- Không được yêu cầu học sinh tự tính lại nếu nguồn đã có đủ dữ kiện để kiểm tra.
-- Với bài tính tiền/gọi món: đọc đúng món và giá từ CHUNK + ẢNH của đúng khách/order, tự cộng và đối chiếu với đáp án học sinh.
-- Trả rõ từng câu: ĐÚNG/SẠI, đáp án đúng và phép tính ngắn gọn; sau đó mới giải thích lỗi nếu sai.
-- Chỉ nói "cậu tự tính" khi học sinh thực sự chưa đưa đáp án hoặc nguồn không đủ dữ kiện để chấm.
+QUY TẮC RIÊNG CHO BÀI TẬP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
+- Nếu đây là lượt RA BÀI / bắt đầu một bài tập và học sinh chưa nộp đáp án: hãy đưa ra đề bài rõ ràng, đúng dữ liệu RAG; ngay bên dưới phải có mục **💡 Gợi ý cách làm**. Gợi ý chỉ hướng dẫn phương pháp/định hướng, KHÔNG nói luôn đáp án.
+- Nếu học sinh đã gửi đáp án hoặc lời giải: coi đó là BÀI NỘP. Hãy tự chấm bằng RAG và ảnh đúng chunk, nêu rõ ĐÚNG/SAI cho từng câu/ý, đáp án đúng (nếu có), rồi giải thích cách giải cụ thể, từng bước, để học sinh hiểu vì sao.
+- Với bài tính tiền/gọi món: đọc đúng món và giá từ CHUNK + ẢNH của đúng khách/order; thực hiện phép tính đầy đủ; không suy đoán giá hoặc món không có trong nguồn.
+- Nếu học sinh sai: chỉ ra chính xác bước sai, giải thích lỗi và làm mẫu lại từ đầu/đến bước cần thiết. Nếu đúng: vẫn giải thích vì sao đúng, không chỉ nói “đúng”.
+- Không yêu cầu học sinh tự kiểm tra lại khi nguồn đã đủ dữ kiện để chấm.
+- Sau khi giải xong, có thể đưa câu tiếp theo hoặc bài luyện tương tự ngắn nếu phù hợp, nhưng không làm mất trọng tâm bài đang học.
+"""
+    elif requested_content_type == "Giáo trình":
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
+- Khi học sinh yêu cầu học một bài/lesson của Giáo trình, trước tiên phải có **📚 Mở đầu bài học**: giới thiệu ngắn gọn mục đích của bài, bài này giúp học sinh làm được gì và các kiến thức/chủ điểm chính sẽ học.
+- Sau phần mở đầu, dạy **từng phần của giáo trình theo đúng thứ tự nguồn RAG**. Mỗi phần phải được giải thích chi tiết, dễ hiểu, có ví dụ từ chính nguồn khi nguồn có, và liên hệ với mục tiêu của bài. Không chỉ tóm tắt toàn bài trong một đoạn ngắn.
+- Khi có nhiều mục/điểm kiến thức, trình bày tuần tự: giải thích → ví dụ → lưu ý/dễ nhầm (nếu nguồn hỗ trợ) → chuyển sang mục tiếp theo.
+- Cuối bài phải có **📝 Tổng kết**: tổng hợp các từ vựng mới và ngữ pháp/cấu trúc mới xuất hiện trong bài, bám theo RAG CONTEXT; không tự bịa danh sách ngoài nguồn.
+- Sau phần tổng kết, nếu nguồn cho phép/đủ dữ kiện, thêm **✏️ Bài tập bổ sung** để học sinh luyện lại kiến thức vừa học. Bài tập phải bám nội dung của bài và không tự tạo kiến thức trái nguồn.
+- Nếu học sinh chỉ hỏi một chi tiết nhỏ của giáo trình, không cần ép toàn bộ cấu trúc trên; chỉ áp dụng đầy đủ khi học sinh yêu cầu học/trình bày cả bài hoặc một phần bài đủ lớn.
 """
     elif any(
         _normalize_chunk_text_for_match(c.get("metadata",{}).get("content_type")) == "giáo trình"
@@ -4007,11 +4022,21 @@ TIN NHẮN HIỆN TẠI:
 {query_text}"""
 
     gen_started = time.perf_counter()
+    # Use deeper reasoning only for the teacher-like content types requested
+    # by the product design. Other content stays on the baseline low level.
+    response_thinking_level = (
+        "medium" if requested_content_type in {"Bài tập", "Giáo trình"}
+        else GEMINI_THINKING_LEVEL
+    )
+    print(
+        f"[CHAT THINKING] request={request_id} content_type={requested_content_type!r} "
+        f"level={response_thinking_level!r}"
+    )
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL)
+            thinking_config=types.ThinkingConfig(thinking_level=response_thinking_level)
         ),
     )
     reply = response.text or ""
