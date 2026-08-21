@@ -2289,6 +2289,38 @@ def _parse_plan_request(text):
     return {"goal":goal,"target_date":target_date,"units_per_day":units_per_day,"days_per_unit":days_per_unit,"scope":scope,"content_type":content_type,"unit_label":unit_label}
 
 
+def _normalize_chat_history(chat_history, max_messages=20):
+    """Normalize the current chatbox history into at most max_messages messages.
+
+    The client supplies the history of the CURRENT open chatbox. This is the
+    authoritative conversational context for routing multi-turn flows such as
+    Study Plan creation. max_messages=20 means up to 10 user/model exchanges.
+    """
+    recent = []
+    for item in (chat_history or [])[-max_messages:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        parts = item.get("parts")
+        msg_text = ""
+        if isinstance(parts, list):
+            pieces = []
+            for part in parts:
+                if isinstance(part, dict) and part.get("text"):
+                    pieces.append(str(part.get("text")))
+            msg_text = " ".join(pieces).strip()
+        elif item.get("text"):
+            msg_text = str(item.get("text")).strip()
+        elif item.get("content"):
+            msg_text = str(item.get("content")).strip()
+        if role in {"user", "model", "assistant"} and msg_text:
+            recent.append({
+                "role": "model" if role == "assistant" else role,
+                "text": msg_text[-1200:],
+            })
+    return recent
+
+
 def _infer_plan_content_type_from_history(recent_history):
     """Infer a pending plan subtype from the most recent explicit user request.
 
@@ -2804,6 +2836,14 @@ def proxy_chat(
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
 
+    # The current open chatbox supplies the authoritative conversational context.
+    # Keep the latest 20 messages (= up to 10 user/model exchanges) available
+    # BEFORE any Study Plan routing so a follow-up like "học trong 5 ngày" keeps
+    # the subtype from the earlier message in the SAME chatbox.
+    plan_recent_history = _normalize_chat_history(data.chat_history, max_messages=20)
+    if plan_recent_history:
+        print(f"[CHAT HISTORY PLAN] messages={len(plan_recent_history)}")
+
     # Structured UI actions from the Study Plan confirmation buttons.
     # These actions bypass text intent parsing and RAG completely.
     ui_action_raw = (str(data.action or "").strip() or None)
@@ -2956,9 +2996,17 @@ def proxy_chat(
     # target sentence (e.g. "mỗi ngày 10 từ bộ thủ") from being mistaken for a lesson.
     pending = _get_pending_plan_request(user["id"]) if profile.get("learning_mode") == "planned" else None
     if pending and pending.get('pending_plan_created_at') and not data.action:
-        pending_type = pending.get('pending_plan_content_type') or _infer_plan_content_type_from_history(recent_history)
+        pending_db_type = pending.get('pending_plan_content_type')
+        history_type = _infer_plan_content_type_from_history(plan_recent_history)
+        current_type = _plan_content_type_from_text(data.text)
+        pending_type = current_type or history_type or pending_db_type or 'Giáo trình'
         pending_scope = pending.get('pending_plan_scope') or ''
         probe = _parse_plan_request(data.text)
+        print(
+            f"[STUDY PLAN CONTEXT] current_type={current_type!r} "
+            f"history_type={history_type!r} db_pending_type={pending_db_type!r} "
+            f"resolved_type={pending_type!r}"
+        )
         has_target = bool(probe.get('target_date') or probe.get('units_per_day') or probe.get('days_per_unit'))
         if has_target:
             if not pending_type:
@@ -3094,7 +3142,7 @@ def proxy_chat(
             req_probe = _parse_plan_request(data.text)
             has_target = bool(req_probe.get('target_date') or req_probe.get('units_per_day') or req_probe.get('days_per_unit'))
             if not has_target:
-                requested_type = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or 'Giáo trình'
+                requested_type = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req_probe.get('content_type') or 'Giáo trình'
                 scope_hint = req_probe.get('scope') or ''
                 _set_pending_plan_request(user["id"], requested_type, scope_hint)
                 msg=("Được nhé! 🤖 Doraemon sẽ tạo một lộ trình mới riêng cho cậu.\n\n"
@@ -3118,7 +3166,7 @@ def proxy_chat(
                 if not has_target:
                     if profile.get("learning_mode") != "planned":
                         _set_learning_profile(user["id"], "planned", True)
-                    req_type = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
+                    req_type = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req_probe.get('content_type') or 'Giáo trình'
                     print(f"[STUDY PLAN] create request lock content_type={req_type!r} source=current/history")
                     _set_pending_plan_request(user["id"], req_type, req_probe.get('scope') or '')
                     msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
@@ -3131,7 +3179,7 @@ def proxy_chat(
             if req.get('target_date') or req.get('units_per_day') or req.get('days_per_unit'):
                 if profile.get("learning_mode") != "planned":
                     _set_learning_profile(user["id"], "planned", True)
-                req['content_type'] = _plan_content_type_from_text(data.text) or req.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
+                req['content_type'] = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req.get('content_type') or 'Giáo trình'
                 print(f"[STUDY PLAN] concrete target content_type={req['content_type']!r} source=current/history")
                 pid,preview=_build_plan_preview(user["id"],req)
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
@@ -3206,28 +3254,8 @@ def proxy_chat(
     #
     # We deliberately keep more than the old 4-message window because a short
     # correction often refers to something said several turns earlier.
-    recent_history = []
-    for item in (data.chat_history or [])[-20:]:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        parts = item.get("parts")
-        text = ""
-        if isinstance(parts, list):
-            texts = []
-            for part in parts:
-                if isinstance(part, dict) and part.get("text"):
-                    texts.append(str(part.get("text")))
-            text = " ".join(texts).strip()
-        elif item.get("text"):
-            text = str(item.get("text")).strip()
-        elif item.get("content"):
-            text = str(item.get("content")).strip()
-        if role in {"user", "model", "assistant"} and text:
-            role = "model" if role == "assistant" else role
-            # Per-message cap prevents an old long answer from dominating the
-            # current prompt while retaining enough detail for references.
-            recent_history.append({"role": role, "text": text[-1200:]})
+    # Reuse the normalized CURRENT chatbox history that was prepared before plan routing.
+    recent_history = plan_recent_history
 
     # A single compact text view is used for routing/embedding. The full
     # normalized 20-message window is still available to Gemini below.
