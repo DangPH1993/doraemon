@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.2-knowledge-cache-lookup-audit"
+BASELINE_VERSION = "19.3-knowledge-cache-db-migration"
 import os
 import ast
 import io
@@ -79,7 +79,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.2-knowledge-cache-lookup-audit")
+print("[DORAEMON SERVER FINGERPRINT] 19.3-knowledge-cache-db-migration")
 SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -211,6 +211,7 @@ def init_db():
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS image_url TEXT;",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS vision_json JSONB DEFAULT '{}'::jsonb;",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE;",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS source_file VARCHAR(500) DEFAULT '';",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS content_type VARCHAR(30);",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);",
@@ -300,6 +301,21 @@ def init_db():
             cur.execute("UPDATE learning_progress SET subject='' WHERE subject IS NULL;")
             cur.execute("UPDATE learning_progress SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
             cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
+            # Backfill cache source_file from its asset when migrating intermediate schemas that
+            # created knowledge_lesson_cache without source_file. This lets legacy cache rows
+            # participate in the new runtime lookup without requiring PDF re-upload.
+            try:
+                cur.execute("""
+                    UPDATE knowledge_lesson_cache kc
+                    SET source_file = ka.source_file
+                    FROM knowledge_assets ka
+                    WHERE kc.asset_id = ka.id
+                      AND (kc.source_file IS NULL OR TRIM(kc.source_file) = '')
+                """)
+            except Exception as exc:
+                print("[KNOWLEDGE CACHE MIGRATION] source_file backfill skipped:", type(exc).__name__, str(exc))
+            cur.execute("UPDATE knowledge_lesson_cache SET source_file='' WHERE source_file IS NULL;")
+            cur.execute("UPDATE knowledge_lesson_cache SET status='READY' WHERE status IS NULL OR TRIM(status)='';")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_lesson_cache_scope ON knowledge_lesson_cache(content_type,lesson,topic,status);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_vision_cache_scope ON knowledge_vision_cache(source_file,lesson,topic,page);")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user
