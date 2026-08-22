@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.7-canonical-lesson-nocontent-fastpath"
+BASELINE_VERSION = "19.8-casual-minimal-fastpath"
 import os
 import ast
 import io
@@ -3625,6 +3625,39 @@ def _chat_model_for_content(content_type: Optional[str], provider: Optional[str]
     return GEMINI_MODEL
 
 
+
+def _is_ultra_simple_casual(text: str) -> bool:
+    """Detect very low-risk social utterances that do not need an LLM call."""
+    s = re.sub(r"\s+", " ", (text or "").strip().casefold())
+    if not s or len(s) > 40:
+        return False
+    exact = {
+        "hehe", "haha", "hihi", "huhu", "ừ", "uh", "ok", "okay", "oke",
+        "vui ghê", "vui quá", "cười xỉu", "mệt quá", "mệt ghê", "chán quá",
+        "hic", "hix", "ôi", "ôi trời", "trời ơi", "hay ghê", "được đó",
+        "cảm ơn", "cám ơn", "thanks", "thank you", "nice", "yay",
+    }
+    if s in exact:
+        return True
+    return bool(re.fullmatch(r"(?:ha|he|hi|hihi|haha|hehe|huhu){1,6}", s))
+
+def _local_casual_reply(text: str) -> str:
+    """Tiny deterministic replies for ultra-simple casual chat; zero LLM tokens."""
+    s = re.sub(r"\s+", " ", (text or "").strip().casefold())
+    if s in {"cảm ơn", "cám ơn", "thanks", "thank you"}:
+        return "Không có gì nhé 😄"
+    if s in {"mệt quá", "mệt ghê", "chán quá", "hic", "hix"}:
+        return "Ừm, nghỉ một chút nha 🤖💙"
+    if s in {"vui ghê", "vui quá", "hay ghê", "được đó", "yay", "nice", "cười xỉu"}:
+        return "Hehe 😄"
+    if s in {"ừ", "uh", "ok", "okay", "oke"}:
+        return "Ừ nha 😄"
+    if s in {"hehe", "haha", "hihi"} or re.fullmatch(r"(?:ha|he|hi|hihi|haha|hehe|huhu){1,6}", s):
+        return "Hehe 😄"
+    if s in {"ôi", "ôi trời", "trời ơi"}:
+        return "Hehe, Doraemon đây 🤖"
+    return "Ừ nha 😄"
+
 def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float):
     """
     Provider-neutral chat adapter.
@@ -3638,7 +3671,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     provider = LLM_PROVIDER
     thinking_level = (
         "medium" if content_type == "Bài tập"
-        else "low"
+        else ("minimal" if content_type is None else "low")
     )
 
     if provider == "openai":
@@ -4289,6 +4322,21 @@ Câu hỏi của người dùng:
         and not data.action
         and not ambiguous_study_request
     ):
+        if _is_ultra_simple_casual(query_text):
+            reply = _local_casual_reply(query_text)
+            print(
+                f"[CHAT ROUTING] ultra-simple casual fast-path: no Gemini "
+                f"tokens request={request_id} text={query_text!r}"
+            )
+            return {
+                "reply": reply,
+                "model": "local-casual-fastpath",
+                "sources": [],
+                "images": [],
+                "content_blocks": [{"type": "text", "text": reply}],
+                "learning_progress": None,
+            }
+
         casual_history = recent_history[-4:]
         casual_context_parts = []
         for h in casual_history:
