@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.6.3-study-session-gate-final"
+BASELINE_VERSION = "19.0-knowledge-cache-runtime-fastpath"
 import os
 import ast
 import io
@@ -11,6 +11,7 @@ from typing import Optional
 import json
 import base64
 import calendar
+import hashlib
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -78,8 +79,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 18.6.3-study-session-gate-final")
-SERVER_VERSION = "2026-08-22-study-session-gate-v3-FINAL"
+print("[DORAEMON SERVER FINGERPRINT] 19.0-knowledge-cache-runtime-fastpath")
+SERVER_VERSION = "2026-08-22-knowledge-cache-runtime-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -172,6 +173,54 @@ def init_db():
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, content_hash VARCHAR(128) NOT NULL,
+                subject VARCHAR(255) NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'READY', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(source_file, content_hash)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_vision_cache (
+                id BIGSERIAL PRIMARY KEY, asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+                source_file VARCHAR(500) NOT NULL, content_type VARCHAR(30), lesson VARCHAR(255), topic VARCHAR(255),
+                page INTEGER, chunk_index INTEGER, image_key TEXT NOT NULL, image_url TEXT,
+                vision_json JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(source_file, image_key)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_lesson_cache (
+                id BIGSERIAL PRIMARY KEY, asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+                source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL, content_type VARCHAR(30) NOT NULL,
+                lesson VARCHAR(255) NOT NULL, topic VARCHAR(255), status VARCHAR(20) NOT NULL DEFAULT 'READY',
+                cache_json JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(source_file, content_type, lesson, topic)
+            );""")
+            # Safe migrations for any cache tables created by intermediate builds.
+            for sql in [
+                "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS content_hash VARCHAR(128);",
+                "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
+                "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS page_count INTEGER DEFAULT 0;",
+                "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'READY';",
+                "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE;",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS content_type VARCHAR(30);",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS topic VARCHAR(255);",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS page INTEGER;",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS chunk_index INTEGER;",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS image_url TEXT;",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS vision_json JSONB DEFAULT '{}'::jsonb;",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE;",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS content_type VARCHAR(30);",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS lesson VARCHAR(255);",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS topic VARCHAR(255);",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'READY';",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS cache_json JSONB DEFAULT '{}'::jsonb;",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();",
+            ]:
+                cur.execute(sql)
+
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plans (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 version INTEGER NOT NULL DEFAULT 1, status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
@@ -244,12 +293,15 @@ def init_db():
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS meaning TEXT;",
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS associated_text TEXT;",
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS bbox TEXT;",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);",
             ]:
                 cur.execute(sql)
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
             cur.execute("UPDATE learning_progress SET subject='' WHERE subject IS NULL;")
             cur.execute("UPDATE learning_progress SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
             cur.execute("UPDATE knowledge_documents SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_lesson_cache_scope ON knowledge_lesson_cache(content_type,lesson,topic,status);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_vision_cache_scope ON knowledge_vision_cache(source_file,lesson,topic,page);")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_user
                            ON learning_progress(user_id,last_studied_at DESC);""")
             cur.execute("""CREATE INDEX IF NOT EXISTS idx_learning_progress_content
@@ -2474,6 +2526,170 @@ def build_rich_content_blocks(reply: str, image_items: list) -> list:
     return blocks
 
 
+def _cache_jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _cache_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cache_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
+    """Persist the complete upload-time knowledge asset and reusable vision cache."""
+    grouped = {}
+    for rec in text_records:
+        md = rec.get("metadata") or {}
+        key = (
+            _normalize_content_type(md.get("content_type")),
+            str(md.get("lesson") or "").strip(),
+            str(md.get("topic") or "").strip() or None,
+        )
+        if not key[1]:
+            continue
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject})
+        grouped[key]["sections"].append({
+            "chunk_index": int(md.get("chunk_index") or 0),
+            "page": md.get("page"),
+            "content_unit_id": md.get("content_unit_id"),
+            "text": str(rec.get("text") or ""),
+            "image_keys": list(rec.get("image_keys") or []),
+            "metadata": {
+                "lesson_pages": md.get("lesson_pages"), "topic_pages": md.get("topic_pages"),
+                "question_pages": md.get("question_pages"), "answer_pages": md.get("answer_pages"),
+            },
+        })
+    for img in image_records:
+        md = img.get("metadata") or {}
+        key = (
+            _normalize_content_type(md.get("content_type")),
+            str(md.get("lesson") or "").strip(),
+            str(md.get("topic") or "").strip() or None,
+        )
+        if not key[1]:
+            continue
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject})
+        vision = {k:v for k,v in md.items() if k not in {"image_key","image_url"}}
+        grouped[key]["images"].append({
+            "image_key": md.get("image_key"), "image_url": md.get("image_url"),
+            "page": md.get("page"), "chunk_index": md.get("chunk_index"),
+            "vision": _cache_jsonable(vision),
+        })
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM knowledge_assets WHERE source_file=%s AND content_hash=%s ORDER BY id DESC LIMIT 1", (source_file, source_hash))
+            existing_asset = cur.fetchone()
+            if existing_asset:
+                asset_id = existing_asset["id"]
+                cur.execute("UPDATE knowledge_assets SET subject=%s,page_count=%s,status='READY',updated_at=NOW() WHERE id=%s", (subject, int(page_count), asset_id))
+            else:
+                cur.execute("""INSERT INTO knowledge_assets(source_file,content_hash,subject,page_count,status,updated_at)
+                               VALUES(%s,%s,%s,%s,'READY',NOW()) RETURNING id""", (source_file, source_hash, subject, int(page_count)))
+                asset_id = cur.fetchone()["id"]
+            cur.execute("DELETE FROM knowledge_vision_cache WHERE source_file=%s", (source_file,))
+            cur.execute("DELETE FROM knowledge_lesson_cache WHERE source_file=%s", (source_file,))
+            for key, payload in grouped.items():
+                ct, lesson, topic = key
+                payload["sections"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
+                payload["images"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
+                # Tiny immutable overview for the runtime prompt; full source remains in sections.
+                overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
+                package = {
+                    "version": 1,
+                    "source_file": source_file,
+                    "content_hash": source_hash,
+                    "subject": subject,
+                    "content_type": ct,
+                    "lesson": lesson,
+                    "topic": topic,
+                    "overview": overview,
+                    "sections": payload["sections"],
+                    "images": payload["images"],
+                }
+                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
+                    (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                for img in payload["images"]:
+                    cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                        (asset_id,source_file,ct,lesson,topic,img.get("page"),img.get("chunk_index"),img.get("image_key"),img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"[KNOWLEDGE CACHE READY] source={source_file!r} lessons={len(grouped)} images={len(image_records)} hash={source_hash[:12]}...")
+    return len(grouped)
+
+
+def _load_runtime_lesson_cache(content_type, lesson, topic=None):
+    if not lesson:
+        return None
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if topic:
+                cur.execute("""SELECT cache_json FROM knowledge_lesson_cache\n                               WHERE status='READY' AND content_type=%s AND lower(lesson)=lower(%s)\n                                 AND lower(coalesce(topic,''))=lower(%s)\n                               ORDER BY updated_at DESC LIMIT 1""", (content_type, lesson, topic))
+            else:
+                cur.execute("""SELECT cache_json FROM knowledge_lesson_cache\n                               WHERE status='READY' AND content_type=%s AND lower(lesson)=lower(%s)\n                               ORDER BY updated_at DESC LIMIT 1""", (content_type, lesson))
+            row = cur.fetchone()
+            return dict(row["cache_json"]) if row and row.get("cache_json") else None
+    except Exception as exc:
+        print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
+        return None
+    finally:
+        conn.close()
+
+
+def _select_runtime_cache_sections(cache, query_text, *, max_sections=2, initial=False):
+    sections = list((cache or {}).get("sections") or [])
+    if not sections:
+        return []
+    if initial:
+        return sections[:max_sections]
+    q = _clean_scope_value(query_text)
+    tokens = [t for t in re.findall(r"[\wÀ-ỹ一-龥ぁ-んァ-ンー]+", q) if len(t) >= 2]
+    scored=[]
+    for idx, sec in enumerate(sections):
+        text=_clean_scope_value(sec.get("text"))
+        score=0
+        for tok in tokens:
+            if tok in text:
+                score += 3 if len(tok) >= 4 else 1
+        # Keep adjacent structure stable so a selected section brings its immediate context.
+        if score:
+            score += max(0, 2 - idx*0.05)
+        scored.append((score, idx, sec))
+    scored.sort(key=lambda x:(x[0], -x[1]), reverse=True)
+    chosen=[x[2] for x in scored[:max_sections] if x[0] > 0]
+    if not chosen:
+        chosen=sections[:max_sections]
+    chosen.sort(key=lambda x:(int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
+    return chosen
+
+
+def _runtime_cache_images(cache, selected_sections):
+    images_by_key={str(x.get("image_key")):x for x in (cache or {}).get("images",[]) if x.get("image_key")}
+    out=[]
+    seen=set()
+    for order, sec in enumerate(selected_sections):
+        for key in sec.get("image_keys") or []:
+            key=str(key).strip()
+            if not key or key in seen or key not in images_by_key:
+                continue
+            item=images_by_key[key]
+            vision=item.get("vision") or {}
+            out.append({
+                "key": key, "url": item.get("image_url") or b2_url(key),
+                "term": vision.get("term", ""), "reading": vision.get("reading", ""),
+                "meaning": vision.get("meaning", ""), "page": item.get("page"),
+                "_chunk_order": order,
+                "content_type": (cache or {}).get("content_type"),
+                "lesson": (cache or {}).get("lesson"), "topic": (cache or {}).get("topic"),
+            })
+            seen.add(key)
+    return out
+
+
 _GREETING_EXACT = {
     "chào", "chào bạn", "chào cậu", "chào doraemon",
     "xin chào", "xin chào bạn", "xin chào doraemon",
@@ -2483,24 +2699,23 @@ _GREETING_EXACT = {
 }
 
 
-def _get_study_session(user_id):
-    """Return the persisted ACTIVE study session, if any.
-
-    This state is the sole authority for opening the expensive study stack
-    (embedding -> Pinecone -> RAG -> images). A lesson mentioned in chat history
-    or learning_progress is never enough by itself.
-    """
+def _get_study_session(user_id, chatbox_id=None):
+    """Return the persisted ACTIVE study session, scoped to the current chatbox."""
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT study_session_active,study_session_content_type,study_session_course,
                        study_session_lesson,study_session_topic,study_session_started_at,
-                       study_end_prompt_pending
+                       study_end_prompt_pending,study_session_chatbox_id
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
             if not row or not row.get("study_session_active"):
+                return None
+            stored_chatbox = str(row.get("study_session_chatbox_id") or "").strip() or None
+            requested_chatbox = str(chatbox_id or "").strip() or None
+            if requested_chatbox and stored_chatbox and stored_chatbox != requested_chatbox:
                 return None
             return {
                 "active": True,
@@ -2510,13 +2725,14 @@ def _get_study_session(user_id):
                 "topic": str(row.get("study_session_topic") or "").strip() or None,
                 "started_at": row.get("study_session_started_at"),
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
+                "chatbox_id": stored_chatbox,
             }
     finally:
         conn.close()
 
 
-def _start_study_session(user_id, scope):
-    """Persist an explicitly confirmed lesson as the only active RAG scope."""
+def _start_study_session(user_id, scope, chatbox_id=None):
+    """Persist an explicitly confirmed lesson as the only active scope for this chatbox."""
     scope = scope or {}
     lesson = str(scope.get("lesson") or "").strip()
     if not lesson:
@@ -2524,6 +2740,7 @@ def _start_study_session(user_id, scope):
     content_type = _normalize_content_type(scope.get("content_type")) or None
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
     topic = str(scope.get("topic") or "").strip() or None
+    chatbox = str(chatbox_id or "").strip() or None
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -2531,22 +2748,36 @@ def _start_study_session(user_id, scope):
                 INSERT INTO user_learning_state(
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
-                    study_session_lesson,study_session_topic,study_session_started_at,
+                    study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
                     study_end_prompt_pending,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,NOW(),FALSE,NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
                     study_session_course=%s,
                     study_session_lesson=%s,
                     study_session_topic=%s,
+                    study_session_chatbox_id=%s,
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
             """, (
-                user_id,content_type,course,lesson,topic,
-                content_type,course,lesson,topic
+                user_id,content_type,course,lesson,topic,chatbox,
+                content_type,course,lesson,topic,chatbox
             ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _finish_study_session(user_id):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE user_learning_state
+                           SET study_session_active=FALSE, study_end_prompt_pending=FALSE,
+                               study_session_chatbox_id=NULL, updated_at=NOW()
+                           WHERE user_id=%s""", (user_id,))
         conn.commit()
     finally:
         conn.close()
@@ -3317,8 +3548,8 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     """
     provider = LLM_PROVIDER
     thinking_level = (
-        "medium" if content_type in {"Bài tập", "Giáo trình"}
-        else GEMINI_THINKING_LEVEL
+        "medium" if content_type == "Bài tập"
+        else "low"
     )
 
     if provider == "openai":
@@ -3332,7 +3563,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         print(
             f"[CHAT THINKING] request={request_id} provider='openai' "
             f"content_type={content_type!r} model={model!r} "
-            f"reasoning={OPENAI_REASONING_MEDIUM if content_type in {'Bài tập','Giáo trình'} else 'none'!r}"
+            f"reasoning={OPENAI_REASONING_MEDIUM if content_type == 'Bài tập' else 'none'!r}"
         )
         kwargs = {
             "model": model,
@@ -3345,7 +3576,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         }
         if model.startswith("gpt-5"):
             kwargs["reasoning"] = {
-                "effort": OPENAI_REASONING_MEDIUM if content_type in {"Bài tập", "Giáo trình"} else "none"
+                "effort": OPENAI_REASONING_MEDIUM if content_type == "Bài tập" else "none"
             }
         response = openai_client.responses.create(**kwargs)
         reply = getattr(response, "output_text", "") or ""
@@ -3415,7 +3646,15 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
-    study_session = _get_study_session(user["id"])
+    if data.chatbox_new and data.chatbox_id:
+        old_session = _get_study_session(user["id"], None)
+        if old_session and old_session.get("chatbox_id") and old_session.get("chatbox_id") != str(data.chatbox_id).strip():
+            print(f"[CHATBOX RESET] new_chatbox=1 old_chatbox={old_session.get('chatbox_id')!r} -> closing previous lesson={old_session.get('lesson')!r}")
+            _finish_study_session(user["id"])
+        elif old_session and not old_session.get("chatbox_id"):
+            print(f"[CHATBOX RESET] new_chatbox=1 legacy session -> closing previous lesson={old_session.get('lesson')!r}")
+            _finish_study_session(user["id"])
+    study_session = _get_study_session(user["id"], data.chatbox_id)
 
     # Safe default before routing is computed. Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
@@ -3477,8 +3716,8 @@ def proxy_chat(
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             lesson_confirmed_scope = decoded
-            _start_study_session(user["id"], lesson_confirmed_scope)
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
             print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}; study_session=ACTIVE")
 
     plan_start_action = None
@@ -3512,8 +3751,8 @@ def proxy_chat(
             forced_lesson = str(planned_start_item.get("lesson") or "").strip()
             print(f"[STUDY PLAN] today_yes user={user['id']} plan={active_plan.get('id') if active_plan else None} lesson={forced_lesson!r} content_type={forced_content_type!r}")
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
 
         elif ui_action == "plan_today_no":
             # The selected plan is identified by action suffix: plan_today_no:<plan_id>.
@@ -3569,8 +3808,8 @@ def proxy_chat(
             msg = f"🤖 Được nhé! Mình cùng học **{forced_lesson}** theo lộ trình nào.\n"
             # Do not return here: continue into the existing RAG path, but force the exact plan scope.
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
         elif ui_action == "plan_start_cancel":
             msg="Được nhé! 🤖 Khi nào cậu muốn bắt đầu bài đầu tiên theo lộ trình, chỉ cần nói với Doraemon."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
@@ -4456,12 +4695,28 @@ Tin nhắn hiện tại:
         _set_study_end_prompt_pending(user["id"], False)
         study_session["end_prompt_pending"] = False
 
+    runtime_lesson_cache = None
+    runtime_cache_hit = False
+    runtime_cache_initial = bool(lesson_confirmed_scope or forced_plan_scope)
+    if study_retrieval_allowed and requested_lesson:
+        runtime_lesson_cache = _load_runtime_lesson_cache(
+            requested_content_type or "Giáo trình", requested_lesson, requested_topic
+        )
+        runtime_cache_hit = bool(runtime_lesson_cache)
+        if runtime_cache_hit:
+            print(f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}")
+
     if not study_retrieval_allowed:
         print(
             "[CHAT ROUTING] study hard-gate: NOT CONFIRMED -> "
             "no embedding/Pinecone/RAG/images"
         )
-        # Keep downstream code compatible: empty retrieval, no image payloads.
+        query_vector = None
+        result = type("_EmptyResult", (), {"matches": []})()
+        rich_images = []
+        perf_embed = time.perf_counter()
+    elif runtime_cache_hit:
+        print("[RAG BYPASS] upload-time knowledge cache is authoritative; skip embedding/Pinecone")
         query_vector = None
         result = type("_EmptyResult", (), {"matches": []})()
         rich_images = []
@@ -4873,7 +5128,30 @@ Tin nhắn hiện tại:
     # Therefore we must use its text AND its image together.
     text_chunks = []
     seen_chunk_keys = set()
-    if not study_retrieval_allowed:
+    cache_selected_sections = []
+    if runtime_cache_hit:
+        cache_selected_sections = _select_runtime_cache_sections(
+            runtime_lesson_cache, query_text, max_sections=2, initial=runtime_cache_initial
+        )
+        for sec in cache_selected_sections:
+            md = {
+                "record_type": "text",
+                "text": str(sec.get("text") or ""),
+                "course": runtime_lesson_cache.get("subject"),
+                "subject": runtime_lesson_cache.get("subject"),
+                "content_type": runtime_lesson_cache.get("content_type"),
+                "source_file": runtime_lesson_cache.get("source_file"),
+                "page": sec.get("page"),
+                "chunk_index": sec.get("chunk_index"),
+                "content_unit_id": sec.get("content_unit_id"),
+                "lesson": runtime_lesson_cache.get("lesson"),
+                "topic": runtime_lesson_cache.get("topic"),
+                "image_keys": json.dumps(sec.get("image_keys") or [], ensure_ascii=False),
+            }
+            text_chunks.append({"text": md["text"], "metadata": md})
+        rich_images = _runtime_cache_images(runtime_lesson_cache, cache_selected_sections)
+        print(f"[KNOWLEDGE CACHE CONTEXT] selected_sections={len(cache_selected_sections)} images_ui={len(rich_images)}")
+    if not study_retrieval_allowed or runtime_cache_hit:
         result.matches = []
     exercise_scope = requested_content_type == "Bài tập" and (requested_lesson or requested_topic)
 
@@ -4955,7 +5233,9 @@ Tin nhắn hiện tại:
     # a study direction. This is intentionally enforced here as a hard guard,
     # immediately before image retrieval, so future retrieval changes cannot
     # accidentally re-introduce unrelated images into the clarification turn.
-    if ambiguous_study_request or lesson_intro_request or recommendation_only_request or exercise_suggestion_only_request:
+    if runtime_cache_hit:
+        print(f"[IMAGE CACHE] reused={len(rich_images)} cached images; not sent to Gemini")
+    elif ambiguous_study_request or lesson_intro_request or recommendation_only_request or exercise_suggestion_only_request:
         rich_images = []
         if ambiguous_study_request:
             print("[IMAGE SKIP] ambiguous study request: no image retrieval/attachment")
@@ -5043,7 +5323,10 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
+    if runtime_cache_hit and runtime_cache_initial:
+        prompt_history = []
+    else:
+        prompt_history = (recent_history[-4:] if runtime_cache_hit else (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:])) if recent_history else []
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
@@ -5188,6 +5471,46 @@ RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 l�
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
+
+    if runtime_cache_hit:
+        cache_context = []
+        for order, sec in enumerate(cache_selected_sections):
+            label = (
+                f"[SECTION_{order}] [Bài: {runtime_lesson_cache.get('lesson','')} | "
+                f"Chủ đề: {runtime_lesson_cache.get('topic','')} | Trang: {sec.get('page','')}]"
+            )
+            cache_context.append(label + "\n" + str(sec.get("text") or ""))
+        selected_keys = {str(k).strip() for sec in cache_selected_sections for k in (sec.get("image_keys") or []) if str(k).strip()}
+        selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if str(x.get("image_key") or "").strip() in selected_keys]
+        vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:2600]
+        marker_rule = ""
+        if rich_images:
+            marker_names = ", ".join(f"[[IMG_CHUNK_{i}]]" for i in sorted({int(x.get('_chunk_order',0)) for x in rich_images}))
+            marker_rule = f"- Nếu dùng dữ kiện từ section có ảnh, đặt marker tương ứng {marker_names} ngay sau đoạn giải thích; marker chỉ dùng cho UI.\n"
+        cache_prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
+DẠY DỰA TRÊN KNOWLEDGE CACHE ĐÃ ĐƯỢC XỬ LÝ KHI UPLOAD; không được yêu cầu nhìn lại ảnh.
+Bài hiện tại: {runtime_lesson_cache.get('lesson','')} | Chủ đề: {runtime_lesson_cache.get('topic') or ''}
+
+QUY TẮC DẠY:
+- Với Giáo trình: giải thích tuần tự, dễ hiểu; dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
+- Khi bắt đầu bài: giới thiệu ngắn mục tiêu rồi dạy phần đang có trong CACHE; không tóm tắt dài toàn bài nếu chưa dạy đến đó.
+- Khi học sinh hỏi chi tiết: trả lời đúng chi tiết đó dựa vào CACHE.
+- Khi thực sự hoàn tất phần hướng dẫn lớn/trọn bài, có thể đặt marker [[LESSON_END_READY]] ở cuối.
+- Ảnh chỉ để UI hiển thị; suy luận nội dung chỉ dựa vào text/facts đã cache.
+{marker_rule}
+VISION FACTS CỦA CÁC ẢNH LIÊN QUAN SECTION HIỆN TẠI:
+{vision_text}
+
+KNOWLEDGE CACHE CONTEXT:
+{chr(10).join(cache_context)}
+
+RECENT CHAT CỦA BOXCHAT HIỆN TẠI:
+{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}
+
+TIN NHẮN HIỆN TẠI:
+{query_text}"""
+        prompt = cache_prompt
+        print(f"[KNOWLEDGE CACHE PROMPT] sections={len(cache_selected_sections)} prompt_chars={len(prompt)}")
 
     gen_started = time.perf_counter()
     reply, response_model, gen_elapsed = _generate_chat_reply(
@@ -6683,6 +7006,9 @@ async def admin_knowledge_upload(
     vectors=[]
     total=0
     image_vectors_total=0
+    knowledge_cache_text_records=[]
+    knowledge_cache_image_records=[]
+    source_hash=hashlib.sha256(raw).hexdigest()
     try:
         # Khi re-upload cùng source_file, xóa các vector cũ của tài liệu này
         # để tránh record V1 cũ tiếp tục cạnh tranh với record V2 mới.
@@ -6755,6 +7081,7 @@ async def admin_knowledge_upload(
                         })
                     if rec["unit_id"].startswith("page:"):
                         print(f"[PINECONE PAGE CHUNK] page={page_no} chunk={rec['chunk_index']} image_keys={rec['image_keys']}")
+                    knowledge_cache_text_records.append({"text": chunk, "metadata": dict(md), "image_keys": list(rec["image_keys"])})
                     vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                     total+=1
 
@@ -6813,6 +7140,7 @@ async def admin_knowledge_upload(
                             "lesson":primary["lesson"],"topic":primary["topic"],
                             "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
                         })
+                    knowledge_cache_image_records.append({"metadata": dict(image_md)})
                     vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
                     if image_md.get("image_scope") == "lesson":
                         print("[IMAGE UPSERT lesson]", {
@@ -6850,6 +7178,7 @@ async def admin_knowledge_upload(
                         "topic":primary["topic"],"topic_pages":primary["topic_pages"],
                         "question_pages":primary["question_pages"],"answer_pages":primary["answer_pages"]
                     })
+                knowledge_cache_text_records.append({"text": chunk, "metadata": dict(md), "image_keys": []})
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                 total+=1
 
@@ -6889,6 +7218,7 @@ async def admin_knowledge_upload(
                         "lesson":primary["lesson"],"topic":primary["topic"],
                         "lesson_pages":primary["lesson_pages"],"topic_pages":primary["topic_pages"]
                     })
+                knowledge_cache_image_records.append({"metadata": dict(image_md)})
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(search_text),"metadata":image_md})
                 image_vectors_total+=1
 
@@ -6915,6 +7245,14 @@ async def admin_knowledge_upload(
         conn.close()
 
     _invalidate_catalog_cache()
+    try:
+        cache_lessons = _upsert_upload_knowledge_cache(
+            source_file, source_hash, subject, len(reader.pages),
+            knowledge_cache_text_records, knowledge_cache_image_records
+        )
+    except Exception as exc:
+        print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
+        raise HTTPException(500, f"Tạo Knowledge Cache thất bại: {exc}")
 
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
@@ -6922,6 +7260,7 @@ async def admin_knowledge_upload(
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
+            "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
