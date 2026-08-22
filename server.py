@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.16-curriculum-global-exercise-gate"
+BASELINE_VERSION = "19.17-curriculum-universal-continue"
 import os
 import ast
 import io
@@ -5049,6 +5049,16 @@ Tin nhắn hiện tại:
         curriculum_exercise_answered=False
         print(f"[CURRICULUM FLOW] text-confirm advance to step={next_step} waiting={waiting_state!r}")
 
+    if curriculum_flow_active and curriculum_waiting in {"continue_after_global_exercise", "continue_after_global_check"} and not data.action and _is_continue_confirmation(query_text):
+        next_step = curriculum_map["summary_step"]
+        _set_curriculum_flow(user["id"], step=next_step, waiting="final", exercise_answered=True)
+        study_session["curriculum_step"] = next_step
+        study_session["curriculum_waiting"] = "final"
+        curriculum_step = next_step
+        curriculum_waiting = "final"
+        curriculum_exercise_answered = True
+        print(f"[CURRICULUM FLOW] text-confirm advance to summary step={next_step}")
+
     # When a section/exercise is waiting for review, ordinary questions remain inside
     # the same lesson and can use the relevant cache context.
 
@@ -5953,6 +5963,7 @@ CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, d
 - TUYỆT ĐỐI KHÔNG tự tạo câu hỏi/bài tập mới. Không suy luận từ việc chunk có dấu `?`, có bảng, có số liệu, hoặc có nội dung có thể dùng để đặt câu hỏi rằng đó là bài tập.
 - Nếu có bài tập thật thuộc riêng chunk này, hãy giải thích phần nội dung trước rồi nêu ĐÚNG câu hỏi/yêu cầu đó cho học sinh làm. Nếu không có bài tập hoặc là bài tập toàn bài, chỉ giải thích chunk.
 - Marker phải xuất hiện đúng 1 lần ở CUỐI câu trả lời: `[[CHUNK_EXERCISE]]`, `[[WHOLE_LESSON_EXERCISE]]` hoặc `[[NO_CHUNK_EXERCISE]]`. Không giải thích marker cho học sinh.
+- Nếu không có bài tập tại chunk này, kết thúc phần giải thích bằng một lời mời sang phần tiếp theo; backend sẽ thêm nút “Bạn muốn sang phần tiếp theo không?”.
 
 CHUNK SOURCE:
 {str(sec.get('text') or '')}
@@ -5972,7 +5983,7 @@ TIN NHẮN HIỆN TẠI:
                     cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là BÀI TẬP CỦA TOÀN BÀI HỌC, được thực hiện SAU KHI đã giới thiệu xong tất cả các chunk của bài {runtime_lesson_cache.get('lesson','')}.
 
 CHỈ sử dụng toàn bộ nguồn bài học và vision facts bên dưới. Hãy đánh giá câu trả lời của học sinh cho đúng câu hỏi/yêu cầu THẬT SỰ có trong nguồn. Không tự tạo câu hỏi mới, không thêm dữ kiện bên ngoài.
-Sau khi nhận xét bài làm, hãy chuyển sang phần TỔNG KẾT của bài: tóm tắt nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp và điểm cần nhớ.
+Sau khi nhận xét bài làm, KHÔNG chuyển ngay sang TỔNG KẾT. Hãy kết thúc bằng câu: “Bạn muốn sang phần tiếp theo không?”; chỉ sau khi học sinh xác nhận ở lượt sau mới chuyển sang TỔNG KẾT. tóm tắt nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp và điểm cần nhớ.
 
 ALL LESSON CHUNKS:\n{all_text}
 
@@ -6138,6 +6149,9 @@ TIN NHẮN HIỆN TẠI:
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["global_exercise_step"]:
             if curriculum_waiting == "global_exercise_answer":
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_exercise", exercise_answered=True)
+                content_blocks.extend([{"type":"text","text":"✅ Doraemon đã nhận xét xong. Bạn muốn sang phần tiếp theo không? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+            elif curriculum_waiting == "continue_after_global_exercise" and is_curriculum_answer_turn:
                 next_summary_step = curriculum_map["summary_step"]
                 _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
                 study_session["curriculum_step"] = next_summary_step
@@ -6147,13 +6161,8 @@ TIN NHẮN HIỆN TẠI:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
                 content_blocks.append({"type":"text","text":"✍️ Đây là bài tập chung của toàn bài. Cậu trả lời câu hỏi này trước nhé; Doraemon sẽ nhận xét rồi chúng mình tổng kết bài."})
             else:
-                next_summary_step = curriculum_map["summary_step"]
-                _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
-                study_session["curriculum_step"] = next_summary_step
-                study_session["curriculum_waiting"] = "final"
-                # Khi không có bài tập toàn bài, prompt ở bước này đã được yêu cầu
-                # chuyển thẳng sang phần tổng kết. The final confirmation is attached here.
-                content_blocks.extend(_curriculum_final_blocks())
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_check", exercise_answered=True)
+                content_blocks.extend([{"type":"text","text":"✅ Mình đã kiểm tra xong phần bài tập của toàn bài. Bạn muốn sang phần tiếp theo không? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["summary_step"]:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="final", exercise_answered=True)
             content_blocks.extend(_curriculum_final_blocks())
