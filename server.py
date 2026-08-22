@@ -78,7 +78,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-21-doraemon-server-v18.1"
+SERVER_VERSION = "2026-08-22-doraemon-server-v18.2-token-log"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -766,6 +766,50 @@ def require_active_user(authorization):
     info = _package_info(user["id"])
     return user
 
+def _log_gemini_usage(response, operation="unknown", request_id=None):
+    """Log Gemini usage metadata in a stable, grep-friendly format.
+
+    Gemini generation responses expose usage_metadata with token counters.
+    We log the counters without logging prompt contents, so Render logs can
+    be used to audit token/cost spikes without leaking the full prompt.
+    """
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        prefix = f" request={request_id}" if request_id else ""
+        if usage is None:
+            print(f"[GEMINI TOKENS]{prefix} operation={operation!r} usage_metadata=NONE")
+            return
+
+        def _num(name):
+            value = getattr(usage, name, None)
+            try:
+                return int(value) if value is not None else 0
+            except Exception:
+                return 0
+
+        prompt_tokens = _num("prompt_token_count")
+        candidates_tokens = _num("candidates_token_count")
+        thoughts_tokens = _num("thoughts_token_count")
+        cached_tokens = _num("cached_content_token_count")
+        tool_tokens = _num("tool_use_prompt_token_count")
+        total_tokens = _num("total_token_count")
+
+        # Some SDK/model combinations may omit total_token_count. Keep the
+        # logged value useful rather than silently showing zero.
+        if total_tokens == 0:
+            total_tokens = prompt_tokens + candidates_tokens + thoughts_tokens
+
+        print(
+            f"[GEMINI TOKENS] operation={operation!r}{prefix} "
+            f"model={GEMINI_MODEL!r} "
+            f"input={prompt_tokens} output={candidates_tokens} "
+            f"thoughts={thoughts_tokens} cached={cached_tokens} "
+            f"tool_prompt={tool_tokens} total={total_tokens}"
+        )
+    except Exception as exc:
+        print("[GEMINI TOKENS] logging failed:", type(exc).__name__, str(exc))
+
+
 def embed_text(text):
     if not gemini:
         raise HTTPException(500, "Gemini chưa được khởi tạo.")
@@ -774,6 +818,10 @@ def embed_text(text):
         contents=text,
         config=types.EmbedContentConfig(output_dimensionality=768)
     )
+    # Embedding responses may expose usage_metadata depending on the SDK/API
+    # version. Log it when available; never fail an embedding because logging
+    # is unsupported.
+    _log_gemini_usage(r, operation="embedding")
     return r.embeddings[0].values
 
 @app.post("/search")
@@ -3084,6 +3132,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
             thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
         ),
     )
+    _log_gemini_usage(response, operation="chat_generation", request_id=request_id)
     reply = response.text or ""
     elapsed = time.perf_counter() - gen_started
     print(
@@ -5504,6 +5553,7 @@ Chỉ trả JSON đúng schema:
         contents=[part, prompt],
         config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
     )
+    _log_gemini_usage(response, operation=f"vision_page_images:{source_file}:page_{page_no}")
     data = _parse_gemini_json(response.text or "{}")
     text = str(data.get("text") or "").strip()
     images = data.get("images") if isinstance(data.get("images"), list) else []
@@ -5687,6 +5737,7 @@ Chỉ trả JSON đúng schema:
             response_mime_type="application/json",
         )
     )
+    _log_gemini_usage(response, operation=f"vision_table_page:{source_file}:page_{page_no}")
     data = _parse_gemini_json(response.text or "{}")
     tables = data.get("tables") if isinstance(data.get("tables"), list) else []
     out=[]
