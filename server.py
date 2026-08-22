@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.8-casual-minimal-fastpath"
+BASELINE_VERSION = "20.0-curriculum-step-by-step-flow"
 import os
 import ast
 import io
@@ -246,6 +246,10 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_topic VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_started_at TIMESTAMPTZ;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_flow_step VARCHAR(30);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_section_index INTEGER NOT NULL DEFAULT 0;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_waiting BOOLEAN NOT NULL DEFAULT FALSE;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_exercise_index INTEGER NOT NULL DEFAULT 0;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_scope VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_created_at TIMESTAMPTZ;""")
@@ -2793,7 +2797,8 @@ def _get_study_session(user_id, chatbox_id=None):
             cur.execute("""
                 SELECT study_session_active,study_session_content_type,study_session_course,
                        study_session_lesson,study_session_topic,study_session_started_at,
-                       study_end_prompt_pending,study_session_chatbox_id
+                       study_end_prompt_pending,study_session_chatbox_id,
+                       curriculum_flow_step,curriculum_section_index,curriculum_waiting,curriculum_exercise_index
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
@@ -2812,6 +2817,10 @@ def _get_study_session(user_id, chatbox_id=None):
                 "started_at": row.get("study_session_started_at"),
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
                 "chatbox_id": stored_chatbox,
+                "curriculum_flow_step": row.get("curriculum_flow_step"),
+                "curriculum_section_index": int(row.get("curriculum_section_index") or 0),
+                "curriculum_waiting": bool(row.get("curriculum_waiting")),
+                "curriculum_exercise_index": int(row.get("curriculum_exercise_index") or 0),
             }
     finally:
         conn.close()
@@ -2827,6 +2836,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
     topic = str(scope.get("topic") or "").strip() or None
     chatbox = str(chatbox_id or "").strip() or None
+    curriculum_step = "OBJECTIVES" if content_type == "Giáo trình" else None
+    curriculum_waiting = bool(content_type == "Giáo trình")
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -2835,8 +2846,9 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
-                    study_end_prompt_pending,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,NOW())
+                    study_end_prompt_pending,curriculum_flow_step,curriculum_section_index,
+                    curriculum_waiting,curriculum_exercise_index,updated_at
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,%s,0,%s,0,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
@@ -2846,15 +2858,19 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     study_session_chatbox_id=%s,
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
+                    curriculum_flow_step=%s,
+                    curriculum_section_index=0,
+                    curriculum_waiting=%s,
+                    curriculum_exercise_index=0,
                     updated_at=NOW()
             """, (
                 user_id,content_type,course,lesson,topic,chatbox,
-                content_type,course,lesson,topic,chatbox
+                curriculum_step,curriculum_waiting,
+                content_type,course,lesson,topic,chatbox,curriculum_step,curriculum_waiting
             ))
         conn.commit()
     finally:
         conn.close()
-
 
 def _finish_study_session(user_id):
     conn = db()
@@ -2862,11 +2878,73 @@ def _finish_study_session(user_id):
         with conn.cursor() as cur:
             cur.execute("""UPDATE user_learning_state
                            SET study_session_active=FALSE, study_end_prompt_pending=FALSE,
-                               study_session_chatbox_id=NULL, updated_at=NOW()
+                               study_session_chatbox_id=NULL, curriculum_flow_step=NULL,
+                               curriculum_section_index=0, curriculum_waiting=FALSE, curriculum_exercise_index=0, updated_at=NOW()
                            WHERE user_id=%s""", (user_id,))
         conn.commit()
     finally:
         conn.close()
+
+
+def _set_curriculum_flow(user_id, step=None, section_index=0, waiting=False, exercise_index=0):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE user_learning_state
+                           SET curriculum_flow_step=%s, curriculum_section_index=%s,
+                               curriculum_waiting=%s, curriculum_exercise_index=%s, updated_at=NOW()
+                           WHERE user_id=%s""",
+                        (step, int(section_index or 0), bool(waiting), int(exercise_index or 0), user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _curriculum_step_for_session(study_session):
+    if not study_session or _normalize_content_type(study_session.get("content_type")) != "Giáo trình":
+        return None
+    return str(study_session.get("curriculum_flow_step") or "").strip().upper() or None
+
+
+def _curriculum_continue_choice(label="Tiếp tục"):
+    return {"type":"choice","id":"curriculum_continue","options":[
+        {"label":"Có","display_label":label,"action":"curriculum_continue_yes"},
+        {"label":"Không","display_label":"Tạm dừng học","action":"curriculum_continue_no"},
+    ]}
+
+
+def _curriculum_exercise_choice():
+    return {"type":"choice","id":"curriculum_exercise","options":[
+        {"label":"Có","display_label":"Có — làm bài tập","action":"curriculum_exercise_yes"},
+        {"label":"Không","display_label":"Không — kết thúc phần học","action":"curriculum_summary_yes"},
+    ]}
+
+
+def _curriculum_summary_choice():
+    return {"type":"choice","id":"curriculum_summary","options":[
+        {"label":"Có","display_label":"Có — tổng kết bài","action":"curriculum_summary_yes"},
+        {"label":"Không","display_label":"Tạm dừng","action":"curriculum_continue_no"},
+    ]}
+
+
+def _curriculum_mastery_choice():
+    return {"type":"choice","id":"curriculum_mastery","options":[
+        {"label":"Có","display_label":"Có — mình đã nắm bài","action":"curriculum_mastery_yes"},
+        {"label":"Chưa","display_label":"Chưa — mình cần ôn lại","action":"curriculum_mastery_no"},
+    ]}
+
+
+def _cache_exercise_sections(cache):
+    sections = list((cache or {}).get("sections") or [])
+    out = []
+    keywords = ("bài tập", "luyện tập", "bài luyện", "bài thực hành", "練習", "れんしゅう")
+    for sec in sections:
+        md = sec.get("metadata") or {}
+        text = str(sec.get("text") or "").casefold()
+        pages = md.get("question_pages") or md.get("answer_pages")
+        if pages or any(k in text for k in keywords):
+            out.append(sec)
+    return out
 
 
 def _set_study_end_prompt_pending(user_id, pending=True):
@@ -3826,6 +3904,44 @@ def proxy_chat(
     action_plan_id = (ui_action_raw.split(":",1)[1] if ui_action_raw and ":" in ui_action_raw else None)
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
+
+    # Giáo trình-only step controls. Other content types keep their existing flow.
+    flow_session_now = _get_study_session(user["id"], data.chatbox_id)
+    if flow_session_now and _normalize_content_type(flow_session_now.get("content_type")) == "Giáo trình":
+        flow_step_now = _curriculum_step_for_session(flow_session_now)
+        idx_now = int(flow_session_now.get("curriculum_section_index") or 0)
+        if not ui_action and bool(flow_session_now.get("curriculum_waiting")) and _is_affirmative(query_text):
+            if flow_step_now == "OBJECTIVES":
+                _set_curriculum_flow(user["id"], "SECTION", 0, False, 0)
+                study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+                flow_step_now = "SECTION"
+                idx_now = 0
+            elif flow_step_now == "SUMMARY":
+                _set_curriculum_flow(user["id"], "MASTERY", idx_now, True, 0)
+                study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+        if ui_action == "curriculum_continue_no":
+            msg = f"Được nhé! 🤖 Mình tạm dừng ở **{flow_session_now.get('lesson') or 'bài này'}**."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        if ui_action == "curriculum_continue_yes":
+            if flow_step_now == "OBJECTIVES":
+                _set_curriculum_flow(user["id"], "SECTION", 0, False, 0)
+            elif flow_step_now == "SECTION":
+                _set_curriculum_flow(user["id"], "SECTION", idx_now + 1, False, 0)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+        elif ui_action == "curriculum_exercise_yes":
+            _set_curriculum_flow(user["id"], "EXERCISE", idx_now, False, 0)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+        elif ui_action == "curriculum_summary_yes":
+            _set_curriculum_flow(user["id"], "SUMMARY", idx_now, False, 0)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+        elif ui_action == "curriculum_mastery_yes":
+            lesson_label = flow_session_now.get("lesson") or "bài này"
+            _finish_study_session(user["id"])
+            msg = f"✅ Tuyệt vời! Doraemon ghi nhận cậu đã nắm bài **{lesson_label}** hôm nay. 🤖"
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        elif ui_action == "curriculum_mastery_no":
+            _set_curriculum_flow(user["id"], "REVIEW", 0, False, 0)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
 
     # Lesson confirmation actions are explicit intent confirmation.
     # They bypass routing/RAG only when YES; NO simply cancels the pending lesson open.
@@ -5297,9 +5413,17 @@ Tin nhắn hiện tại:
     seen_chunk_keys = set()
     cache_selected_sections = []
     if runtime_cache_hit:
-        cache_selected_sections = _select_runtime_cache_sections(
-            runtime_lesson_cache, query_text, max_sections=2, initial=runtime_cache_initial
-        )
+        flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
+        flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
+        all_curriculum_sections = list((runtime_lesson_cache or {}).get("sections") or [])
+        if flow_step in {"SECTION", "REVIEW"}:
+            cache_selected_sections = all_curriculum_sections[flow_idx:flow_idx+1] or all_curriculum_sections[:1]
+        elif flow_step in {"EXERCISE", "EVALUATION", "SUMMARY"}:
+            cache_selected_sections = _cache_exercise_sections(runtime_lesson_cache) or all_curriculum_sections
+        else:
+            cache_selected_sections = _select_runtime_cache_sections(
+                runtime_lesson_cache, query_text, max_sections=2, initial=True
+            )
         for sec in cache_selected_sections:
             md = {
                 "record_type": "text",
@@ -5669,11 +5793,28 @@ TIN NHẮN HIỆN TẠI:
         if rich_images:
             marker_names = ", ".join(f"[[IMG_CHUNK_{i}]]" for i in sorted({int(x.get('_chunk_order',0)) for x in rich_images}))
             marker_rule = f"- Nếu dùng dữ kiện từ section có ảnh, đặt marker tương ứng {marker_names} ngay sau đoạn giải thích; marker chỉ dùng cho UI.\n"
+        curriculum_flow_instruction = ""
+        _flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
+        _flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
+        if _flow_step == "OBJECTIVES":
+            curriculum_flow_instruction = "- Đây là bước MỤC TIÊU: chỉ giới thiệu mục tiêu, lợi ích và lộ trình các phần; chưa dạy chi tiết section."
+        elif _flow_step == "SECTION":
+            curriculum_flow_instruction = f"- Đây là bước SECTION {_flow_idx + 1}: chỉ dạy section hiện tại được cung cấp; bao gồm nội dung, từ vựng và ngữ pháp liên quan nếu nguồn có."
+        elif _flow_step == "EXERCISE":
+            curriculum_flow_instruction = "- Đây là bước BÀI TẬP CỦA GIÁO TRÌNH: giới thiệu bài tập từ nguồn và yêu cầu học sinh tự làm; không tự giải trước."
+        elif _flow_step == "EVALUATION":
+            curriculum_flow_instruction = "- Đây là bước ĐÁNH GIÁ: dùng toàn bộ context của lesson để chấm câu trả lời gần nhất của học sinh, vì câu hỏi có thể phụ thuộc nhiều section."
+        elif _flow_step == "SUMMARY":
+            curriculum_flow_instruction = "- Đây là bước TỔNG KẾT: tổng hợp toàn bộ kiến thức đã học, từ vựng, ngữ pháp và lỗi chính của bài."
+        elif _flow_step == "REVIEW":
+            curriculum_flow_instruction = f"- Đây là bước ÔN LẠI SECTION {_flow_idx + 1}: giải thích lại section hiện tại, sau đó hướng sang phần tiếp theo."
+
         cache_prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 DẠY DỰA TRÊN KNOWLEDGE CACHE ĐÃ ĐƯỢC XỬ LÝ KHI UPLOAD; không được yêu cầu nhìn lại ảnh.
 Bài hiện tại: {runtime_lesson_cache.get('lesson','')} | Chủ đề: {runtime_lesson_cache.get('topic') or ''}
 
 QUY TẮC DẠY:
+{curriculum_flow_instruction}
 - Với Giáo trình: giải thích tuần tự, dễ hiểu; dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
 - Khi bắt đầu bài: giới thiệu ngắn mục tiêu rồi dạy phần đang có trong CACHE; không tóm tắt dài toàn bài nếu chưa dạy đến đó.
 - Khi học sinh hỏi chi tiết: trả lời đúng chi tiết đó dựa vào CACHE.
@@ -5707,9 +5848,50 @@ TIN NHẮN HIỆN TẠI:
     )
     perf_gen = time.perf_counter()
 
+    # Giáo trình v20: state machine owns progression; other content types keep legacy behavior.
+    curriculum_flow = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
+    curriculum_content_blocks = None
+    if curriculum_flow and runtime_cache_hit:
+        all_sections = list((runtime_lesson_cache or {}).get("sections") or [])
+        exercise_sections = _cache_exercise_sections(runtime_lesson_cache)
+        idx = int((study_session or {}).get("curriculum_section_index") or 0)
+        if curriculum_flow == "OBJECTIVES":
+            _set_curriculum_flow(user["id"], "OBJECTIVES", 0, True, 0)
+            reply = (reply or "").rstrip() + "\n\nCậu muốn Doraemon sang **phần 1** chứ?"
+            curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần 1")]
+        elif curriculum_flow == "SECTION":
+            if idx + 1 < len(all_sections):
+                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
+                reply = (reply or "").rstrip() + "\n\nCậu muốn sang **phần tiếp theo** chứ?"
+                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần tiếp theo")]
+            elif exercise_sections:
+                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
+                reply = (reply or "").rstrip() + "\n\n📚 Phần nội dung chính đã xong. Cậu muốn sang **bài tập của giáo trình** chứ?"
+                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_exercise_choice()]
+            else:
+                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
+                reply = (reply or "").rstrip() + "\n\nCậu muốn Doraemon **tổng kết bài** chứ?"
+                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_summary_choice()]
+        elif curriculum_flow == "EXERCISE":
+            _set_curriculum_flow(user["id"], "EVALUATION", idx, False, 0)
+        elif curriculum_flow == "EVALUATION":
+            _set_curriculum_flow(user["id"], "SUMMARY", idx, False, 0)
+        elif curriculum_flow == "SUMMARY":
+            _set_curriculum_flow(user["id"], "MASTERY", idx, True, 0)
+            reply = (reply or "").rstrip() + "\n\nCậu thấy mình đã **nắm được bài này** chưa?"
+            curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_mastery_choice()]
+        elif curriculum_flow == "REVIEW":
+            if idx + 1 < len(all_sections):
+                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
+                reply = (reply or "").rstrip() + "\n\nCậu muốn sang **phần tiếp theo** chứ?"
+                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần tiếp theo")]
+            else:
+                _set_curriculum_flow(user["id"], "SUMMARY", idx, False, 0)
+                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_mastery_choice()]
+
     # The model may explicitly signal that a full teaching turn is complete.
     # This becomes a cheap UI-level end-of-study choice; there is NO second LLM call.
-    lesson_end_ready = bool(study_session and "[[LESSON_END_READY]]" in (reply or ""))
+    lesson_end_ready = bool((not curriculum_flow) and study_session and "[[LESSON_END_READY]]" in (reply or ""))
     if lesson_end_ready:
         reply = (reply or "").replace("[[LESSON_END_READY]]", "").rstrip()
         _set_study_end_prompt_pending(user["id"], True)
@@ -5718,7 +5900,7 @@ TIN NHẮN HIỆN TẠI:
 
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
-    content_blocks = build_rich_content_blocks(reply, rich_images)
+    content_blocks = curriculum_content_blocks if curriculum_content_blocks is not None else build_rich_content_blocks(reply, rich_images)
     if lesson_end_ready:
         content_blocks.extend(_study_end_choice_blocks(_active_session_scope(study_session)))
     # The client still receives a flat images array for backwards compatibility.
