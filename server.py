@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.13-curriculum-chunk-embedded-exercise-flow"
+BASELINE_VERSION = "19.15-curriculum-llm-exercise-detection"
 import os
 import ast
 import io
@@ -3019,47 +3019,20 @@ def _curriculum_sections(cache):
     return sections
 
 
-def _curriculum_chunk_has_exercise(sec):
-    """Whether this single curriculum chunk contains an embedded task/question."""
-    md=sec.get("metadata") or {}
-    if md.get("question_pages") or md.get("answer_pages"):
-        return True
-    text=str(sec.get("text") or "").casefold()
-    markers=(
-        "bài tập", "bài luyện", "yêu cầu", "hãy làm", "làm bài",
-        "hãy trả lời", "trả lời câu hỏi", "câu hỏi", "điền",
-        "練習", "れんしゅう", "問題", "質問", "答え", "こたえ",
-    )
-    if any(m in text for m in markers):
-        return True
-    # Stronger heuristic for source chunks that embed a concrete question.
-    if "?" in text or "？" in text:
-        return True
-    if any(token in text for token in ("khi nào", "ở đâu", "ai", "bao giờ", "điền vào")):
-        return True
-    return False
-
-
-def _curriculum_has_exercise(cache):
-    """Detect whether the uploaded Giáo trình contains a lesson task anywhere."""
-    return any(_curriculum_chunk_has_exercise(sec) for sec in _curriculum_sections(cache))
-
-
 def _curriculum_step_map(cache):
-    """Fixed pedagogical skeleton; each source chunk is one teaching step.
-    A chunk may own an embedded exercise, which must be answered before moving on.
+    """Fixed Giáo trình flow; each Knowledge Cache chunk is exactly one teaching step.
+
+    Exercise presence is decided at runtime by the same LLM call that teaches the
+    current chunk. Upload-time metadata is not used as an exercise classifier.
     """
-    sections=_curriculum_sections(cache)
-    exercise=_curriculum_has_exercise(cache)
-    embedded_exercise_steps={i+1 for i,sec in enumerate(sections) if _curriculum_chunk_has_exercise(sec)}
-    exercise_step=1+len(sections) if exercise else None
-    summary_step=1+len(sections)+(1 if exercise else 0)
+    sections = _curriculum_sections(cache)
     return {
-        "sections":sections,
-        "exercise":exercise,
-        "embedded_exercise_steps":embedded_exercise_steps,
-        "exercise_step":exercise_step,
-        "summary_step":summary_step,
+        "sections": sections,
+        "exercise": None,
+        "embedded_exercise_steps": set(),
+        "post_chunk_exercise": False,
+        "exercise_step": None,
+        "summary_step": 1 + len(sections),
     }
 
 
@@ -5054,18 +5027,11 @@ Tin nhắn hiện tại:
     curriculum_waiting = str((study_session or {}).get("curriculum_waiting") or "continue") if curriculum_flow_active else None
     curriculum_exercise_answered = bool((study_session or {}).get("curriculum_exercise_answered")) if curriculum_flow_active else False
 
-    # Normalize state when entering a chunk that contains an embedded task.
-    if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
-        if curriculum_step in curriculum_map.get("embedded_exercise_steps", set()) and curriculum_waiting == "continue" and not curriculum_exercise_answered:
-            curriculum_waiting = "chunk_prompt"
-            study_session["curriculum_waiting"] = "chunk_prompt"
-            _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_prompt", exercise_answered=False)
-
     # Backward-compatible text confirmation: when a fixed flow is waiting for Continue,
     # simple confirmations advance exactly one state without embedding/RAG changes.
     if curriculum_flow_active and curriculum_waiting == "continue" and not data.action and _is_continue_confirmation(query_text):
         next_step=curriculum_step+1
-        waiting_state = "chunk_prompt" if next_step in curriculum_map.get("embedded_exercise_steps", set()) else ("answer" if next_step == curriculum_map["exercise_step"] else "continue")
+        waiting_state = "continue"
         _set_curriculum_flow(user["id"], step=next_step, waiting=waiting_state, exercise_answered=False)
         study_session["curriculum_step"]=next_step
         study_session["curriculum_waiting"]=waiting_state
@@ -5527,9 +5493,8 @@ Tin nhắn hiện tại:
             if curriculum_step == 0:
                 cache_selected_sections=[]
             elif 1 <= curriculum_step <= len(secs):
+                # Exactly one source chunk per teaching step.
                 cache_selected_sections=[secs[curriculum_step-1]]
-            elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
-                cache_selected_sections=list(secs)
             elif curriculum_step == curriculum_map["summary_step"]:
                 cache_selected_sections=list(secs)
             else:
@@ -5847,7 +5812,7 @@ QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘ
 - Sau phần mở đầu, dạy **từng phần của giáo trình theo đúng thứ tự nguồn RAG**. Mỗi phần phải được giải thích chi tiết, dễ hiểu, có ví dụ từ chính nguồn khi nguồn có, và liên hệ với mục tiêu của bài. Không chỉ tóm tắt toàn bài trong một đoạn ngắn.
 - Khi có nhiều mục/điểm kiến thức, trình bày tuần tự: giải thích → ví dụ → lưu ý/dễ nhầm (nếu nguồn hỗ trợ) → chuyển sang mục tiếp theo.
 - Cuối bài phải có **📝 Tổng kết**: tổng hợp các từ vựng mới và ngữ pháp/cấu trúc mới xuất hiện trong bài, bám theo RAG CONTEXT; không tự bịa danh sách ngoài nguồn.
-- Sau phần tổng kết, nếu nguồn cho phép/đủ dữ kiện, thêm **✏️ Bài tập bổ sung** để học sinh luyện lại kiến thức vừa học. Bài tập phải bám nội dung của bài và không tự tạo kiến thức trái nguồn.
+- Không tự thêm bài tập bổ sung. Chỉ cho người học làm câu hỏi/yêu cầu thực sự có trong từng chunk nguồn.
 - Nếu học sinh chỉ hỏi một chi tiết nhỏ của giáo trình, không cần ép toàn bộ cấu trúc trên; chỉ áp dụng đầy đủ khi học sinh yêu cầu học/trình bày cả bài hoặc một phần bài đủ lớn.
 """
     elif any(
@@ -5871,8 +5836,8 @@ NGUYÊN TẮC:
 - Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
 - Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
 - Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
-- Với Giáo trình: học theo FLOW CỐ ĐỊNH của server: B0 giới thiệu mục tiêu + từ vựng cần học + ngữ pháp cần học; B1..Bn mỗi bước chỉ giải thích đúng MỘT CHUNK của Knowledge Cache; sau cùng là yêu cầu/bài tập của chính bài (nếu có); bước cuối luôn là Tổng kết. Không được tự đổi thứ tự hoặc gộp nhiều chunk vào một teaching step.
-- Bài tập của Giáo trình vẫn thuộc content type Giáo trình. Khi chấm một câu hỏi của bài, được phép lấy toàn bộ các chunk của đúng bài để đối chiếu nếu câu hỏi liên quan nhiều phần.
+- Với Giáo trình: học theo FLOW CỐ ĐỊNH của server: B0 giới thiệu mục tiêu + từ vựng cần học + ngữ pháp cần học; B1..Bn mỗi bước chỉ giải thích đúng MỘT CHUNK của Knowledge Cache; sau mỗi chunk chỉ bắt người học làm bài nếu chính LLM khi dạy chunk đó xác định trong source/vision facts có bài tập thật; không được tự bịa. Bước cuối luôn là Tổng kết. Không được tự đổi thứ tự hoặc gộp nhiều chunk vào một teaching step.
+- Bài tập nằm trong chunk của Giáo trình vẫn thuộc content type Giáo trình. Khi chấm câu hỏi đó, được phép lấy toàn bộ các chunk của đúng bài để đối chiếu nếu câu hỏi liên quan nhiều phần.
 - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
 - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
 - Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
@@ -5940,45 +5905,49 @@ Không bịa kiến thức ngoài nguồn. Đây là bước giới thiệu, kh�
 SOURCE CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif 1 <= curriculum_step <= len(secs):
                 sec=secs[curriculum_step-1]
-                chunk_has_exercise = curriculum_step in curriculum_map.get("embedded_exercise_steps", set())
-                if chunk_has_exercise and curriculum_waiting == "chunk_answer":
+                if curriculum_waiting == "chunk_answer":
                     cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây vẫn là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
-Đây là lượt HỌC SINH TRẢ LỜI CÂU HỎI/BÀI TẬP nằm ngay trong CHUNK NÀY.
+Đây là lượt HỌC SINH TRẢ LỜI CÂU HỎI/BÀI TẬP THỰC SỰ NẰM TRONG CHUNK NÀY.
 CHỈ sử dụng đúng chunk bên dưới và vision facts của chính chunk này.
 Hãy đánh giá đáp án của học sinh, chỉ ra đúng/sai, giải thích ngắn gọn dựa trên nguồn, và nếu cần cho biết đáp án đúng.
 Không lấy nội dung từ chunk khác.
 Sau khi nhận xét xong, hỏi học sinh có muốn sang phần tiếp theo không.
 
-CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nĐÁP ÁN CỦA HỌC SINH:\n{query_text}"""
+CHUNK SOURCE:
+{str(sec.get('text') or '')}
+
+VISION FACTS:
+{vision_text}
+
+RECENT CHAT:
+{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}
+
+ĐÁP ÁN CỦA HỌC SINH:
+{query_text}"""
                 else:
-                    chunk_task_rule = ""
-                    if chunk_has_exercise:
-                        chunk_task_rule = "\n- CHUNK này có yêu cầu/câu hỏi/bài tập. Hãy giải thích nội dung chunk trước, sau đó nêu rõ câu hỏi/yêu cầu đó và yêu cầu người học tự trả lời. CHƯA chuyển sang phần tiếp theo cho tới khi người học trả lời và Doraemon nhận xét xong."
-                    else:
-                        chunk_task_rule = "\n- CHUNK này không có bài tập nội bộ cần dừng lại; cuối cùng mới hỏi người học có muốn sang phần tiếp theo không."
                     cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
 CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, dữ kiện, hình/bảng hoặc ví dụ từ bất kỳ chunk nào khác. Không tóm tắt các chunk khác và không dạy trước phần sau.
 - Giải thích rõ ràng, dễ hiểu.
 - Khai thác từ vựng/kanji/grammar có trong chính chunk này khi phù hợp; từ vựng phải kèm cách đọc và hướng dẫn phát âm nếu nguồn có.
 - Dùng chính ví dụ/số liệu/bảng trong nguồn.
 - Nếu chunk có hình/bảng, chỉ dùng VISION FACTS được gắn chính xác với chunk này; không dùng vision facts của chunk khác và không yêu cầu nhìn lại ảnh.
-{chunk_task_rule}
+- QUAN TRỌNG: Trong chính CHUNK + VISION FACTS này, hãy kiểm tra xem nguồn có đưa ra một CÂU HỎI/BÀI TẬP/YÊU CẦU THỰC SỰ mà người học phải trả lời hay không.
+- Chỉ đánh dấu `[[CHUNK_EXERCISE]]` khi nguồn thực sự yêu cầu người học làm/trả lời một nhiệm vụ. Nếu không có, đánh dấu `[[NO_CHUNK_EXERCISE]]`.
+- TUYỆT ĐỐI KHÔNG tự tạo câu hỏi/bài tập mới. Không suy luận từ việc chunk có dấu `?`, có bảng, có số liệu, hoặc có nội dung có thể dùng để đặt câu hỏi rằng đó là bài tập.
+- Nếu có bài tập thật trong nguồn, hãy giải thích phần nội dung trước rồi nêu ĐÚNG câu hỏi/yêu cầu đó cho học sinh làm. Nếu không có bài tập, chỉ giải thích chunk và kết thúc phần.
+- Marker phải xuất hiện đúng 1 lần ở CUỐI câu trả lời: `[[CHUNK_EXERCISE]]` hoặc `[[NO_CHUNK_EXERCISE]]`. Không giải thích marker cho học sinh.
 
-CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
-            elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
-                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
-                all_text=all_text[:16000]
-                if curriculum_waiting == "answer" and not curriculum_exercise_answered:
-                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là BƯỚC BÀI TẬP của bài {runtime_lesson_cache.get('lesson','')}.
-Hãy dựa trên TOÀN BỘ các chunk của đúng bài để đưa/giải yêu cầu bài học nếu nguồn có. Nếu người học vừa gửi đáp án, hãy chấm và giải thích đúng/sai dựa trên nguồn. Có thể đối chiếu nhiều chunk vì câu hỏi có thể phụ thuộc nhiều phần.
-KHÔNG dùng kiến thức ngoài nguồn. Ở cuối, báo kết quả và hỏi người học có muốn sang bước Tổng kết không.
+CHUNK SOURCE:
+{str(sec.get('text') or '')}
 
-ALL LESSON CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nĐÁP ÁN/TIN NHẮN HIỆN TẠI:\n{query_text}"""
-                else:
-                    cache_prompt=f"""Bạn là Doraemon. Đây là bước BÀI TẬP của bài {runtime_lesson_cache.get('lesson','')}.
-Dựa trên toàn bộ chunk nguồn để trình bày yêu cầu/bài tập chính của bài và chờ học sinh làm. Không bịa ngoài nguồn.
+VISION FACTS:
+{vision_text}
 
-ALL LESSON CHUNKS:\n{all_text}\n\nTIN NHẮN:\n{query_text}"""
+RECENT CHAT:
+{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}
+
+TIN NHẮN HIỆN TẠI:
+{query_text}"""
             elif curriculum_step == curriculum_map["summary_step"]:
                 all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
                 all_text=all_text[:16000]
@@ -6048,6 +6017,19 @@ TIN NHẮN HIỆN TẠI:
     )
     perf_gen = time.perf_counter()
 
+    detected_chunk_exercise = None
+    if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]) and curriculum_waiting != "chunk_answer":
+        if "[[CHUNK_EXERCISE]]" in (reply or ""):
+            detected_chunk_exercise = True
+            print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=1 source='llm_chunk_inspection'")
+        elif "[[NO_CHUNK_EXERCISE]]" in (reply or ""):
+            detected_chunk_exercise = False
+            print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=0 source='llm_chunk_inspection'")
+        else:
+            detected_chunk_exercise = False
+            print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=0 source='missing_marker_fail_closed'")
+        reply=(reply or '').replace('[[CHUNK_EXERCISE]]','').replace('[[NO_CHUNK_EXERCISE]]','')
+
     # Fixed curriculum flow owns the ending for Giáo trình. Legacy LESSON_END_READY remains for non-curriculum types.
     if curriculum_flow_active:
         reply=(reply or '').replace('[[LESSON_END_READY]]','').rstrip()
@@ -6071,29 +6053,18 @@ TIN NHẮN HIỆN TẠI:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
             content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif 1 <= curriculum_step <= len(curriculum_map["sections"]):
-            chunk_has_exercise = curriculum_step in curriculum_map.get("embedded_exercise_steps", set())
-            if chunk_has_exercise and curriculum_waiting == "chunk_answer" and is_curriculum_answer_turn:
+            if curriculum_waiting == "chunk_answer" and is_curriculum_answer_turn:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=True)
                 content_blocks.extend([{"type":"text","text":"✅ Doraemon đã nhận xét xong. Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
-            elif chunk_has_exercise and curriculum_waiting in {"chunk_prompt", "chunk_answer"} and not curriculum_exercise_answered:
+            elif curriculum_waiting == "chunk_answer" and not curriculum_exercise_answered:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_answer", exercise_answered=False)
-                # No next-section button yet: force the learner to answer the embedded task.
-                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng ta mới sang phần tiếp theo."})
+                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập có trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng mình mới sang phần tiếp theo."})
+            elif detected_chunk_exercise:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_answer", exercise_answered=False)
+                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập có trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng mình mới sang phần tiếp theo."})
             else:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
-        elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
-            # Arrival at the exercise step: present the task and wait for a real answer.
-            # A non-empty user message on this step is treated as the exercise answer.
-            is_answer_turn = bool((query_text or "").strip()) and not bool(data.action)
-            if curriculum_waiting == "answer" and not curriculum_exercise_answered and is_curriculum_answer_turn:
-                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="summary_continue", exercise_answered=True)
-                study_session["curriculum_waiting"]="summary_continue"
-                content_blocks.extend([{"type":"text","text":"Mình sang bước Tổng kết nhé? 😊"}] + _curriculum_continue_blocks(curriculum_step, "Tổng kết"))
-            elif curriculum_waiting == "summary_continue":
-                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="summary_continue", exercise_answered=True)
-            else:
-                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="answer", exercise_answered=False)
         elif curriculum_step == curriculum_map["summary_step"]:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="final", exercise_answered=True)
             content_blocks.extend(_curriculum_final_blocks())
