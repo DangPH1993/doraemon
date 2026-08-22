@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.4-knowledge-cache-runtime-hit-fix"
+BASELINE_VERSION = "19.5-upload-sourcefile-fix"
 import os
 import ast
 import io
@@ -79,7 +79,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.4-knowledge-cache-runtime-hit-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.5-upload-sourcefile-fix")
 SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -6421,7 +6421,7 @@ def _parse_gemini_json(text: str):
             return json.loads(m.group(0))
         raise ValueError("Gemini OCR không trả về JSON hợp lệ.")
 
-def gemini_ocr_page(page_png: bytes, page_no: int):
+def gemini_ocr_page(page_png: bytes, page_no: int, source_file: str = ""):
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
     prompt = f"""Đây là trang {page_no} của một sách học tập, có thể là trang từ vựng/giáo trình tiếng Nhật.
@@ -6594,7 +6594,7 @@ def _page_has_table_grid(page, page_png=None, extracted_text: str = ""):
     return _detect_long_grid_lines(page_png)
 
 
-def gemini_explain_table_page(page_png: bytes, page_no: int, extracted_text: str = ""):
+def gemini_explain_table_page(page_png: bytes, page_no: int, extracted_text: str = "", source_file: str = ""):
     """Vision extraction for original tables.
 
     The table image remains the visual source of truth. Vision also emits
@@ -6911,7 +6911,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         stored = []
         if text_len < 30:
-            ocr_text, detected = gemini_ocr_page(png, page_no)
+            ocr_text, detected = gemini_ocr_page(png, page_no, source_file=source_file)
             for idx, item in enumerate(detected, 1):
                 cropped = crop_image_from_page(png, item.get("box"))
                 if not cropped:
@@ -6947,7 +6947,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
         # and only then appended lesson images, so the normal text unit got
         # image_keys=[] even though the images were already stored in B2.
         if table_page:
-            table_items = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted)
+            table_items = gemini_explain_table_page(png, page_no, extracted_text=ocr_text or extracted, source_file=source_file)
 
             # Extract only non-table native illustrations as normal lesson images.
             # Table regions are excluded by their Vision boxes; table images are
