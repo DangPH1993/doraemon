@@ -78,7 +78,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-22-doraemon-server-v18.2-token-log"
+SERVER_VERSION = "2026-08-22-doraemon-server-v18.3-casual-routing"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1375,6 +1375,41 @@ def _select_active_scope(query_text, text_matches, catalog):
         "lesson": lesson,
         "topic": topic,
     }
+
+
+def _is_casual_conversation_request(text: str) -> bool:
+    """Detect short casual/emotional chat that does not need study retrieval.
+
+    This is intentionally conservative: explicit study words are excluded, and
+    short emotional/social utterances such as "mệt quá hic" take a lightweight
+    conversational path instead of embedding/Pinecone/image retrieval.
+    """
+    q = str(text or "").strip().casefold()
+    if not q:
+        return False
+    study_markers = (
+        "học", "bài", "giáo trình", "ngữ pháp", "từ vựng", "bộ thủ", "kanji",
+        "bài tập", "truyện đọc", "lộ trình", "ôn", "luyện", "giải thích",
+        "đáp án", "câu hỏi", "sai", "đúng",
+    )
+    if any(m in q for m in study_markers):
+        return False
+
+    casual_phrases = (
+        "mệt quá", "mệt thật", "mệt ghê", "mệt quá hic", "hic", "huhu",
+        "chán quá", "chán thật", "buồn quá", "buồn thật", "nản quá",
+        "đuối quá", "kiệt sức", "khó chịu quá", "bực quá", "stress quá",
+        "haha", "hihi", "hehe", "haiz", "thở dài", "ôi mệt", "mệt ghê",
+        "hôm nay mệt", "hôm nay chán", "hôm nay buồn",
+    )
+    if any(p in q for p in casual_phrases):
+        return True
+
+    # Very short social utterances are safe to handle conversationally, but do
+    # not swallow likely lesson follow-ups such as "vậy thì sao?".
+    if len(q) <= 18 and q in {"hic", "huhu", "haiz", "haha", "hihi", "hehe", "ôi", "wow"}:
+        return True
+    return False
 
 
 def _is_general_non_learning_request(text: str) -> bool:
@@ -3597,6 +3632,7 @@ def proxy_chat(
     low = query_text.strip().lower()
     ambiguous_study_request = _is_ambiguous_study_request(query_text)
     general_non_learning_request = _is_general_non_learning_request(query_text)
+    casual_conversation_request = _is_casual_conversation_request(query_text)
     exercise_suggestion_only_request = _is_exercise_suggestion_only_request(query_text)
     if general_non_learning_request:
         print("[CHAT ROUTING] general non-learning request: bypass study RAG/images/suggestions")
@@ -3657,6 +3693,66 @@ Câu hỏi của người dùng:
             f"scope={thread_scope} "
             f"switch_requested={thread_switch_requested}"
         )
+
+    # Casual/emotional chat stays inside the open conversation but deliberately
+    # bypasses embedding, Pinecone RAG and image retrieval. We keep only a small
+    # tail of the current boxchat as lightweight context so a message like
+    # "mệt quá hic" is understood naturally without paying for the study stack.
+    # Explicit thread switches/study targets always take precedence.
+    if (
+        casual_conversation_request
+        and not thread_switch_requested
+        and not data.action
+        and not ambiguous_study_request
+    ):
+        casual_history = recent_history[-4:]
+        casual_context_parts = []
+        for h in casual_history:
+            role = str(h.get("role") or "user")
+            txt = str(h.get("text") or "").strip()
+            if txt:
+                casual_context_parts.append(f"{role}: {txt[-450:]}")
+        casual_context = "\n".join(casual_context_parts)
+        thread_hint = ""
+        if thread_scope:
+            scope_parts = [
+                str(thread_scope.get("content_type") or ""),
+                str(thread_scope.get("lesson") or ""),
+                str(thread_scope.get("topic") or ""),
+            ]
+            scope_label = " / ".join(x for x in scope_parts if x)
+            if scope_label:
+                thread_hint = f"\nNgữ cảnh nhẹ của boxchat hiện tại: {scope_label}."
+
+        minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
+Đây là câu trò chuyện đời thường/cảm xúc, KHÔNG phải yêu cầu truy xuất hay dạy bài học.
+Trả lời tự nhiên, ngắn gọn, đồng cảm và không tự mở bài học mới.
+Không gọi lại giáo trình, không đề xuất bài tập, không đính kèm ảnh học tập.
+Nếu người dùng muốn quay lại học, hãy chờ họ nói rõ hoặc hỏi tiếp.
+{thread_hint}
+
+Một phần lịch sử gần nhất của boxchat (chỉ để hiểu ngữ cảnh):
+{casual_context}
+
+Tin nhắn hiện tại:
+{query_text}"""
+        print(
+            "[CHAT ROUTING] casual conversation: lightweight thread context; "
+            "no embedding/RAG/images"
+        )
+        gen_started = time.perf_counter()
+        reply, model_used, _ = _generate_chat_reply(
+            minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started
+        )
+        return {
+            "reply": reply,
+            "model": model_used,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": reply}],
+            "learning_progress": None,
+        }
+
     named_lesson_topic = _explicit_lesson_topic(low, catalog)
 
     if ambiguous_study_request:
