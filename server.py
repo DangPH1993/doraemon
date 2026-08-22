@@ -1,4 +1,4 @@
-BASELINE_VERSION = "20.2-curriculum-high-planner-vocab-pronunciation"
+BASELINE_VERSION = "20.3-curriculum-high-planner-async-upload"
 import os
 import ast
 import io
@@ -2733,7 +2733,7 @@ CHỈ TRẢ JSON THEO SCHEMA:
             "summary": {"title":"Tổng kết", "focus":[]},
         }
 
-def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
+def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records, *, defer_curriculum_plan=False):
     """Persist the complete upload-time knowledge asset and reusable vision cache."""
     grouped = {}
     for rec in text_records:
@@ -2795,7 +2795,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 # Tiny immutable overview for the runtime prompt; full source remains in sections.
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
                 curriculum_plan = None
-                if ct == "Giáo trình":
+                if ct == "Giáo trình" and not defer_curriculum_plan:
                     curriculum_plan = _build_curriculum_plan(
                         {**payload, "source_file": source_file, "content_type": ct, "lesson": lesson, "topic": topic},
                         request_label=f"{source_file}:{lesson}:{topic or ''}"
@@ -2813,8 +2813,9 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "images": payload["images"],
                     "curriculum_plan": curriculum_plan,
                 }
-                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
-                    (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                cache_status = 'PLANNING' if (defer_curriculum_plan and ct == "Giáo trình") else 'READY'
+                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())""",
+                    (asset_id, source_file, subject, ct, lesson, topic, cache_status, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
                     image_key = str(img.get("image_key") or "").strip()
                     image_hash = str(img.get("image_hash") or "").strip() or None
@@ -2829,6 +2830,47 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         conn.close()
     print(f"[KNOWLEDGE CACHE READY] source={source_file!r} lessons={len(grouped)} images={len(image_records)} hash={source_hash[:12]}...")
     return len(grouped)
+
+
+def _finish_deferred_curriculum_plans(source_file: str):
+    """Run HIGH-reasoning curriculum planning after the upload HTTP response.
+    Lesson cache rows stay PLANNING until a complete plan is written, so runtime
+    never consumes an incomplete pedagogical plan.
+    """
+    print(f"[CURRICULUM PLAN ASYNC] start source={source_file!r} thinking_level='high'")
+    conn = db()
+    promoted = 0
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT id,cache_json,lesson,topic
+                           FROM knowledge_lesson_cache
+                           WHERE source_file=%s AND content_type='Giáo trình' AND status='PLANNING'
+                           ORDER BY id""", (source_file,))
+            rows = cur.fetchall() or []
+    finally:
+        conn.close()
+
+    for row in rows:
+        payload = row.get('cache_json') if isinstance(row.get('cache_json'), dict) else {}
+        plan = _build_curriculum_plan(
+            payload,
+            request_label=f"{source_file}:{row.get('lesson')}:{row.get('topic') or ''}"
+        )
+        payload['curriculum_plan'] = plan
+        conn2 = db()
+        try:
+            with conn2.cursor() as cur2:
+                cur2.execute("""UPDATE knowledge_lesson_cache
+                               SET cache_json=%s::jsonb,status='READY',updated_at=NOW()
+                               WHERE id=%s AND status='PLANNING'""",
+                             (json.dumps(_cache_jsonable(payload), ensure_ascii=False), row.get('id')))
+            conn2.commit()
+        finally:
+            conn2.close()
+        promoted += 1
+        print(f"[CURRICULUM PLAN READY] cache_id={row.get('id')} lesson={row.get('lesson')!r} sections={len(plan.get('teaching_sections') or [])}")
+    print(f"[CURRICULUM PLAN ASYNC] done source={source_file!r} promoted={promoted}")
+    return promoted
 
 
 def _canonical_lesson_key(value: str) -> str:
@@ -7591,6 +7633,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
+    background_tasks: BackgroundTasks,
     password: str = Form(""),
     file: UploadFile = File(...),
     subject: str = Form(""),
@@ -7887,7 +7930,8 @@ async def admin_knowledge_upload(
     try:
         cache_lessons = _upsert_upload_knowledge_cache(
             source_file, source_hash, subject, len(reader.pages),
-            knowledge_cache_text_records, knowledge_cache_image_records
+            knowledge_cache_text_records, knowledge_cache_image_records,
+            defer_curriculum_plan=True
         )
     except Exception as exc:
         print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
@@ -7896,10 +7940,15 @@ async def admin_knowledge_upload(
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
+    if cache_lessons:
+        background_tasks.add_task(_finish_deferred_curriculum_plans, source_file)
+        print(f"[CURRICULUM PLAN ASYNC QUEUED] source={source_file!r} lessons={cache_lessons}")
+
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
             "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
+            "curriculum_plan_status": "PLANNING" if cache_lessons else "READY",
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
