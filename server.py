@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.12-chatbox-bound-study-session"
+BASELINE_VERSION = "18.13-exercise-token-optimized"
 import os
 import ast
 import io
@@ -3318,7 +3318,7 @@ def _chat_model_for_content(content_type: Optional[str], provider: Optional[str]
     return GEMINI_MODEL
 
 
-def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float):
+def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float, thinking_level_override: Optional[str] = None):
     """
     Provider-neutral chat adapter.
     Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
@@ -3326,7 +3326,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     content_blocks stay unchanged.
     """
     provider = LLM_PROVIDER
-    thinking_level = (
+    thinking_level = thinking_level_override or (
         "medium" if content_type in {"Bài tập", "Giáo trình"}
         else GEMINI_THINKING_LEVEL
     )
@@ -4505,8 +4505,16 @@ Tin nhắn hiện tại:
 
     # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
     # Never exceed 10 unless the client explicitly sends a smaller value.
-    retrieval_k = min(50 if requested_content_type == "Bài tập" and (requested_lesson or requested_topic) else 10,
-                      max(4, int(data.top_k or 8)))
+    exercise_start_turn = bool(
+        requested_content_type == "Bài tập"
+        and (lesson_confirmed_scope or forced_plan_scope)
+        and not correction_followup
+    )
+    retrieval_k = (
+        6 if exercise_start_turn else
+        min(50 if requested_content_type == "Bài tập" and (requested_lesson or requested_topic) else 10,
+            max(4, int(data.top_k or 8)))
+    )
 
     text_filter = build_scope_filter(
         "text",
@@ -5074,7 +5082,7 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
+    prompt_history = ([] if (lesson_confirmed_scope or forced_plan_scope) else recent_history[-4:]) if study_retrieval_allowed else (recent_history[-2:] if recent_history else [])
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
@@ -5175,57 +5183,86 @@ QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
 - Nếu có nhiều bảng trong cùng bài, giữ đúng quan hệ giữa từng bảng và ảnh của bảng đó.
 """
 
-    prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
+    # Compact path for the first turn of a confirmed exercise lesson. The full
+    # teacher policy is valuable for grading/corrections, but it is unnecessary
+    # on the initial "ra bài + gợi ý" turn and causes avoidable input/reasoning cost.
+    if exercise_start_turn:
+        compact_images = image_marker_rule
+        compact_rag = chr(10).join(prompt_contexts[:4])
+        compact_state = json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))
+        prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là lượt BẮT ĐẦU BÀI TẬP đã được người học xác nhận.
 
-NGUYÊN TẮC:
-- Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
-- Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
-- Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
-- Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
-- Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
-- Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
-- “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
-- Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
-- Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
-- Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
-- Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
-- Khi cậu đã THỰC SỰ hoàn tất lượt hướng dẫn trọn bài/chủ đề hiện tại (không phải chỉ trả lời một câu hỏi nhỏ), hãy đặt marker kỹ thuật `[[LESSON_END_READY]]` ở CUỐI câu trả lời. Nếu vẫn còn nội dung chính cần dạy hoặc đây chỉ là follow-up ngắn, KHÔNG đặt marker này. Marker sẽ được server đổi thành lựa chọn Có/Không để xác nhận kết thúc buổi học và không hiển thị cho học sinh.
-- Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
-- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
-- Không bịa nội dung/trang không có trong RAG.
-- Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
-- Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
-- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
-- Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
-- Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
-{image_marker_rule}
+QUY TẮC:
+- Chỉ dùng dữ liệu trong RAG CONTEXT của đúng lesson hiện tại.
+- Ra đề/bài luyện rõ ràng, ngắn gọn, đúng nguồn.
+- Ngay sau đề có mục **💡 Gợi ý cách làm**; chỉ gợi ý phương pháp, không đưa đáp án.
+- Với bài gọi món, đọc đúng món/giá từ CHUNK + ẢNH, không tự suy đoán.
+- Không dạy nội dung ngoài bài tập hiện tại.
+- Nếu chưa đến bước chấm bài, không cần suy luận dài.
+{compact_images}
 
-{mode_specific_rules}
-
-ACTIVE LEARNING STATE:
-{json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
-
-DANH MỤC (chỉ có khi cần gợi ý):
-{json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
+ACTIVE LESSON:
+{compact_state}
 
 RAG CONTEXT:
-{chr(10).join(prompt_contexts)}
+{compact_rag}
 
-RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
-{json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
-- Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
-- Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
-- Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
-
-TIN NHẮN HIỆN TẠI:
+TIN NHẮN:
 {query_text}"""
+    else:
+        prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
+
+    NGUYÊN TẮC:
+    - Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
+    - Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
+    - Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
+    - Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
+    - Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
+    - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
+    - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
+    - Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
+    - Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
+    - Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
+    - Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
+    - Khi cậu đã THỰC SỰ hoàn tất lượt hướng dẫn trọn bài/chủ đề hiện tại (không phải chỉ trả lời một câu hỏi nhỏ), hãy đặt marker kỹ thuật `[[LESSON_END_READY]]` ở CUỐI câu trả lời. Nếu vẫn còn nội dung chính cần dạy hoặc đây chỉ là follow-up ngắn, KHÔNG đặt marker này. Marker sẽ được server đổi thành lựa chọn Có/Không để xác nhận kết thúc buổi học và không hiển thị cho học sinh.
+    - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
+    - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
+    - Không bịa nội dung/trang không có trong RAG.
+    - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
+    - Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
+    - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
+    - Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
+    - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
+    {image_marker_rule}
+
+    {mode_specific_rules}
+
+    ACTIVE LEARNING STATE:
+    {json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
+
+    DANH MỤC (chỉ có khi cần gợi ý):
+    {json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
+
+    RAG CONTEXT:
+    {chr(10).join(prompt_contexts)}
+
+    RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
+    {json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+    - Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
+    - Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
+    - Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
+
+    TIN NHẮN HIỆN TẠI:
+    {query_text}"""
 
     gen_started = time.perf_counter()
+    thinking_override = "low" if exercise_start_turn else None
     reply, response_model, gen_elapsed = _generate_chat_reply(
         prompt,
         content_type=requested_content_type,
         request_id=request_id,
         gen_started=gen_started,
+        thinking_level_override=thinking_override,
     )
     perf_gen = time.perf_counter()
 
