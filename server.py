@@ -1,4 +1,4 @@
-BASELINE_VERSION = "20.3-curriculum-high-planner-async-upload"
+BASELINE_VERSION = "20.4-memory-safe-curriculum-planner"
 import os
 import ast
 import io
@@ -6,6 +6,7 @@ import uuid
 import re
 import time
 import threading
+import gc
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
@@ -2579,17 +2580,24 @@ def _build_curriculum_plan(payload, *, request_label="upload"):
             "chunk_index": sec.get("chunk_index"),
             "page": sec.get("page"),
             "content_unit_id": sec.get("content_unit_id"),
-            "text": str(sec.get("text") or "")[:7000],
+            "text": str(sec.get("text") or "")[:3200],
             "image_keys": list(sec.get("image_keys") or []),
         })
     vision_items = []
     for img in images:
         vision = img.get("vision") or {}
+        # Curriculum planning only needs semantic facts, not the full vision payload.
+        # Keep the source-of-truth cache untouched; compact only the HIGH-planner prompt.
         vision_items.append({
             "image_key": img.get("image_key"),
             "page": img.get("page"),
             "chunk_index": img.get("chunk_index"),
-            "vision": vision,
+            "vision": {
+                k: vision.get(k) for k in (
+                    "term", "reading", "meaning", "associated_text", "description",
+                    "table_facts", "facts", "image_kind", "image_scope"
+                ) if vision.get(k) not in (None, "", [], {})
+            },
         })
 
     prompt = f"""Bạn là một chuyên gia thiết kế bài học tiếng Nhật cho Doraemon.
@@ -2873,7 +2881,52 @@ def _finish_deferred_curriculum_plans(source_file: str):
     return promoted
 
 
-def _canonical_lesson_key(value: str) -> str:
+def _ensure_curriculum_plan_ready(cache: dict, *, request_id: str = ""):
+    """Promote one PLANNING lesson cache to READY on first real curriculum use.
+
+    v20.4 deliberately avoids FastAPI BackgroundTasks for HIGH planning because
+    BackgroundTasks runs inside the same Render web process and still counts
+    against the 512 MB container limit. The heavy planner is therefore triggered
+    only after upload memory has been released, and only for the lesson actually
+    being opened.
+    """
+    if not isinstance(cache, dict):
+        return cache
+    status = str(cache.get("__cache_status") or "READY").upper()
+    plan = cache.get("curriculum_plan")
+    if status != "PLANNING" or plan:
+        return cache
+    source_file = str(cache.get("source_file") or cache.get("__cache_source_file") or "")
+    lesson = str(cache.get("lesson") or "")
+    topic = str(cache.get("topic") or "")
+    cache_id = cache.get("__cache_id")
+    print(f"[CURRICULUM PLAN LAZY] request={request_id} cache_id={cache_id} lesson={lesson!r} topic={topic!r} thinking_level='high'")
+    gc.collect()
+    plan = _build_curriculum_plan(cache, request_label=f"{source_file}:{lesson}:{topic}")
+    payload = dict(cache)
+    payload.pop("__cache_status", None)
+    payload.pop("__cache_id", None)
+    payload.pop("__cache_source_file", None)
+    payload["curriculum_plan"] = plan
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE knowledge_lesson_cache
+                           SET cache_json=%s::jsonb,status='READY',updated_at=NOW()
+                           WHERE id=%s AND status='PLANNING'""",
+                        (json.dumps(_cache_jsonable(payload), ensure_ascii=False), cache_id))
+        conn.commit()
+    finally:
+        conn.close()
+    gc.collect()
+    payload["__cache_status"] = "READY"
+    payload["__cache_id"] = cache_id
+    payload["__cache_source_file"] = source_file
+    print(f"[CURRICULUM PLAN READY] request={request_id} cache_id={cache_id} lesson={lesson!r} sections={len(plan.get('teaching_sections') or [])}")
+    return payload
+
+
+def _canonical_lesson_key(value: str):
     """Normalize lesson names so UI phrases like "bài visionv1" match cached "visionv1"."""
     s = str(value or "").strip().casefold()
     s = re.sub(r"^\s*bài\s+", "", s)
@@ -2894,12 +2947,12 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             rows = []
-            # Pull only READY rows for the same content type, then resolve lesson/topic
+            # Pull READY/PLANNING rows for the same content type, then resolve lesson/topic
             # aliases in Python so "bài visionv1" can match cached "visionv1" safely.
             cur.execute(
                 """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
                    FROM knowledge_lesson_cache
-                   WHERE status='READY'
+                   WHERE status IN ('READY','PLANNING')
                      AND lower(trim(content_type))=lower(trim(%s))
                    ORDER BY updated_at DESC""",
                 (ct,),
@@ -2945,7 +2998,11 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                     f"[KNOWLEDGE CACHE LOOKUP] request={request_id} canonical_match=1 "
                     f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r} cache_id={exact.get('id')}"
                 )
-                return dict(payload)
+                out = dict(payload)
+                out["__cache_status"] = str(exact.get("status") or "READY")
+                out["__cache_id"] = exact.get("id")
+                out["__cache_source_file"] = exact.get("source_file")
+                return out
             return None
     except Exception as exc:
         print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
@@ -5247,9 +5304,11 @@ Tin nhắn hiện tại:
         runtime_lesson_cache = _load_runtime_lesson_cache(
             requested_content_type or "Giáo trình", requested_lesson, requested_topic, request_id=request_id
         )
+        if runtime_lesson_cache and (requested_content_type or "") == "Giáo trình":
+            runtime_lesson_cache = _ensure_curriculum_plan_ready(runtime_lesson_cache, request_id=request_id)
         runtime_cache_hit = bool(runtime_lesson_cache)
         if not runtime_cache_hit:
-            print(f"[KNOWLEDGE CACHE RUNTIME MISS] request={request_id} lesson={requested_lesson!r} topic={requested_topic!r} reason='no_ready_payload'" )
+            print(f"[KNOWLEDGE CACHE RUNTIME MISS] request={request_id} lesson={requested_lesson!r} topic={requested_topic!r} reason='no_ready_payload'")
         if runtime_cache_hit:
             print(f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}")
     print(
@@ -7467,7 +7526,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # A low-cost local visual check is used only to detect whether an
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
-            preview = render_pdf_page(raw_pdf, page_no, dpi=90)
+            preview = render_pdf_page(raw_pdf, page_no, dpi=72)
             table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
@@ -7479,7 +7538,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             table_page = False
 
         # Scan/low-text pages retain the old Gemini OCR behavior.
-        png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
+        png = render_pdf_page(raw_pdf, page_no, dpi=140 if table_page else 120)
         ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
@@ -7629,6 +7688,20 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         if stored:
             page_images[page_no] = stored
+        # Release large rendered buffers before processing the next page.
+        try:
+            del preview
+        except Exception:
+            pass
+        try:
+            del png
+        except Exception:
+            pass
+        try:
+            del page
+        except Exception:
+            pass
+        gc.collect()
     return page_texts, page_images, page_units
 
 @app.post("/admin/api/knowledge/upload")
@@ -7941,8 +8014,14 @@ async def admin_knowledge_upload(
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
     if cache_lessons:
-        background_tasks.add_task(_finish_deferred_curriculum_plans, source_file)
-        print(f"[CURRICULUM PLAN ASYNC QUEUED] source={source_file!r} lessons={cache_lessons}")
+        print(f"[CURRICULUM PLAN DEFERRED] source={source_file!r} lessons={cache_lessons}; HIGH planner will run lazily on first curriculum use")
+
+    # Explicitly release upload-time working sets before returning to Render.
+    try:
+        del page_texts, page_images, page_units, knowledge_cache_text_records, knowledge_cache_image_records, vectors, raw, reader, records_meta
+    except Exception:
+        pass
+    gc.collect()
 
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
