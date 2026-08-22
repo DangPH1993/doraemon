@@ -1,4 +1,4 @@
-BASELINE_VERSION = "20.4-memory-safe-curriculum-planner"
+BASELINE_VERSION = "19.9-curriculum-chunk-step-flow"
 import os
 import ast
 import io
@@ -6,7 +6,6 @@ import uuid
 import re
 import time
 import threading
-import gc
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
@@ -247,10 +246,6 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_topic VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_started_at TIMESTAMPTZ;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_flow_step VARCHAR(30);""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_section_index INTEGER NOT NULL DEFAULT 0;""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_waiting BOOLEAN NOT NULL DEFAULT FALSE;""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_exercise_index INTEGER NOT NULL DEFAULT 0;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_scope VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_created_at TIMESTAMPTZ;""")
@@ -301,6 +296,9 @@ def init_db():
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS associated_text TEXT;",
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS bbox TEXT;",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_step INTEGER NOT NULL DEFAULT 0;",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_waiting VARCHAR(20) DEFAULT 'continue';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_exercise_answered BOOLEAN NOT NULL DEFAULT FALSE;",
             ]:
                 cur.execute(sql)
             cur.execute("UPDATE knowledge_vision_cache SET image_hash=md5(image_key) WHERE image_hash IS NULL AND image_key IS NOT NULL;")
@@ -2559,189 +2557,7 @@ def _cache_jsonable(value):
     return str(value)
 
 
-
-def _build_curriculum_plan(payload, *, request_label="upload"):
-    """Create a pedagogical plan for Giáo trình once at upload time.
-
-    The plan is derived only from cached source text/vision facts. Runtime uses this
-    plan to avoid treating every raw chunk as a separate lesson section. Full source
-    sections remain intact in cache; the plan is only a navigation layer.
-    """
-    sections = list((payload or {}).get("sections") or [])
-    images = list((payload or {}).get("images") or [])
-    if not sections:
-        return {"version": 1, "intro": {"text": "", "objectives": []}, "teaching_sections": [],
-                "exercise": {"exists": False, "depends_on_section_indices": []}, "summary": {"focus": []}}
-
-    source_sections = []
-    for i, sec in enumerate(sections):
-        source_sections.append({
-            "index": i,
-            "chunk_index": sec.get("chunk_index"),
-            "page": sec.get("page"),
-            "content_unit_id": sec.get("content_unit_id"),
-            "text": str(sec.get("text") or "")[:3200],
-            "image_keys": list(sec.get("image_keys") or []),
-        })
-    vision_items = []
-    for img in images:
-        vision = img.get("vision") or {}
-        # Curriculum planning only needs semantic facts, not the full vision payload.
-        # Keep the source-of-truth cache untouched; compact only the HIGH-planner prompt.
-        vision_items.append({
-            "image_key": img.get("image_key"),
-            "page": img.get("page"),
-            "chunk_index": img.get("chunk_index"),
-            "vision": {
-                k: vision.get(k) for k in (
-                    "term", "reading", "meaning", "associated_text", "description",
-                    "table_facts", "facts", "image_kind", "image_scope"
-                ) if vision.get(k) not in (None, "", [], {})
-            },
-        })
-
-    prompt = f"""Bạn là một chuyên gia thiết kế bài học tiếng Nhật cho Doraemon.
-Hãy tạo PEDAGOGICAL PLAN cho một tài liệu GIÁO TRÌNH dựa CHỈ trên nguồn bên dưới.
-Không được thêm kiến thức bên ngoài. Không được đổi sự thật của nguồn.
-Mục tiêu là tổ chức bài thành các bước dạy tuần tự, không phải tóm tắt lại toàn bộ bài.
-
-YÊU CẦU FLOW:
-- Bước 0: INTRO/OBJECTIVES — giới thiệu mục tiêu, bài học sẽ đi qua những phần nào.
-- Sau đó là các TEACHING SECTIONS độc lập về mặt trình bày. Ví dụ nếu nguồn có lịch Ken và lịch bác sĩ thì phải tạo 2 section riêng, không gộp.
-- Mỗi teaching section phải có title, teaching_text dựa trực tiếp trên nguồn, source_section_indices và image_keys liên quan.
-- Khi một section có TỪ VỰNG, phải giữ/khai thác cả cách đọc (kana/reading) và hướng dẫn phát âm để runtime có thể dạy từ đó; không tự đổi hoặc bịa reading nếu nguồn đã cung cấp reading khác.
-- Nếu một source chunk chứa nhiều chủ đề, hãy tách thành nhiều teaching section bằng cách chia lại nội dung nguồn; tuyệt đối không bịa dữ kiện.
-- Sau các teaching sections là EXERCISE. Exercise có thể phụ thuộc nhiều teaching sections. Hãy ghi rõ depends_on_section_indices.
-- Nếu nguồn không có bài tập, exists=false.
-- Cuối cùng là SUMMARY, tổng kết toàn bộ kiến thức đã học.
-
-SOURCE TEXT SECTIONS:
-{json.dumps(source_sections, ensure_ascii=False, separators=(',', ':'))}
-
-VISION FACTS/IMAGES:
-{json.dumps(vision_items, ensure_ascii=False, separators=(',', ':'))}
-
-CHỈ TRẢ JSON THEO SCHEMA:
-{{
-  "intro": {{"title":"", "text":"", "objectives":[]}},
-  "teaching_sections": [
-    {{
-      "id":"section_1",
-      "title":"",
-      "teaching_text":"",
-      "source_section_indices":[],
-      "image_keys":[],
-      "focus_facts":[]
-    }}
-  ],
-  "exercise": {{
-    "exists": false,
-    "title":"",
-    "instruction":"",
-    "source_section_indices":[],
-    "depends_on_section_indices":[],
-    "questions":[]
-  }},
-  "summary": {{"title":"", "focus":[]}}
-}}"""
-    try:
-        if gemini is None:
-            raise RuntimeError("Gemini unavailable")
-        print(f"[CURRICULUM PLAN] request_label={request_label!r} thinking_level='high'")
-        response = gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                # Curriculum planning is an offline, upload-time operation.
-                # Spend the highest reasoning budget here so the cached pedagogy
-                # plan can correctly detect independent sections and exercise
-                # dependencies once, then be reused by every learner.
-                thinking_config=types.ThinkingConfig(thinking_level="high"),
-                response_mime_type="application/json",
-            ),
-        )
-        _log_gemini_usage(response, operation=f"curriculum_plan:{request_label}")
-        data = _parse_gemini_json(response.text or "{}")
-        if not isinstance(data, dict):
-            raise ValueError("invalid curriculum plan JSON")
-
-        # Validate / normalize while preserving source-only semantics.
-        norm_sections = []
-        for i, item in enumerate(data.get("teaching_sections") or [], start=1):
-            if not isinstance(item, dict):
-                continue
-            idxs = []
-            for x in item.get("source_section_indices") or []:
-                try:
-                    x = int(x)
-                    if 0 <= x < len(sections):
-                        idxs.append(x)
-                except Exception:
-                    continue
-            if not idxs:
-                continue
-            img_keys = [str(x).strip() for x in (item.get("image_keys") or []) if str(x).strip()]
-            text = str(item.get("teaching_text") or "").strip()
-            if not text:
-                text = "\n\n".join(str(sections[x].get("text") or "") for x in idxs).strip()
-            norm_sections.append({
-                "id": str(item.get("id") or f"section_{i}"),
-                "title": str(item.get("title") or f"Phần {i}"),
-                "teaching_text": text,
-                "source_section_indices": idxs,
-                "image_keys": img_keys,
-                "focus_facts": [str(x).strip() for x in (item.get("focus_facts") or []) if str(x).strip()],
-            })
-
-        intro = data.get("intro") if isinstance(data.get("intro"), dict) else {}
-        exercise = data.get("exercise") if isinstance(data.get("exercise"), dict) else {}
-        deps = []
-        for x in exercise.get("depends_on_section_indices") or []:
-            try:
-                x = int(x)
-                if 0 <= x < len(norm_sections):
-                    deps.append(x)
-            except Exception:
-                continue
-        exercise_norm = {
-            "exists": bool(exercise.get("exists")),
-            "title": str(exercise.get("title") or ""),
-            "instruction": str(exercise.get("instruction") or ""),
-            "source_section_indices": [int(x) for x in (exercise.get("source_section_indices") or []) if str(x).isdigit() and 0 <= int(x) < len(sections)],
-            "depends_on_section_indices": deps,
-            "questions": [str(x).strip() for x in (exercise.get("questions") or []) if str(x).strip()],
-        }
-        return {
-            "version": 2,
-            "intro": {
-                "title": str(intro.get("title") or "Mục tiêu bài học"),
-                "text": str(intro.get("text") or "").strip(),
-                "objectives": [str(x).strip() for x in (intro.get("objectives") or []) if str(x).strip()],
-            },
-            "teaching_sections": norm_sections,
-            "exercise": exercise_norm,
-            "summary": data.get("summary") if isinstance(data.get("summary"), dict) else {"title":"Tổng kết", "focus":[]},
-        }
-    except Exception as exc:
-        print(f"[CURRICULUM PLAN] build failed: {type(exc).__name__}: {exc}; using safe fallback")
-        fallback=[]
-        for i, sec in enumerate(sections, start=1):
-            fallback.append({
-                "id": f"section_{i}", "title": f"Phần {i}",
-                "teaching_text": str(sec.get("text") or ""),
-                "source_section_indices": [i-1],
-                "image_keys": list(sec.get("image_keys") or []), "focus_facts": [],
-            })
-        return {
-            "version": 1,
-            "intro": {"title":"Mục tiêu bài học", "text":"", "objectives":[]},
-            "teaching_sections": fallback,
-            "exercise": {"exists": bool(_cache_exercise_sections({"sections": sections})), "title":"Bài tập", "instruction":"", "source_section_indices":[], "depends_on_section_indices": list(range(len(fallback))), "questions":[]},
-            "summary": {"title":"Tổng kết", "focus":[]},
-        }
-
-def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records, *, defer_curriculum_plan=False):
+def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
     """Persist the complete upload-time knowledge asset and reusable vision cache."""
     grouped = {}
     for rec in text_records:
@@ -2802,14 +2618,8 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 payload["images"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
                 # Tiny immutable overview for the runtime prompt; full source remains in sections.
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
-                curriculum_plan = None
-                if ct == "Giáo trình" and not defer_curriculum_plan:
-                    curriculum_plan = _build_curriculum_plan(
-                        {**payload, "source_file": source_file, "content_type": ct, "lesson": lesson, "topic": topic},
-                        request_label=f"{source_file}:{lesson}:{topic or ''}"
-                    )
                 package = {
-                    "version": 2,
+                    "version": 1,
                     "source_file": source_file,
                     "content_hash": source_hash,
                     "subject": subject,
@@ -2819,11 +2629,9 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "overview": overview,
                     "sections": payload["sections"],
                     "images": payload["images"],
-                    "curriculum_plan": curriculum_plan,
                 }
-                cache_status = 'PLANNING' if (defer_curriculum_plan and ct == "Giáo trình") else 'READY'
-                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())""",
-                    (asset_id, source_file, subject, ct, lesson, topic, cache_status, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
+                    (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
                     image_key = str(img.get("image_key") or "").strip()
                     image_hash = str(img.get("image_hash") or "").strip() or None
@@ -2840,93 +2648,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
     return len(grouped)
 
 
-def _finish_deferred_curriculum_plans(source_file: str):
-    """Run HIGH-reasoning curriculum planning after the upload HTTP response.
-    Lesson cache rows stay PLANNING until a complete plan is written, so runtime
-    never consumes an incomplete pedagogical plan.
-    """
-    print(f"[CURRICULUM PLAN ASYNC] start source={source_file!r} thinking_level='high'")
-    conn = db()
-    promoted = 0
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,cache_json,lesson,topic
-                           FROM knowledge_lesson_cache
-                           WHERE source_file=%s AND content_type='Giáo trình' AND status='PLANNING'
-                           ORDER BY id""", (source_file,))
-            rows = cur.fetchall() or []
-    finally:
-        conn.close()
-
-    for row in rows:
-        payload = row.get('cache_json') if isinstance(row.get('cache_json'), dict) else {}
-        plan = _build_curriculum_plan(
-            payload,
-            request_label=f"{source_file}:{row.get('lesson')}:{row.get('topic') or ''}"
-        )
-        payload['curriculum_plan'] = plan
-        conn2 = db()
-        try:
-            with conn2.cursor() as cur2:
-                cur2.execute("""UPDATE knowledge_lesson_cache
-                               SET cache_json=%s::jsonb,status='READY',updated_at=NOW()
-                               WHERE id=%s AND status='PLANNING'""",
-                             (json.dumps(_cache_jsonable(payload), ensure_ascii=False), row.get('id')))
-            conn2.commit()
-        finally:
-            conn2.close()
-        promoted += 1
-        print(f"[CURRICULUM PLAN READY] cache_id={row.get('id')} lesson={row.get('lesson')!r} sections={len(plan.get('teaching_sections') or [])}")
-    print(f"[CURRICULUM PLAN ASYNC] done source={source_file!r} promoted={promoted}")
-    return promoted
-
-
-def _ensure_curriculum_plan_ready(cache: dict, *, request_id: str = ""):
-    """Promote one PLANNING lesson cache to READY on first real curriculum use.
-
-    v20.4 deliberately avoids FastAPI BackgroundTasks for HIGH planning because
-    BackgroundTasks runs inside the same Render web process and still counts
-    against the 512 MB container limit. The heavy planner is therefore triggered
-    only after upload memory has been released, and only for the lesson actually
-    being opened.
-    """
-    if not isinstance(cache, dict):
-        return cache
-    status = str(cache.get("__cache_status") or "READY").upper()
-    plan = cache.get("curriculum_plan")
-    if status != "PLANNING" or plan:
-        return cache
-    source_file = str(cache.get("source_file") or cache.get("__cache_source_file") or "")
-    lesson = str(cache.get("lesson") or "")
-    topic = str(cache.get("topic") or "")
-    cache_id = cache.get("__cache_id")
-    print(f"[CURRICULUM PLAN LAZY] request={request_id} cache_id={cache_id} lesson={lesson!r} topic={topic!r} thinking_level='high'")
-    gc.collect()
-    plan = _build_curriculum_plan(cache, request_label=f"{source_file}:{lesson}:{topic}")
-    payload = dict(cache)
-    payload.pop("__cache_status", None)
-    payload.pop("__cache_id", None)
-    payload.pop("__cache_source_file", None)
-    payload["curriculum_plan"] = plan
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE knowledge_lesson_cache
-                           SET cache_json=%s::jsonb,status='READY',updated_at=NOW()
-                           WHERE id=%s AND status='PLANNING'""",
-                        (json.dumps(_cache_jsonable(payload), ensure_ascii=False), cache_id))
-        conn.commit()
-    finally:
-        conn.close()
-    gc.collect()
-    payload["__cache_status"] = "READY"
-    payload["__cache_id"] = cache_id
-    payload["__cache_source_file"] = source_file
-    print(f"[CURRICULUM PLAN READY] request={request_id} cache_id={cache_id} lesson={lesson!r} sections={len(plan.get('teaching_sections') or [])}")
-    return payload
-
-
-def _canonical_lesson_key(value: str):
+def _canonical_lesson_key(value: str) -> str:
     """Normalize lesson names so UI phrases like "bài visionv1" match cached "visionv1"."""
     s = str(value or "").strip().casefold()
     s = re.sub(r"^\s*bài\s+", "", s)
@@ -2947,12 +2669,12 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             rows = []
-            # Pull READY/PLANNING rows for the same content type, then resolve lesson/topic
+            # Pull only READY rows for the same content type, then resolve lesson/topic
             # aliases in Python so "bài visionv1" can match cached "visionv1" safely.
             cur.execute(
                 """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
                    FROM knowledge_lesson_cache
-                   WHERE status IN ('READY','PLANNING')
+                   WHERE status='READY'
                      AND lower(trim(content_type))=lower(trim(%s))
                    ORDER BY updated_at DESC""",
                 (ct,),
@@ -2998,11 +2720,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                     f"[KNOWLEDGE CACHE LOOKUP] request={request_id} canonical_match=1 "
                     f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r} cache_id={exact.get('id')}"
                 )
-                out = dict(payload)
-                out["__cache_status"] = str(exact.get("status") or "READY")
-                out["__cache_id"] = exact.get("id")
-                out["__cache_source_file"] = exact.get("source_file")
-                return out
+                return dict(payload)
             return None
     except Exception as exc:
         print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
@@ -3079,7 +2797,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 SELECT study_session_active,study_session_content_type,study_session_course,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending,study_session_chatbox_id,
-                       curriculum_flow_step,curriculum_section_index,curriculum_waiting,curriculum_exercise_index
+                       curriculum_step,curriculum_waiting,curriculum_exercise_answered
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
@@ -3098,10 +2816,9 @@ def _get_study_session(user_id, chatbox_id=None):
                 "started_at": row.get("study_session_started_at"),
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
                 "chatbox_id": stored_chatbox,
-                "curriculum_flow_step": row.get("curriculum_flow_step"),
-                "curriculum_section_index": int(row.get("curriculum_section_index") or 0),
-                "curriculum_waiting": bool(row.get("curriculum_waiting")),
-                "curriculum_exercise_index": int(row.get("curriculum_exercise_index") or 0),
+                "curriculum_step": int(row.get("curriculum_step") or 0),
+                "curriculum_waiting": str(row.get("curriculum_waiting") or "continue"),
+                "curriculum_exercise_answered": bool(row.get("curriculum_exercise_answered")),
             }
     finally:
         conn.close()
@@ -3117,8 +2834,6 @@ def _start_study_session(user_id, scope, chatbox_id=None):
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
     topic = str(scope.get("topic") or "").strip() or None
     chatbox = str(chatbox_id or "").strip() or None
-    curriculum_step = "OBJECTIVES" if content_type == "Giáo trình" else None
-    curriculum_waiting = bool(content_type == "Giáo trình")
     conn = db()
     try:
         with conn.cursor() as cur:
@@ -3127,9 +2842,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
-                    study_end_prompt_pending,curriculum_flow_step,curriculum_section_index,
-                    curriculum_waiting,curriculum_exercise_index,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,%s,0,%s,0,NOW())
+                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,updated_at
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
@@ -3139,19 +2853,18 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     study_session_chatbox_id=%s,
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
-                    curriculum_flow_step=%s,
-                    curriculum_section_index=0,
-                    curriculum_waiting=%s,
-                    curriculum_exercise_index=0,
+                    curriculum_step=0,
+                    curriculum_waiting='continue',
+                    curriculum_exercise_answered=FALSE,
                     updated_at=NOW()
             """, (
                 user_id,content_type,course,lesson,topic,chatbox,
-                curriculum_step,curriculum_waiting,
-                content_type,course,lesson,topic,chatbox,curriculum_step,curriculum_waiting
+                content_type,course,lesson,topic,chatbox
             ))
         conn.commit()
     finally:
         conn.close()
+
 
 def _finish_study_session(user_id):
     conn = db()
@@ -3159,140 +2872,11 @@ def _finish_study_session(user_id):
         with conn.cursor() as cur:
             cur.execute("""UPDATE user_learning_state
                            SET study_session_active=FALSE, study_end_prompt_pending=FALSE,
-                               study_session_chatbox_id=NULL, curriculum_flow_step=NULL,
-                               curriculum_section_index=0, curriculum_waiting=FALSE, curriculum_exercise_index=0, updated_at=NOW()
+                               study_session_chatbox_id=NULL, updated_at=NOW()
                            WHERE user_id=%s""", (user_id,))
         conn.commit()
     finally:
         conn.close()
-
-
-def _set_curriculum_flow(user_id, step=None, section_index=0, waiting=False, exercise_index=0):
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE user_learning_state
-                           SET curriculum_flow_step=%s, curriculum_section_index=%s,
-                               curriculum_waiting=%s, curriculum_exercise_index=%s, updated_at=NOW()
-                           WHERE user_id=%s""",
-                        (step, int(section_index or 0), bool(waiting), int(exercise_index or 0), user_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _curriculum_step_for_session(study_session):
-    if not study_session or _normalize_content_type(study_session.get("content_type")) != "Giáo trình":
-        return None
-    return str(study_session.get("curriculum_flow_step") or "").strip().upper() or None
-
-
-def _curriculum_continue_choice(label="Tiếp tục"):
-    return {"type":"choice","id":"curriculum_continue","options":[
-        {"label":"Có","display_label":label,"action":"curriculum_continue_yes"},
-        {"label":"Không","display_label":"Tạm dừng học","action":"curriculum_continue_no"},
-    ]}
-
-
-def _curriculum_exercise_choice():
-    return {"type":"choice","id":"curriculum_exercise","options":[
-        {"label":"Có","display_label":"Có — làm bài tập","action":"curriculum_exercise_yes"},
-        {"label":"Không","display_label":"Không — kết thúc phần học","action":"curriculum_summary_yes"},
-    ]}
-
-
-def _curriculum_summary_choice():
-    return {"type":"choice","id":"curriculum_summary","options":[
-        {"label":"Có","display_label":"Có — tổng kết bài","action":"curriculum_summary_yes"},
-        {"label":"Không","display_label":"Tạm dừng","action":"curriculum_continue_no"},
-    ]}
-
-
-def _curriculum_mastery_choice():
-    return {"type":"choice","id":"curriculum_mastery","options":[
-        {"label":"Có","display_label":"Có — mình đã nắm bài","action":"curriculum_mastery_yes"},
-        {"label":"Chưa","display_label":"Chưa — mình cần ôn lại","action":"curriculum_mastery_no"},
-    ]}
-
-
-
-def _runtime_curriculum_sections(cache):
-    """Return pedagogical teaching sections for Giáo trình runtime.
-
-    The upload-time curriculum_plan is authoritative when present. Raw cache sections
-    remain the lossless source-of-truth and are used as fallback.
-    """
-    plan = (cache or {}).get("curriculum_plan") or {}
-    teaching = plan.get("teaching_sections") if isinstance(plan, dict) else None
-    raw = list((cache or {}).get("sections") or [])
-    if not isinstance(teaching, list) or not teaching:
-        return raw
-    out=[]
-    for i, item in enumerate(teaching):
-        if not isinstance(item, dict):
-            continue
-        idxs=[]
-        for x in item.get("source_section_indices") or []:
-            try:
-                x=int(x)
-                if 0 <= x < len(raw): idxs.append(x)
-            except Exception:
-                continue
-        text=str(item.get("teaching_text") or "").strip()
-        if not text and idxs:
-            text="\n\n".join(str(raw[x].get("text") or "") for x in idxs).strip()
-        image_keys=[str(k).strip() for k in (item.get("image_keys") or []) if str(k).strip()]
-        if not image_keys:
-            for x in idxs:
-                image_keys += [str(k).strip() for k in (raw[x].get("image_keys") or []) if str(k).strip()]
-        # Include source metadata for traceability without changing the source facts.
-        source_pages=[]
-        for x in idxs:
-            if raw[x].get("page") is not None: source_pages.append(raw[x].get("page"))
-        out.append({
-            "chunk_index": i,
-            "page": source_pages[0] if source_pages else None,
-            "content_unit_id": item.get("id") or f"section_{i+1}",
-            "text": text,
-            "image_keys": list(dict.fromkeys(image_keys)),
-            "metadata": {"source_section_indices": idxs, "title": item.get("title"), "focus_facts": item.get("focus_facts") or []},
-            "curriculum_title": str(item.get("title") or f"Phần {i+1}"),
-        })
-    return out or raw
-
-
-def _runtime_curriculum_intro(cache):
-    plan=(cache or {}).get("curriculum_plan") or {}
-    intro=plan.get("intro") if isinstance(plan, dict) else None
-    return intro if isinstance(intro, dict) else {"title":"Mục tiêu bài học", "text": str((cache or {}).get("overview") or ""), "objectives":[]}
-
-
-def _runtime_curriculum_exercise_sections(cache, teaching_sections):
-    plan=(cache or {}).get("curriculum_plan") or {}
-    exercise=plan.get("exercise") if isinstance(plan, dict) else None
-    if isinstance(exercise, dict):
-        deps=exercise.get("depends_on_section_indices") or []
-        chosen=[]
-        for x in deps:
-            try:
-                x=int(x)
-                if 0 <= x < len(teaching_sections): chosen.append(teaching_sections[x])
-            except Exception:
-                continue
-        if chosen: return chosen
-    return teaching_sections
-
-def _cache_exercise_sections(cache):
-    sections = list((cache or {}).get("sections") or [])
-    out = []
-    keywords = ("bài tập", "luyện tập", "bài luyện", "bài thực hành", "練習", "れんしゅう")
-    for sec in sections:
-        md = sec.get("metadata") or {}
-        text = str(sec.get("text") or "").casefold()
-        pages = md.get("question_pages") or md.get("answer_pages")
-        if pages or any(k in text for k in keywords):
-            out.append(sec)
-    return out
 
 
 def _set_study_end_prompt_pending(user_id, pending=True):
@@ -3323,6 +2907,9 @@ def _finish_study_session(user_id):
                     study_session_topic=NULL,
                     study_session_started_at=NULL,
                     study_end_prompt_pending=FALSE,
+                    curriculum_step=0,
+                    curriculum_waiting='continue',
+                    curriculum_exercise_answered=FALSE,
                     updated_at=NOW()
                 WHERE user_id=%s
             """, (user_id,))
@@ -3340,6 +2927,73 @@ def _active_session_scope(session):
         "lesson": session.get("lesson"),
         "topic": session.get("topic"),
     }
+
+
+def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=None):
+    """Persist the lightweight Giáo trình step state for the current study session."""
+    sets=[]; vals=[]
+    if step is not None:
+        sets.append("curriculum_step=%s"); vals.append(int(step))
+    if waiting is not None:
+        sets.append("curriculum_waiting=%s"); vals.append(str(waiting))
+    if exercise_answered is not None:
+        sets.append("curriculum_exercise_answered=%s"); vals.append(bool(exercise_answered))
+    if not sets:
+        return
+    sets.append("updated_at=NOW()")
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE user_learning_state SET {', '.join(sets)} WHERE user_id=%s", tuple(vals+[user_id]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _curriculum_sections(cache):
+    """Return cache chunks as deterministic teaching sections in page/chunk order."""
+    sections=list((cache or {}).get("sections") or [])
+    sections.sort(key=lambda x:(int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
+    return sections
+
+
+def _curriculum_has_exercise(cache):
+    """Detect whether the uploaded Giáo trình itself contains a task/requirement."""
+    for sec in _curriculum_sections(cache):
+        md=sec.get("metadata") or {}
+        if md.get("question_pages") or md.get("answer_pages"):
+            return True
+        text=str(sec.get("text") or "").casefold()
+        markers=("bài tập", "bài luyện", "yêu cầu", "hãy làm", "làm bài", "練習", "れんしゅう", "問題")
+        if any(m in text for m in markers):
+            return True
+    return False
+
+
+def _curriculum_step_map(cache):
+    """Fixed pedagogical skeleton; number of chunk sections remains dynamic per lesson."""
+    sections=_curriculum_sections(cache)
+    exercise=_curriculum_has_exercise(cache)
+    first_chunk_step=1
+    exercise_step=1+len(sections) if exercise else None
+    summary_step=1+len(sections)+(1 if exercise else 0)
+    return {"sections":sections,"exercise":exercise,"exercise_step":exercise_step,"summary_step":summary_step}
+
+
+def _is_continue_confirmation(text):
+    q=str(text or "").strip().casefold()
+    return q in {"có","co","ok","okay","oke","ừ","ừm","vâng","được","được rồi","tiếp","tiếp đi","tiếp nhé","tiếp tục","rồi","hiểu rồi","sang phần tiếp theo","tổng kết đi","mình sẵn sàng"}
+
+
+def _curriculum_continue_blocks(step, label="Tiếp tục"):
+    return [{"type":"choice","id":"curriculum_next","options":[{"label":label,"action":f"curriculum_next:{int(step)}"}]}]
+
+
+def _curriculum_final_blocks():
+    return [{"type":"choice","id":"curriculum_final","options":[
+        {"label":"Có — mình nắm rồi","action":"curriculum_finish_yes"},
+        {"label":"Chưa — mình muốn ôn lại","action":"curriculum_finish_no"},
+    ]}]
 
 
 def _is_study_followup(text):
@@ -4253,43 +3907,36 @@ def proxy_chat(
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
 
-    # Giáo trình-only step controls. Other content types keep their existing flow.
-    flow_session_now = _get_study_session(user["id"], data.chatbox_id)
-    if flow_session_now and _normalize_content_type(flow_session_now.get("content_type")) == "Giáo trình":
-        flow_step_now = _curriculum_step_for_session(flow_session_now)
-        idx_now = int(flow_session_now.get("curriculum_section_index") or 0)
-        if not ui_action and bool(flow_session_now.get("curriculum_waiting")) and _is_affirmative(query_text):
-            if flow_step_now == "OBJECTIVES":
-                _set_curriculum_flow(user["id"], "SECTION", 0, False, 0)
-                study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
-                flow_step_now = "SECTION"
-                idx_now = 0
-            elif flow_step_now == "SUMMARY":
-                _set_curriculum_flow(user["id"], "MASTERY", idx_now, True, 0)
-                study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
-        if ui_action == "curriculum_continue_no":
-            msg = f"Được nhé! 🤖 Mình tạm dừng ở **{flow_session_now.get('lesson') or 'bài này'}**."
-            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-        if ui_action == "curriculum_continue_yes":
-            if flow_step_now == "OBJECTIVES":
-                _set_curriculum_flow(user["id"], "SECTION", 0, False, 0)
-            elif flow_step_now == "SECTION":
-                _set_curriculum_flow(user["id"], "SECTION", idx_now + 1, False, 0)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
-        elif ui_action == "curriculum_exercise_yes":
-            _set_curriculum_flow(user["id"], "EXERCISE", idx_now, False, 0)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
-        elif ui_action == "curriculum_summary_yes":
-            _set_curriculum_flow(user["id"], "SUMMARY", idx_now, False, 0)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
-        elif ui_action == "curriculum_mastery_yes":
-            lesson_label = flow_session_now.get("lesson") or "bài này"
+    # Fixed Giáo trình curriculum flow actions. Only Giáo trình uses this state machine;
+    # other content types keep the v19.8 flow unchanged.
+    if ui_action in {"curriculum_finish_yes", "curriculum_finish_no"}:
+        if ui_action == "curriculum_finish_yes" and study_session and study_session.get("content_type") == "Giáo trình":
+            lesson_label=(study_session or {}).get("lesson") or "bài học này"
             _finish_study_session(user["id"])
-            msg = f"✅ Tuyệt vời! Doraemon ghi nhận cậu đã nắm bài **{lesson_label}** hôm nay. 🤖"
+            msg=f"✅ Tuyệt vời! Doraemon đã ghi nhận cậu đã hoàn thành **{lesson_label}**. Hẹn gặp cậu ở bài tiếp theo nhé! 🤖"
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-        elif ui_action == "curriculum_mastery_no":
-            _set_curriculum_flow(user["id"], "REVIEW", 0, False, 0)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or flow_session_now)
+        if ui_action == "curriculum_finish_no" and study_session and study_session.get("content_type") == "Giáo trình":
+            _set_curriculum_flow(user["id"], waiting="review")
+            msg="Được nhé! 🤖 Cậu muốn Doraemon ôn lại phần nào của bài? Cậu có thể nói tên phần, từ, ngữ pháp hoặc câu hỏi cậu chưa chắc."
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+    if ui_action == "curriculum_next" and study_session and study_session.get("content_type") == "Giáo trình":
+        try:
+            expected=int(action_plan_id or -1)
+        except Exception:
+            expected=-1
+        current=int(study_session.get("curriculum_step") or 0)
+        if expected == current:
+            step=current+1
+            # The exercise step waits for a user answer; other steps wait for a continue click after generation.
+            _set_curriculum_flow(user["id"], step=step, waiting="answer" if step else "continue", exercise_answered=False)
+            study_session["curriculum_step"]=step
+            study_session["curriculum_waiting"]="answer" if step else "continue"
+            study_session["curriculum_exercise_answered"]=False
+            print(f"[CURRICULUM FLOW] advance user={user['id']} from={current} to={step}")
+
+    if ui_action == "curriculum_next" and (not study_session or study_session.get("content_type") != "Giáo trình"):
+        pass
 
     # Lesson confirmation actions are explicit intent confirmation.
     # They bypass routing/RAG only when YES; NO simply cancels the pending lesson open.
@@ -5304,11 +4951,9 @@ Tin nhắn hiện tại:
         runtime_lesson_cache = _load_runtime_lesson_cache(
             requested_content_type or "Giáo trình", requested_lesson, requested_topic, request_id=request_id
         )
-        if runtime_lesson_cache and (requested_content_type or "") == "Giáo trình":
-            runtime_lesson_cache = _ensure_curriculum_plan_ready(runtime_lesson_cache, request_id=request_id)
         runtime_cache_hit = bool(runtime_lesson_cache)
         if not runtime_cache_hit:
-            print(f"[KNOWLEDGE CACHE RUNTIME MISS] request={request_id} lesson={requested_lesson!r} topic={requested_topic!r} reason='no_ready_payload'")
+            print(f"[KNOWLEDGE CACHE RUNTIME MISS] request={request_id} lesson={requested_lesson!r} topic={requested_topic!r} reason='no_ready_payload'" )
         if runtime_cache_hit:
             print(f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}")
     print(
@@ -5317,6 +4962,29 @@ Tin nhắn hiện tại:
         f"embedding_will_run={int(study_retrieval_allowed and not runtime_cache_hit)} "
         f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
+
+    curriculum_flow_active = bool(
+        runtime_cache_hit and requested_content_type == "Giáo trình" and study_session
+    )
+    curriculum_map = _curriculum_step_map(runtime_lesson_cache) if curriculum_flow_active else None
+    curriculum_step = int((study_session or {}).get("curriculum_step") or 0) if curriculum_flow_active else None
+    curriculum_waiting = str((study_session or {}).get("curriculum_waiting") or "continue") if curriculum_flow_active else None
+    curriculum_exercise_answered = bool((study_session or {}).get("curriculum_exercise_answered")) if curriculum_flow_active else False
+
+    # Backward-compatible text confirmation: when a fixed flow is waiting for Continue,
+    # simple confirmations advance exactly one state without embedding/RAG changes.
+    if curriculum_flow_active and curriculum_waiting == "continue" and not data.action and _is_continue_confirmation(query_text):
+        next_step=curriculum_step+1
+        _set_curriculum_flow(user["id"], step=next_step, waiting="answer" if next_step == curriculum_map["exercise_step"] else "continue", exercise_answered=False)
+        study_session["curriculum_step"]=next_step
+        study_session["curriculum_waiting"]="answer" if next_step == curriculum_map["exercise_step"] else "continue"
+        curriculum_step=next_step
+        curriculum_waiting=study_session["curriculum_waiting"]
+        curriculum_exercise_answered=False
+        print(f"[CURRICULUM FLOW] text-confirm advance to step={next_step}")
+
+    # When a section/exercise is waiting for review, ordinary questions remain inside
+    # the same lesson and can use the relevant cache context.
 
     if not study_retrieval_allowed:
         print(
@@ -5763,20 +5431,22 @@ Tin nhắn hiện tại:
     seen_chunk_keys = set()
     cache_selected_sections = []
     if runtime_cache_hit:
-        flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
-        flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
-        all_curriculum_sections = _runtime_curriculum_sections(runtime_lesson_cache) if requested_content_type == "Giáo trình" else list((runtime_lesson_cache or {}).get("sections") or [])
-        if flow_step == "OBJECTIVES":
-            cache_selected_sections = []
-        elif flow_step in {"SECTION", "REVIEW"}:
-            cache_selected_sections = all_curriculum_sections[flow_idx:flow_idx+1] or all_curriculum_sections[:1]
-        elif flow_step in {"EXERCISE", "EVALUATION"}:
-            cache_selected_sections = _runtime_curriculum_exercise_sections(runtime_lesson_cache, all_curriculum_sections) if requested_content_type == "Giáo trình" else (_cache_exercise_sections(runtime_lesson_cache) or all_curriculum_sections)
-        elif flow_step == "SUMMARY":
-            cache_selected_sections = all_curriculum_sections
+        if curriculum_flow_active:
+            secs=curriculum_map["sections"]
+            if curriculum_step == 0:
+                cache_selected_sections=[]
+            elif 1 <= curriculum_step <= len(secs):
+                cache_selected_sections=[secs[curriculum_step-1]]
+            elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
+                cache_selected_sections=list(secs)
+            elif curriculum_step == curriculum_map["summary_step"]:
+                cache_selected_sections=list(secs)
+            else:
+                cache_selected_sections=[]
+            print(f"[CURRICULUM FLOW] lesson={runtime_lesson_cache.get('lesson')!r} step={curriculum_step} sections_for_prompt={len(cache_selected_sections)}")
         else:
             cache_selected_sections = _select_runtime_cache_sections(
-                runtime_lesson_cache, query_text, max_sections=2, initial=True
+                runtime_lesson_cache, query_text, max_sections=2, initial=runtime_cache_initial
             )
         for sec in cache_selected_sections:
             md = {
@@ -5795,6 +5465,8 @@ Tin nhắn hiện tại:
             }
             text_chunks.append({"text": md["text"], "metadata": md})
         rich_images = _runtime_cache_images(runtime_lesson_cache, cache_selected_sections)
+        if curriculum_flow_active and (curriculum_step == 0 or curriculum_step == curriculum_map["summary_step"]):
+            rich_images=[]
         print(f"[KNOWLEDGE CACHE CONTEXT] selected_sections={len(cache_selected_sections)} images_ui={len(rich_images)}")
     if not study_retrieval_allowed or runtime_cache_hit:
         result.matches = []
@@ -6067,21 +5739,11 @@ QUY TẮC RIÊNG CHO BÀI TẬP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC)
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
 - Khi học sinh yêu cầu học một bài/lesson của Giáo trình, trước tiên phải có **📚 Mở đầu bài học**: giới thiệu ngắn gọn mục đích của bài, bài này giúp học sinh làm được gì và các kiến thức/chủ điểm chính sẽ học.
-- Khi một phần có từ vựng mới, luôn kèm **cách đọc và cách phát âm** của từ đó trước khi sang từ tiếp theo.
 - Sau phần mở đầu, dạy **từng phần của giáo trình theo đúng thứ tự nguồn RAG**. Mỗi phần phải được giải thích chi tiết, dễ hiểu, có ví dụ từ chính nguồn khi nguồn có, và liên hệ với mục tiêu của bài. Không chỉ tóm tắt toàn bài trong một đoạn ngắn.
 - Khi có nhiều mục/điểm kiến thức, trình bày tuần tự: giải thích → ví dụ → lưu ý/dễ nhầm (nếu nguồn hỗ trợ) → chuyển sang mục tiếp theo.
 - Cuối bài phải có **📝 Tổng kết**: tổng hợp các từ vựng mới và ngữ pháp/cấu trúc mới xuất hiện trong bài, bám theo RAG CONTEXT; không tự bịa danh sách ngoài nguồn.
 - Sau phần tổng kết, nếu nguồn cho phép/đủ dữ kiện, thêm **✏️ Bài tập bổ sung** để học sinh luyện lại kiến thức vừa học. Bài tập phải bám nội dung của bài và không tự tạo kiến thức trái nguồn.
 - Nếu học sinh chỉ hỏi một chi tiết nhỏ của giáo trình, không cần ép toàn bộ cấu trúc trên; chỉ áp dụng đầy đủ khi học sinh yêu cầu học/trình bày cả bài hoặc một phần bài đủ lớn.
-"""
-    elif requested_content_type == "Từ vựng":
-        mode_specific_rules = """
-QUY TẮC RIÊNG CHO TỪ VỰNG — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
-- Khi giới thiệu mỗi từ mới, luôn dạy ĐỦ: từ tiếng Nhật, cách đọc (kana/reading nếu nguồn có), cách phát âm, nghĩa tiếng Việt và ví dụ/cách dùng nếu nguồn có.
-- Với từ có Kanji, chỉ ra cách đọc bằng kana nếu nguồn cung cấp; không tự thay reading của nguồn.
-- Hướng dẫn phát âm ngắn gọn, dễ bắt chước; chú ý trường âm, âm ngắt và âm ghép khi dữ liệu nguồn cho phép xác định.
-- Không chỉ liệt kê nghĩa; phải giúp học sinh biết cách ĐỌC và PHÁT ÂM từ đó.
-- Nếu nguồn không có reading hoặc không đủ dữ kiện để xác định cách đọc, nói rõ điều đó thay vì đoán.
 """
     elif any(
         _normalize_chunk_text_for_match(c.get("metadata",{}).get("content_type")) == "giáo trình"
@@ -6104,14 +5766,15 @@ NGUYÊN TẮC:
 - Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
 - Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
 - Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
-- Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
+- Với Giáo trình: học theo FLOW CỐ ĐỊNH của server: B0 giới thiệu mục tiêu + từ vựng cần học + ngữ pháp cần học; B1..Bn mỗi bước chỉ giải thích đúng MỘT CHUNK của Knowledge Cache; sau cùng là yêu cầu/bài tập của chính bài (nếu có); bước cuối luôn là Tổng kết. Không được tự đổi thứ tự hoặc gộp nhiều chunk vào một teaching step.
+- Bài tập của Giáo trình vẫn thuộc content type Giáo trình. Khi chấm một câu hỏi của bài, được phép lấy toàn bộ các chunk của đúng bài để đối chiếu nếu câu hỏi liên quan nhiều phần.
 - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
 - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
 - Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
 - Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
 - Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
 - Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
-- Khi cậu đã THỰC SỰ hoàn tất lượt hướng dẫn trọn bài/chủ đề hiện tại (không phải chỉ trả lời một câu hỏi nhỏ), hãy đặt marker kỹ thuật `[[LESSON_END_READY]]` ở CUỐI câu trả lời. Nếu vẫn còn nội dung chính cần dạy hoặc đây chỉ là follow-up ngắn, KHÔNG đặt marker này. Marker sẽ được server đổi thành lựa chọn Có/Không để xác nhận kết thúc buổi học và không hiển thị cho học sinh.
+- Với Giáo trình đang chạy curriculum flow, KHÔNG dùng marker `[[LESSON_END_READY]]`; server tự điều khiển bước tiếp theo bằng state/buttons.
 - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
@@ -6144,15 +5807,9 @@ TIN NHẮN HIỆN TẠI:
 
     if runtime_cache_hit:
         cache_context = []
-        if _flow_step == "OBJECTIVES":
-            intro = _runtime_curriculum_intro(runtime_lesson_cache)
-            cache_context.append("[INTRO / MỤC TIÊU]\n" + str(intro.get("text") or ""))
-            if intro.get("objectives"):
-                cache_context.append("MỤC TIÊU: " + "; ".join(str(x) for x in intro.get("objectives") or []))
         for order, sec in enumerate(cache_selected_sections):
-            title = sec.get("curriculum_title") or (sec.get("metadata") or {}).get("title") or f"Phần {order+1}"
             label = (
-                f"[SECTION_{order+1}] {title} [Bài: {runtime_lesson_cache.get('lesson','')} | "
+                f"[SECTION_{order}] [Bài: {runtime_lesson_cache.get('lesson','')} | "
                 f"Chủ đề: {runtime_lesson_cache.get('topic','')} | Trang: {sec.get('page','')}]"
             )
             cache_context.append(label + "\n" + str(sec.get("text") or ""))
@@ -6160,35 +5817,85 @@ TIN NHẮN HIỆN TẠI:
         selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if str(x.get("image_key") or "").strip() in selected_keys]
         vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:2600]
         marker_rule = ""
-        if rich_images:
-            marker_names = ", ".join(f"[[IMG_CHUNK_{i}]]" for i in sorted({int(x.get('_chunk_order',0)) for x in rich_images}))
-            marker_rule = f"- Nếu dùng dữ kiện từ section có ảnh, đặt marker tương ứng {marker_names} ngay sau đoạn giải thích; marker chỉ dùng cho UI.\n"
-        curriculum_flow_instruction = ""
-        _flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
-        _flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
-        if _flow_step == "OBJECTIVES":
-            curriculum_flow_instruction = "- Đây là BƯỚC 0 — GIỚI THIỆU: chỉ giới thiệu mục tiêu, lợi ích và cấu trúc các phần của bài; chưa dạy nội dung Ken/bác sĩ hay bài tập."
-        elif _flow_step == "SECTION":
-            curriculum_flow_instruction = f"- Đây là PHẦN HỌC {_flow_idx + 1}: chỉ dạy đúng phần hiện tại được cung cấp, không lặp lại nội dung của các phần khác; bao gồm nội dung, từ vựng và ngữ pháp liên quan nếu nguồn có."
-        elif _flow_step == "EXERCISE":
-            curriculum_flow_instruction = "- Đây là BƯỚC BÀI TẬP: giới thiệu đúng câu hỏi/bài tập từ nguồn và yêu cầu học sinh tự nêu đáp án; khi đánh giá, dùng tất cả các phần mà bài tập phụ thuộc vào; không tự giải trước ở lượt giao bài."
-        elif _flow_step == "EVALUATION":
-            curriculum_flow_instruction = "- Đây là bước ĐÁNH GIÁ: dùng toàn bộ context của lesson để chấm câu trả lời gần nhất của học sinh, vì câu hỏi có thể phụ thuộc nhiều section."
-        elif _flow_step == "SUMMARY":
-            curriculum_flow_instruction = "- Đây là BƯỚC TỔNG KẾT: tổng hợp toàn bộ các phần đã học, từ vựng, ngữ pháp và kết quả bài tập; có thể dùng toàn bộ teaching sections."
-        elif _flow_step == "REVIEW":
-            curriculum_flow_instruction = f"- Đây là bước ÔN LẠI SECTION {_flow_idx + 1}: giải thích lại section hiện tại, sau đó hướng sang phần tiếp theo."
+        if curriculum_flow_active:
+            secs=curriculum_map["sections"]
+            vocab_grammar_context=""
+            if curriculum_step == 0:
+                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
+                all_text=all_text[:14000]
+                cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân. Đây là BƯỚC 0 — GIỚI THIỆU của bài {runtime_lesson_cache.get('lesson','')}.
+Dựa CHỈ trên các chunk nguồn bên dưới. Hãy:
+1) giới thiệu bài học và mục tiêu chính;
+2) liệt kê các từ vựng cần học, kèm cách đọc/kana và cách phát âm nếu nguồn có dữ kiện;
+3) liệt kê các điểm ngữ pháp cần học nếu nguồn có;
+4) nói ngắn gọn bài học sẽ đi qua các phần nào, nhưng CHƯA giải thích chi tiết từng chunk.
+Cuối cùng hỏi người học có muốn sang phần 1 không.
+Không bịa kiến thức ngoài nguồn. Đây là bước giới thiệu, không dùng [[LESSON_END_READY]].
 
-        cache_prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
+SOURCE CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
+            elif 1 <= curriculum_step <= len(secs):
+                sec=secs[curriculum_step-1]
+                cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
+CHỈ giải thích đúng MỘT CHUNK dưới đây. Không tóm tắt các chunk khác và không dạy trước phần sau.
+- Giải thích rõ ràng, dễ hiểu.
+- Khai thác từ vựng/kanji/grammar có trong chính chunk này khi phù hợp; từ vựng phải kèm cách đọc và hướng dẫn phát âm nếu nguồn có.
+- Dùng chính ví dụ/số liệu/bảng trong nguồn.
+- Nếu chunk có hình/bảng, giải thích theo vision facts đã cache; không yêu cầu nhìn lại ảnh.
+Cuối cùng hỏi người học có muốn sang phần tiếp theo không.
+
+CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
+            elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
+                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
+                all_text=all_text[:16000]
+                if curriculum_waiting == "answer" and not curriculum_exercise_answered:
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là BƯỚC BÀI TẬP của bài {runtime_lesson_cache.get('lesson','')}.
+Hãy dựa trên TOÀN BỘ các chunk của đúng bài để đưa/giải yêu cầu bài học nếu nguồn có. Nếu người học vừa gửi đáp án, hãy chấm và giải thích đúng/sai dựa trên nguồn. Có thể đối chiếu nhiều chunk vì câu hỏi có thể phụ thuộc nhiều phần.
+KHÔNG dùng kiến thức ngoài nguồn. Ở cuối, báo kết quả và hỏi người học có muốn sang bước Tổng kết không.
+
+ALL LESSON CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nĐÁP ÁN/TIN NHẮN HIỆN TẠI:\n{query_text}"""
+                else:
+                    cache_prompt=f"""Bạn là Doraemon. Đây là bước BÀI TẬP của bài {runtime_lesson_cache.get('lesson','')}.
+Dựa trên toàn bộ chunk nguồn để trình bày yêu cầu/bài tập chính của bài và chờ học sinh làm. Không bịa ngoài nguồn.
+
+ALL LESSON CHUNKS:\n{all_text}\n\nTIN NHẮN:\n{query_text}"""
+            elif curriculum_step == curriculum_map["summary_step"]:
+                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
+                all_text=all_text[:16000]
+                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.
+Tổng kết ngắn gọn nhưng đầy đủ dựa trên toàn bộ chunks nguồn: nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp, điểm cần nhớ và kết quả bài tập nếu có trong lịch sử gần đây.
+Không thêm kiến thức ngoài nguồn. Sau tổng kết hãy hỏi: “Cậu thấy mình đã nắm được bài này chưa?”
+
+ALL LESSON CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history[-6:], ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN:\n{query_text}"""
+            else:
+                cache_prompt=None
+            if cache_prompt is not None:
+                prompt=cache_prompt
+                print(f"[CURRICULUM PROMPT] request={request_id} step={curriculum_step} prompt_chars={len(prompt)} image_parts_sent_to_gemini=0")
+                # Skip the legacy cache prompt builder below.
+                marker_rule = "__CURRICULUM_PROMPT_READY__"
+        if curriculum_flow_active:
+            # Curriculum-specific prompt was built above. Do not overwrite it with the legacy cache prompt.
+            if prompt is None:
+                raise RuntimeError("curriculum prompt was not constructed")
+            print(
+                f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
+                f"curriculum_step={curriculum_step} sections={len(cache_selected_sections)} "
+                f"prompt_chars={len(prompt)} vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
+            )
+        else:
+            marker_rule = ""
+            if rich_images:
+                marker_names = ", ".join(
+                    f"[[IMG_CHUNK_{i}]]" for i in sorted({int(x.get('_chunk_order', 0)) for x in rich_images})
+                )
+                marker_rule = f"- Nếu dùng dữ kiện từ section có ảnh, đặt marker tương ứng {marker_names} ngay sau đoạn giải thích; marker chỉ dùng cho UI.\n"
+            cache_prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 DẠY DỰA TRÊN KNOWLEDGE CACHE ĐÃ ĐƯỢC XỬ LÝ KHI UPLOAD; không được yêu cầu nhìn lại ảnh.
 Bài hiện tại: {runtime_lesson_cache.get('lesson','')} | Chủ đề: {runtime_lesson_cache.get('topic') or ''}
 
 QUY TẮC DẠY:
-{curriculum_flow_instruction}
-- Với Giáo trình: flow cố định là BƯỚC 0 GIỚI THIỆU → các PHẦN HỌC → BÀI TẬP → ĐÁNH GIÁ → TỔNG KẾT → XÁC NHẬN NẮM BÀI.
-- Chỉ phần hiện tại được dạy chi tiết. Không lặp lại kiến thức của phần sau hoặc phần trước trừ khi bài tập/đánh giá cần đối chiếu.
-- Dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
-- Khi bắt đầu bài: giới thiệu mục tiêu và lộ trình; chưa dạy nội dung chi tiết nếu đang ở BƯỚC 0.
+- Với Giáo trình: giải thích tuần tự, dễ hiểu; dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
+- Khi bắt đầu bài: giới thiệu ngắn mục tiêu rồi dạy phần đang có trong CACHE; không tóm tắt dài toàn bài nếu chưa dạy đến đó.
 - Khi học sinh hỏi chi tiết: trả lời đúng chi tiết đó dựa vào CACHE.
 - Khi thực sự hoàn tất phần hướng dẫn lớn/trọn bài, có thể đặt marker [[LESSON_END_READY]] ở cuối.
 - Ảnh chỉ để UI hiển thị; suy luận nội dung chỉ dựa vào text/facts đã cache.
@@ -6204,12 +5911,12 @@ RECENT CHAT CỦA BOXCHAT HIỆN TẠI:
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
-        prompt = cache_prompt
-        print(
-            f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
-            f"sections={len(cache_selected_sections)} prompt_chars={len(prompt)} "
-            f"vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
-        )
+            prompt = cache_prompt
+            print(
+                f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
+                f"sections={len(cache_selected_sections)} prompt_chars={len(prompt)} "
+                f"vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
+            )
 
     gen_started = time.perf_counter()
     reply, response_model, gen_elapsed = _generate_chat_reply(
@@ -6220,50 +5927,10 @@ TIN NHẮN HIỆN TẠI:
     )
     perf_gen = time.perf_counter()
 
-    # Giáo trình v20: state machine owns progression; other content types keep legacy behavior.
-    curriculum_flow = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
-    curriculum_content_blocks = None
-    if curriculum_flow and runtime_cache_hit:
-        all_sections = _runtime_curriculum_sections(runtime_lesson_cache)
-        exercise_sections = _runtime_curriculum_exercise_sections(runtime_lesson_cache, all_sections)
-        idx = int((study_session or {}).get("curriculum_section_index") or 0)
-        if curriculum_flow == "OBJECTIVES":
-            _set_curriculum_flow(user["id"], "OBJECTIVES", 0, True, 0)
-            reply = (reply or "").rstrip() + "\n\nCậu muốn Doraemon sang **phần 1** chứ?"
-            curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần 1")]
-        elif curriculum_flow == "SECTION":
-            if idx + 1 < len(all_sections):
-                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
-                reply = (reply or "").rstrip() + "\n\nCậu muốn sang **phần tiếp theo** chứ?"
-                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần tiếp theo")]
-            elif exercise_sections:
-                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
-                reply = (reply or "").rstrip() + "\n\n📚 Phần nội dung chính đã xong. Cậu muốn sang **bài tập của giáo trình** chứ?"
-                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_exercise_choice()]
-            else:
-                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
-                reply = (reply or "").rstrip() + "\n\nCậu muốn Doraemon **tổng kết bài** chứ?"
-                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_summary_choice()]
-        elif curriculum_flow == "EXERCISE":
-            _set_curriculum_flow(user["id"], "EVALUATION", idx, False, 0)
-        elif curriculum_flow == "EVALUATION":
-            _set_curriculum_flow(user["id"], "SUMMARY", idx, False, 0)
-        elif curriculum_flow == "SUMMARY":
-            _set_curriculum_flow(user["id"], "MASTERY", idx, True, 0)
-            reply = (reply or "").rstrip() + "\n\nCậu thấy mình đã **nắm được bài này** chưa?"
-            curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_mastery_choice()]
-        elif curriculum_flow == "REVIEW":
-            if idx + 1 < len(all_sections):
-                _set_curriculum_flow(user["id"], "SECTION", idx, True, 0)
-                reply = (reply or "").rstrip() + "\n\nCậu muốn sang **phần tiếp theo** chứ?"
-                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_continue_choice("Có — sang phần tiếp theo")]
-            else:
-                _set_curriculum_flow(user["id"], "SUMMARY", idx, False, 0)
-                curriculum_content_blocks = [{"type":"text","text":reply}, _curriculum_mastery_choice()]
-
-    # The model may explicitly signal that a full teaching turn is complete.
-    # This becomes a cheap UI-level end-of-study choice; there is NO second LLM call.
-    lesson_end_ready = bool((not curriculum_flow) and study_session and "[[LESSON_END_READY]]" in (reply or ""))
+    # Fixed curriculum flow owns the ending for Giáo trình. Legacy LESSON_END_READY remains for non-curriculum types.
+    if curriculum_flow_active:
+        reply=(reply or '').replace('[[LESSON_END_READY]]','').rstrip()
+    lesson_end_ready = bool((not curriculum_flow_active) and study_session and "[[LESSON_END_READY]]" in (reply or ""))
     if lesson_end_ready:
         reply = (reply or "").replace("[[LESSON_END_READY]]", "").rstrip()
         _set_study_end_prompt_pending(user["id"], True)
@@ -6272,7 +5939,28 @@ TIN NHẮN HIỆN TẠI:
 
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
-    content_blocks = curriculum_content_blocks if curriculum_content_blocks is not None else build_rich_content_blocks(reply, rich_images)
+    content_blocks = build_rich_content_blocks(reply, rich_images)
+
+    if curriculum_flow_active:
+        # Step 0 and teaching chunks: wait for explicit Continue.
+        if curriculum_step == 0 or (1 <= curriculum_step <= len(curriculum_map["sections"])):
+            _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
+            content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+        elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
+            # Arrival at the exercise step: present the task and wait for a real answer.
+            # A non-empty user message on this step is treated as the exercise answer.
+            is_answer_turn = bool((query_text or "").strip()) and not bool(data.action)
+            if curriculum_waiting == "answer" and not curriculum_exercise_answered and is_answer_turn:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="summary_continue", exercise_answered=True)
+                study_session["curriculum_waiting"]="summary_continue"
+                content_blocks.extend([{"type":"text","text":"Mình sang bước Tổng kết nhé? 😊"}] + _curriculum_continue_blocks(curriculum_step, "Tổng kết"))
+            elif curriculum_waiting == "summary_continue":
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="summary_continue", exercise_answered=True)
+            else:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="answer", exercise_answered=False)
+        elif curriculum_step == curriculum_map["summary_step"]:
+            _set_curriculum_flow(user["id"], step=curriculum_step, waiting="final", exercise_answered=True)
+            content_blocks.extend(_curriculum_final_blocks())
     if lesson_end_ready:
         content_blocks.extend(_study_end_choice_blocks(_active_session_scope(study_session)))
     # The client still receives a flat images array for backwards compatibility.
@@ -7526,7 +7214,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # A low-cost local visual check is used only to detect whether an
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
-            preview = render_pdf_page(raw_pdf, page_no, dpi=72)
+            preview = render_pdf_page(raw_pdf, page_no, dpi=90)
             table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
@@ -7538,7 +7226,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             table_page = False
 
         # Scan/low-text pages retain the old Gemini OCR behavior.
-        png = render_pdf_page(raw_pdf, page_no, dpi=140 if table_page else 120)
+        png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
         ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
@@ -7688,25 +7376,10 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         if stored:
             page_images[page_no] = stored
-        # Release large rendered buffers before processing the next page.
-        try:
-            del preview
-        except Exception:
-            pass
-        try:
-            del png
-        except Exception:
-            pass
-        try:
-            del page
-        except Exception:
-            pass
-        gc.collect()
     return page_texts, page_images, page_units
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
-    background_tasks: BackgroundTasks,
     password: str = Form(""),
     file: UploadFile = File(...),
     subject: str = Form(""),
@@ -8003,8 +7676,7 @@ async def admin_knowledge_upload(
     try:
         cache_lessons = _upsert_upload_knowledge_cache(
             source_file, source_hash, subject, len(reader.pages),
-            knowledge_cache_text_records, knowledge_cache_image_records,
-            defer_curriculum_plan=True
+            knowledge_cache_text_records, knowledge_cache_image_records
         )
     except Exception as exc:
         print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
@@ -8013,21 +7685,10 @@ async def admin_knowledge_upload(
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
-    if cache_lessons:
-        print(f"[CURRICULUM PLAN DEFERRED] source={source_file!r} lessons={cache_lessons}; HIGH planner will run lazily on first curriculum use")
-
-    # Explicitly release upload-time working sets before returning to Render.
-    try:
-        del page_texts, page_images, page_units, knowledge_cache_text_records, knowledge_cache_image_records, vectors, raw, reader, records_meta
-    except Exception:
-        pass
-    gc.collect()
-
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
             "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
-            "curriculum_plan_status": "PLANNING" if cache_lessons else "READY",
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
