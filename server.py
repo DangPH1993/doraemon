@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.15-knowledge-cache-chatbox-bound"
+BASELINE_VERSION = "18.6.3-study-session-gate-final"
 import os
 import ast
 import io
@@ -11,7 +11,6 @@ from typing import Optional
 import json
 import base64
 import calendar
-import hashlib
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -79,8 +78,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 18.15-knowledge-cache-chatbox-bound")
-SERVER_VERSION = "2026-08-22-knowledge-cache-chatbox-bound-v1"
+print("[DORAEMON SERVER FINGERPRINT] 18.6.3-study-session-gate-final")
+SERVER_VERSION = "2026-08-22-study-session-gate-v3-FINAL"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -97,219 +96,6 @@ CATALOG_CACHE_TTL = 300.0
 _catalog_cache = None
 _catalog_cache_at = 0.0
 _catalog_cache_lock = threading.Lock()
-
-def _knowledge_content_hash(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _get_lesson_knowledge_cache(content_type, lesson, topic):
-    lesson = str(lesson or "").strip()
-    if not lesson:
-        return None
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id,asset_id,content_type,lesson,topic,package_json,status
-                FROM knowledge_lesson_cache
-                WHERE lower(content_type)=lower(%s)
-                  AND lower(lesson)=lower(%s)
-                  AND (topic IS NOT DISTINCT FROM %s)
-                  AND status='READY'
-                ORDER BY id DESC LIMIT 1
-            """, (_normalize_content_type(content_type), lesson, str(topic or "").strip() or None))
-            row = cur.fetchone()
-            if not row:
-                return None
-            row = dict(row)
-            pkg = row.get("package_json") or {}
-            if isinstance(pkg, str):
-                pkg = json.loads(pkg)
-            row["package_json"] = pkg
-            return row
-    finally:
-        conn.close()
-
-
-def _cache_tokens(value):
-    return [t.casefold() for t in re.findall(r"[\wÀ-ỹ一-龥ぁ-んァ-ンー]+", str(value or "")) if len(t) > 1]
-
-
-def _select_cache_context(cache_row, query_text, current_position=0, first_turn=False):
-    pkg = (cache_row or {}).get("package_json") or {}
-    sections = [x for x in (pkg.get("sections") or []) if isinstance(x, dict) and str(x.get("text") or "").strip()]
-    if not sections:
-        return [], []
-    q = set(_cache_tokens(query_text))
-    scored = []
-    pos = max(0, min(int(current_position or 0), len(sections)-1))
-    for idx, sec in enumerate(sections):
-        toks = set(_cache_tokens(sec.get("text")))
-        overlap = len(q & toks)
-        proximity = 3 if abs(idx-pos) <= 1 else 0
-        scored.append((overlap + proximity, -idx, idx, sec))
-    if first_turn or not q:
-        idxs = list(range(0, min(2, len(sections))))
-    elif any(x[0] >= 3 for x in scored):
-        idxs = [x[2] for x in sorted(scored, reverse=True)[:2]]
-        idxs.sort()
-    else:
-        idxs = list(range(pos, min(pos+2, len(sections))))
-    chosen = [sections[i] for i in idxs]
-    keys = set()
-    for sec in chosen:
-        keys.update(str(k).strip() for k in (sec.get("image_keys") or []) if str(k).strip())
-    vision = []
-    for item in pkg.get("vision") or []:
-        if not isinstance(item, dict):
-            continue
-        key = str(item.get("image_key") or "").strip()
-        sem = str(item.get("semantic_text") or "")
-        if key in keys or (q and len(q & set(_cache_tokens(sem))) >= 2):
-            vision.append(item)
-    return chosen, vision
-
-
-def _cache_rich_images(vision_items, chunk_order=0):
-    out = []
-    for item in vision_items or []:
-        key = str(item.get("image_key") or "").strip()
-        if not key:
-            continue
-        url = b2_url(key)
-        if not url:
-            continue
-        out.append({
-            "key": key, "url": url,
-            "content_type": item.get("content_type"),
-            "lesson": item.get("lesson"), "topic": item.get("topic"),
-            "_chunk_order": chunk_order,
-            "image_scope": item.get("image_scope") or "cache",
-            "description": item.get("semantic_text") or "",
-        })
-    return out
-
-
-def _create_upload_knowledge_cache(raw, source_file, subject, namespace, pdf_url,
-                                   records_meta, page_texts, page_images, chunk_size, overlap):
-    """Create shared lesson/vision cache from the already-computed upload-time OCR/Vision outputs."""
-    content_hash = _knowledge_content_hash(raw)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                INSERT INTO knowledge_assets(source_file,content_hash,subject,namespace,status,pdf_url)
-                VALUES(%s,%s,%s,%s,'READY',%s)
-                ON CONFLICT(content_hash) DO UPDATE SET
-                    source_file=EXCLUDED.source_file, subject=EXCLUDED.subject,
-                    namespace=EXCLUDED.namespace, status='READY',
-                    pdf_url=EXCLUDED.pdf_url, updated_at=NOW()
-                RETURNING id
-            """, (source_file,content_hash,subject,namespace,pdf_url))
-            asset_id = int(cur.fetchone()["id"])
-            cur.execute("DELETE FROM knowledge_lesson_cache WHERE asset_id=%s", (asset_id,))
-
-            packages = {}
-            for page_no, page_text in sorted((page_texts or {}).items()):
-                metas = metadata_for_page(records_meta, page_no)
-                if not metas:
-                    continue
-                page_imgs = (page_images or {}).get(page_no, []) or []
-                page_keys = [str(x.get("key") or "").strip() for x in page_imgs if str(x.get("key") or "").strip()]
-                chunks = kb_chunk_text(str(page_text or "").strip(), chunk_size, overlap)
-                for meta in metas:
-                    lesson = str(meta.get("lesson") or "").strip()
-                    if not lesson:
-                        continue
-                    ct = _normalize_content_type(meta.get("content_type"))
-                    topic = str(meta.get("topic") or "").strip() or None
-                    k = (ct.casefold(), lesson.casefold(), (topic or "").casefold())
-                    pkg = packages.setdefault(k, {
-                        "content_type": ct, "lesson": lesson, "topic": topic,
-                        "source_files": [source_file], "sections": [], "vision": []
-                    })
-                    for ch in chunks:
-                        if str(ch).strip():
-                            pkg["sections"].append({
-                                "section_id": f"{source_file}:p{page_no}:{len(pkg['sections'])}",
-                                "page": page_no, "text": ch, "image_keys": page_keys
-                            })
-
-            for page_no, imgs in (page_images or {}).items():
-                metas = metadata_for_page(records_meta, page_no)
-                for img in imgs or []:
-                    image_key = str(img.get("key") or "").strip()
-                    if not image_key:
-                        continue
-                    semantic = " | ".join(
-                        str(x).strip() for x in [
-                            img.get("description"), img.get("term"), img.get("reading"),
-                            img.get("meaning"), img.get("associated_text"), img.get("explanation"),
-                            " ".join(str(x).strip() for x in (img.get("facts") or []))
-                        ] if str(x or "").strip()
-                    )
-                    for meta in metas:
-                        lesson = str(meta.get("lesson") or "").strip()
-                        if not lesson:
-                            continue
-                        ct = _normalize_content_type(meta.get("content_type"))
-                        topic = str(meta.get("topic") or "").strip() or None
-                        k = (ct.casefold(), lesson.casefold(), (topic or "").casefold())
-                        pkg = packages.setdefault(k, {
-                            "content_type": ct, "lesson": lesson, "topic": topic,
-                            "source_files": [source_file], "sections": [], "vision": []
-                        })
-                        pkg["vision"].append({
-                            "image_key": image_key, "page": page_no,
-                            "lesson": lesson, "topic": topic,
-                            "content_type": ct, "semantic_text": semantic,
-                            "image_scope": img.get("image_scope") or img.get("kind") or "image"
-                        })
-
-            for pkg in packages.values():
-                seen = set(); sections=[]
-                for sec in pkg["sections"]:
-                    sk=(sec["page"], sec["text"][:300])
-                    if sk not in seen:
-                        seen.add(sk); sections.append(sec)
-                pkg["sections"] = sections
-                seen=set(); visions=[]
-                for vi in pkg["vision"]:
-                    if vi["image_key"] not in seen:
-                        seen.add(vi["image_key"]); visions.append(vi)
-                pkg["vision"] = visions
-
-                cur.execute("""
-                    INSERT INTO knowledge_lesson_cache(asset_id,content_type,lesson,topic,package_json,status)
-                    VALUES(%s,%s,%s,%s,%s::jsonb,'READY')
-                    ON CONFLICT(asset_id,content_type,lesson,topic) DO UPDATE SET
-                        package_json=EXCLUDED.package_json,status='READY',updated_at=NOW()
-                """, (asset_id,pkg["content_type"],pkg["lesson"],pkg["topic"],
-                      json.dumps(pkg,ensure_ascii=False,separators=(",",":"))))
-
-                for vi in pkg["vision"]:
-                    cur.execute("""
-                        INSERT INTO knowledge_vision_cache(
-                            asset_id,source_file,page,lesson,topic,image_key,image_kind,image_scope,
-                            semantic_text,vision_json
-                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-                        ON CONFLICT(asset_id,image_key) DO UPDATE SET
-                            page=EXCLUDED.page,lesson=EXCLUDED.lesson,topic=EXCLUDED.topic,
-                            image_kind=EXCLUDED.image_kind,image_scope=EXCLUDED.image_scope,
-                            semantic_text=EXCLUDED.semantic_text,vision_json=EXCLUDED.vision_json
-                    """, (
-                        asset_id,source_file,int(vi["page"]),vi["lesson"],vi["topic"],
-                        vi["image_key"],"vision",vi.get("image_scope") or "image",
-                        vi.get("semantic_text") or "",
-                        json.dumps(vi,ensure_ascii=False,separators=(",",":"))
-                    ))
-        conn.commit()
-        print(f"[KNOWLEDGE CACHE BUILD] asset={asset_id} source={source_file!r} lessons={len(packages)}")
-        return {"asset_id":asset_id,"content_hash":content_hash,"lessons":len(packages)}
-    finally:
-        conn.close()
-
-
 def _study_confirmation_hard_gate(
     *,
     study_confirmed: bool = False,
@@ -380,48 +166,6 @@ def init_db():
                 image_key TEXT NOT NULL, image_url TEXT, description TEXT,
                 term TEXT, reading TEXT, meaning TEXT, associated_text TEXT,
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
-                id BIGSERIAL PRIMARY KEY,
-                source_file VARCHAR(500) NOT NULL,
-                content_hash VARCHAR(128) NOT NULL UNIQUE,
-                subject VARCHAR(255) NOT NULL DEFAULT '',
-                namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
-                status VARCHAR(20) NOT NULL DEFAULT 'READY',
-                pdf_url TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_lesson_cache (
-                id BIGSERIAL PRIMARY KEY,
-                asset_id BIGINT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
-                content_type VARCHAR(30) NOT NULL,
-                lesson VARCHAR(255) NOT NULL,
-                topic VARCHAR(255),
-                package_json JSONB NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'READY',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(asset_id, content_type, lesson, topic)
-            );""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_vision_cache (
-                id BIGSERIAL PRIMARY KEY,
-                asset_id BIGINT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
-                source_file VARCHAR(500) NOT NULL,
-                page INTEGER NOT NULL,
-                lesson VARCHAR(255),
-                topic VARCHAR(255),
-                image_key TEXT NOT NULL,
-                image_kind VARCHAR(50),
-                image_scope VARCHAR(50),
-                semantic_text TEXT,
-                vision_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(asset_id, image_key)
-            );""")
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_lesson_cache_scope
-                           ON knowledge_lesson_cache(content_type,lesson,topic,status);""")
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_knowledge_vision_cache_scope
-                           ON knowledge_vision_cache(lesson,topic,page);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
@@ -451,7 +195,6 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_topic VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_started_at TIMESTAMPTZ;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_scope VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_created_at TIMESTAMPTZ;""")
@@ -2740,14 +2483,18 @@ _GREETING_EXACT = {
 }
 
 
-def _get_study_session(user_id, chatbox_id=None, allow_any=False):
-    """Return ACTIVE study session only when it belongs to this chatbox."""
+def _get_study_session(user_id):
+    """Return the persisted ACTIVE study session, if any.
+
+    This state is the sole authority for opening the expensive study stack
+    (embedding -> Pinecone -> RAG -> images). A lesson mentioned in chat history
+    or learning_progress is never enough by itself.
+    """
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT study_session_active,study_session_chatbox_id,
-                       study_session_content_type,study_session_course,
+                SELECT study_session_active,study_session_content_type,study_session_course,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending
                 FROM user_learning_state WHERE user_id=%s
@@ -2755,13 +2502,8 @@ def _get_study_session(user_id, chatbox_id=None, allow_any=False):
             row = cur.fetchone()
             if not row or not row.get("study_session_active"):
                 return None
-            stored_chatbox = str(row.get("study_session_chatbox_id") or "").strip()
-            current_chatbox = str(chatbox_id or "").strip()
-            if not allow_any and stored_chatbox != current_chatbox:
-                return None
             return {
                 "active": True,
-                "chatbox_id": stored_chatbox,
                 "content_type": _normalize_content_type(row.get("study_session_content_type")) or None,
                 "course": str(row.get("study_session_course") or "").strip() or None,
                 "lesson": str(row.get("study_session_lesson") or "").strip() or None,
@@ -2773,15 +2515,12 @@ def _get_study_session(user_id, chatbox_id=None, allow_any=False):
         conn.close()
 
 
-def _start_study_session(user_id, scope, chatbox_id):
-    """Persist an explicitly confirmed lesson bound to one chatbox."""
+def _start_study_session(user_id, scope):
+    """Persist an explicitly confirmed lesson as the only active RAG scope."""
     scope = scope or {}
     lesson = str(scope.get("lesson") or "").strip()
     if not lesson:
         raise ValueError("Study session requires an exact lesson.")
-    chatbox_id = str(chatbox_id or "").strip()
-    if not chatbox_id:
-        raise ValueError("Study session requires chatbox_id.")
     content_type = _normalize_content_type(scope.get("content_type")) or None
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
     topic = str(scope.get("topic") or "").strip() or None
@@ -2791,14 +2530,12 @@ def _start_study_session(user_id, scope, chatbox_id):
             cur.execute("""
                 INSERT INTO user_learning_state(
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
-                    study_session_active,study_session_chatbox_id,
-                    study_session_content_type,study_session_course,
+                    study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_started_at,
                     study_end_prompt_pending,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,%s,NOW(),FALSE,NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,NOW(),FALSE,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
-                    study_session_chatbox_id=%s,
                     study_session_content_type=%s,
                     study_session_course=%s,
                     study_session_lesson=%s,
@@ -2807,8 +2544,8 @@ def _start_study_session(user_id, scope, chatbox_id):
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
             """, (
-                user_id,chatbox_id,content_type,course,lesson,topic,
-                chatbox_id,content_type,course,lesson,topic
+                user_id,content_type,course,lesson,topic,
+                content_type,course,lesson,topic
             ))
         conn.commit()
     finally:
@@ -3565,7 +3302,7 @@ def _chat_model_for_content(content_type: Optional[str], provider: Optional[str]
     """Resolve the chat model without changing routing/RAG decisions."""
     provider = (provider or LLM_PROVIDER).strip().lower()
     if provider == "openai":
-        if content_type == "Bài tập":
+        if content_type in {"Bài tập", "Giáo trình"}:
             return OPENAI_MODEL_MEDIUM
         return OPENAI_MODEL_LOW
     return GEMINI_MODEL
@@ -3580,7 +3317,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     """
     provider = LLM_PROVIDER
     thinking_level = (
-        "medium" if content_type == "Bài tập"
+        "medium" if content_type in {"Bài tập", "Giáo trình"}
         else GEMINI_THINKING_LEVEL
     )
 
@@ -3595,7 +3332,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         print(
             f"[CHAT THINKING] request={request_id} provider='openai' "
             f"content_type={content_type!r} model={model!r} "
-            f"reasoning={OPENAI_REASONING_MEDIUM if content_type == 'Bài tập' else 'none'!r}"
+            f"reasoning={OPENAI_REASONING_MEDIUM if content_type in {'Bài tập','Giáo trình'} else 'none'!r}"
         )
         kwargs = {
             "model": model,
@@ -3608,7 +3345,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         }
         if model.startswith("gpt-5"):
             kwargs["reasoning"] = {
-                "effort": OPENAI_REASONING_MEDIUM if content_type == "Bài tập" else "none"
+                "effort": OPENAI_REASONING_MEDIUM if content_type in {"Bài tập", "Giáo trình"} else "none"
             }
         response = openai_client.responses.create(**kwargs)
         reply = getattr(response, "output_text", "") or ""
@@ -3678,13 +3415,7 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
-    current_chatbox_id = str(data.chatbox_id or "").strip() or None
-    if data.chatbox_new:
-        previous_session = _get_study_session(user["id"], None, allow_any=True)
-        if previous_session:
-            print(f"[CHATBOX RESET] new_chatbox=1 chatbox_id={current_chatbox_id!r} -> closing previous study session lesson={previous_session.get('lesson')!r}")
-            _finish_study_session(user["id"])
-    study_session = _get_study_session(user["id"], current_chatbox_id)
+    study_session = _get_study_session(user["id"])
 
     # Safe default before routing is computed. Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
@@ -3746,8 +3477,8 @@ def proxy_chat(
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             lesson_confirmed_scope = decoded
-            _start_study_session(user["id"], lesson_confirmed_scope, current_chatbox_id)
-            study_session = dict(_get_study_session(user["id"], current_chatbox_id) or {})
+            _start_study_session(user["id"], lesson_confirmed_scope)
+            study_session = dict(_get_study_session(user["id"]) or {})
             print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}; study_session=ACTIVE")
 
     plan_start_action = None
@@ -4725,32 +4456,12 @@ Tin nhắn hiện tại:
         _set_study_end_prompt_pending(user["id"], False)
         study_session["end_prompt_pending"] = False
 
-    # Knowledge Cache lookup MUST happen before embed_text().
-    # A cache hit is the fast path: no embedding, no Pinecone query, no runtime image retrieval.
-    runtime_knowledge_cache = None
-    runtime_knowledge_cache_hit = False
-    if study_retrieval_allowed:
-        runtime_knowledge_cache = _get_lesson_knowledge_cache(
-            requested_content_type, requested_lesson, requested_topic
-        )
-        runtime_knowledge_cache_hit = bool(runtime_knowledge_cache)
-        if runtime_knowledge_cache_hit:
-            print(
-                f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} "
-                f"topic={requested_topic!r} content_type={requested_content_type!r} "
-                "-> no embedding/Pinecone/runtime image retrieval"
-            )
-
     if not study_retrieval_allowed:
         print(
             "[CHAT ROUTING] study hard-gate: NOT CONFIRMED -> "
             "no embedding/Pinecone/RAG/images"
         )
-        query_vector = None
-        result = type("_EmptyResult", (), {"matches": []})()
-        rich_images = []
-        perf_embed = time.perf_counter()
-    elif runtime_knowledge_cache_hit:
+        # Keep downstream code compatible: empty retrieval, no image payloads.
         query_vector = None
         result = type("_EmptyResult", (), {"matches": []})()
         rich_images = []
@@ -4758,6 +4469,8 @@ Tin nhắn hiện tại:
     else:
         query_vector = embed_text(rag_query_text)
         perf_embed = time.perf_counter()
+
+    perf_embed = time.perf_counter()
 
     # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
     # Never exceed 10 unless the client explicitly sends a smaller value.
@@ -5218,37 +4931,6 @@ Tin nhắn hiện tại:
         if len(text_chunks) >= (12 if exercise_scope else 6):
             break
 
-    cached_vision_items = []
-    if runtime_knowledge_cache_hit:
-        current_pos = int((active_learning or {}).get("current_position") or 0)
-        selected_sections, cached_vision_items = _select_cache_context(
-            runtime_knowledge_cache,
-            query_text,
-            current_pos,
-            first_turn=bool(lesson_confirmed_scope or not recent_history),
-        )
-        pkg = runtime_knowledge_cache.get("package_json") or {}
-        text_chunks = []
-        for idx, sec in enumerate(selected_sections):
-            text_chunks.append({
-                "text": str(sec.get("text") or ""),
-                "metadata": {
-                    "record_type": "text",
-                    "content_type": runtime_knowledge_cache.get("content_type") or requested_content_type,
-                    "subject": requested_course or "",
-                    "course": requested_course or "",
-                    "lesson": runtime_knowledge_cache.get("lesson") or requested_lesson,
-                    "topic": runtime_knowledge_cache.get("topic") or requested_topic,
-                    "source_file": (pkg.get("source_files") or ["knowledge-cache"])[0],
-                    "page": sec.get("page"),
-                    "chunk_index": f"cache:{idx}",
-                    "image_keys": json.dumps(sec.get("image_keys") or [], ensure_ascii=False),
-                    "_knowledge_cache": True,
-                },
-                "score": 1.0,
-            })
-        print(f"[KNOWLEDGE CACHE CONTEXT] sections={len(text_chunks)} vision_candidates={len(cached_vision_items)}")
-
     chunk_debug = []
     for c in text_chunks[:6]:
         md = c["metadata"]
@@ -5281,9 +4963,6 @@ Tin nhắn hiện tại:
             print("[IMAGE SKIP] recommendation-only request: no image retrieval/attachment")
         else:
             print("[IMAGE SKIP] lesson introduction/selection turn: no image retrieval/attachment")
-    elif study_retrieval_allowed and runtime_knowledge_cache_hit:
-        rich_images = _cache_rich_images(cached_vision_items, chunk_order=0)
-        print(f"[IMAGE CACHE] reused={len(rich_images)}; not sent to Gemini")
     elif study_retrieval_allowed:
         rich_images = _retrieve_images_for_text_chunks(
             text_chunks, index, namespace, query_vector
@@ -5353,11 +5032,9 @@ Tin nhắn hiện tại:
         if item.get("_chunk_order") is not None
     })
 
-    # Keep the runtime context compact. With upload-time cache, only selected
-    # cached sections are sent to Gemini.
+    # Keep the RAG context compact: retrieval still uses up to 10 matches,
+    # but Gemini only receives the best six selected text chunks.
     prompt_contexts = []
-    if runtime_knowledge_cache_hit:
-        prompt_contexts.append("[KNOWLEDGE CACHE — upload-time, authoritative text/facts]")
     for c in contexts:
         if len(c) > 1800:
             c = c[:1800] + "…"
@@ -5366,7 +5043,7 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = ([] if runtime_knowledge_cache_hit and lesson_confirmed_scope else (recent_history[-4:] if study_retrieval_allowed else recent_history[-2:])) if recent_history else []
+    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
@@ -5485,7 +5162,6 @@ NGUYÊN TẮC:
 - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
 - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
 - Không bịa nội dung/trang không có trong RAG.
-- Khi KNOWLEDGE CACHE xuất hiện, đây là text/facts đã được xử lý lúc upload; không suy luận từ ảnh trực tiếp và không cần xem lại ảnh.
 - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
 - Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
 - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
@@ -5501,7 +5177,7 @@ ACTIVE LEARNING STATE:
 DANH MỤC (chỉ có khi cần gợi ý):
 {json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
 
-RAG / KNOWLEDGE CACHE CONTEXT:
+RAG CONTEXT:
 {chr(10).join(prompt_contexts)}
 
 RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
@@ -5621,7 +5297,6 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
                     learning_mode=NULL,
                     onboarding_completed=FALSE,
                     study_session_active=FALSE,
-                    study_session_chatbox_id=NULL,
                     study_session_content_type=NULL,
                     study_session_course=NULL,
                     study_session_lesson=NULL,
@@ -6362,7 +6037,7 @@ Chỉ trả JSON đúng schema:
         contents=[part, prompt],
         config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
     )
-    _log_gemini_usage(response, operation=f"vision_page_images:page_{page_no}")
+    _log_gemini_usage(response, operation=f"vision_page_images:{source_file}:page_{page_no}")
     data = _parse_gemini_json(response.text or "{}")
     text = str(data.get("text") or "").strip()
     images = data.get("images") if isinstance(data.get("images"), list) else []
@@ -6546,7 +6221,7 @@ Chỉ trả JSON đúng schema:
             response_mime_type="application/json",
         )
     )
-    _log_gemini_usage(response, operation=f"vision_table_page:page_{page_no}")
+    _log_gemini_usage(response, operation=f"vision_table_page:{source_file}:page_{page_no}")
     data = _parse_gemini_json(response.text or "{}")
     tables = data.get("tables") if isinstance(data.get("tables"), list) else []
     out=[]
@@ -6980,21 +6655,6 @@ async def admin_knowledge_upload(
     if len(raw)>50*1024*1024:
         raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
     try:
-        content_hash = _knowledge_content_hash(raw)
-        conn = db()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id,status FROM knowledge_assets WHERE content_hash=%s LIMIT 1", (content_hash,))
-                prior_cache = cur.fetchone()
-        finally:
-            conn.close()
-        if prior_cache and str(prior_cache.get("status") or "").upper() == "READY":
-            print(f"[KNOWLEDGE CACHE HIT] upload source={file.filename!r} hash={content_hash[:12]}")
-            return {"success":True,"filename":os.path.basename(file.filename),"cache_hit":True,
-                    "message":"Knowledge Cache đã tồn tại; không cần xử lý lại PDF/Vision."}
-    except Exception as exc:
-        print("[KNOWLEDGE CACHE] hash lookup skipped:", type(exc).__name__, str(exc))
-    try:
         reader=PdfReader(io.BytesIO(raw))
         records_meta=normalize_kb_records(metadata_json,len(reader.pages))
     except ValueError as e:
@@ -7255,13 +6915,6 @@ async def admin_knowledge_upload(
         conn.close()
 
     _invalidate_catalog_cache()
-    try:
-        cache_info = _create_upload_knowledge_cache(
-            raw, source_file, subject, namespace, pdf_url,
-            records_meta, page_texts, page_images, chunk_size, overlap
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Lỗi tạo Knowledge Cache: {type(e).__name__}: {e}")
 
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
@@ -7269,8 +6922,7 @@ async def admin_knowledge_upload(
     return {"success":True,"filename":source_file,"subject":subject,
             "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
-            "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace,
-            "knowledge_cache":cache_info}
+            "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
 def admin_knowledge_images(password: str, source_file: str = ""):
