@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.17-curriculum-universal-continue"
+BASELINE_VERSION = "19.18-curriculum-continue-always"
 import os
 import ast
 import io
@@ -5036,8 +5036,10 @@ Tin nhắn hiện tại:
     curriculum_waiting = str((study_session or {}).get("curriculum_waiting") or "continue") if curriculum_flow_active else None
     curriculum_exercise_answered = bool((study_session or {}).get("curriculum_exercise_answered")) if curriculum_flow_active else False
 
-    # Backward-compatible text confirmation: when a fixed flow is waiting for Continue,
-    # simple confirmations advance exactly one state without embedding/RAG changes.
+    # In the curriculum flow, the Continue button is always available—even when
+    # a chunk/global exercise is still unanswered. Pressing Continue advances one
+    # state without embedding/RAG changes, intentionally allowing the learner to skip.
+    # Text confirmations are supported the same way.
     if curriculum_flow_active and curriculum_waiting == "continue" and not data.action and _is_continue_confirmation(query_text):
         next_step=curriculum_step+1
         waiting_state = "continue"
@@ -6140,17 +6142,26 @@ TIN NHẮN HIỆN TẠI:
                 content_blocks.extend([{"type":"text","text":"✅ Doraemon đã nhận xét xong. Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
             elif curriculum_waiting == "chunk_answer" and not curriculum_exercise_answered:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_answer", exercise_answered=False)
-                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập có trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng mình mới sang phần tiếp theo."})
+                content_blocks.extend([
+                    {"type":"text","text":"✍️ Cậu có thể trả lời câu hỏi/bài tập có trong phần này. Nếu chưa muốn làm, cậu vẫn có thể sang phần tiếp theo nhé."},
+                    {"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"},
+                ] + _curriculum_continue_blocks(curriculum_step))
             elif detected_chunk_exercise:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_answer", exercise_answered=False)
-                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập có trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng mình mới sang phần tiếp theo."})
+                content_blocks.extend([
+                    {"type":"text","text":"✍️ Trong phần này có một câu hỏi/bài tập từ chính tài liệu. Cậu có thể trả lời ngay; nếu chưa muốn làm, cậu vẫn có thể sang phần tiếp theo nhé."},
+                    {"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"},
+                ] + _curriculum_continue_blocks(curriculum_step))
             else:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["global_exercise_step"]:
             if curriculum_waiting == "global_exercise_answer":
-                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_exercise", exercise_answered=True)
-                content_blocks.extend([{"type":"text","text":"✅ Doraemon đã nhận xét xong. Bạn muốn sang phần tiếp theo không? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
+                content_blocks.extend([
+                    {"type":"text","text":"✍️ Đây là bài tập chung của toàn bài. Cậu có thể trả lời ngay; nếu chưa muốn làm, cậu vẫn có thể sang phần tiếp theo nhé."},
+                    {"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"},
+                ] + _curriculum_continue_blocks(curriculum_step))
             elif curriculum_waiting == "continue_after_global_exercise" and is_curriculum_answer_turn:
                 next_summary_step = curriculum_map["summary_step"]
                 _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
