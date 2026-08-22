@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.6-knowledge-vision-imagehash-migration-fix"
+BASELINE_VERSION = "19.7-canonical-lesson-nocontent-fastpath"
 import os
 import ast
 import io
@@ -79,8 +79,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.6-knowledge-vision-imagehash-migration-fix")
-SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
+print("[DORAEMON SERVER FINGERPRINT] 19.7-canonical-lesson-nocontent-fastpath")
+SERVER_VERSION = "2026-08-22-baseline-v19-7-canonical-lesson-nocontent-fastpath"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2645,65 +2645,62 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
     return len(grouped)
 
 
+def _canonical_lesson_key(value: str) -> str:
+    """Normalize lesson names so UI phrases like "bài visionv1" match cached "visionv1"."""
+    s = str(value or "").strip().casefold()
+    s = re.sub(r"^\s*bài\s+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=None):
-    """Load runtime lesson cache with explicit diagnostics and tolerant scope matching."""
+    """Load runtime lesson cache with canonical lesson-name matching and diagnostics."""
     if not lesson:
         return None
     ct = str(content_type or "").strip()
     ls = str(lesson or "").strip()
     tp = str(topic or "").strip()
+    canonical_ls = _canonical_lesson_key(ls)
+    canonical_tp = _canonical_lesson_key(tp)
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            exact = None
-            if tp:
-                cur.execute(
-                    """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
-                       FROM knowledge_lesson_cache
-                       WHERE status='READY'
-                         AND lower(trim(content_type))=lower(trim(%s))
-                         AND lower(trim(lesson))=lower(trim(%s))
-                         AND lower(trim(coalesce(topic,'')))=lower(trim(%s))
-                       ORDER BY CASE WHEN cache_json ? 'sections' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT 1""",
-                    (ct, ls, tp),
-                )
-                exact = cur.fetchone()
-
-            # Tolerant fallback: if topic is missing/stale, prefer the newest READY
-            # cache for the exact lesson/content type rather than forcing runtime RAG.
-            if exact is None:
-                cur.execute(
-                    """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
-                       FROM knowledge_lesson_cache
-                       WHERE status='READY'
-                         AND lower(trim(content_type))=lower(trim(%s))
-                         AND lower(trim(lesson))=lower(trim(%s))
-                       ORDER BY CASE WHEN cache_json ? 'sections' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT 1""",
-                    (ct, ls),
-                )
-                exact = cur.fetchone()
-                if exact:
-                    print(
-                        f"[KNOWLEDGE CACHE LOOKUP] request={request_id} fallback=lesson-only "
-                        f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
-                        f"matched_topic={exact.get('topic')!r} cache_id={exact.get('id')} source_file={exact.get('source_file')!r}"
-                    )
-
-            # Diagnostics: tell us whether cache rows exist at all for this lesson,
-            # even when content_type/topic metadata prevent an exact match.
+            rows = []
+            # Pull only READY rows for the same content type, then resolve lesson/topic
+            # aliases in Python so "bài visionv1" can match cached "visionv1" safely.
             cur.execute(
-                """SELECT COUNT(*) AS n,
-                          COUNT(*) FILTER (WHERE status='READY') AS ready_n
+                """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
                    FROM knowledge_lesson_cache
-                   WHERE lower(trim(lesson))=lower(trim(%s))""",
-                (ls,),
+                   WHERE status='READY'
+                     AND lower(trim(content_type))=lower(trim(%s))
+                   ORDER BY updated_at DESC""",
+                (ct,),
             )
-            diag = cur.fetchone() or {}
+            all_rows = cur.fetchall() or []
+            exact = None
+            for row in all_rows:
+                row_ls = _canonical_lesson_key(row.get('lesson'))
+                row_tp = _canonical_lesson_key(row.get('topic'))
+                if row_ls != canonical_ls:
+                    continue
+                if canonical_tp and row_tp and row_tp != canonical_tp:
+                    continue
+                if exact is None:
+                    exact = row
+                payload = row.get('cache_json')
+                if isinstance(payload, dict) and payload.get('sections'):
+                    exact = row
+                    break
+
+            # Diagnostics against all rows for this canonical lesson.
+            lesson_rows = [r for r in all_rows if _canonical_lesson_key(r.get('lesson')) == canonical_ls]
+            ready_rows = len(lesson_rows)
             print(
                 f"[KNOWLEDGE CACHE LOOKUP] request={request_id} "
                 f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
-                f"lesson_rows={int(diag.get('n') or 0)} ready_rows={int(diag.get('ready_n') or 0)} "
-                f"match={'1' if exact else '0'} payload_ready={'1' if (exact and isinstance(exact.get('cache_json'), dict) and exact.get('cache_json', {}).get('sections')) else '0'}"
+                f"canonical_lesson={canonical_ls!r} canonical_topic={canonical_tp!r} "
+                f"lesson_rows={len(lesson_rows)} ready_rows={ready_rows} "
+                f"match={'1' if exact else '0'}"
             )
 
             payload = exact.get('cache_json') if exact else None
@@ -2712,9 +2709,14 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                 print(
                     f"[KNOWLEDGE CACHE PAYLOAD] request={request_id} cache_id={exact.get('id')} "
                     f"payload_ready={int(payload_ready)} sections={len((payload or {}).get('sections') or []) if isinstance(payload, dict) else 0} "
-                    f"images={len((payload or {}).get('images') or []) if isinstance(payload, dict) else 0}"
+                    f"images={len((payload or {}).get('images') or []) if isinstance(payload, dict) else 0} "
+                    f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r}"
                 )
             if exact and payload_ready:
+                print(
+                    f"[KNOWLEDGE CACHE LOOKUP] request={request_id} canonical_match=1 "
+                    f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r} cache_id={exact.get('id')}"
+                )
                 return dict(payload)
             return None
     except Exception as exc:
@@ -4642,6 +4644,7 @@ Tin nhắn hiện tại:
         requested_content_type = requested_scope.get("content_type")
         requested_course = requested_scope.get("course")
         requested_lesson = requested_scope.get("lesson")
+        requested_lesson_canonical = _canonical_lesson_key(requested_lesson)
         requested_topic = requested_scope.get("topic")
 
     if correction_followup and active_learning and not thread_scope_locked:
@@ -5060,6 +5063,27 @@ Tin nhắn hiện tại:
         class _EmptyResult:
             matches = []
         result = _EmptyResult()
+
+    # HARD NO-CONTENT FAST PATH: if a confirmed lesson has neither a usable
+    # Knowledge Cache nor any scoped RAG text, never spend another LLM call just
+    # to say that content is unavailable. Return a deterministic response instead.
+    if study_retrieval_allowed and (requested_lesson or requested_topic) and not runtime_cache_hit and not _usable_matches(result.matches):
+        msg = (
+            f"Tớ chưa tìm thấy nội dung chi tiết của bài **{requested_lesson or requested_topic}** "
+            "trong thư viện tài liệu hiện tại. Cậu kiểm tra lại tên bài hoặc tải lại tài liệu của bài này nhé! 🤖"
+        )
+        print(
+            f"[NO-CONTENT FAST-PATH] request={request_id} lesson={requested_lesson!r} "
+            f"topic={requested_topic!r} llm=0 embedding={int(query_vector is not None)}"
+        )
+        return {
+            "reply": msg,
+            "model": GEMINI_MODEL,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": msg}],
+            "learning_progress": None,
+        }
 
     # IMPORTANT: retrieve TEXT first. Images are NOT searched independently.
     # They are resolved later from the exact text chunks that actually enter the
