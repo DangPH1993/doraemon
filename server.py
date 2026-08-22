@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.12-curriculum-chunk-imagekey-authority"
+BASELINE_VERSION = "19.13-curriculum-chunk-embedded-exercise-flow"
 import os
 import ast
 import io
@@ -3019,27 +3019,48 @@ def _curriculum_sections(cache):
     return sections
 
 
-def _curriculum_has_exercise(cache):
-    """Detect whether the uploaded Giáo trình itself contains a task/requirement."""
-    for sec in _curriculum_sections(cache):
-        md=sec.get("metadata") or {}
-        if md.get("question_pages") or md.get("answer_pages"):
-            return True
-        text=str(sec.get("text") or "").casefold()
-        markers=("bài tập", "bài luyện", "yêu cầu", "hãy làm", "làm bài", "練習", "れんしゅう", "問題")
-        if any(m in text for m in markers):
-            return True
+def _curriculum_chunk_has_exercise(sec):
+    """Whether this single curriculum chunk contains an embedded task/question."""
+    md=sec.get("metadata") or {}
+    if md.get("question_pages") or md.get("answer_pages"):
+        return True
+    text=str(sec.get("text") or "").casefold()
+    markers=(
+        "bài tập", "bài luyện", "yêu cầu", "hãy làm", "làm bài",
+        "hãy trả lời", "trả lời câu hỏi", "câu hỏi", "điền",
+        "練習", "れんしゅう", "問題", "質問", "答え", "こたえ",
+    )
+    if any(m in text for m in markers):
+        return True
+    # Stronger heuristic for source chunks that embed a concrete question.
+    if "?" in text or "？" in text:
+        return True
+    if any(token in text for token in ("khi nào", "ở đâu", "ai", "bao giờ", "điền vào")):
+        return True
     return False
 
 
+def _curriculum_has_exercise(cache):
+    """Detect whether the uploaded Giáo trình contains a lesson task anywhere."""
+    return any(_curriculum_chunk_has_exercise(sec) for sec in _curriculum_sections(cache))
+
+
 def _curriculum_step_map(cache):
-    """Fixed pedagogical skeleton; number of chunk sections remains dynamic per lesson."""
+    """Fixed pedagogical skeleton; each source chunk is one teaching step.
+    A chunk may own an embedded exercise, which must be answered before moving on.
+    """
     sections=_curriculum_sections(cache)
     exercise=_curriculum_has_exercise(cache)
-    first_chunk_step=1
+    embedded_exercise_steps={i+1 for i,sec in enumerate(sections) if _curriculum_chunk_has_exercise(sec)}
     exercise_step=1+len(sections) if exercise else None
     summary_step=1+len(sections)+(1 if exercise else 0)
-    return {"sections":sections,"exercise":exercise,"exercise_step":exercise_step,"summary_step":summary_step}
+    return {
+        "sections":sections,
+        "exercise":exercise,
+        "embedded_exercise_steps":embedded_exercise_steps,
+        "exercise_step":exercise_step,
+        "summary_step":summary_step,
+    }
 
 
 def _is_continue_confirmation(text):
@@ -3990,10 +4011,10 @@ def proxy_chat(
         current=int(study_session.get("curriculum_step") or 0)
         if expected == current:
             step=current+1
-            # The exercise step waits for a user answer; other steps wait for a continue click after generation.
-            _set_curriculum_flow(user["id"], step=step, waiting="answer" if step else "continue", exercise_answered=False)
+            # The exact next-state classification is resolved after cache lookup below.
+            _set_curriculum_flow(user["id"], step=step, waiting="continue", exercise_answered=False)
             study_session["curriculum_step"]=step
-            study_session["curriculum_waiting"]="answer" if step else "continue"
+            study_session["curriculum_waiting"]="continue"
             study_session["curriculum_exercise_answered"]=False
             print(f"[CURRICULUM FLOW] advance user={user['id']} from={current} to={step}")
 
@@ -5033,17 +5054,25 @@ Tin nhắn hiện tại:
     curriculum_waiting = str((study_session or {}).get("curriculum_waiting") or "continue") if curriculum_flow_active else None
     curriculum_exercise_answered = bool((study_session or {}).get("curriculum_exercise_answered")) if curriculum_flow_active else False
 
+    # Normalize state when entering a chunk that contains an embedded task.
+    if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
+        if curriculum_step in curriculum_map.get("embedded_exercise_steps", set()) and curriculum_waiting == "continue" and not curriculum_exercise_answered:
+            curriculum_waiting = "chunk_prompt"
+            study_session["curriculum_waiting"] = "chunk_prompt"
+            _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_prompt", exercise_answered=False)
+
     # Backward-compatible text confirmation: when a fixed flow is waiting for Continue,
     # simple confirmations advance exactly one state without embedding/RAG changes.
     if curriculum_flow_active and curriculum_waiting == "continue" and not data.action and _is_continue_confirmation(query_text):
         next_step=curriculum_step+1
-        _set_curriculum_flow(user["id"], step=next_step, waiting="answer" if next_step == curriculum_map["exercise_step"] else "continue", exercise_answered=False)
+        waiting_state = "chunk_prompt" if next_step in curriculum_map.get("embedded_exercise_steps", set()) else ("answer" if next_step == curriculum_map["exercise_step"] else "continue")
+        _set_curriculum_flow(user["id"], step=next_step, waiting=waiting_state, exercise_answered=False)
         study_session["curriculum_step"]=next_step
-        study_session["curriculum_waiting"]="answer" if next_step == curriculum_map["exercise_step"] else "continue"
+        study_session["curriculum_waiting"]=waiting_state
         curriculum_step=next_step
-        curriculum_waiting=study_session["curriculum_waiting"]
+        curriculum_waiting=waiting_state
         curriculum_exercise_answered=False
-        print(f"[CURRICULUM FLOW] text-confirm advance to step={next_step}")
+        print(f"[CURRICULUM FLOW] text-confirm advance to step={next_step} waiting={waiting_state!r}")
 
     # When a section/exercise is waiting for review, ordinary questions remain inside
     # the same lesson and can use the relevant cache context.
@@ -5911,13 +5940,29 @@ Không bịa kiến thức ngoài nguồn. Đây là bước giới thiệu, kh�
 SOURCE CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif 1 <= curriculum_step <= len(secs):
                 sec=secs[curriculum_step-1]
-                cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
+                chunk_has_exercise = curriculum_step in curriculum_map.get("embedded_exercise_steps", set())
+                if chunk_has_exercise and curriculum_waiting == "chunk_answer":
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây vẫn là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
+Đây là lượt HỌC SINH TRẢ LỜI CÂU HỎI/BÀI TẬP nằm ngay trong CHUNK NÀY.
+CHỈ sử dụng đúng chunk bên dưới và vision facts của chính chunk này.
+Hãy đánh giá đáp án của học sinh, chỉ ra đúng/sai, giải thích ngắn gọn dựa trên nguồn, và nếu cần cho biết đáp án đúng.
+Không lấy nội dung từ chunk khác.
+Sau khi nhận xét xong, hỏi học sinh có muốn sang phần tiếp theo không.
+
+CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nĐÁP ÁN CỦA HỌC SINH:\n{query_text}"""
+                else:
+                    chunk_task_rule = ""
+                    if chunk_has_exercise:
+                        chunk_task_rule = "\n- CHUNK này có yêu cầu/câu hỏi/bài tập. Hãy giải thích nội dung chunk trước, sau đó nêu rõ câu hỏi/yêu cầu đó và yêu cầu người học tự trả lời. CHƯA chuyển sang phần tiếp theo cho tới khi người học trả lời và Doraemon nhận xét xong."
+                    else:
+                        chunk_task_rule = "\n- CHUNK này không có bài tập nội bộ cần dừng lại; cuối cùng mới hỏi người học có muốn sang phần tiếp theo không."
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
 CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, dữ kiện, hình/bảng hoặc ví dụ từ bất kỳ chunk nào khác. Không tóm tắt các chunk khác và không dạy trước phần sau.
 - Giải thích rõ ràng, dễ hiểu.
 - Khai thác từ vựng/kanji/grammar có trong chính chunk này khi phù hợp; từ vựng phải kèm cách đọc và hướng dẫn phát âm nếu nguồn có.
 - Dùng chính ví dụ/số liệu/bảng trong nguồn.
 - Nếu chunk có hình/bảng, chỉ dùng VISION FACTS được gắn chính xác với chunk này; không dùng vision facts của chunk khác và không yêu cầu nhìn lại ảnh.
-Cuối cùng hỏi người học có muốn sang phần tiếp theo không.
+{chunk_task_rule}
 
 CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
@@ -6016,17 +6061,32 @@ TIN NHẮN HIỆN TẠI:
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
     content_blocks = build_rich_content_blocks(reply, rich_images)
+    is_curriculum_answer_turn = bool((query_text or "").strip()) and not bool(data.action)
 
     if curriculum_flow_active:
-        # Step 0 and teaching chunks: wait for explicit Continue.
-        if curriculum_step == 0 or (1 <= curriculum_step <= len(curriculum_map["sections"])):
+        # Step 0 and teaching chunks: normal chunks wait for Continue.
+        # Chunks containing an embedded exercise instead wait for an answer,
+        # then explicitly return to Continue only after Doraemon has evaluated it.
+        if curriculum_step == 0:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
             content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+        elif 1 <= curriculum_step <= len(curriculum_map["sections"]):
+            chunk_has_exercise = curriculum_step in curriculum_map.get("embedded_exercise_steps", set())
+            if chunk_has_exercise and curriculum_waiting == "chunk_answer" and is_curriculum_answer_turn:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=True)
+                content_blocks.extend([{"type":"text","text":"✅ Doraemon đã nhận xét xong. Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+            elif chunk_has_exercise and curriculum_waiting in {"chunk_prompt", "chunk_answer"} and not curriculum_exercise_answered:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="chunk_answer", exercise_answered=False)
+                # No next-section button yet: force the learner to answer the embedded task.
+                content_blocks.append({"type":"text","text":"✍️ Cậu trả lời câu hỏi/bài tập trong phần này trước nhé. Doraemon sẽ nhận xét rồi chúng ta mới sang phần tiếp theo."})
+            else:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
+                content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_map["exercise_step"] is not None and curriculum_step == curriculum_map["exercise_step"]:
             # Arrival at the exercise step: present the task and wait for a real answer.
             # A non-empty user message on this step is treated as the exercise answer.
             is_answer_turn = bool((query_text or "").strip()) and not bool(data.action)
-            if curriculum_waiting == "answer" and not curriculum_exercise_answered and is_answer_turn:
+            if curriculum_waiting == "answer" and not curriculum_exercise_answered and is_curriculum_answer_turn:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="summary_continue", exercise_answered=True)
                 study_session["curriculum_waiting"]="summary_continue"
                 content_blocks.extend([{"type":"text","text":"Mình sang bước Tổng kết nhé? 😊"}] + _curriculum_continue_blocks(curriculum_step, "Tổng kết"))
