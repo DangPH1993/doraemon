@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.10-curriculum-waiting-schema-fix"
+BASELINE_VERSION = "19.11-curriculum-chunk-exact-image-scope"
 import os
 import ast
 import io
@@ -2772,6 +2772,49 @@ def _select_runtime_cache_sections(cache, query_text, *, max_sections=2, initial
     return chosen
 
 
+def _curriculum_chunk_images(cache, selected_section):
+    """Return ONLY images whose provenance belongs to the exact curriculum chunk.
+
+    Curriculum rule: one teaching step = one Knowledge Cache chunk. Do not leak
+    lesson-wide images from the page or sibling chunks into that step.
+    """
+    if not isinstance(selected_section, dict):
+        return []
+    images = list((cache or {}).get("images") or [])
+    target_chunk = selected_section.get("chunk_index")
+    target_unit = str(selected_section.get("content_unit_id") or "").strip()
+    target_keys = {str(k).strip() for k in (selected_section.get("image_keys") or []) if str(k).strip()}
+    out=[]
+    seen=set()
+    for item in images:
+        key=str(item.get("image_key") or "").strip()
+        if not key or key in seen:
+            continue
+        item_chunk=item.get("chunk_index")
+        item_unit=str(item.get("content_unit_id") or "").strip()
+        exact_chunk = (target_chunk not in (None, "") and item_chunk not in (None, "") and str(item_chunk)==str(target_chunk))
+        exact_unit = bool(target_unit and item_unit and item_unit==target_unit)
+        key_linked = key in target_keys
+        # For teaching sections, provenance wins. A lesson-scoped image with no
+        # exact chunk provenance is intentionally excluded. This prevents a
+        # single page's Ken + doctor images from leaking into one chunk.
+        if not (exact_chunk or exact_unit):
+            continue
+        vision=item.get("vision") or {}
+        out.append({
+            "key": key, "url": item.get("image_url") or b2_url(key),
+            "term": vision.get("term", ""), "reading": vision.get("reading", ""),
+            "meaning": vision.get("meaning", ""), "page": item.get("page"),
+            "_chunk_order": 0,
+            "content_type": (cache or {}).get("content_type"),
+            "lesson": (cache or {}).get("lesson"), "topic": (cache or {}).get("topic"),
+            "_exact_chunk": True,
+            "_key_linked": key_linked,
+        })
+        seen.add(key)
+    return out
+
+
 def _runtime_cache_images(cache, selected_sections):
     images_by_key={str(x.get("image_key")):x for x in (cache or {}).get("images",[]) if x.get("image_key")}
     out=[]
@@ -5459,7 +5502,7 @@ Tin nhắn hiện tại:
                 cache_selected_sections=list(secs)
             else:
                 cache_selected_sections=[]
-            print(f"[CURRICULUM FLOW] lesson={runtime_lesson_cache.get('lesson')!r} step={curriculum_step} sections_for_prompt={len(cache_selected_sections)}")
+            print(f"[CURRICULUM FLOW] lesson={runtime_lesson_cache.get('lesson')!r} step={curriculum_step} exact_chunk={cache_selected_sections[0].get('chunk_index') if len(cache_selected_sections)==1 else None} sections_for_prompt={len(cache_selected_sections)}")
         else:
             cache_selected_sections = _select_runtime_cache_sections(
                 runtime_lesson_cache, query_text, max_sections=2, initial=runtime_cache_initial
@@ -5480,9 +5523,13 @@ Tin nhắn hiện tại:
                 "image_keys": json.dumps(sec.get("image_keys") or [], ensure_ascii=False),
             }
             text_chunks.append({"text": md["text"], "metadata": md})
-        rich_images = _runtime_cache_images(runtime_lesson_cache, cache_selected_sections)
-        if curriculum_flow_active and (curriculum_step == 0 or curriculum_step == curriculum_map["summary_step"]):
+        if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
+            # One teaching step = exactly one chunk and only that chunk's images.
+            rich_images = _curriculum_chunk_images(runtime_lesson_cache, cache_selected_sections[0])
+        elif curriculum_flow_active and (curriculum_step == 0 or curriculum_step == curriculum_map["summary_step"]):
             rich_images=[]
+        else:
+            rich_images = _runtime_cache_images(runtime_lesson_cache, cache_selected_sections)
         print(f"[KNOWLEDGE CACHE CONTEXT] selected_sections={len(cache_selected_sections)} images_ui={len(rich_images)}")
     if not study_retrieval_allowed or runtime_cache_hit:
         result.matches = []
@@ -5568,10 +5615,20 @@ Tin nhắn hiện tại:
     # accidentally re-introduce unrelated images into the clarification turn.
     if runtime_cache_hit:
         vision_fact_chars = 0
-        selected_keys = {str(k).strip() for sec in cache_selected_sections for k in (sec.get("image_keys") or []) if str(k).strip()}
-        for _img in (runtime_lesson_cache.get("images") or []):
-            if str(_img.get("image_key") or "").strip() in selected_keys:
-                vision_fact_chars += len(json.dumps(_img.get("vision") or {}, ensure_ascii=False, separators=(",", ":")))
+        if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
+            exact_imgs = _curriculum_chunk_images(runtime_lesson_cache, curriculum_map["sections"][curriculum_step-1])
+            for _img in exact_imgs:
+                # Re-find the cached image payload by key so the audit reflects
+                # exactly what this chunk can use.
+                for _cached_img in (runtime_lesson_cache.get("images") or []):
+                    if str(_cached_img.get("image_key") or "").strip() == str(_img.get("key") or "").strip():
+                        vision_fact_chars += len(json.dumps(_cached_img.get("vision") or {}, ensure_ascii=False, separators=(",", ":")))
+                        break
+        else:
+            selected_keys = {str(k).strip() for sec in cache_selected_sections for k in (sec.get("image_keys") or []) if str(k).strip()}
+            for _img in (runtime_lesson_cache.get("images") or []):
+                if str(_img.get("image_key") or "").strip() in selected_keys:
+                    vision_fact_chars += len(json.dumps(_img.get("vision") or {}, ensure_ascii=False, separators=(",", ":")))
         print(
             f"[VISION CACHE AUDIT] request={request_id} mode=cache "
             f"cache_images={len(runtime_lesson_cache.get('images') or [])} "
@@ -5852,11 +5909,11 @@ SOURCE CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_a
             elif 1 <= curriculum_step <= len(secs):
                 sec=secs[curriculum_step-1]
                 cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
-CHỈ giải thích đúng MỘT CHUNK dưới đây. Không tóm tắt các chunk khác và không dạy trước phần sau.
+CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, dữ kiện, hình/bảng hoặc ví dụ từ bất kỳ chunk nào khác. Không tóm tắt các chunk khác và không dạy trước phần sau.
 - Giải thích rõ ràng, dễ hiểu.
 - Khai thác từ vựng/kanji/grammar có trong chính chunk này khi phù hợp; từ vựng phải kèm cách đọc và hướng dẫn phát âm nếu nguồn có.
 - Dùng chính ví dụ/số liệu/bảng trong nguồn.
-- Nếu chunk có hình/bảng, giải thích theo vision facts đã cache; không yêu cầu nhìn lại ảnh.
+- Nếu chunk có hình/bảng, chỉ dùng VISION FACTS được gắn chính xác với chunk này; không dùng vision facts của chunk khác và không yêu cầu nhìn lại ảnh.
 Cuối cùng hỏi người học có muốn sang phần tiếp theo không.
 
 CHUNK SOURCE:\n{str(sec.get('text') or '')}\n\nVISION FACTS:\n{vision_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
