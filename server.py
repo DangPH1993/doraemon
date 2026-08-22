@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.1-knowledge-cache-vision-audit"
+BASELINE_VERSION = "19.2-knowledge-cache-lookup-audit"
 import os
 import ast
 import io
@@ -79,8 +79,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.1-knowledge-cache-vision-audit")
-SERVER_VERSION = "2026-08-22-knowledge-cache-vision-audit-v1"
+print("[DORAEMON SERVER FINGERPRINT] 19.2-knowledge-cache-lookup-audit")
+SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2621,18 +2621,70 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
     return len(grouped)
 
 
-def _load_runtime_lesson_cache(content_type, lesson, topic=None):
+def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=None):
+    """Load runtime lesson cache with explicit diagnostics and tolerant scope matching."""
     if not lesson:
         return None
+    ct = str(content_type or "").strip()
+    ls = str(lesson or "").strip()
+    tp = str(topic or "").strip()
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if topic:
-                cur.execute("""SELECT cache_json FROM knowledge_lesson_cache\n                               WHERE status='READY' AND content_type=%s AND lower(lesson)=lower(%s)\n                                 AND lower(coalesce(topic,''))=lower(%s)\n                               ORDER BY updated_at DESC LIMIT 1""", (content_type, lesson, topic))
-            else:
-                cur.execute("""SELECT cache_json FROM knowledge_lesson_cache\n                               WHERE status='READY' AND content_type=%s AND lower(lesson)=lower(%s)\n                               ORDER BY updated_at DESC LIMIT 1""", (content_type, lesson))
-            row = cur.fetchone()
-            return dict(row["cache_json"]) if row and row.get("cache_json") else None
+            exact = None
+            if tp:
+                cur.execute(
+                    """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
+                       FROM knowledge_lesson_cache
+                       WHERE status='READY'
+                         AND lower(trim(content_type))=lower(trim(%s))
+                         AND lower(trim(lesson))=lower(trim(%s))
+                         AND lower(trim(coalesce(topic,'')))=lower(trim(%s))
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (ct, ls, tp),
+                )
+                exact = cur.fetchone()
+
+            # Tolerant fallback: if topic is missing/stale, prefer the newest READY
+            # cache for the exact lesson/content type rather than forcing runtime RAG.
+            if exact is None:
+                cur.execute(
+                    """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
+                       FROM knowledge_lesson_cache
+                       WHERE status='READY'
+                         AND lower(trim(content_type))=lower(trim(%s))
+                         AND lower(trim(lesson))=lower(trim(%s))
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (ct, ls),
+                )
+                exact = cur.fetchone()
+                if exact:
+                    print(
+                        f"[KNOWLEDGE CACHE LOOKUP] request={request_id} fallback=lesson-only "
+                        f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
+                        f"matched_topic={exact.get('topic')!r} cache_id={exact.get('id')} source_file={exact.get('source_file')!r}"
+                    )
+
+            # Diagnostics: tell us whether cache rows exist at all for this lesson,
+            # even when content_type/topic metadata prevent an exact match.
+            cur.execute(
+                """SELECT COUNT(*) AS n,
+                          COUNT(*) FILTER (WHERE status='READY') AS ready_n
+                   FROM knowledge_lesson_cache
+                   WHERE lower(trim(lesson))=lower(trim(%s))""",
+                (ls,),
+            )
+            diag = cur.fetchone() or {}
+            print(
+                f"[KNOWLEDGE CACHE LOOKUP] request={request_id} "
+                f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
+                f"lesson_rows={int(diag.get('n') or 0)} ready_rows={int(diag.get('ready_n') or 0)} "
+                f"match={'1' if exact else '0'}"
+            )
+
+            if exact and exact.get('cache_json'):
+                return dict(exact['cache_json'])
+            return None
     except Exception as exc:
         print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
         return None
@@ -4703,7 +4755,7 @@ Tin nhắn hiện tại:
     runtime_cache_initial = bool(lesson_confirmed_scope or forced_plan_scope)
     if study_retrieval_allowed and requested_lesson:
         runtime_lesson_cache = _load_runtime_lesson_cache(
-            requested_content_type or "Giáo trình", requested_lesson, requested_topic
+            requested_content_type or "Giáo trình", requested_lesson, requested_topic, request_id=request_id
         )
         runtime_cache_hit = bool(runtime_lesson_cache)
         if runtime_cache_hit:
@@ -4711,7 +4763,8 @@ Tin nhắn hiện tại:
     print(
         f"[KNOWLEDGE/RAG AUDIT] request={request_id} "
         f"cache_hit={int(runtime_cache_hit)} study_allowed={int(study_retrieval_allowed)} "
-        f"embedding_will_run={int(study_retrieval_allowed and not runtime_cache_hit)}"
+        f"embedding_will_run={int(study_retrieval_allowed and not runtime_cache_hit)} "
+        f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
 
     if not study_retrieval_allowed:
