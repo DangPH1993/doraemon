@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.6.3-study-session-gate-final"
+BASELINE_VERSION = "18.8-scoped-study-context"
 import os
 import ast
 import io
@@ -62,6 +62,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_LOW = os.getenv("OPENAI_MODEL_LOW", "gpt-4.1-mini")
 OPENAI_MODEL_MEDIUM = os.getenv("OPENAI_MODEL_MEDIUM", "gpt-5-mini")
 OPENAI_REASONING_MEDIUM = os.getenv("OPENAI_REASONING_MEDIUM", "medium")
+OPENAI_REASONING_LOW = os.getenv("OPENAI_REASONING_LOW", "low")
 
 GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_THINKING_LEVEL = "low"
@@ -291,8 +292,9 @@ def startup():
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
     print("LLM provider:", LLM_PROVIDER)
-    print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning:", OPENAI_REASONING_MEDIUM)
+    print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning_low:", OPENAI_REASONING_LOW, "reasoning_medium:", OPENAI_REASONING_MEDIUM)
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
+    print(f"[DORAEMON SERVER FINGERPRINT] {BASELINE_VERSION}")
 
 class RegisterRequest(BaseModel):
     phone: str
@@ -1449,8 +1451,11 @@ def _is_general_non_learning_request(text: str) -> bool:
     if any(m in q for m in study_markers):
         return False
     weather_markers = (
-        "thời tiết", "thoi tiet", "nhiệt độ", "nhiet do", "mưa không", "mưa không",
-        "trời mưa", "trời nắng", "dự báo thời tiết", "du bao thoi tiet",
+        "thời tiết", "thoi tiet", "nhiệt độ", "nhiet do",
+        "mưa không", "trời mưa", "trời nắng", "trời đẹp", "trời đẹp rồi",
+        "trời xấu", "nắng đẹp", "đẹp trời", "hôm nay nắng", "hôm nay mưa",
+        "mưa quá", "nắng quá", "gió quá", "oi quá", "lạnh quá", "nóng quá",
+        "dự báo thời tiết", "du bao thoi tiet",
     )
     time_markers = ("mấy giờ", "may gio", "bây giờ là mấy giờ", "gio hien tai")
     date_markers = ("hôm nay ngày mấy", "hom nay ngay may", "hôm nay là ngày", "ngày hôm nay")
@@ -2637,7 +2642,26 @@ def _is_off_topic_during_study(text):
     )
     if any(x in q for x in emotional):
         return True
-    return _is_general_non_learning_request(text)
+    if _is_general_non_learning_request(text):
+        return True
+    # Common everyday/weather statements are off-topic even when they are not
+    # phrased as a question. This must be decided locally before embedding.
+    weather_statement_markers = (
+        "trời đẹp", "đẹp trời", "trời xấu", "trời mưa", "trời nắng",
+        "mưa quá", "nắng quá", "gió quá", "lạnh quá", "nóng quá",
+        "hôm nay mưa", "hôm nay nắng", "hôm nay lạnh", "hôm nay nóng",
+    )
+    return any(x in q for x in weather_statement_markers)
+
+
+def _scope_looks_like_weather(scope):
+    """Return True if the active lesson/topic itself is about weather/time outside."""
+    parts = [str((scope or {}).get(k) or "").casefold() for k in ("lesson", "topic", "content_type")]
+    joined = " ".join(parts)
+    markers = (
+        "thời tiết", "weather", "mưa", "nắng", "gió", "nhiệt độ", "khí hậu",
+    )
+    return any(m in joined for m in markers)
 
 
 def _study_end_choice_blocks(scope, prefix=""):
@@ -3316,8 +3340,14 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     content_blocks stay unchanged.
     """
     provider = LLM_PROVIDER
+    # Token-optimized reasoning policy:
+    # - Giáo trình: LOW. Chủ yếu là source-grounded exposition, không cần
+    #   reasoning sâu mặc định.
+    # - Bài tập: MEDIUM cho chấm/tính toán/suy luận.
+    # - Casual/routing: global LOW.
     thinking_level = (
-        "medium" if content_type in {"Bài tập", "Giáo trình"}
+        "medium" if content_type == "Bài tập"
+        else "low" if content_type == "Giáo trình"
         else GEMINI_THINKING_LEVEL
     )
 
@@ -3332,7 +3362,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         print(
             f"[CHAT THINKING] request={request_id} provider='openai' "
             f"content_type={content_type!r} model={model!r} "
-            f"reasoning={OPENAI_REASONING_MEDIUM if content_type in {'Bài tập','Giáo trình'} else 'none'!r}"
+            f"reasoning={OPENAI_REASONING_MEDIUM if content_type == 'Bài tập' else OPENAI_REASONING_LOW if content_type == 'Giáo trình' else 'none'!r}"
         )
         kwargs = {
             "model": model,
@@ -3345,7 +3375,11 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
         }
         if model.startswith("gpt-5"):
             kwargs["reasoning"] = {
-                "effort": OPENAI_REASONING_MEDIUM if content_type in {"Bài tập", "Giáo trình"} else "none"
+                "effort": (
+                    OPENAI_REASONING_MEDIUM if content_type == "Bài tập"
+                    else OPENAI_REASONING_LOW if content_type == "Giáo trình"
+                    else "none"
+                )
             }
         response = openai_client.responses.create(**kwargs)
         reply = getattr(response, "output_text", "") or ""
@@ -3416,6 +3450,53 @@ def proxy_chat(
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
     study_session = _get_study_session(user["id"])
+
+    # IMPORTANT: while a Study Session is ACTIVE, the current lesson/session is
+    # the only knowledge context allowed. Clear everyday/off-topic statements
+    # must be handled BEFORE general_non_learning_request and BEFORE embedding,
+    # otherwise a harmless sentence such as "trời đẹp rồi" can still spend
+    # embedding + Pinecone + full study generation tokens.
+    early_active_scope = _active_session_scope(study_session)
+    if (
+        early_active_scope
+        and not data.action
+        and not _scope_looks_like_weather(early_active_scope)
+        and _is_off_topic_during_study(data.text)
+    ):
+        if not bool(study_session.get("end_prompt_pending")):
+            _set_study_end_prompt_pending(user["id"], True)
+            blocks = _study_end_choice_blocks(
+                early_active_scope,
+                prefix="Ừ, tớ hiểu. Tin nhắn này không còn thuộc phần bài đang học."
+            )
+            print(
+                f"[CHAT ROUTING] ACTIVE STUDY SCOPE={early_active_scope.get('lesson')!r} "
+                f"off-topic={data.text!r} -> END PROMPT; no embedding/RAG/LLM"
+            )
+            return {
+                "reply": blocks[0]["text"],
+                "model": GEMINI_MODEL,
+                "sources": [],
+                "images": [],
+                "content_blocks": blocks,
+                "learning_progress": None,
+            }
+        msg = (
+            f"Mình vẫn đang giữ bài **{early_active_scope.get('lesson') or 'này'}** mở nhé. "
+            "Cậu muốn hỏi tiếp phần đang học hay bấm **Có** để kết thúc bài hôm nay?"
+        )
+        print(
+            f"[CHAT ROUTING] ACTIVE STUDY SCOPE={early_active_scope.get('lesson')!r} "
+            "off-topic repeated -> END PROMPT already pending"
+        )
+        return {
+            "reply": msg,
+            "model": GEMINI_MODEL,
+            "sources": [],
+            "images": [],
+            "content_blocks": [{"type": "text", "text": msg}],
+            "learning_progress": None,
+        }
 
     # Safe default before routing is computed. Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
@@ -3908,14 +3989,19 @@ Câu hỏi của người dùng:
     # Reuse the normalized CURRENT chatbox history that was prepared before plan routing.
     recent_history = plan_recent_history
 
-    # A single compact text view is used for routing/embedding. The full
-    # normalized 20-message window is still available to Gemini below.
-    thread_history_for_rag = recent_history[-20:]
+    # A single compact text view is used for routing/embedding.
+    # Study Session is the authoritative lesson scope, so do not stuff the
+    # whole chatbox history into the embedding query. Keep only a tiny fallback
+    # for correction/routing cases.
+    if study_session and _active_session_scope(study_session):
+        thread_history_for_rag = []
+    else:
+        thread_history_for_rag = recent_history[-4:]
     thread_history_text = "\n".join(
         f"{h['role']}: {h['text']}" for h in thread_history_for_rag
     )
-    if len(thread_history_text) > 9000:
-        thread_history_text = thread_history_text[-9000:]
+    if len(thread_history_text) > 3500:
+        thread_history_text = thread_history_text[-3500:]
 
     # Pinecone is required only once the request has passed lightweight
     # conversation routing and is actually entering study retrieval.
@@ -4386,7 +4472,7 @@ Tin nhắn hiện tại:
             f"Tin nhắn hiện tại: {query_text}"
         )
     elif correction_followup and recent_history:
-        history_tail = recent_history[-6:]
+        history_tail = recent_history[-4:]
         history_context = "\n".join(f"{h['role']}: {h['text'][-1200:]}" for h in history_tail)
         rag_query_text = (
             "ĐÂY LÀ PHẢN HỒI/SỬA LẠI CÂU TRẢ LỜI TRƯỚC. Giữ nguyên bài/lesson đang học; "
@@ -5043,7 +5129,22 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
+    # Token-optimized study prompt history:
+    # - newly confirmed lesson/start-plan: no prior chat needed; Study Session
+    #   + exact RAG scope are authoritative.
+    # - ongoing study: last 4 messages only for pronouns/corrections.
+    # - non-study: last 2 messages.
+    if not recent_history:
+        prompt_history = []
+    elif study_retrieval_allowed:
+        prompt_history = [] if (lesson_confirmed_scope or forced_plan_scope) else recent_history[-4:]
+    else:
+        prompt_history = recent_history[-2:]
+    print(
+        f"[PROMPT CONTEXT] study={int(study_retrieval_allowed)} "
+        f"new_lesson={int(bool(lesson_confirmed_scope or forced_plan_scope))} "
+        f"history_messages={len(prompt_history)}"
+    )
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
