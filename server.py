@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.6-study-session-gate"
+BASELINE_VERSION = "18.6.3-study-session-gate-final"
 import os
 import ast
 import io
@@ -78,7 +78,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-22-study-session-gate-v1"
+print("[DORAEMON SERVER FINGERPRINT] 18.6.3-study-session-gate-final")
+SERVER_VERSION = "2026-08-22-study-session-gate-v3-FINAL"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3416,6 +3417,12 @@ def proxy_chat(
     low0=data.text.casefold().strip()
     study_session = _get_study_session(user["id"])
 
+    # Safe default before routing is computed. Some confirmation/session branches
+    # are evaluated earlier than the final hard-gate calculation below. Keeping
+    # this initialized here prevents UnboundLocalError and, importantly, defaults
+    # to CLOSED rather than accidentally enabling study retrieval.
+    study_retrieval_allowed = False
+
     # End-of-lesson confirmation is a pure state transition: no Gemini,
     # embedding, Pinecone, RAG, images, or question quota.
     if ui_action_raw := (str(data.action or "").strip() or None):
@@ -4360,10 +4367,8 @@ Tin nhắn hiện tại:
     # the active lesson/exercise, do NOT embed the whole chat history. Only the
     # active scope/state plus the new user message is needed. For a genuinely
     # unscoped query, use at most the two latest chat turns as a fallback hint.
-    if _study_retrieval_allowed and study_session and study_session.get("end_prompt_pending"):
-        _set_study_end_prompt_pending(user["id"], False)
-        study_session["end_prompt_pending"] = False
-
+    # NOTE: end_prompt_pending is handled only AFTER the hard study gate is
+    # computed. Never reference study_retrieval_allowed before that point.
     rag_query_text = query_text
     if thread_scope_locked and recent_history:
         scope_parts = [
@@ -4415,7 +4420,7 @@ Tin nhắn hiện tại:
     # ================================================================
     # HARD STUDY GATE v2
     # Compute the gate variables BEFORE using them.  The previous build used
-    # _study_retrieval_allowed before _study_confirmation was initialized,
+    # study_retrieval_allowed before _study_confirmation was initialized,
     # causing UnboundLocalError on ordinary chat messages.
     # IMPORTANT:
     # Having active_learning / thread_scope / history is NOT confirmation
@@ -4441,9 +4446,17 @@ Tin nhắn hiện tại:
     # sessions may answer short follow-ups without repeating the lesson name.
     if lesson_confirmed_scope or forced_plan_scope:
         _has_explicit_study_scope = True
-    _study_retrieval_allowed = bool(_study_confirmation and _has_explicit_study_scope)
+    study_retrieval_allowed = bool(_study_confirmation and _has_explicit_study_scope)
 
-    if not _study_retrieval_allowed:
+    # Clear the one-shot end prompt only after the request is confirmed as a
+    # valid active-study turn. This ordering prevents an UnboundLocalError and
+    # also ensures pending end-of-lesson state can never accidentally run during
+    # a non-study request.
+    if study_retrieval_allowed and study_session and study_session.get("end_prompt_pending"):
+        _set_study_end_prompt_pending(user["id"], False)
+        study_session["end_prompt_pending"] = False
+
+    if not study_retrieval_allowed:
         print(
             "[CHAT ROUTING] study hard-gate: NOT CONFIRMED -> "
             "no embedding/Pinecone/RAG/images"
@@ -4860,7 +4873,7 @@ Tin nhắn hiện tại:
     # Therefore we must use its text AND its image together.
     text_chunks = []
     seen_chunk_keys = set()
-    if not _study_retrieval_allowed:
+    if not study_retrieval_allowed:
         result.matches = []
     exercise_scope = requested_content_type == "Bài tập" and (requested_lesson or requested_topic)
 
@@ -4950,7 +4963,7 @@ Tin nhắn hiện tại:
             print("[IMAGE SKIP] recommendation-only request: no image retrieval/attachment")
         else:
             print("[IMAGE SKIP] lesson introduction/selection turn: no image retrieval/attachment")
-    elif _study_retrieval_allowed:
+    elif study_retrieval_allowed:
         rich_images = _retrieve_images_for_text_chunks(
             text_chunks, index, namespace, query_vector
         )
@@ -5030,7 +5043,7 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = (recent_history[-20:] if _study_retrieval_allowed else recent_history[-2:]) if recent_history else []
+    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
