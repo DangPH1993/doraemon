@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.15-curriculum-llm-exercise-detection"
+BASELINE_VERSION = "19.16-curriculum-global-exercise-gate"
 import os
 import ast
 import io
@@ -3020,19 +3020,28 @@ def _curriculum_sections(cache):
 
 
 def _curriculum_step_map(cache):
-    """Fixed Giáo trình flow; each Knowledge Cache chunk is exactly one teaching step.
+    """Fixed Giáo trình flow with a separate whole-lesson exercise checkpoint.
 
-    Exercise presence is decided at runtime by the same LLM call that teaches the
-    current chunk. Upload-time metadata is not used as an exercise classifier.
+    Flow:
+      0 = introduction only
+      1..N = exactly one Knowledge Cache chunk per teaching step
+      N+1 = whole-lesson exercise checkpoint (only if a real source exercise exists)
+      N+2 = final summary
+
+    Runtime LLM decides whether an exercise belongs to the current chunk. A question
+    that needs multiple chunks is deferred to the whole-lesson checkpoint.
     """
     sections = _curriculum_sections(cache)
+    global_exercise_step = 1 + len(sections)
+    summary_step = 2 + len(sections)
     return {
         "sections": sections,
         "exercise": None,
         "embedded_exercise_steps": set(),
-        "post_chunk_exercise": False,
-        "exercise_step": None,
-        "summary_step": 1 + len(sections),
+        "post_chunk_exercise": True,
+        "global_exercise_step": global_exercise_step,
+        "exercise_step": global_exercise_step,
+        "summary_step": summary_step,
     }
 
 
@@ -5495,7 +5504,7 @@ Tin nhắn hiện tại:
             elif 1 <= curriculum_step <= len(secs):
                 # Exactly one source chunk per teaching step.
                 cache_selected_sections=[secs[curriculum_step-1]]
-            elif curriculum_step == curriculum_map["summary_step"]:
+            elif curriculum_step in {curriculum_map["global_exercise_step"], curriculum_map["summary_step"]}:
                 cache_selected_sections=list(secs)
             else:
                 cache_selected_sections=[]
@@ -5523,7 +5532,9 @@ Tin nhắn hiện tại:
         if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
             # One teaching step = exactly one chunk and only that chunk's images.
             rich_images = _curriculum_chunk_images(runtime_lesson_cache, cache_selected_sections[0])
-        elif curriculum_flow_active and (curriculum_step == 0 or curriculum_step == curriculum_map["summary_step"]):
+        elif curriculum_flow_active and (curriculum_step == 0 or curriculum_step in {curriculum_map["global_exercise_step"], curriculum_map["summary_step"]}):
+            # Global exercise and summary use cached vision facts as text; images are
+            # not automatically dumped into the UI.
             rich_images=[]
         else:
             rich_images = _runtime_cache_images(runtime_lesson_cache, cache_selected_sections)
@@ -5884,8 +5895,12 @@ TIN NHẮN HIỆN TẠI:
             )
             cache_context.append(label + "\n" + str(sec.get("text") or ""))
         selected_keys = {str(k).strip() for sec in cache_selected_sections for k in (sec.get("image_keys") or []) if str(k).strip()}
-        selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if str(x.get("image_key") or "").strip() in selected_keys]
-        vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:2600]
+        if curriculum_flow_active and curriculum_step in {curriculum_map["global_exercise_step"], curriculum_map["summary_step"]}:
+            selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if x.get("vision")]
+            vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:7000]
+        else:
+            selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if str(x.get("image_key") or "").strip() in selected_keys]
+            vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:2600]
         marker_rule = ""
         if curriculum_flow_active:
             secs=curriculum_map["sections"]
@@ -5932,10 +5947,12 @@ CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, d
 - Dùng chính ví dụ/số liệu/bảng trong nguồn.
 - Nếu chunk có hình/bảng, chỉ dùng VISION FACTS được gắn chính xác với chunk này; không dùng vision facts của chunk khác và không yêu cầu nhìn lại ảnh.
 - QUAN TRỌNG: Trong chính CHUNK + VISION FACTS này, hãy kiểm tra xem nguồn có đưa ra một CÂU HỎI/BÀI TẬP/YÊU CẦU THỰC SỰ mà người học phải trả lời hay không.
-- Chỉ đánh dấu `[[CHUNK_EXERCISE]]` khi nguồn thực sự yêu cầu người học làm/trả lời một nhiệm vụ. Nếu không có, đánh dấu `[[NO_CHUNK_EXERCISE]]`.
+- Chỉ đánh dấu `[[CHUNK_EXERCISE]]` khi câu hỏi/yêu cầu thực sự nằm trong chunk này VÀ có thể trả lời đầy đủ chỉ bằng chunk này + vision facts của chính chunk.
+- Nếu nguồn có một câu hỏi/bài tập nhưng để trả lời phải đối chiếu nội dung từ chunk khác/toàn bài, KHÔNG hỏi user ở đây; đánh dấu `[[WHOLE_LESSON_EXERCISE]]` để đưa về bước kiểm tra bài tập toàn bài sau khi học hết các chunk.
+- Nếu không có bài tập thật, đánh dấu `[[NO_CHUNK_EXERCISE]]`.
 - TUYỆT ĐỐI KHÔNG tự tạo câu hỏi/bài tập mới. Không suy luận từ việc chunk có dấu `?`, có bảng, có số liệu, hoặc có nội dung có thể dùng để đặt câu hỏi rằng đó là bài tập.
-- Nếu có bài tập thật trong nguồn, hãy giải thích phần nội dung trước rồi nêu ĐÚNG câu hỏi/yêu cầu đó cho học sinh làm. Nếu không có bài tập, chỉ giải thích chunk và kết thúc phần.
-- Marker phải xuất hiện đúng 1 lần ở CUỐI câu trả lời: `[[CHUNK_EXERCISE]]` hoặc `[[NO_CHUNK_EXERCISE]]`. Không giải thích marker cho học sinh.
+- Nếu có bài tập thật thuộc riêng chunk này, hãy giải thích phần nội dung trước rồi nêu ĐÚNG câu hỏi/yêu cầu đó cho học sinh làm. Nếu không có bài tập hoặc là bài tập toàn bài, chỉ giải thích chunk.
+- Marker phải xuất hiện đúng 1 lần ở CUỐI câu trả lời: `[[CHUNK_EXERCISE]]`, `[[WHOLE_LESSON_EXERCISE]]` hoặc `[[NO_CHUNK_EXERCISE]]`. Không giải thích marker cho học sinh.
 
 CHUNK SOURCE:
 {str(sec.get('text') or '')}
@@ -5948,6 +5965,40 @@ RECENT CHAT:
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
+            elif curriculum_step == curriculum_map["global_exercise_step"]:
+                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
+                all_text=all_text[:18000]
+                if curriculum_waiting == "global_exercise_answer":
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là BÀI TẬP CỦA TOÀN BÀI HỌC, được thực hiện SAU KHI đã giới thiệu xong tất cả các chunk của bài {runtime_lesson_cache.get('lesson','')}.
+
+CHỈ sử dụng toàn bộ nguồn bài học và vision facts bên dưới. Hãy đánh giá câu trả lời của học sinh cho đúng câu hỏi/yêu cầu THẬT SỰ có trong nguồn. Không tự tạo câu hỏi mới, không thêm dữ kiện bên ngoài.
+Sau khi nhận xét bài làm, hãy chuyển sang phần TỔNG KẾT của bài: tóm tắt nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp và điểm cần nhớ.
+
+ALL LESSON CHUNKS:\n{all_text}
+
+VISION FACTS TOÀN BÀI:\n{vision_text}
+
+RECENT CHAT:\n{json.dumps(prompt_history[-8:], ensure_ascii=False, separators=(',', ':'))}
+
+CÂU TRẢ LỜI CỦA HỌC SINH:\n{query_text}"""
+                else:
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Cậu đã dạy XONG toàn bộ các chunk của bài {runtime_lesson_cache.get('lesson','')}.
+
+Bây giờ hãy kiểm tra xem trong nguồn có một BÀI TẬP/CÂU HỎI CỦA TOÀN BÀI học, không phải phần bài tập đã xử lý trực tiếp bên trong một chunk, hay không.
+- CHỈ xác định bài tập nếu nguồn thực sự yêu cầu người học trả lời/làm.
+- Nếu có một câu hỏi cần đối chiếu nhiều chunk hoặc là yêu cầu chung của cả bài, đánh dấu `[[GLOBAL_EXERCISE]]` và nêu ĐÚNG câu hỏi/yêu cầu đó.
+- Nếu không có bài tập riêng của toàn bài, đánh dấu `[[NO_GLOBAL_EXERCISE]]`.
+- TUYỆT ĐỐI KHÔNG tự bịa bài tập.
+- Nếu không có bài tập riêng, thay vì kéo dài phần kiểm tra, hãy chuyển thẳng sang TỔNG KẾT ngắn gọn.
+- Marker chỉ dùng nội bộ và phải xuất hiện đúng 1 lần ở CUỐI phần kiểm tra.
+
+ALL LESSON CHUNKS:\n{all_text}
+
+VISION FACTS TOÀN BÀI:\n{vision_text}
+
+RECENT CHAT:\n{json.dumps(prompt_history[-8:], ensure_ascii=False, separators=(',', ':'))}
+
+TIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif curriculum_step == curriculum_map["summary_step"]:
                 all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
                 all_text=all_text[:16000]
@@ -5955,7 +6006,12 @@ TIN NHẮN HIỆN TẠI:
 Tổng kết ngắn gọn nhưng đầy đủ dựa trên toàn bộ chunks nguồn: nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp, điểm cần nhớ và kết quả bài tập nếu có trong lịch sử gần đây.
 Không thêm kiến thức ngoài nguồn. Sau tổng kết hãy hỏi: “Cậu thấy mình đã nắm được bài này chưa?”
 
-ALL LESSON CHUNKS:\n{all_text}\n\nRECENT CHAT:\n{json.dumps(prompt_history[-6:], ensure_ascii=False, separators=(',', ':'))}\n\nTIN NHẮN:\n{query_text}"""
+ALL LESSON CHUNKS:\n{all_text}\n
+VISION FACTS TOÀN BÀI:\n{vision_text}
+
+RECENT CHAT:\n{json.dumps(prompt_history[-6:], ensure_ascii=False, separators=(',', ':'))}
+
+TIN NHẮN:\n{query_text}"""
             else:
                 cache_prompt=None
             if cache_prompt is not None:
@@ -6018,17 +6074,32 @@ TIN NHẮN HIỆN TẠI:
     perf_gen = time.perf_counter()
 
     detected_chunk_exercise = None
+    detected_global_exercise = None
     if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]) and curriculum_waiting != "chunk_answer":
         if "[[CHUNK_EXERCISE]]" in (reply or ""):
             detected_chunk_exercise = True
             print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=1 source='llm_chunk_inspection'")
+        elif "[[WHOLE_LESSON_EXERCISE]]" in (reply or ""):
+            detected_chunk_exercise = False
+            print(f"[CURRICULUM EXERCISE DEFER] request={request_id} step={curriculum_step} whole_lesson=1 source='llm_chunk_inspection'")
         elif "[[NO_CHUNK_EXERCISE]]" in (reply or ""):
             detected_chunk_exercise = False
             print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=0 source='llm_chunk_inspection'")
         else:
             detected_chunk_exercise = False
             print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=0 source='missing_marker_fail_closed'")
-        reply=(reply or '').replace('[[CHUNK_EXERCISE]]','').replace('[[NO_CHUNK_EXERCISE]]','')
+        reply=(reply or '').replace('[[CHUNK_EXERCISE]]','').replace('[[NO_CHUNK_EXERCISE]]','').replace('[[WHOLE_LESSON_EXERCISE]]','')
+    elif curriculum_flow_active and curriculum_step == curriculum_map["global_exercise_step"] and curriculum_waiting != "global_exercise_answer":
+        if "[[GLOBAL_EXERCISE]]" in (reply or ""):
+            detected_global_exercise = True
+            print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=1")
+        elif "[[NO_GLOBAL_EXERCISE]]" in (reply or ""):
+            detected_global_exercise = False
+            print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=0")
+        else:
+            detected_global_exercise = False
+            print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=0 source='missing_marker_fail_closed'")
+        reply=(reply or '').replace('[[GLOBAL_EXERCISE]]','').replace('[[NO_GLOBAL_EXERCISE]]','').rstrip()
 
     # Fixed curriculum flow owns the ending for Giáo trình. Legacy LESSON_END_READY remains for non-curriculum types.
     if curriculum_flow_active:
@@ -6065,6 +6136,24 @@ TIN NHẮN HIỆN TẠI:
             else:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+        elif curriculum_step == curriculum_map["global_exercise_step"]:
+            if curriculum_waiting == "global_exercise_answer":
+                next_summary_step = curriculum_map["summary_step"]
+                _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
+                study_session["curriculum_step"] = next_summary_step
+                study_session["curriculum_waiting"] = "final"
+                content_blocks.extend(_curriculum_final_blocks())
+            elif detected_global_exercise:
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
+                content_blocks.append({"type":"text","text":"✍️ Đây là bài tập chung của toàn bài. Cậu trả lời câu hỏi này trước nhé; Doraemon sẽ nhận xét rồi chúng mình tổng kết bài."})
+            else:
+                next_summary_step = curriculum_map["summary_step"]
+                _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
+                study_session["curriculum_step"] = next_summary_step
+                study_session["curriculum_waiting"] = "final"
+                # Khi không có bài tập toàn bài, prompt ở bước này đã được yêu cầu
+                # chuyển thẳng sang phần tổng kết. The final confirmation is attached here.
+                content_blocks.extend(_curriculum_final_blocks())
         elif curriculum_step == curriculum_map["summary_step"]:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="final", exercise_answered=True)
             content_blocks.extend(_curriculum_final_blocks())
