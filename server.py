@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.9-curriculum-chunk-step-flow"
+BASELINE_VERSION = "19.10-curriculum-waiting-schema-fix"
 import os
 import ast
 import io
@@ -297,10 +297,26 @@ def init_db():
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS bbox TEXT;",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_step INTEGER NOT NULL DEFAULT 0;",
-                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_waiting VARCHAR(20) DEFAULT 'continue';",
+                """DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='user_learning_state' AND column_name='curriculum_waiting'
+                    ) THEN
+                        ALTER TABLE user_learning_state ADD COLUMN curriculum_waiting VARCHAR(20) DEFAULT 'continue';
+                    ELSIF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='user_learning_state' AND column_name='curriculum_waiting' AND data_type='boolean'
+                    ) THEN
+                        ALTER TABLE user_learning_state ALTER COLUMN curriculum_waiting TYPE VARCHAR(20)
+                        USING CASE WHEN curriculum_waiting IS TRUE THEN 'continue' ELSE 'answer' END;
+                    END IF;
+                END $$;""",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_exercise_answered BOOLEAN NOT NULL DEFAULT FALSE;",
             ]:
                 cur.execute(sql)
+            cur.execute("ALTER TABLE user_learning_state ALTER COLUMN curriculum_waiting SET DEFAULT 'continue';")
+            cur.execute("UPDATE user_learning_state SET curriculum_waiting='continue' WHERE curriculum_waiting IS NULL OR curriculum_waiting='';")
             cur.execute("UPDATE knowledge_vision_cache SET image_hash=md5(image_key) WHERE image_hash IS NULL AND image_key IS NOT NULL;")
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
             cur.execute("UPDATE learning_progress SET subject='' WHERE subject IS NULL;")
