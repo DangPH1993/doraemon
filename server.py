@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.3-knowledge-cache-db-migration"
+BASELINE_VERSION = "19.4-knowledge-cache-runtime-hit-fix"
 import os
 import ast
 import io
@@ -79,7 +79,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.3-knowledge-cache-db-migration")
+print("[DORAEMON SERVER FINGERPRINT] 19.4-knowledge-cache-runtime-hit-fix")
 SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -2656,7 +2656,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                          AND lower(trim(content_type))=lower(trim(%s))
                          AND lower(trim(lesson))=lower(trim(%s))
                          AND lower(trim(coalesce(topic,'')))=lower(trim(%s))
-                       ORDER BY updated_at DESC LIMIT 1""",
+                       ORDER BY CASE WHEN cache_json ? 'sections' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT 1""",
                     (ct, ls, tp),
                 )
                 exact = cur.fetchone()
@@ -2670,7 +2670,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                        WHERE status='READY'
                          AND lower(trim(content_type))=lower(trim(%s))
                          AND lower(trim(lesson))=lower(trim(%s))
-                       ORDER BY updated_at DESC LIMIT 1""",
+                       ORDER BY CASE WHEN cache_json ? 'sections' THEN 1 ELSE 0 END DESC, updated_at DESC LIMIT 1""",
                     (ct, ls),
                 )
                 exact = cur.fetchone()
@@ -2695,11 +2695,19 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                 f"[KNOWLEDGE CACHE LOOKUP] request={request_id} "
                 f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
                 f"lesson_rows={int(diag.get('n') or 0)} ready_rows={int(diag.get('ready_n') or 0)} "
-                f"match={'1' if exact else '0'}"
+                f"match={'1' if exact else '0'} payload_ready={'1' if (exact and isinstance(exact.get('cache_json'), dict) and exact.get('cache_json', {}).get('sections')) else '0'}"
             )
 
-            if exact and exact.get('cache_json'):
-                return dict(exact['cache_json'])
+            payload = exact.get('cache_json') if exact else None
+            payload_ready = bool(isinstance(payload, dict) and payload.get('sections'))
+            if exact:
+                print(
+                    f"[KNOWLEDGE CACHE PAYLOAD] request={request_id} cache_id={exact.get('id')} "
+                    f"payload_ready={int(payload_ready)} sections={len((payload or {}).get('sections') or []) if isinstance(payload, dict) else 0} "
+                    f"images={len((payload or {}).get('images') or []) if isinstance(payload, dict) else 0}"
+                )
+            if exact and payload_ready:
+                return dict(payload)
             return None
     except Exception as exc:
         print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
@@ -4774,6 +4782,8 @@ Tin nhắn hiện tại:
             requested_content_type or "Giáo trình", requested_lesson, requested_topic, request_id=request_id
         )
         runtime_cache_hit = bool(runtime_lesson_cache)
+        if not runtime_cache_hit:
+            print(f"[KNOWLEDGE CACHE RUNTIME MISS] request={request_id} lesson={requested_lesson!r} topic={requested_topic!r} reason='no_ready_payload'" )
         if runtime_cache_hit:
             print(f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}")
     print(
