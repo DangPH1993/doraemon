@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.11-curriculum-chunk-exact-image-scope"
+BASELINE_VERSION = "19.12-curriculum-chunk-imagekey-authority"
 import os
 import ast
 import io
@@ -2795,10 +2795,13 @@ def _curriculum_chunk_images(cache, selected_section):
         exact_chunk = (target_chunk not in (None, "") and item_chunk not in (None, "") and str(item_chunk)==str(target_chunk))
         exact_unit = bool(target_unit and item_unit and item_unit==target_unit)
         key_linked = key in target_keys
-        # For teaching sections, provenance wins. A lesson-scoped image with no
-        # exact chunk provenance is intentionally excluded. This prevents a
-        # single page's Ken + doctor images from leaking into one chunk.
-        if not (exact_chunk or exact_unit):
+        # Curriculum section.image_keys is authoritative provenance created at
+        # upload/chunking time. If a chunk explicitly carries an image key, that
+        # image belongs to the chunk even when the legacy knowledge_vision_cache
+        # row has no chunk_index/content_unit_id (older caches often look like this).
+        # Exact chunk/unit provenance remains preferred, but explicit key linkage
+        # must be honored so cached lesson images are not silently dropped.
+        if not (exact_chunk or exact_unit or key_linked):
             continue
         vision=item.get("vision") or {}
         out.append({
