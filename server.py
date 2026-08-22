@@ -1,4 +1,4 @@
-BASELINE_VERSION = "20.0-curriculum-step-by-step-flow"
+BASELINE_VERSION = "20.2-curriculum-high-planner-vocab-pronunciation"
 import os
 import ast
 import io
@@ -2558,6 +2558,181 @@ def _cache_jsonable(value):
     return str(value)
 
 
+
+def _build_curriculum_plan(payload, *, request_label="upload"):
+    """Create a pedagogical plan for Giáo trình once at upload time.
+
+    The plan is derived only from cached source text/vision facts. Runtime uses this
+    plan to avoid treating every raw chunk as a separate lesson section. Full source
+    sections remain intact in cache; the plan is only a navigation layer.
+    """
+    sections = list((payload or {}).get("sections") or [])
+    images = list((payload or {}).get("images") or [])
+    if not sections:
+        return {"version": 1, "intro": {"text": "", "objectives": []}, "teaching_sections": [],
+                "exercise": {"exists": False, "depends_on_section_indices": []}, "summary": {"focus": []}}
+
+    source_sections = []
+    for i, sec in enumerate(sections):
+        source_sections.append({
+            "index": i,
+            "chunk_index": sec.get("chunk_index"),
+            "page": sec.get("page"),
+            "content_unit_id": sec.get("content_unit_id"),
+            "text": str(sec.get("text") or "")[:7000],
+            "image_keys": list(sec.get("image_keys") or []),
+        })
+    vision_items = []
+    for img in images:
+        vision = img.get("vision") or {}
+        vision_items.append({
+            "image_key": img.get("image_key"),
+            "page": img.get("page"),
+            "chunk_index": img.get("chunk_index"),
+            "vision": vision,
+        })
+
+    prompt = f"""Bạn là một chuyên gia thiết kế bài học tiếng Nhật cho Doraemon.
+Hãy tạo PEDAGOGICAL PLAN cho một tài liệu GIÁO TRÌNH dựa CHỈ trên nguồn bên dưới.
+Không được thêm kiến thức bên ngoài. Không được đổi sự thật của nguồn.
+Mục tiêu là tổ chức bài thành các bước dạy tuần tự, không phải tóm tắt lại toàn bộ bài.
+
+YÊU CẦU FLOW:
+- Bước 0: INTRO/OBJECTIVES — giới thiệu mục tiêu, bài học sẽ đi qua những phần nào.
+- Sau đó là các TEACHING SECTIONS độc lập về mặt trình bày. Ví dụ nếu nguồn có lịch Ken và lịch bác sĩ thì phải tạo 2 section riêng, không gộp.
+- Mỗi teaching section phải có title, teaching_text dựa trực tiếp trên nguồn, source_section_indices và image_keys liên quan.
+- Khi một section có TỪ VỰNG, phải giữ/khai thác cả cách đọc (kana/reading) và hướng dẫn phát âm để runtime có thể dạy từ đó; không tự đổi hoặc bịa reading nếu nguồn đã cung cấp reading khác.
+- Nếu một source chunk chứa nhiều chủ đề, hãy tách thành nhiều teaching section bằng cách chia lại nội dung nguồn; tuyệt đối không bịa dữ kiện.
+- Sau các teaching sections là EXERCISE. Exercise có thể phụ thuộc nhiều teaching sections. Hãy ghi rõ depends_on_section_indices.
+- Nếu nguồn không có bài tập, exists=false.
+- Cuối cùng là SUMMARY, tổng kết toàn bộ kiến thức đã học.
+
+SOURCE TEXT SECTIONS:
+{json.dumps(source_sections, ensure_ascii=False, separators=(',', ':'))}
+
+VISION FACTS/IMAGES:
+{json.dumps(vision_items, ensure_ascii=False, separators=(',', ':'))}
+
+CHỈ TRẢ JSON THEO SCHEMA:
+{{
+  "intro": {{"title":"", "text":"", "objectives":[]}},
+  "teaching_sections": [
+    {{
+      "id":"section_1",
+      "title":"",
+      "teaching_text":"",
+      "source_section_indices":[],
+      "image_keys":[],
+      "focus_facts":[]
+    }}
+  ],
+  "exercise": {{
+    "exists": false,
+    "title":"",
+    "instruction":"",
+    "source_section_indices":[],
+    "depends_on_section_indices":[],
+    "questions":[]
+  }},
+  "summary": {{"title":"", "focus":[]}}
+}}"""
+    try:
+        if gemini is None:
+            raise RuntimeError("Gemini unavailable")
+        print(f"[CURRICULUM PLAN] request_label={request_label!r} thinking_level='high'")
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                # Curriculum planning is an offline, upload-time operation.
+                # Spend the highest reasoning budget here so the cached pedagogy
+                # plan can correctly detect independent sections and exercise
+                # dependencies once, then be reused by every learner.
+                thinking_config=types.ThinkingConfig(thinking_level="high"),
+                response_mime_type="application/json",
+            ),
+        )
+        _log_gemini_usage(response, operation=f"curriculum_plan:{request_label}")
+        data = _parse_gemini_json(response.text or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("invalid curriculum plan JSON")
+
+        # Validate / normalize while preserving source-only semantics.
+        norm_sections = []
+        for i, item in enumerate(data.get("teaching_sections") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            idxs = []
+            for x in item.get("source_section_indices") or []:
+                try:
+                    x = int(x)
+                    if 0 <= x < len(sections):
+                        idxs.append(x)
+                except Exception:
+                    continue
+            if not idxs:
+                continue
+            img_keys = [str(x).strip() for x in (item.get("image_keys") or []) if str(x).strip()]
+            text = str(item.get("teaching_text") or "").strip()
+            if not text:
+                text = "\n\n".join(str(sections[x].get("text") or "") for x in idxs).strip()
+            norm_sections.append({
+                "id": str(item.get("id") or f"section_{i}"),
+                "title": str(item.get("title") or f"Phần {i}"),
+                "teaching_text": text,
+                "source_section_indices": idxs,
+                "image_keys": img_keys,
+                "focus_facts": [str(x).strip() for x in (item.get("focus_facts") or []) if str(x).strip()],
+            })
+
+        intro = data.get("intro") if isinstance(data.get("intro"), dict) else {}
+        exercise = data.get("exercise") if isinstance(data.get("exercise"), dict) else {}
+        deps = []
+        for x in exercise.get("depends_on_section_indices") or []:
+            try:
+                x = int(x)
+                if 0 <= x < len(norm_sections):
+                    deps.append(x)
+            except Exception:
+                continue
+        exercise_norm = {
+            "exists": bool(exercise.get("exists")),
+            "title": str(exercise.get("title") or ""),
+            "instruction": str(exercise.get("instruction") or ""),
+            "source_section_indices": [int(x) for x in (exercise.get("source_section_indices") or []) if str(x).isdigit() and 0 <= int(x) < len(sections)],
+            "depends_on_section_indices": deps,
+            "questions": [str(x).strip() for x in (exercise.get("questions") or []) if str(x).strip()],
+        }
+        return {
+            "version": 2,
+            "intro": {
+                "title": str(intro.get("title") or "Mục tiêu bài học"),
+                "text": str(intro.get("text") or "").strip(),
+                "objectives": [str(x).strip() for x in (intro.get("objectives") or []) if str(x).strip()],
+            },
+            "teaching_sections": norm_sections,
+            "exercise": exercise_norm,
+            "summary": data.get("summary") if isinstance(data.get("summary"), dict) else {"title":"Tổng kết", "focus":[]},
+        }
+    except Exception as exc:
+        print(f"[CURRICULUM PLAN] build failed: {type(exc).__name__}: {exc}; using safe fallback")
+        fallback=[]
+        for i, sec in enumerate(sections, start=1):
+            fallback.append({
+                "id": f"section_{i}", "title": f"Phần {i}",
+                "teaching_text": str(sec.get("text") or ""),
+                "source_section_indices": [i-1],
+                "image_keys": list(sec.get("image_keys") or []), "focus_facts": [],
+            })
+        return {
+            "version": 1,
+            "intro": {"title":"Mục tiêu bài học", "text":"", "objectives":[]},
+            "teaching_sections": fallback,
+            "exercise": {"exists": bool(_cache_exercise_sections({"sections": sections})), "title":"Bài tập", "instruction":"", "source_section_indices":[], "depends_on_section_indices": list(range(len(fallback))), "questions":[]},
+            "summary": {"title":"Tổng kết", "focus":[]},
+        }
+
 def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
     """Persist the complete upload-time knowledge asset and reusable vision cache."""
     grouped = {}
@@ -2619,8 +2794,14 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 payload["images"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
                 # Tiny immutable overview for the runtime prompt; full source remains in sections.
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
+                curriculum_plan = None
+                if ct == "Giáo trình":
+                    curriculum_plan = _build_curriculum_plan(
+                        {**payload, "source_file": source_file, "content_type": ct, "lesson": lesson, "topic": topic},
+                        request_label=f"{source_file}:{lesson}:{topic or ''}"
+                    )
                 package = {
-                    "version": 1,
+                    "version": 2,
                     "source_file": source_file,
                     "content_hash": source_hash,
                     "subject": subject,
@@ -2630,6 +2811,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "overview": overview,
                     "sections": payload["sections"],
                     "images": payload["images"],
+                    "curriculum_plan": curriculum_plan,
                 }
                 cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
                     (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
@@ -2933,6 +3115,73 @@ def _curriculum_mastery_choice():
         {"label":"Chưa","display_label":"Chưa — mình cần ôn lại","action":"curriculum_mastery_no"},
     ]}
 
+
+
+def _runtime_curriculum_sections(cache):
+    """Return pedagogical teaching sections for Giáo trình runtime.
+
+    The upload-time curriculum_plan is authoritative when present. Raw cache sections
+    remain the lossless source-of-truth and are used as fallback.
+    """
+    plan = (cache or {}).get("curriculum_plan") or {}
+    teaching = plan.get("teaching_sections") if isinstance(plan, dict) else None
+    raw = list((cache or {}).get("sections") or [])
+    if not isinstance(teaching, list) or not teaching:
+        return raw
+    out=[]
+    for i, item in enumerate(teaching):
+        if not isinstance(item, dict):
+            continue
+        idxs=[]
+        for x in item.get("source_section_indices") or []:
+            try:
+                x=int(x)
+                if 0 <= x < len(raw): idxs.append(x)
+            except Exception:
+                continue
+        text=str(item.get("teaching_text") or "").strip()
+        if not text and idxs:
+            text="\n\n".join(str(raw[x].get("text") or "") for x in idxs).strip()
+        image_keys=[str(k).strip() for k in (item.get("image_keys") or []) if str(k).strip()]
+        if not image_keys:
+            for x in idxs:
+                image_keys += [str(k).strip() for k in (raw[x].get("image_keys") or []) if str(k).strip()]
+        # Include source metadata for traceability without changing the source facts.
+        source_pages=[]
+        for x in idxs:
+            if raw[x].get("page") is not None: source_pages.append(raw[x].get("page"))
+        out.append({
+            "chunk_index": i,
+            "page": source_pages[0] if source_pages else None,
+            "content_unit_id": item.get("id") or f"section_{i+1}",
+            "text": text,
+            "image_keys": list(dict.fromkeys(image_keys)),
+            "metadata": {"source_section_indices": idxs, "title": item.get("title"), "focus_facts": item.get("focus_facts") or []},
+            "curriculum_title": str(item.get("title") or f"Phần {i+1}"),
+        })
+    return out or raw
+
+
+def _runtime_curriculum_intro(cache):
+    plan=(cache or {}).get("curriculum_plan") or {}
+    intro=plan.get("intro") if isinstance(plan, dict) else None
+    return intro if isinstance(intro, dict) else {"title":"Mục tiêu bài học", "text": str((cache or {}).get("overview") or ""), "objectives":[]}
+
+
+def _runtime_curriculum_exercise_sections(cache, teaching_sections):
+    plan=(cache or {}).get("curriculum_plan") or {}
+    exercise=plan.get("exercise") if isinstance(plan, dict) else None
+    if isinstance(exercise, dict):
+        deps=exercise.get("depends_on_section_indices") or []
+        chosen=[]
+        for x in deps:
+            try:
+                x=int(x)
+                if 0 <= x < len(teaching_sections): chosen.append(teaching_sections[x])
+            except Exception:
+                continue
+        if chosen: return chosen
+    return teaching_sections
 
 def _cache_exercise_sections(cache):
     sections = list((cache or {}).get("sections") or [])
@@ -5415,11 +5664,15 @@ Tin nhắn hiện tại:
     if runtime_cache_hit:
         flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
         flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
-        all_curriculum_sections = list((runtime_lesson_cache or {}).get("sections") or [])
-        if flow_step in {"SECTION", "REVIEW"}:
+        all_curriculum_sections = _runtime_curriculum_sections(runtime_lesson_cache) if requested_content_type == "Giáo trình" else list((runtime_lesson_cache or {}).get("sections") or [])
+        if flow_step == "OBJECTIVES":
+            cache_selected_sections = []
+        elif flow_step in {"SECTION", "REVIEW"}:
             cache_selected_sections = all_curriculum_sections[flow_idx:flow_idx+1] or all_curriculum_sections[:1]
-        elif flow_step in {"EXERCISE", "EVALUATION", "SUMMARY"}:
-            cache_selected_sections = _cache_exercise_sections(runtime_lesson_cache) or all_curriculum_sections
+        elif flow_step in {"EXERCISE", "EVALUATION"}:
+            cache_selected_sections = _runtime_curriculum_exercise_sections(runtime_lesson_cache, all_curriculum_sections) if requested_content_type == "Giáo trình" else (_cache_exercise_sections(runtime_lesson_cache) or all_curriculum_sections)
+        elif flow_step == "SUMMARY":
+            cache_selected_sections = all_curriculum_sections
         else:
             cache_selected_sections = _select_runtime_cache_sections(
                 runtime_lesson_cache, query_text, max_sections=2, initial=True
@@ -5713,11 +5966,21 @@ QUY TẮC RIÊNG CHO BÀI TẬP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC)
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
 - Khi học sinh yêu cầu học một bài/lesson của Giáo trình, trước tiên phải có **📚 Mở đầu bài học**: giới thiệu ngắn gọn mục đích của bài, bài này giúp học sinh làm được gì và các kiến thức/chủ điểm chính sẽ học.
+- Khi một phần có từ vựng mới, luôn kèm **cách đọc và cách phát âm** của từ đó trước khi sang từ tiếp theo.
 - Sau phần mở đầu, dạy **từng phần của giáo trình theo đúng thứ tự nguồn RAG**. Mỗi phần phải được giải thích chi tiết, dễ hiểu, có ví dụ từ chính nguồn khi nguồn có, và liên hệ với mục tiêu của bài. Không chỉ tóm tắt toàn bài trong một đoạn ngắn.
 - Khi có nhiều mục/điểm kiến thức, trình bày tuần tự: giải thích → ví dụ → lưu ý/dễ nhầm (nếu nguồn hỗ trợ) → chuyển sang mục tiếp theo.
 - Cuối bài phải có **📝 Tổng kết**: tổng hợp các từ vựng mới và ngữ pháp/cấu trúc mới xuất hiện trong bài, bám theo RAG CONTEXT; không tự bịa danh sách ngoài nguồn.
 - Sau phần tổng kết, nếu nguồn cho phép/đủ dữ kiện, thêm **✏️ Bài tập bổ sung** để học sinh luyện lại kiến thức vừa học. Bài tập phải bám nội dung của bài và không tự tạo kiến thức trái nguồn.
 - Nếu học sinh chỉ hỏi một chi tiết nhỏ của giáo trình, không cần ép toàn bộ cấu trúc trên; chỉ áp dụng đầy đủ khi học sinh yêu cầu học/trình bày cả bài hoặc một phần bài đủ lớn.
+"""
+    elif requested_content_type == "Từ vựng":
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO TỪ VỰNG — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
+- Khi giới thiệu mỗi từ mới, luôn dạy ĐỦ: từ tiếng Nhật, cách đọc (kana/reading nếu nguồn có), cách phát âm, nghĩa tiếng Việt và ví dụ/cách dùng nếu nguồn có.
+- Với từ có Kanji, chỉ ra cách đọc bằng kana nếu nguồn cung cấp; không tự thay reading của nguồn.
+- Hướng dẫn phát âm ngắn gọn, dễ bắt chước; chú ý trường âm, âm ngắt và âm ghép khi dữ liệu nguồn cho phép xác định.
+- Không chỉ liệt kê nghĩa; phải giúp học sinh biết cách ĐỌC và PHÁT ÂM từ đó.
+- Nếu nguồn không có reading hoặc không đủ dữ kiện để xác định cách đọc, nói rõ điều đó thay vì đoán.
 """
     elif any(
         _normalize_chunk_text_for_match(c.get("metadata",{}).get("content_type")) == "giáo trình"
@@ -5780,9 +6043,15 @@ TIN NHẮN HIỆN TẠI:
 
     if runtime_cache_hit:
         cache_context = []
+        if _flow_step == "OBJECTIVES":
+            intro = _runtime_curriculum_intro(runtime_lesson_cache)
+            cache_context.append("[INTRO / MỤC TIÊU]\n" + str(intro.get("text") or ""))
+            if intro.get("objectives"):
+                cache_context.append("MỤC TIÊU: " + "; ".join(str(x) for x in intro.get("objectives") or []))
         for order, sec in enumerate(cache_selected_sections):
+            title = sec.get("curriculum_title") or (sec.get("metadata") or {}).get("title") or f"Phần {order+1}"
             label = (
-                f"[SECTION_{order}] [Bài: {runtime_lesson_cache.get('lesson','')} | "
+                f"[SECTION_{order+1}] {title} [Bài: {runtime_lesson_cache.get('lesson','')} | "
                 f"Chủ đề: {runtime_lesson_cache.get('topic','')} | Trang: {sec.get('page','')}]"
             )
             cache_context.append(label + "\n" + str(sec.get("text") or ""))
@@ -5797,15 +6066,15 @@ TIN NHẮN HIỆN TẠI:
         _flow_step = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
         _flow_idx = int((study_session or {}).get("curriculum_section_index") or 0)
         if _flow_step == "OBJECTIVES":
-            curriculum_flow_instruction = "- Đây là bước MỤC TIÊU: chỉ giới thiệu mục tiêu, lợi ích và lộ trình các phần; chưa dạy chi tiết section."
+            curriculum_flow_instruction = "- Đây là BƯỚC 0 — GIỚI THIỆU: chỉ giới thiệu mục tiêu, lợi ích và cấu trúc các phần của bài; chưa dạy nội dung Ken/bác sĩ hay bài tập."
         elif _flow_step == "SECTION":
-            curriculum_flow_instruction = f"- Đây là bước SECTION {_flow_idx + 1}: chỉ dạy section hiện tại được cung cấp; bao gồm nội dung, từ vựng và ngữ pháp liên quan nếu nguồn có."
+            curriculum_flow_instruction = f"- Đây là PHẦN HỌC {_flow_idx + 1}: chỉ dạy đúng phần hiện tại được cung cấp, không lặp lại nội dung của các phần khác; bao gồm nội dung, từ vựng và ngữ pháp liên quan nếu nguồn có."
         elif _flow_step == "EXERCISE":
-            curriculum_flow_instruction = "- Đây là bước BÀI TẬP CỦA GIÁO TRÌNH: giới thiệu bài tập từ nguồn và yêu cầu học sinh tự làm; không tự giải trước."
+            curriculum_flow_instruction = "- Đây là BƯỚC BÀI TẬP: giới thiệu đúng câu hỏi/bài tập từ nguồn và yêu cầu học sinh tự nêu đáp án; khi đánh giá, dùng tất cả các phần mà bài tập phụ thuộc vào; không tự giải trước ở lượt giao bài."
         elif _flow_step == "EVALUATION":
             curriculum_flow_instruction = "- Đây là bước ĐÁNH GIÁ: dùng toàn bộ context của lesson để chấm câu trả lời gần nhất của học sinh, vì câu hỏi có thể phụ thuộc nhiều section."
         elif _flow_step == "SUMMARY":
-            curriculum_flow_instruction = "- Đây là bước TỔNG KẾT: tổng hợp toàn bộ kiến thức đã học, từ vựng, ngữ pháp và lỗi chính của bài."
+            curriculum_flow_instruction = "- Đây là BƯỚC TỔNG KẾT: tổng hợp toàn bộ các phần đã học, từ vựng, ngữ pháp và kết quả bài tập; có thể dùng toàn bộ teaching sections."
         elif _flow_step == "REVIEW":
             curriculum_flow_instruction = f"- Đây là bước ÔN LẠI SECTION {_flow_idx + 1}: giải thích lại section hiện tại, sau đó hướng sang phần tiếp theo."
 
@@ -5815,8 +6084,10 @@ Bài hiện tại: {runtime_lesson_cache.get('lesson','')} | Chủ đề: {runti
 
 QUY TẮC DẠY:
 {curriculum_flow_instruction}
-- Với Giáo trình: giải thích tuần tự, dễ hiểu; dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
-- Khi bắt đầu bài: giới thiệu ngắn mục tiêu rồi dạy phần đang có trong CACHE; không tóm tắt dài toàn bài nếu chưa dạy đến đó.
+- Với Giáo trình: flow cố định là BƯỚC 0 GIỚI THIỆU → các PHẦN HỌC → BÀI TẬP → ĐÁNH GIÁ → TỔNG KẾT → XÁC NHẬN NẮM BÀI.
+- Chỉ phần hiện tại được dạy chi tiết. Không lặp lại kiến thức của phần sau hoặc phần trước trừ khi bài tập/đánh giá cần đối chiếu.
+- Dùng ví dụ trong nguồn nếu có; không bịa ngoài nguồn.
+- Khi bắt đầu bài: giới thiệu mục tiêu và lộ trình; chưa dạy nội dung chi tiết nếu đang ở BƯỚC 0.
 - Khi học sinh hỏi chi tiết: trả lời đúng chi tiết đó dựa vào CACHE.
 - Khi thực sự hoàn tất phần hướng dẫn lớn/trọn bài, có thể đặt marker [[LESSON_END_READY]] ở cuối.
 - Ảnh chỉ để UI hiển thị; suy luận nội dung chỉ dựa vào text/facts đã cache.
@@ -5852,8 +6123,8 @@ TIN NHẮN HIỆN TẠI:
     curriculum_flow = _curriculum_step_for_session(study_session) if requested_content_type == "Giáo trình" else None
     curriculum_content_blocks = None
     if curriculum_flow and runtime_cache_hit:
-        all_sections = list((runtime_lesson_cache or {}).get("sections") or [])
-        exercise_sections = _cache_exercise_sections(runtime_lesson_cache)
+        all_sections = _runtime_curriculum_sections(runtime_lesson_cache)
+        exercise_sections = _runtime_curriculum_exercise_sections(runtime_lesson_cache, all_sections)
         idx = int((study_session or {}).get("curriculum_section_index") or 0)
         if curriculum_flow == "OBJECTIVES":
             _set_curriculum_flow(user["id"], "OBJECTIVES", 0, True, 0)
