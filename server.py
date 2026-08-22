@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.13-exercise-token-optimized"
+BASELINE_VERSION = "18.14-upload-time-knowledge-cache"
 import os
 import ast
 import io
@@ -11,6 +11,7 @@ from typing import Optional
 import json
 import base64
 import calendar
+import hashlib
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -78,7 +79,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-SERVER_VERSION = "2026-08-22-chatbox-bound-study-session-v4"
+print("[DORAEMON SERVER FINGERPRINT] 18.6.3-study-session-gate-final")
+SERVER_VERSION = "2026-08-22-study-session-gate-v3-FINAL"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -165,6 +167,25 @@ def init_db():
                 image_key TEXT NOT NULL, image_url TEXT, description TEXT,
                 term TEXT, reading TEXT, meaning TEXT, associated_text TEXT,
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL DEFAULT '',
+                content_hash VARCHAR(64) NOT NULL, namespace VARCHAR(255) NOT NULL DEFAULT '__default__',
+                status VARCHAR(20) NOT NULL DEFAULT 'PROCESSING', lesson_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(source_file, content_hash, namespace));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_vision_cache (
+                id BIGSERIAL PRIMARY KEY, asset_id BIGINT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+                source_file VARCHAR(500) NOT NULL, page INTEGER NOT NULL, image_key TEXT NOT NULL, image_hash VARCHAR(64) NOT NULL,
+                image_kind VARCHAR(50) NOT NULL DEFAULT 'educational_image', subject VARCHAR(255) NOT NULL DEFAULT '',
+                content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng', lesson VARCHAR(255), topic VARCHAR(255),
+                vision_json JSONB NOT NULL DEFAULT '{}'::jsonb, vision_text TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(image_hash));""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_lesson_cache (
+                id BIGSERIAL PRIMARY KEY, asset_id BIGINT NOT NULL REFERENCES knowledge_assets(id) ON DELETE CASCADE,
+                content_type VARCHAR(30) NOT NULL DEFAULT 'Giáo trình', lesson VARCHAR(255) NOT NULL, topic VARCHAR(255),
+                knowledge_json JSONB NOT NULL DEFAULT '{}'::jsonb, knowledge_text TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(asset_id, content_type, lesson, topic));""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
@@ -192,7 +213,6 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_lesson VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_topic VARCHAR(255);""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_started_at TIMESTAMPTZ;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
@@ -290,7 +310,6 @@ def startup():
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
-    print("[DORAEMON SERVER FINGERPRINT] 18.12-chatbox-bound-study-session")
     print("LLM provider:", LLM_PROVIDER)
     print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning:", OPENAI_REASONING_MEDIUM)
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
@@ -2484,7 +2503,7 @@ _GREETING_EXACT = {
 }
 
 
-def _get_study_session(user_id, chatbox_id=None):
+def _get_study_session(user_id):
     """Return the persisted ACTIVE study session, if any.
 
     This state is the sole authority for opening the expensive study stack
@@ -2496,18 +2515,12 @@ def _get_study_session(user_id, chatbox_id=None):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT study_session_active,study_session_content_type,study_session_course,
-                       study_session_lesson,study_session_topic,study_session_chatbox_id,
-                       study_session_started_at,study_end_prompt_pending
+                       study_session_lesson,study_session_topic,study_session_started_at,
+                       study_end_prompt_pending
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
             if not row or not row.get("study_session_active"):
-                return None
-            stored_chatbox_id = str(row.get("study_session_chatbox_id") or "").strip() or None
-            current_chatbox_id = str(chatbox_id or "").strip() or None
-            # Study Session belongs to exactly one chatbox. A missing/mismatched
-            # chatbox id is never allowed to inherit the previous lesson.
-            if current_chatbox_id and stored_chatbox_id != current_chatbox_id:
                 return None
             return {
                 "active": True,
@@ -2515,7 +2528,6 @@ def _get_study_session(user_id, chatbox_id=None):
                 "course": str(row.get("study_session_course") or "").strip() or None,
                 "lesson": str(row.get("study_session_lesson") or "").strip() or None,
                 "topic": str(row.get("study_session_topic") or "").strip() or None,
-                "chatbox_id": stored_chatbox_id,
                 "started_at": row.get("study_session_started_at"),
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
             }
@@ -2523,7 +2535,7 @@ def _get_study_session(user_id, chatbox_id=None):
         conn.close()
 
 
-def _start_study_session(user_id, scope, chatbox_id=None):
+def _start_study_session(user_id, scope):
     """Persist an explicitly confirmed lesson as the only active RAG scope."""
     scope = scope or {}
     lesson = str(scope.get("lesson") or "").strip()
@@ -2539,22 +2551,21 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                 INSERT INTO user_learning_state(
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
-                    study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
+                    study_session_lesson,study_session_topic,study_session_started_at,
                     study_end_prompt_pending,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,NOW(),FALSE,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
                     study_session_course=%s,
                     study_session_lesson=%s,
                     study_session_topic=%s,
-                    study_session_chatbox_id=%s,
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
             """, (
-                user_id,content_type,course,lesson,topic,chatbox_id,
-                content_type,course,lesson,topic,chatbox_id
+                user_id,content_type,course,lesson,topic,
+                content_type,course,lesson,topic
             ))
         conn.commit()
     finally:
@@ -2587,7 +2598,6 @@ def _finish_study_session(user_id):
                     study_session_course=NULL,
                     study_session_lesson=NULL,
                     study_session_topic=NULL,
-                    study_session_chatbox_id=NULL,
                     study_session_started_at=NULL,
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
@@ -3318,7 +3328,7 @@ def _chat_model_for_content(content_type: Optional[str], provider: Optional[str]
     return GEMINI_MODEL
 
 
-def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float, thinking_level_override: Optional[str] = None):
+def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float):
     """
     Provider-neutral chat adapter.
     Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
@@ -3326,7 +3336,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     content_blocks stay unchanged.
     """
     provider = LLM_PROVIDER
-    thinking_level = thinking_level_override or (
+    thinking_level = (
         "medium" if content_type in {"Bài tập", "Giáo trình"}
         else GEMINI_THINKING_LEVEL
     )
@@ -3425,30 +3435,9 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
-    # Read the persisted session twice intentionally: one view ignores chatbox scope
-    # so a newly opened chatbox can always invalidate an older active session; the
-    # scoped view is the only one allowed to authorize RAG for the current box.
-    study_session_any = _get_study_session(user["id"])
-    study_session = _get_study_session(user["id"], data.chatbox_id)
+    study_session = _get_study_session(user["id"])
 
-    # CHATBOX ISOLATION: chatbox_new is an explicit conversation boundary from the
-    # client. A new box ALWAYS starts CLOSED for retrieval, even if PostgreSQL still
-    # contains an active session from the previous box. Learning progress remains
-    # durable; Study Session/RAG scope is not inherited across chatboxes.
-    if data.chatbox_new:
-        if study_session_any and study_session_any.get("active"):
-            prev_scope = _active_session_scope(study_session_any) or {}
-            print(
-                "[CHATBOX RESET] new_chatbox=1 "
-                f"chatbox_id={data.chatbox_id!r} -> closing previous study session "
-                f"lesson={prev_scope.get('lesson')!r} topic={prev_scope.get('topic')!r} "
-                f"previous_chatbox_id={study_session_any.get('chatbox_id')!r}; "
-                "new conversation starts CLOSED"
-            )
-            _finish_study_session(user["id"])
-        study_session = None
-
-    # Safe default before routing is computed Some confirmation/session branches
+    # Safe default before routing is computed. Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
     # this initialized here prevents UnboundLocalError and, importantly, defaults
     # to CLOSED rather than accidentally enabling study retrieval.
@@ -3508,8 +3497,8 @@ def proxy_chat(
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             lesson_confirmed_scope = decoded
-            _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            _start_study_session(user["id"], lesson_confirmed_scope)
+            study_session = dict(_get_study_session(user["id"]) or {})
             print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}; study_session=ACTIVE")
 
     plan_start_action = None
@@ -3543,8 +3532,8 @@ def proxy_chat(
             forced_lesson = str(planned_start_item.get("lesson") or "").strip()
             print(f"[STUDY PLAN] today_yes user={user['id']} plan={active_plan.get('id') if active_plan else None} lesson={forced_lesson!r} content_type={forced_content_type!r}")
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
+            study_session = dict(_get_study_session(user["id"]) or {})
 
         elif ui_action == "plan_today_no":
             # The selected plan is identified by action suffix: plan_today_no:<plan_id>.
@@ -3600,8 +3589,8 @@ def proxy_chat(
             msg = f"🤖 Được nhé! Mình cùng học **{forced_lesson}** theo lộ trình nào.\n"
             # Do not return here: continue into the existing RAG path, but force the exact plan scope.
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
-            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
+            study_session = dict(_get_study_session(user["id"]) or {})
         elif ui_action == "plan_start_cancel":
             msg="Được nhé! 🤖 Khi nào cậu muốn bắt đầu bài đầu tiên theo lộ trình, chỉ cần nói với Doraemon."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
@@ -4505,16 +4494,8 @@ Tin nhắn hiện tại:
 
     # Default 8 text matches is enough for the compact prompt and keeps RAG fast.
     # Never exceed 10 unless the client explicitly sends a smaller value.
-    exercise_start_turn = bool(
-        requested_content_type == "Bài tập"
-        and (lesson_confirmed_scope or forced_plan_scope)
-        and not correction_followup
-    )
-    retrieval_k = (
-        6 if exercise_start_turn else
-        min(50 if requested_content_type == "Bài tập" and (requested_lesson or requested_topic) else 10,
-            max(4, int(data.top_k or 8)))
-    )
+    retrieval_k = min(50 if requested_content_type == "Bài tập" and (requested_lesson or requested_topic) else 10,
+                      max(4, int(data.top_k or 8)))
 
     text_filter = build_scope_filter(
         "text",
@@ -5071,6 +5052,33 @@ Tin nhắn hiện tại:
         if item.get("_chunk_order") is not None
     })
 
+    # On the first confirmed turn of a lesson, prepend the shared upload-time
+    # teaching package. Ongoing turns stay retrieval-focused, so we do not pay
+    # the input-token cost of the whole lesson package on every message.
+    if (lesson_confirmed_scope or forced_plan_scope) and requested_lesson:
+        try:
+            conn_kc=db()
+            try:
+                with conn_kc.cursor(cursor_factory=RealDictCursor) as cur_kc:
+                    cur_kc.execute("""
+                        SELECT kc.knowledge_text
+                        FROM knowledge_lesson_cache kc
+                        JOIN knowledge_assets ka ON ka.id=kc.asset_id
+                        WHERE LOWER(kc.lesson)=LOWER(%s)
+                          AND LOWER(COALESCE(kc.content_type,''))=LOWER(%s)
+                          AND (%s='' OR LOWER(COALESCE(kc.topic,''))=LOWER(%s))
+                          AND ka.status='READY'
+                        ORDER BY kc.updated_at DESC LIMIT 1
+                    """, (requested_lesson,requested_content_type or 'Giáo trình',str(requested_topic or ''),str(requested_topic or '')))
+                    cached_lesson=cur_kc.fetchone()
+            finally:
+                conn_kc.close()
+            if cached_lesson and cached_lesson.get('knowledge_text'):
+                contexts.insert(0, "[SHARED UPLOAD-TIME KNOWLEDGE CACHE]\n"+str(cached_lesson['knowledge_text'])[:9000])
+                print(f"[KNOWLEDGE CACHE HIT] lesson={requested_lesson!r} topic={requested_topic!r}")
+        except Exception as exc:
+            print('[KNOWLEDGE CACHE] runtime read skipped:', type(exc).__name__, str(exc))
+
     # Keep the RAG context compact: retrieval still uses up to 10 matches,
     # but Gemini only receives the best six selected text chunks.
     prompt_contexts = []
@@ -5082,7 +5090,7 @@ Tin nhắn hiện tại:
     # Compact prompt-only catalog/history. V3.7 accidentally referenced
     # prompt_catalog/prompt_history without constructing them, causing
     # NameError before Gemini was called.
-    prompt_history = ([] if (lesson_confirmed_scope or forced_plan_scope) else recent_history[-4:]) if study_retrieval_allowed else (recent_history[-2:] if recent_history else [])
+    prompt_history = (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:]) if recent_history else []
 
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
@@ -5183,86 +5191,57 @@ QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
 - Nếu có nhiều bảng trong cùng bài, giữ đúng quan hệ giữa từng bảng và ảnh của bảng đó.
 """
 
-    # Compact path for the first turn of a confirmed exercise lesson. The full
-    # teacher policy is valuable for grading/corrections, but it is unnecessary
-    # on the initial "ra bài + gợi ý" turn and causes avoidable input/reasoning cost.
-    if exercise_start_turn:
-        compact_images = image_marker_rule
-        compact_rag = chr(10).join(prompt_contexts[:4])
-        compact_state = json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))
-        prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là lượt BẮT ĐẦU BÀI TẬP đã được người học xác nhận.
+    prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
-QUY TẮC:
-- Chỉ dùng dữ liệu trong RAG CONTEXT của đúng lesson hiện tại.
-- Ra đề/bài luyện rõ ràng, ngắn gọn, đúng nguồn.
-- Ngay sau đề có mục **💡 Gợi ý cách làm**; chỉ gợi ý phương pháp, không đưa đáp án.
-- Với bài gọi món, đọc đúng món/giá từ CHUNK + ẢNH, không tự suy đoán.
-- Không dạy nội dung ngoài bài tập hiện tại.
-- Nếu chưa đến bước chấm bài, không cần suy luận dài.
-{compact_images}
+NGUYÊN TẮC:
+- Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
+- Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
+- Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
+- Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
+- Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
+- Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
+- “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
+- Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
+- Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
+- Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
+- Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
+- Khi cậu đã THỰC SỰ hoàn tất lượt hướng dẫn trọn bài/chủ đề hiện tại (không phải chỉ trả lời một câu hỏi nhỏ), hãy đặt marker kỹ thuật `[[LESSON_END_READY]]` ở CUỐI câu trả lời. Nếu vẫn còn nội dung chính cần dạy hoặc đây chỉ là follow-up ngắn, KHÔNG đặt marker này. Marker sẽ được server đổi thành lựa chọn Có/Không để xác nhận kết thúc buổi học và không hiển thị cho học sinh.
+- Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
+- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
+- Không bịa nội dung/trang không có trong RAG.
+- Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
+- Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
+- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
+- Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
+- Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
+{image_marker_rule}
 
-ACTIVE LESSON:
-{compact_state}
+{mode_specific_rules}
+
+ACTIVE LEARNING STATE:
+{json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
+
+DANH MỤC (chỉ có khi cần gợi ý):
+{json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
 
 RAG CONTEXT:
-{compact_rag}
+{chr(10).join(prompt_contexts)}
 
-TIN NHẮN:
+RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
+{json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+- Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
+- Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
+- Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
+
+TIN NHẮN HIỆN TẠI:
 {query_text}"""
-    else:
-        prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
-
-    NGUYÊN TẮC:
-    - Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
-    - Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
-    - Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
-    - Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
-    - Với Giáo trình: bám đúng lesson/phạm vi được RAG cung cấp; có thể vừa hướng dẫn/giải thích vừa cho học sinh làm các bài tập nằm trong chính giáo trình đó. Các bài tập nằm trong Giáo trình vẫn thuộc content type Giáo trình, không tự chuyển thành content type Bài tập.
-    - Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
-    - “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
-    - Khi BOXCHAT ĐANG MỞ, RECENT CHAT là ngữ cảnh hội thoại ưu tiên số 1 cho tối đa 10 lượt gần nhất. ACTIVE LEARNING STATE chỉ là ngữ cảnh dự phòng. Không được dùng tiến độ cũ để ghi đè chủ đề đang được trao đổi trong boxchat.
-    - Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
-    - Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
-    - Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
-    - Khi cậu đã THỰC SỰ hoàn tất lượt hướng dẫn trọn bài/chủ đề hiện tại (không phải chỉ trả lời một câu hỏi nhỏ), hãy đặt marker kỹ thuật `[[LESSON_END_READY]]` ở CUỐI câu trả lời. Nếu vẫn còn nội dung chính cần dạy hoặc đây chỉ là follow-up ngắn, KHÔNG đặt marker này. Marker sẽ được server đổi thành lựa chọn Có/Không để xác nhận kết thúc buổi học và không hiển thị cho học sinh.
-    - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
-    - Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
-    - Không bịa nội dung/trang không có trong RAG.
-    - Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
-    - Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
-    - Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
-    - Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
-    - Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
-    {image_marker_rule}
-
-    {mode_specific_rules}
-
-    ACTIVE LEARNING STATE:
-    {json.dumps(active_state, ensure_ascii=False, default=str, separators=(",", ":"))}
-
-    DANH MỤC (chỉ có khi cần gợi ý):
-    {json.dumps(prompt_catalog, ensure_ascii=False, default=str, separators=(",", ":"))}
-
-    RAG CONTEXT:
-    {chr(10).join(prompt_contexts)}
-
-    RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
-    {json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
-    - Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
-    - Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
-    - Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
-
-    TIN NHẮN HIỆN TẠI:
-    {query_text}"""
 
     gen_started = time.perf_counter()
-    thinking_override = "low" if exercise_start_turn else None
     reply, response_model, gen_elapsed = _generate_chat_reply(
         prompt,
         content_type=requested_content_type,
         request_id=request_id,
         gen_started=gen_started,
-        thinking_level_override=thinking_override,
     )
     perf_gen = time.perf_counter()
 
@@ -6505,10 +6484,165 @@ def extract_lesson_images(raw_pdf: bytes, page_no: int, source_file: str, subjec
                 conn.commit()
             finally:
                 conn.close()
-            stored.append({"key":key,"description":"Lesson image","page":page_no,"width":width,"height":height})
+            stored.append({"key":key,"description":"Lesson image","page":page_no,"width":width,"height":height,"_xref":xref})
     finally:
         doc.close()
     return stored
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data or b"").hexdigest()
+
+def _knowledge_asset_get_or_create(source_file: str, subject: str, content_hash: str, namespace: str = "__default__"):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM knowledge_assets WHERE source_file=%s AND content_hash=%s AND namespace=%s LIMIT 1", (source_file,content_hash,namespace))
+            row=cur.fetchone()
+            if row:
+                return dict(row)
+            cur.execute("INSERT INTO knowledge_assets(source_file,subject,content_hash,namespace,status) VALUES(%s,%s,%s,%s,'PROCESSING') RETURNING *", (source_file,subject,content_hash,namespace))
+            row=dict(cur.fetchone())
+        conn.commit(); return row
+    finally: conn.close()
+
+def _knowledge_asset_mark_ready(asset_id: int, lesson_count: int):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE knowledge_assets SET status='READY', lesson_count=%s, updated_at=NOW() WHERE id=%s", (lesson_count,asset_id))
+        conn.commit()
+    finally: conn.close()
+
+def _vision_cache_upsert(asset_id, source_file, page, image_key, image_bytes, image_kind, subject, content_type, lesson, topic, vision_json, vision_text):
+    image_hash=_sha256_bytes(image_bytes)
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO knowledge_vision_cache(asset_id,source_file,page,image_key,image_hash,image_kind,subject,content_type,lesson,topic,vision_json,vision_text)
+                         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         ON CONFLICT(image_hash) DO UPDATE SET asset_id=EXCLUDED.asset_id,source_file=EXCLUDED.source_file,page=EXCLUDED.page,image_key=EXCLUDED.image_key,image_kind=EXCLUDED.image_kind,subject=EXCLUDED.subject,content_type=EXCLUDED.content_type,lesson=EXCLUDED.lesson,topic=EXCLUDED.topic,vision_json=EXCLUDED.vision_json,vision_text=EXCLUDED.vision_text""",
+                        (asset_id,source_file,page,image_key,image_hash,image_kind,subject,content_type,lesson,topic,json.dumps(vision_json or {},ensure_ascii=False),vision_text or ""))
+        conn.commit()
+    finally: conn.close()
+
+def gemini_analyze_knowledge_image(image_bytes: bytes, page_no: int, image_kind: str, page_context: str):
+    if not gemini: raise RuntimeError("Gemini chưa được khởi tạo.")
+    mime="image/jpeg" if image_bytes[:2]==b"\xff\xd8" else "image/png"
+    prompt=f"""Đây là một hình ảnh giáo dục trong tài liệu học tập, trang {page_no}.
+
+Tạo một BẢN GHI KIẾN THỨC BẰNG TEXT đủ chi tiết để về sau Doraemon có thể trả lời câu hỏi về hình mà KHÔNG cần nhìn lại hình. Chỉ dùng thông tin nhìn thấy; không dùng kiến thức ngoài.
+
+Trích xuất đầy đủ:
+- ocr_text: toàn bộ chữ nhìn thấy, nguyên ngôn ngữ gốc
+- summary: mô tả chính xác nội dung
+- entities: người/vật/tên/món/nhãn/số/giá/thời gian
+- relations: quan hệ nhìn thấy
+- facts: dữ kiện độc lập, rõ chủ thể và giá trị
+- qa_facts: facts viết tối ưu cho hỏi đáp
+- spatial_facts: vị trí/tương quan khi nhìn thấy rõ
+- numbers_prices: số, tiền, số lượng, thời gian
+- symbols: ký hiệu và ý nghĩa khi hình thể hiện rõ
+- uncertain: chi tiết không chắc, không được đoán
+
+Nếu là bảng, giữ chính xác quan hệ hàng/cột/ô/ngày/giờ/ký hiệu. Nếu có ô trống có ý nghĩa, ghi rõ chỉ khi bố cục chứng minh được.
+
+TEXT của trang chỉ dùng để hỗ trợ liên hệ, không được ưu tiên hơn ảnh:
+{(page_context or '')[:5000]}
+
+Chỉ trả JSON:
+{{"ocr_text":"","summary":"","entities":[],"relations":[],"facts":[],"qa_facts":[],"spatial_facts":[],"numbers_prices":[],"symbols":[],"uncertain":[]}}"""
+    part=types.Part.from_bytes(data=image_bytes,mime_type=mime)
+    response=gemini.models.generate_content(model=GEMINI_MODEL,contents=[part,prompt],config=types.GenerateContentConfig(temperature=0.0,thinking_config=types.ThinkingConfig(thinking_level="low"),response_mime_type="application/json"))
+    _log_gemini_usage(response,operation=f"vision_cache:{image_kind}:page_{page_no}")
+    data=_parse_gemini_json(response.text or "{}")
+    lines=[]
+    if data.get("summary"): lines.append("SUMMARY: "+str(data.get("summary")))
+    if data.get("ocr_text"): lines.append("OCR: "+str(data.get("ocr_text")))
+    for k in ("facts","qa_facts","relations","spatial_facts","numbers_prices","symbols","uncertain","entities"):
+        vals=data.get(k)
+        if isinstance(vals,list) and vals: lines.append(k.upper()+":\n"+"\n".join("- "+str(x).strip() for x in vals if str(x).strip()))
+    return data,"\n".join(lines).strip()
+
+def _persist_vision_cache_and_vectors(asset_id, raw_pdf, page_images, records_meta, page_texts, source_file, subject, namespace):
+    analyzed=0; vectors=[]
+    doc=fitz.open(stream=raw_pdf,filetype="pdf") if fitz is not None else None
+    try:
+        for page_no,imgs in (page_images or {}).items():
+            page_meta=metadata_for_page(records_meta,int(page_no)); primary=page_meta[0] if page_meta else {}
+            page_context=str(page_texts.get(page_no) or "")
+            page_png=None
+            for img in imgs or []:
+                key=str(img.get("key") or "").strip()
+                if not key: continue
+                kind=str(img.get("kind") or "educational_image")
+                if kind=="table_source":
+                    facts=[str(x).strip() for x in (img.get("facts") or []) if str(x).strip()]
+                    vj={"image_kind":"table_source","summary":str(img.get("explanation") or "").strip(),"facts":facts,"qa_facts":facts,"source":"table_vision"}
+                    vt=("TABLE SUMMARY: "+str(img.get("explanation") or "").strip()+"\nFACTS:\n"+"\n".join("- "+x for x in facts)).strip()
+                    # Do not re-run Vision for tables; the table Vision output is authoritative cache input.
+                    image_bytes=(b"table-cache:"+key.encode("utf-8"))
+                else:
+                    # Extract the exact native image when xref is available. OCR/scanned crops already have their own image bytes in B2;
+                    # for those, the original page preview is used as a safe fallback.
+                    image_bytes=img.get("_image_bytes") or b""
+                    xref=img.get("_xref")
+                    try:
+                        if not image_bytes and xref is not None and doc is not None:
+                            info=doc.extract_image(int(xref)); image_bytes=info.get("image") or b""
+                            if Image is not None and image_bytes:
+                                im=Image.open(io.BytesIO(image_bytes)).convert("RGB"); out=io.BytesIO(); im.save(out,format="JPEG",quality=92,optimize=True); image_bytes=out.getvalue()
+                        if not image_bytes:
+                            if page_png is None: page_png=render_pdf_page(raw_pdf,int(page_no),dpi=170)
+                            image_bytes=page_png
+                    except Exception:
+                        continue
+                    vj,vt=gemini_analyze_knowledge_image(image_bytes,int(page_no),kind,page_context)
+                ctype=str(primary.get("content_type") or "Từ vựng")
+                lesson=primary.get("lesson"); topic=primary.get("topic")
+                _vision_cache_upsert(asset_id,source_file,int(page_no),key,image_bytes,kind,subject,ctype,lesson,topic,vj,vt)
+                if vt:
+                    md={"record_type":"text","source_kind":"vision_cache","text":vt,"course":subject,"subject":subject,"content_type":ctype,"source_file":source_file,"page":int(page_no),"chunk_index":str(img.get("chunk_index") if img.get("chunk_index") not in (None,"") else f"vision:{key}"),"image_keys":json.dumps([key],ensure_ascii=False),"image_key":key,"vision_cache":True,"image_scope":str(img.get("image_scope") or ("table" if kind=="table_source" else "chunk")),"lesson":lesson,"topic":topic}
+                    vectors.append({"id":uuid.uuid4().hex,"values":embed_text(vt),"metadata":md})
+                analyzed+=1
+                if len(vectors)>=50: index.upsert(vectors=vectors,namespace=namespace); vectors=[]
+    finally:
+        if doc is not None: doc.close()
+    if vectors: index.upsert(vectors=vectors,namespace=namespace)
+    return analyzed
+
+def _build_lesson_knowledge_cache(asset_id, content_type, lesson, topic, page_texts, records_meta):
+    lesson_low=(lesson or "").strip().casefold(); topic_low=(topic or "").strip().casefold(); parts=[]
+    for pno,text in (page_texts or {}).items():
+        metas=metadata_for_page(records_meta,int(pno))
+        if any(str(m.get("lesson") or "").strip().casefold()==lesson_low and (not topic_low or str(m.get("topic") or "").strip().casefold()==topic_low) for m in metas) and text:
+            parts.append(f"[PAGE {pno}]\n{text}")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT page,image_key,image_kind,vision_text FROM knowledge_vision_cache WHERE asset_id=%s AND LOWER(COALESCE(lesson,''))=%s AND (%s='' OR LOWER(COALESCE(topic,''))=%s) ORDER BY page,id",(asset_id,lesson_low,topic_low,topic_low))
+            vr=cur.fetchall() or []
+    finally: conn.close()
+    vision="\n\n".join(f"[VISION page {r['page']} image {r['image_key']}]\n{r['vision_text']}" for r in vr if r.get('vision_text'))
+    prompt=f"""Tạo KNOWLEDGE PACKAGE dùng chung cho {content_type!r} lesson {lesson!r} topic {topic!r}. Đây là cache tạo một lần lúc upload; chỉ dùng source dưới đây, không dùng kiến thức ngoài.
+
+SOURCE TEXT:\n{('\\n\\n'.join(parts))[:90000]}
+
+VISION CACHE TEXT:\n{vision[:90000]}
+
+Trả JSON gồm: lesson_title, learning_objectives[], ordered_sections[] (title,purpose,source_text,key_points[]), vocabulary[], grammar_points[], examples[], exercise_data[], common_mistakes[], teaching_notes[], source_boundaries[]."""
+    response=gemini.models.generate_content(model=GEMINI_MODEL,contents=[prompt],config=types.GenerateContentConfig(temperature=0.0,thinking_config=types.ThinkingConfig(thinking_level="low"),response_mime_type="application/json"))
+    _log_gemini_usage(response,operation=f"knowledge_lesson_cache:{lesson}")
+    data=_parse_gemini_json(response.text or "{}")
+    txt=json.dumps(data,ensure_ascii=False,indent=2)
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO knowledge_lesson_cache(asset_id,content_type,lesson,topic,knowledge_json,knowledge_text)
+                         VALUES(%s,%s,%s,%s,%s,%s)
+                         ON CONFLICT(asset_id,content_type,lesson,topic) DO UPDATE SET knowledge_json=EXCLUDED.knowledge_json,knowledge_text=EXCLUDED.knowledge_text,updated_at=NOW()""",(asset_id,content_type,lesson,topic,json.dumps(data,ensure_ascii=False),txt))
+        conn.commit()
+    finally: conn.close()
+    return data
 
 def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, subject: str):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
@@ -6577,7 +6711,8 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
                 finally:
                     conn.close()
                 stored.append({"key": key, "description": description, "term": term, "reading": reading,
-                               "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
+                               "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no,
+                               "_image_bytes": image_bytes})
 
         # For table pages, keep EACH ORIGINAL TABLE as its own image and add
         # one semantic Vision explanation per table to the text that is embedded in the RAG chunk.
@@ -6732,6 +6867,12 @@ async def admin_knowledge_upload(
 
     source_file=os.path.basename(file.filename)
     namespace="__default__"
+    content_hash=_sha256_bytes(raw)
+    asset=_knowledge_asset_get_or_create(source_file,subject,content_hash,namespace)
+    if str(asset.get("status") or "").upper()=="READY":
+        print(f"[KNOWLEDGE CACHE HIT] source_file={source_file!r} hash={content_hash[:12]} asset_id={asset.get('id')}")
+        return {"success":True,"filename":source_file,"subject":subject,"pages":len(reader.pages),"chunks":0,"records":len(records_meta),"images":0,"image_vectors":0,"table_source_images":0,"cache":"HIT","asset_id":asset.get("id"),"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
+    asset_id=int(asset["id"])
 
     # Save original PDF to B2 when configured.
     pdf_key = f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"
@@ -6747,6 +6888,28 @@ async def admin_knowledge_upload(
         page_texts, page_images, page_units = process_pdf_pages(raw, reader, records_meta, source_file, subject)
     except Exception as e:
         raise HTTPException(500, f"OCR Gemini/xử lý ảnh thất bại: {e}")
+
+    # Build the shared upload-time Vision Cache. Each image is analyzed once;
+    # table images reuse the structured table facts already generated during ingestion.
+    try:
+        vision_cache_count=_persist_vision_cache_and_vectors(asset_id, raw, page_images, records_meta, page_texts, source_file, subject, namespace)
+        print(f"[KNOWLEDGE CACHE] vision_images={vision_cache_count}")
+    except Exception as e:
+        raise HTTPException(500, f"Vision cache thất bại: {e}")
+
+    # Build a shared teaching/knowledge package for every lesson represented by the upload.
+    lesson_keys=[]
+    for r in records_meta:
+        key=(str(r.get("content_type") or "Từ vựng"),str(r.get("lesson") or "").strip(),str(r.get("topic") or "").strip() or None)
+        if key[1] and key not in lesson_keys: lesson_keys.append(key)
+    lesson_cache_count=0
+    try:
+        for ct,lesson,topic in lesson_keys:
+            _build_lesson_knowledge_cache(asset_id,ct,lesson,topic,page_texts,records_meta)
+            lesson_cache_count+=1
+        print(f"[KNOWLEDGE CACHE] lessons={lesson_cache_count} source_file={source_file!r}")
+    except Exception as e:
+        raise HTTPException(500, f"Lesson knowledge cache thất bại: {e}")
 
     vectors=[]
     total=0
@@ -6982,6 +7145,7 @@ async def admin_knowledge_upload(
     finally:
         conn.close()
 
+    _knowledge_asset_mark_ready(asset_id,lesson_cache_count)
     _invalidate_catalog_cache()
 
     image_count=sum(len(v) for v in page_images.values())
