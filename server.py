@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.5-upload-sourcefile-fix"
+BASELINE_VERSION = "19.6-knowledge-vision-imagehash-migration-fix"
 import os
 import ast
 import io
@@ -79,7 +79,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.5-upload-sourcefile-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.6-knowledge-vision-imagehash-migration-fix")
 SERVER_VERSION = "2026-08-22-knowledge-cache-lookup-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -164,7 +164,7 @@ def init_db():
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL,
                 subject VARCHAR(255) NOT NULL DEFAULT '', content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
                 lesson VARCHAR(255), topic VARCHAR(255), page INTEGER NOT NULL,
-                image_key TEXT NOT NULL, image_url TEXT, description TEXT,
+                image_key TEXT NOT NULL, image_hash VARCHAR(128), image_url TEXT, description TEXT,
                 term TEXT, reading TEXT, meaning TEXT, associated_text TEXT,
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
@@ -208,6 +208,7 @@ def init_db():
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS topic VARCHAR(255);",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS page INTEGER;",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS chunk_index INTEGER;",
+                "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS image_hash VARCHAR(128);",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS image_url TEXT;",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS vision_json JSONB DEFAULT '{}'::jsonb;",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE;",
@@ -297,6 +298,7 @@ def init_db():
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);",
             ]:
                 cur.execute(sql)
+            cur.execute("UPDATE knowledge_vision_cache SET image_hash=md5(image_key) WHERE image_hash IS NULL AND image_key IS NOT NULL;")
             cur.execute("UPDATE learning_progress SET last_studied_at=NOW() WHERE last_studied_at IS NULL;")
             cur.execute("UPDATE learning_progress SET subject='' WHERE subject IS NULL;")
             cur.execute("UPDATE learning_progress SET content_type='Từ vựng' WHERE content_type IS NULL OR TRIM(content_type)='';")
@@ -2628,8 +2630,14 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
                     (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
-                    cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
-                        (asset_id,source_file,ct,lesson,topic,img.get("page"),img.get("chunk_index"),img.get("image_key"),img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
+                    image_key = str(img.get("image_key") or "").strip()
+                    image_hash = str(img.get("image_hash") or "").strip() or None
+                    if image_hash is None and image_key:
+                        import hashlib
+                        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()
+                    __IMAGE_HASH__ = image_hash
+                    cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_hash,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                        (asset_id,source_file,ct,lesson,topic,img.get("page"),img.get("chunk_index"),img.get("image_key"),__IMAGE_HASH__,img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
         conn.commit()
     finally:
         conn.close()
