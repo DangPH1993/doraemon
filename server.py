@@ -1,4 +1,4 @@
-BASELINE_VERSION = "18.6.3-study-session-gate-final"
+BASELINE_VERSION = "18.12-chatbox-bound-study-session"
 import os
 import ast
 import io
@@ -78,8 +78,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 18.6.3-study-session-gate-final")
-SERVER_VERSION = "2026-08-22-study-session-gate-v3-FINAL"
+SERVER_VERSION = "2026-08-22-chatbox-bound-study-session-v4"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -193,6 +192,7 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_lesson VARCHAR(255);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_topic VARCHAR(255);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_started_at TIMESTAMPTZ;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
@@ -290,6 +290,7 @@ def startup():
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
+    print("[DORAEMON SERVER FINGERPRINT] 18.12-chatbox-bound-study-session")
     print("LLM provider:", LLM_PROVIDER)
     print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning:", OPENAI_REASONING_MEDIUM)
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
@@ -2483,7 +2484,7 @@ _GREETING_EXACT = {
 }
 
 
-def _get_study_session(user_id):
+def _get_study_session(user_id, chatbox_id=None):
     """Return the persisted ACTIVE study session, if any.
 
     This state is the sole authority for opening the expensive study stack
@@ -2495,12 +2496,18 @@ def _get_study_session(user_id):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT study_session_active,study_session_content_type,study_session_course,
-                       study_session_lesson,study_session_topic,study_session_started_at,
-                       study_end_prompt_pending
+                       study_session_lesson,study_session_topic,study_session_chatbox_id,
+                       study_session_started_at,study_end_prompt_pending
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
             if not row or not row.get("study_session_active"):
+                return None
+            stored_chatbox_id = str(row.get("study_session_chatbox_id") or "").strip() or None
+            current_chatbox_id = str(chatbox_id or "").strip() or None
+            # Study Session belongs to exactly one chatbox. A missing/mismatched
+            # chatbox id is never allowed to inherit the previous lesson.
+            if current_chatbox_id and stored_chatbox_id != current_chatbox_id:
                 return None
             return {
                 "active": True,
@@ -2508,6 +2515,7 @@ def _get_study_session(user_id):
                 "course": str(row.get("study_session_course") or "").strip() or None,
                 "lesson": str(row.get("study_session_lesson") or "").strip() or None,
                 "topic": str(row.get("study_session_topic") or "").strip() or None,
+                "chatbox_id": stored_chatbox_id,
                 "started_at": row.get("study_session_started_at"),
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
             }
@@ -2515,7 +2523,7 @@ def _get_study_session(user_id):
         conn.close()
 
 
-def _start_study_session(user_id, scope):
+def _start_study_session(user_id, scope, chatbox_id=None):
     """Persist an explicitly confirmed lesson as the only active RAG scope."""
     scope = scope or {}
     lesson = str(scope.get("lesson") or "").strip()
@@ -2531,21 +2539,22 @@ def _start_study_session(user_id, scope):
                 INSERT INTO user_learning_state(
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
-                    study_session_lesson,study_session_topic,study_session_started_at,
+                    study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
                     study_end_prompt_pending,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,NOW(),FALSE,NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
                     study_session_course=%s,
                     study_session_lesson=%s,
                     study_session_topic=%s,
+                    study_session_chatbox_id=%s,
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
             """, (
-                user_id,content_type,course,lesson,topic,
-                content_type,course,lesson,topic
+                user_id,content_type,course,lesson,topic,chatbox_id,
+                content_type,course,lesson,topic,chatbox_id
             ))
         conn.commit()
     finally:
@@ -2578,6 +2587,7 @@ def _finish_study_session(user_id):
                     study_session_course=NULL,
                     study_session_lesson=NULL,
                     study_session_topic=NULL,
+                    study_session_chatbox_id=NULL,
                     study_session_started_at=NULL,
                     study_end_prompt_pending=FALSE,
                     updated_at=NOW()
@@ -3415,9 +3425,30 @@ def proxy_chat(
     # random lesson (for example Bài tập) immediately after saying hello.
     profile=_get_learning_profile(user["id"])
     low0=data.text.casefold().strip()
-    study_session = _get_study_session(user["id"])
+    # Read the persisted session twice intentionally: one view ignores chatbox scope
+    # so a newly opened chatbox can always invalidate an older active session; the
+    # scoped view is the only one allowed to authorize RAG for the current box.
+    study_session_any = _get_study_session(user["id"])
+    study_session = _get_study_session(user["id"], data.chatbox_id)
 
-    # Safe default before routing is computed. Some confirmation/session branches
+    # CHATBOX ISOLATION: chatbox_new is an explicit conversation boundary from the
+    # client. A new box ALWAYS starts CLOSED for retrieval, even if PostgreSQL still
+    # contains an active session from the previous box. Learning progress remains
+    # durable; Study Session/RAG scope is not inherited across chatboxes.
+    if data.chatbox_new:
+        if study_session_any and study_session_any.get("active"):
+            prev_scope = _active_session_scope(study_session_any) or {}
+            print(
+                "[CHATBOX RESET] new_chatbox=1 "
+                f"chatbox_id={data.chatbox_id!r} -> closing previous study session "
+                f"lesson={prev_scope.get('lesson')!r} topic={prev_scope.get('topic')!r} "
+                f"previous_chatbox_id={study_session_any.get('chatbox_id')!r}; "
+                "new conversation starts CLOSED"
+            )
+            _finish_study_session(user["id"])
+        study_session = None
+
+    # Safe default before routing is computed Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
     # this initialized here prevents UnboundLocalError and, importantly, defaults
     # to CLOSED rather than accidentally enabling study retrieval.
@@ -3477,8 +3508,8 @@ def proxy_chat(
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             lesson_confirmed_scope = decoded
-            _start_study_session(user["id"], lesson_confirmed_scope)
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
             print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}; study_session=ACTIVE")
 
     plan_start_action = None
@@ -3512,8 +3543,8 @@ def proxy_chat(
             forced_lesson = str(planned_start_item.get("lesson") or "").strip()
             print(f"[STUDY PLAN] today_yes user={user['id']} plan={active_plan.get('id') if active_plan else None} lesson={forced_lesson!r} content_type={forced_content_type!r}")
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
 
         elif ui_action == "plan_today_no":
             # The selected plan is identified by action suffix: plan_today_no:<plan_id>.
@@ -3569,8 +3600,8 @@ def proxy_chat(
             msg = f"🤖 Được nhé! Mình cùng học **{forced_lesson}** theo lộ trình nào.\n"
             # Do not return here: continue into the existing RAG path, but force the exact plan scope.
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None})
-            study_session = dict(_get_study_session(user["id"]) or {})
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
         elif ui_action == "plan_start_cancel":
             msg="Được nhé! 🤖 Khi nào cậu muốn bắt đầu bài đầu tiên theo lộ trình, chỉ cần nói với Doraemon."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
