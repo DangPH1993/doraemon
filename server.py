@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.0-knowledge-cache-runtime-fastpath"
+BASELINE_VERSION = "19.1-knowledge-cache-vision-audit"
 import os
 import ast
 import io
@@ -79,8 +79,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.0-knowledge-cache-runtime-fastpath")
-SERVER_VERSION = "2026-08-22-knowledge-cache-runtime-v1"
+print("[DORAEMON SERVER FINGERPRINT] 19.1-knowledge-cache-vision-audit")
+SERVER_VERSION = "2026-08-22-knowledge-cache-vision-audit-v1"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3546,6 +3546,9 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     for the same final prompt so RAG, Study Plan, chat history, routing and
     content_blocks stay unchanged.
     """
+    # Runtime audit: this adapter receives a text-only prompt. If image_parts=0,
+    # no binary/image payload is being sent to Gemini from the chat generation path.
+    print(f"[GEMINI INPUT AUDIT] request={request_id} prompt_chars={len(prompt)} image_parts=0")
     provider = LLM_PROVIDER
     thinking_level = (
         "medium" if content_type == "Bài tập"
@@ -4705,6 +4708,11 @@ Tin nhắn hiện tại:
         runtime_cache_hit = bool(runtime_lesson_cache)
         if runtime_cache_hit:
             print(f"[KNOWLEDGE CACHE RUNTIME HIT] lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}")
+    print(
+        f"[KNOWLEDGE/RAG AUDIT] request={request_id} "
+        f"cache_hit={int(runtime_cache_hit)} study_allowed={int(study_retrieval_allowed)} "
+        f"embedding_will_run={int(study_retrieval_allowed and not runtime_cache_hit)}"
+    )
 
     if not study_retrieval_allowed:
         print(
@@ -5234,6 +5242,17 @@ Tin nhắn hiện tại:
     # immediately before image retrieval, so future retrieval changes cannot
     # accidentally re-introduce unrelated images into the clarification turn.
     if runtime_cache_hit:
+        vision_fact_chars = 0
+        selected_keys = {str(k).strip() for sec in cache_selected_sections for k in (sec.get("image_keys") or []) if str(k).strip()}
+        for _img in (runtime_lesson_cache.get("images") or []):
+            if str(_img.get("image_key") or "").strip() in selected_keys:
+                vision_fact_chars += len(json.dumps(_img.get("vision") or {}, ensure_ascii=False, separators=(",", ":")))
+        print(
+            f"[VISION CACHE AUDIT] request={request_id} mode=cache "
+            f"cache_images={len(runtime_lesson_cache.get('images') or [])} "
+            f"selected_images={len(rich_images)} vision_fact_chars={vision_fact_chars} "
+            f"image_parts_sent_to_gemini=0"
+        )
         print(f"[IMAGE CACHE] reused={len(rich_images)} cached images; not sent to Gemini")
     elif ambiguous_study_request or lesson_intro_request or recommendation_only_request or exercise_suggestion_only_request:
         rich_images = []
@@ -5246,6 +5265,10 @@ Tin nhắn hiện tại:
     elif study_retrieval_allowed:
         rich_images = _retrieve_images_for_text_chunks(
             text_chunks, index, namespace, query_vector
+        )
+        print(
+            f"[VISION CACHE AUDIT] request={request_id} mode=live_retrieval "
+            f"selected_images={len(rich_images)} image_parts_sent_to_gemini=0"
         )
     else:
         rich_images = []
@@ -5510,7 +5533,11 @@ RECENT CHAT CỦA BOXCHAT HIỆN TẠI:
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
         prompt = cache_prompt
-        print(f"[KNOWLEDGE CACHE PROMPT] sections={len(cache_selected_sections)} prompt_chars={len(prompt)}")
+        print(
+            f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
+            f"sections={len(cache_selected_sections)} prompt_chars={len(prompt)} "
+            f"vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
+        )
 
     gen_started = time.perf_counter()
     reply, response_model, gen_elapsed = _generate_chat_reply(
