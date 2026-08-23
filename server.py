@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.37-kb-strict-id-delete-verify"
+BASELINE_VERSION = "19.38-kb-chunk-order-cache-fix"
 import os
 import ast
 import io
@@ -81,8 +81,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.37-kb-strict-id-delete-verify")
-SERVER_VERSION = "2026-08-23-kb-strict-id-delete-verify"
+print("[DORAEMON SERVER FINGERPRINT] 19.38-kb-chunk-order-cache-fix")
+SERVER_VERSION = "2026-08-23-kb-chunk-order-cache-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2583,18 +2583,25 @@ def _cache_jsonable(value):
 
 
 def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records, *, defer_curriculum_plan=False):
-    """Persist the complete upload-time knowledge asset and reusable vision cache."""
+    """Persist upload-time knowledge with deterministic one-section-per-text-chunk ordering."""
+    def _norm_topic(value):
+        t = str(value or "").strip()
+        return re.sub(r"\s+", " ", t) or None
+
+    def _group_key(md):
+        return (
+            _normalize_content_type(md.get("content_type")),
+            _canonical_lesson_key(md.get("lesson")),
+            _norm_topic(md.get("topic")),
+        )
+
     grouped = {}
     for rec in text_records:
         md = rec.get("metadata") or {}
-        key = (
-            _normalize_content_type(md.get("content_type")),
-            str(md.get("lesson") or "").strip(),
-            str(md.get("topic") or "").strip() or None,
-        )
+        key = _group_key(md)
         if not key[1]:
             continue
-        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject})
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
         grouped[key]["sections"].append({
             "chunk_index": int(md.get("chunk_index") or 0),
             "page": md.get("page"),
@@ -2608,14 +2615,10 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         })
     for img in image_records:
         md = img.get("metadata") or {}
-        key = (
-            _normalize_content_type(md.get("content_type")),
-            str(md.get("lesson") or "").strip(),
-            str(md.get("topic") or "").strip() or None,
-        )
+        key = _group_key(md)
         if not key[1]:
             continue
-        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject})
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
         vision = {k:v for k,v in md.items() if k not in {"image_key","image_url"}}
         grouped[key]["images"].append({
             "image_key": md.get("image_key"), "image_url": md.get("image_url"),
@@ -2642,9 +2645,28 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
             # within the upload transaction and tolerate an existing global row.
             seen_image_hashes = set()
             for key, payload in grouped.items():
-                ct, lesson, topic = key
-                payload["sections"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
-                payload["images"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
+                ct, lesson_key, topic = key
+                lesson = payload.get("lesson_display") or lesson_key
+                topic_display = payload.get("topic_display") or topic
+                payload["sections"].sort(key=lambda x: (
+                    int(x.get("page") or 0),
+                    int(x.get("chunk_index") or 0),
+                    str(x.get("content_unit_id") or ""),
+                ))
+                for new_idx, section in enumerate(payload["sections"]):
+                    section["chunk_index"] = new_idx
+                payload["images"].sort(key=lambda x: (
+                    int(x.get("page") or 0),
+                    int(x.get("chunk_index") or 0),
+                    str(x.get("image_key") or ""),
+                ))
+                if not payload["sections"]:
+                    raise RuntimeError(f"Knowledge Cache không có text sections cho lesson={lesson_key!r}")
+                print(
+                    f"[KNOWLEDGE CACHE CHUNK AUDIT] source={source_file!r} lesson={lesson!r} "
+                    f"topic={topic!r} sections={len(payload['sections'])} "
+                    f"chunk_indexes={[x.get('chunk_index') for x in payload['sections']]}"
+                )
                 # Tiny immutable overview for the runtime prompt; full source remains in sections.
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
                 package = {
@@ -2654,13 +2676,13 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "subject": subject,
                     "content_type": ct,
                     "lesson": lesson,
-                    "topic": topic,
+                    "topic": topic_display,
                     "overview": overview,
                     "sections": payload["sections"],
                     "images": payload["images"],
                 }
                 cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
-                    (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                    (asset_id, source_file, subject, ct, lesson, topic_display, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
                     image_key = str(img.get("image_key") or "").strip()
                     image_hash = str(img.get("image_hash") or "").strip() or None
@@ -2674,7 +2696,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                         seen_image_hashes.add(image_hash)
                     __IMAGE_HASH__ = image_hash
                     cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_hash,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)\n                    ON CONFLICT (image_hash) DO NOTHING""",
-                        (asset_id,source_file,ct,lesson,topic,img.get("page"),img.get("chunk_index"),img.get("image_key"),__IMAGE_HASH__,img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
+                        (asset_id,source_file,ct,lesson,topic_display,img.get("page"),img.get("chunk_index"),img.get("image_key"),__IMAGE_HASH__,img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
         conn.commit()
     finally:
         conn.close()
@@ -2691,77 +2713,114 @@ def _canonical_lesson_key(value: str) -> str:
 
 
 def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=None):
-    """Load runtime lesson cache with canonical lesson-name matching and diagnostics."""
+    """Load runtime lesson cache and merge compatible legacy rows deterministically."""
     if not lesson:
         return None
     ct = str(content_type or "").strip()
     ls = str(lesson or "").strip()
     tp = str(topic or "").strip()
     canonical_ls = _canonical_lesson_key(ls)
-    canonical_tp = _canonical_lesson_key(tp)
+    canonical_tp = re.sub(r"\s+", " ", tp).strip().casefold()
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            rows = []
-            # Pull only READY rows for the same content type, then resolve lesson/topic
-            # aliases in Python so "bài visionv1" can match cached "visionv1" safely.
             cur.execute(
-                """SELECT id,source_file,content_type,lesson,topic,status,updated_at,cache_json
+                """SELECT id,source_file,subject,content_type,lesson,topic,status,updated_at,cache_json
                    FROM knowledge_lesson_cache
                    WHERE status='READY'
                      AND lower(trim(content_type))=lower(trim(%s))
-                   ORDER BY updated_at DESC""",
+                   ORDER BY updated_at DESC,id DESC""",
                 (ct,),
             )
             all_rows = cur.fetchall() or []
-            exact = None
-            for row in all_rows:
-                row_ls = _canonical_lesson_key(row.get('lesson'))
-                row_tp = _canonical_lesson_key(row.get('topic'))
-                if row_ls != canonical_ls:
-                    continue
-                if canonical_tp and row_tp and row_tp != canonical_tp:
-                    continue
-                if exact is None:
-                    exact = row
-                payload = row.get('cache_json')
-                if isinstance(payload, dict) and payload.get('sections'):
-                    exact = row
-                    break
-
-            # Diagnostics against all rows for this canonical lesson.
             lesson_rows = [r for r in all_rows if _canonical_lesson_key(r.get('lesson')) == canonical_ls]
-            ready_rows = len(lesson_rows)
+            if canonical_tp:
+                compatible = [
+                    r for r in lesson_rows
+                    if re.sub(r"\s+", " ", str(r.get('topic') or '').strip()).casefold() == canonical_tp
+                ]
+            else:
+                compatible = lesson_rows
+
             print(
                 f"[KNOWLEDGE CACHE LOOKUP] request={request_id} "
                 f"requested_content_type={ct!r} requested_lesson={ls!r} requested_topic={tp!r} "
                 f"canonical_lesson={canonical_ls!r} canonical_topic={canonical_tp!r} "
-                f"lesson_rows={len(lesson_rows)} ready_rows={ready_rows} "
-                f"match={'1' if exact else '0'}"
+                f"lesson_rows={len(lesson_rows)} compatible_rows={len(compatible)} "
+                f"match={'1' if compatible else '0'}"
             )
+            if not compatible:
+                return None
 
-            payload = exact.get('cache_json') if exact else None
-            payload_ready = bool(isinstance(payload, dict) and payload.get('sections'))
-            if exact:
-                print(
-                    f"[KNOWLEDGE CACHE PAYLOAD] request={request_id} cache_id={exact.get('id')} "
-                    f"payload_ready={int(payload_ready)} sections={len((payload or {}).get('sections') or []) if isinstance(payload, dict) else 0} "
-                    f"images={len((payload or {}).get('images') or []) if isinstance(payload, dict) else 0} "
-                    f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r}"
-                )
-            if exact and payload_ready:
-                print(
-                    f"[KNOWLEDGE CACHE LOOKUP] request={request_id} canonical_match=1 "
-                    f"stored_lesson={exact.get('lesson')!r} stored_topic={exact.get('topic')!r} cache_id={exact.get('id')}"
-                )
-                return dict(payload)
-            return None
+            payloads = []
+            base = dict(compatible[0])
+            for row in compatible:
+                payload = row.get('cache_json')
+                if isinstance(payload, dict) and payload.get('sections'):
+                    payloads.append(payload)
+            if not payloads:
+                return None
+
+            merged_sections = []
+            merged_images = []
+            seen_section_keys = set()
+            seen_image_keys = set()
+            for payload in payloads:
+                for sec in payload.get('sections') or []:
+                    sec = dict(sec)
+                    key = (
+                        str(sec.get('content_unit_id') or ''),
+                        int(sec.get('page') or 0),
+                        str(sec.get('text') or ''),
+                    )
+                    if key in seen_section_keys:
+                        continue
+                    seen_section_keys.add(key)
+                    merged_sections.append(sec)
+                for img in payload.get('images') or []:
+                    img = dict(img)
+                    key = str(img.get('image_key') or '').strip()
+                    if key and key not in seen_image_keys:
+                        seen_image_keys.add(key)
+                        merged_images.append(img)
+
+            merged_sections.sort(key=lambda x: (
+                int(x.get('page') or 0),
+                int(x.get('chunk_index') or 0),
+                str(x.get('content_unit_id') or ''),
+                str(x.get('text') or ''),
+            ))
+            for idx, sec in enumerate(merged_sections):
+                sec['chunk_index'] = idx
+            merged_images.sort(key=lambda x: (
+                int(x.get('page') or 0),
+                int(x.get('chunk_index') or 0),
+                str(x.get('image_key') or ''),
+            ))
+
+            merged = {
+                'version': 1,
+                'source_file': base.get('source_file'),
+                'content_hash': (payloads[0] or {}).get('content_hash'),
+                'subject': base.get('subject') or (payloads[0] or {}).get('subject'),
+                'content_type': base.get('content_type') or (payloads[0] or {}).get('content_type'),
+                'lesson': base.get('lesson') or canonical_ls,
+                'topic': base.get('topic') or tp or None,
+                'overview': ' '.join(str(s.get('text') or '') for s in merged_sections[:2]).strip()[:2400],
+                'sections': merged_sections,
+                'images': merged_images,
+            }
+            print(
+                f"[KNOWLEDGE CACHE PAYLOAD] request={request_id} cache_id={base.get('id')} "
+                f"payload_ready=1 sections={len(merged_sections)} images={len(merged_images)} "
+                f"stored_lesson={base.get('lesson')!r} stored_topic={base.get('topic')!r}"
+            )
+            return merged
     except Exception as exc:
         print("[KNOWLEDGE CACHE] load failed:", type(exc).__name__, str(exc))
         return None
     finally:
         conn.close()
-
 
 def _select_runtime_cache_sections(cache, query_text, *, max_sections=2, initial=False):
     sections = list((cache or {}).get("sections") or [])
@@ -3118,10 +3177,25 @@ def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=
 
 
 def _curriculum_sections(cache):
-    """Return cache chunks as deterministic teaching sections in page/chunk order."""
-    sections=list((cache or {}).get("sections") or [])
-    sections.sort(key=lambda x:(int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
-    return sections
+    """Return deterministic teaching sections with fresh contiguous indexes.
+
+    Some older uploads retained page-local/duplicate chunk indexes. Curriculum
+    order must follow the stored section list, not trust those legacy indexes.
+    """
+    raw = list((cache or {}).get("sections") or [])
+    indexed = list(enumerate(raw))
+    indexed.sort(key=lambda pair: (
+        int(pair[1].get("page") or 0),
+        int(pair[1].get("chunk_index") or 0),
+        str(pair[1].get("content_unit_id") or ""),
+        pair[0],
+    ))
+    out = []
+    for new_idx, (_, section) in enumerate(indexed):
+        sec = dict(section)
+        sec["chunk_index"] = new_idx
+        out.append(sec)
+    return out
 
 
 def _curriculum_step_map(cache):
@@ -6070,22 +6144,31 @@ TIN NHẮN HIỆN TẠI:
             secs=curriculum_map["sections"]
             vocab_grammar_context=""
             if curriculum_step == 0:
-                all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
-                all_text=all_text[:14000]
+                # B0 chỉ làm nhiệm vụ định hướng: không dạy lại từ vựng/ngữ pháp.
+                # Dùng một preview ngắn của từng chunk để giữ prompt nhỏ, tránh lặp lại
+                # nội dung chi tiết sẽ được dạy ở B1/B2/...
+                overview_text = "\n\n".join(
+                    f"[CHUNK_{i}] {str(sec.get('text') or '')[:1200]}"
+                    for i, sec in enumerate(secs)
+                )
                 cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân. Đây là BƯỚC 0 — GIỚI THIỆU
 - Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
  của bài {runtime_lesson_cache.get('lesson','')}.
-Dựa CHỈ trên các chunk nguồn bên dưới. Hãy:
-1) giới thiệu bài học và mục tiêu chính;
-2) liệt kê các từ vựng cần học, kèm cách đọc/kana và cách phát âm nếu nguồn có dữ kiện;
-3) liệt kê các điểm ngữ pháp cần học nếu nguồn có;
-4) nói ngắn gọn bài học sẽ đi qua các phần nào, nhưng CHƯA giải thích chi tiết từng chunk.
-5) Nếu nguồn có một câu hỏi/bài tập TOÀN BÀI không thuộc riêng một chunk, hãy ghi ở cuối bằng marker nội bộ:
-[[GLOBAL_LESSON_EXERCISE_Q]] Q: <đúng câu hỏi/yêu cầu>. Không hỏi người học làm ở bước này.
-Cuối cùng hỏi người học có muốn sang phần 1 không.
-Không bịa kiến thức ngoài nguồn. Đây là bước giới thiệu, không dùng [[LESSON_END_READY]].
 
-SOURCE CHUNKS:\n{all_text}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
+MỤC TIÊU CỦA BƯỚC 0:
+- Chỉ giới thiệu TỔNG QUAN bài học: bài này nói về chủ đề gì, người học sẽ làm quen với những nội dung/phần nào, và mục tiêu sau khi học xong.
+- KHÔNG dạy từ vựng ở bước 0.
+- KHÔNG liệt kê từ vựng, Kanji, cách đọc hoặc phát âm ở bước 0. Những nội dung này chỉ được dạy trong từng chunk tương ứng ở các bước sau.
+- KHÔNG giải thích ngữ pháp ở bước 0.
+- KHÔNG lặp lại chi tiết của các chunk ở bước 0.
+- Không bịa kiến thức ngoài nguồn.
+
+Nếu nguồn có một câu hỏi/bài tập TOÀN BÀI không thuộc riêng một chunk, hãy ghi ở cuối bằng marker nội bộ:
+[[GLOBAL_LESSON_EXERCISE_Q]] Q: <đúng câu hỏi/yêu cầu>. Không yêu cầu người học giải ở bước này.
+
+Cuối cùng hỏi người học có muốn sang phần 1 không. Đây là bước giới thiệu, không dùng [[LESSON_END_READY]].
+
+SOURCE PREVIEW (chỉ để hiểu chủ đề tổng quan, không được biến thành bài giảng chi tiết):\n{overview_text}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif 1 <= curriculum_step <= len(secs):
                 sec=secs[curriculum_step-1]
                 if curriculum_waiting == "chunk_answer":
