@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.21-ultra-compact-curriculum"
+BASELINE_VERSION = "19.22-global-exercise-dbfix-continue"
 import os
 import ast
 import io
@@ -3005,7 +3005,7 @@ def _active_session_scope(session):
 
 
 def _set_curriculum_compact_state(user_id, *, global_question=None, global_evidence=None, summary_notes=None):
-    conn = get_conn()
+    conn = db()
     cur = conn.cursor()
     try:
         sets = []
@@ -6225,9 +6225,12 @@ TIN NHẮN HIỆN TẠI:
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
             elif detected_global_exercise:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
-                # Question-only turn: no teaching preamble and no extra continue prompt.
+                # Question-only turn: keep it ultra-compact, but always expose Continue.
                 q = globals().get("_detected_global_question") or str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
-                content_blocks.append({"type":"text","text":q or "Câu hỏi của bài học ở trên nhé."})
+                content_blocks.extend([
+                    {"type":"text","text":q or "Câu hỏi của bài học ở trên nhé."},
+                    {"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"},
+                ] + _curriculum_continue_blocks(curriculum_step))
             elif curriculum_waiting == "continue_after_global_exercise" and not is_curriculum_answer_turn:
                 next_summary_step = curriculum_map["summary_step"]
                 _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
