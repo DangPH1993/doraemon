@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.20-curriculum-chunk-context-only"
+BASELINE_VERSION = "19.21-ultra-compact-curriculum"
 import os
 import ast
 import io
@@ -313,6 +313,9 @@ def init_db():
                     END IF;
                 END $$;""",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_exercise_answered BOOLEAN NOT NULL DEFAULT FALSE;",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_global_exercise_question TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_global_exercise_evidence TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_summary_notes TEXT NOT NULL DEFAULT '';",
             ]:
                 cur.execute(sql)
             cur.execute("ALTER TABLE user_learning_state ALTER COLUMN curriculum_waiting TYPE VARCHAR(50)")
@@ -2882,6 +2885,9 @@ def _get_study_session(user_id, chatbox_id=None):
                 "curriculum_step": int(row.get("curriculum_step") or 0),
                 "curriculum_waiting": str(row.get("curriculum_waiting") or "continue"),
                 "curriculum_exercise_answered": bool(row.get("curriculum_exercise_answered")),
+                "curriculum_global_exercise_question": str(row.get("curriculum_global_exercise_question") or ""),
+                "curriculum_global_exercise_evidence": str(row.get("curriculum_global_exercise_evidence") or ""),
+                "curriculum_summary_notes": str(row.get("curriculum_summary_notes") or ""),
             }
     finally:
         conn.close()
@@ -2905,8 +2911,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
-                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,NOW())
+                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,updated_at
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','',NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
@@ -2919,6 +2925,9 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     curriculum_step=0,
                     curriculum_waiting='continue',
                     curriculum_exercise_answered=FALSE,
+                    curriculum_global_exercise_question='',
+                    curriculum_global_exercise_evidence='',
+                    curriculum_summary_notes='',
                     updated_at=NOW()
             """, (
                 user_id,content_type,course,lesson,topic,chatbox,
@@ -2973,6 +2982,9 @@ def _finish_study_session(user_id):
                     curriculum_step=0,
                     curriculum_waiting='continue',
                     curriculum_exercise_answered=FALSE,
+                    curriculum_global_exercise_question='',
+                    curriculum_global_exercise_evidence='',
+                    curriculum_summary_notes='',
                     updated_at=NOW()
                 WHERE user_id=%s
             """, (user_id,))
@@ -2991,6 +3003,28 @@ def _active_session_scope(session):
         "topic": session.get("topic"),
     }
 
+
+def _set_curriculum_compact_state(user_id, *, global_question=None, global_evidence=None, summary_notes=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        sets = []
+        vals = []
+        if global_question is not None:
+            sets.append("curriculum_global_exercise_question=%s")
+            vals.append(str(global_question)[:1200])
+        if global_evidence is not None:
+            sets.append("curriculum_global_exercise_evidence=%s")
+            vals.append(str(global_evidence)[:2400])
+        if summary_notes is not None:
+            sets.append("curriculum_summary_notes=%s")
+            vals.append(str(summary_notes)[:6000])
+        if sets:
+            sets.append("updated_at=NOW()")
+            cur.execute("UPDATE user_learning_state SET " + ", ".join(sets) + " WHERE user_id=%s", tuple(vals + [user_id]))
+            conn.commit()
+    finally:
+        conn.close()
 
 def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=None):
     """Persist the lightweight Giáo trình step state for the current study session."""
@@ -5980,37 +6014,43 @@ TIN NHẮN HIỆN TẠI:
             elif curriculum_step == curriculum_map["global_exercise_step"]:
                 all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
                 all_text=all_text[:18000]
-                if curriculum_waiting == "global_exercise_answer":
-                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là BÀI TẬP CỦA TOÀN BÀI HỌC, được thực hiện SAU KHI đã giới thiệu xong tất cả các chunk của bài {runtime_lesson_cache.get('lesson','')}.
+                saved_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+                saved_ev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                if curriculum_waiting == "global_exercise_answer" and saved_q:
+                    cache_prompt=f"""Bạn là Doraemon chấm bài.
+CÂU HỎI NGUỒN: {saved_q}
+BẰNG CHỨNG NGUỒN:
+{saved_ev}
 
-CHỈ sử dụng toàn bộ nguồn bài học và vision facts bên dưới. Hãy đánh giá câu trả lời của học sinh cho đúng câu hỏi/yêu cầu THẬT SỰ có trong nguồn. Không tự tạo câu hỏi mới, không thêm dữ kiện bên ngoài.
-Sau khi nhận xét bài làm, KHÔNG chuyển ngay sang TỔNG KẾT. Hãy kết thúc bằng câu: “Bạn muốn sang phần tiếp theo không?”; chỉ sau khi học sinh xác nhận ở lượt sau mới chuyển sang TỔNG KẾT. tóm tắt nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp và điểm cần nhớ.
+Đánh giá NGẮN GỌN câu trả lời của học sinh: đúng/sai, lý do theo nguồn, và đáp án đúng nếu cần. Không nhắc lại toàn bài, không thêm kiến thức ngoài nguồn, không tạo câu hỏi mới.
 
-ALL LESSON CHUNKS:\n{all_text}
-
-VISION FACTS TOÀN BÀI:\n{vision_text}
-
-RECENT CHAT:\n{json.dumps(prompt_history[-8:], ensure_ascii=False, separators=(',', ':'))}
-
-CÂU TRẢ LỜI CỦA HỌC SINH:\n{query_text}"""
+CÂU TRẢ LỜI:
+{query_text}"""
                 else:
-                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Cậu đã dạy XONG toàn bộ các chunk của bài {runtime_lesson_cache.get('lesson','')}.
+                    cache_prompt=f"""Bạn là Doraemon. Cậu đã dạy xong toàn bộ chunks của bài {runtime_lesson_cache.get('lesson','')}.
+Nhiệm vụ duy nhất: kiểm tra nguồn xem có BÀI TẬP/CÂU HỎI THỰC SỰ thuộc TOÀN BÀI (không nằm gọn trong một chunk hoặc cần đối chiếu nhiều phần).
+Nếu CÓ, chỉ trả đúng định dạng nội bộ:
+[[GLOBAL_EXERCISE]]
+Q: <đúng câu hỏi/yêu cầu>
+E: <bằng chứng tối thiểu để chấm>
+Nếu KHÔNG: [[NO_GLOBAL_EXERCISE]]
+Không giải thích, không dẫn dắt, không hỏi tiếp, không bịa bài tập.
 
-Bây giờ hãy kiểm tra xem trong nguồn có một BÀI TẬP/CÂU HỎI CỦA TOÀN BÀI học, không phải phần bài tập đã xử lý trực tiếp bên trong một chunk, hay không.
-- CHỈ xác định bài tập nếu nguồn thực sự yêu cầu người học trả lời/làm.
-- Nếu có một câu hỏi cần đối chiếu nhiều chunk hoặc là yêu cầu chung của cả bài, đánh dấu `[[GLOBAL_EXERCISE]]` và nêu ĐÚNG câu hỏi/yêu cầu đó.
-- Nếu không có bài tập riêng của toàn bài, đánh dấu `[[NO_GLOBAL_EXERCISE]]`.
-- TUYỆT ĐỐI KHÔNG tự bịa bài tập.
-- Nếu không có bài tập riêng, thay vì kéo dài phần kiểm tra, hãy chuyển thẳng sang TỔNG KẾT ngắn gọn.
-- Marker chỉ dùng nội bộ và phải xuất hiện đúng 1 lần ở CUỐI phần kiểm tra.
+ALL LESSON CHUNKS:
+{all_text}
 
-ALL LESSON CHUNKS:\n{all_text}
+VISION FACTS TOÀN BÀI:
+{vision_text}"""
+            elif curriculum_step == curriculum_map["summary_step"]:
+                notes = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
+                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.
+Dựa vào ghi chú giảng dạy đã tích lũy dưới đây. Tổng kết ngắn gọn: nội dung chính, từ vựng + cách đọc/phát âm, ngữ pháp, điểm cần nhớ và kết quả bài tập nếu có. Không thêm kiến thức ngoài nguồn. Cuối cùng hỏi: “Cậu thấy mình đã nắm được bài này chưa?”
 
-VISION FACTS TOÀN BÀI:\n{vision_text}
+GHI CHÚ GIẢNG DẠY:
+{notes[-6000:]}
 
-RECENT CHAT:\n{json.dumps(prompt_history[-8:], ensure_ascii=False, separators=(',', ':'))}
-
-TIN NHẮN HIỆN TẠI:\n{query_text}"""
+TIN NHẮN:
+{query_text}"""
             elif curriculum_step == curriculum_map["summary_step"]:
                 all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
                 all_text=all_text[:16000]
@@ -6089,6 +6129,7 @@ TIN NHẮN HIỆN TẠI:
 
     detected_chunk_exercise = None
     detected_global_exercise = None
+    _detected_global_question = ""
     if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]) and curriculum_waiting != "chunk_answer":
         if "[[CHUNK_EXERCISE]]" in (reply or ""):
             detected_chunk_exercise = True
@@ -6104,16 +6145,25 @@ TIN NHẮN HIỆN TẠI:
             print(f"[CURRICULUM EXERCISE DETECT] request={request_id} step={curriculum_step} has_exercise=0 source='missing_marker_fail_closed'")
         reply=(reply or '').replace('[[CHUNK_EXERCISE]]','').replace('[[NO_CHUNK_EXERCISE]]','').replace('[[WHOLE_LESSON_EXERCISE]]','')
     elif curriculum_flow_active and curriculum_step == curriculum_map["global_exercise_step"] and curriculum_waiting != "global_exercise_answer":
-        if "[[GLOBAL_EXERCISE]]" in (reply or ""):
-            detected_global_exercise = True
-            print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=1")
-        elif "[[NO_GLOBAL_EXERCISE]]" in (reply or ""):
+        raw_reply = reply or ""
+        if "[[GLOBAL_EXERCISE]]" in raw_reply:
+            qm = re.search(r"(?:^|\n)Q:\s*(.+?)(?=\nE:|$)", raw_reply, re.S)
+            em = re.search(r"(?:^|\n)E:\s*(.+)$", raw_reply, re.S)
+            question = qm.group(1).strip() if qm else ""
+            evidence = em.group(1).strip() if em else ""
+            detected_global_exercise = bool(question)
+            globals()["_detected_global_question"] = question
+            if detected_global_exercise:
+                _set_curriculum_compact_state(user["id"], global_question=question, global_evidence=evidence)
+            print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise={int(detected_global_exercise)} cached_question_chars={len(question)} cached_evidence_chars={len(evidence)}")
+        elif "[[NO_GLOBAL_EXERCISE]]" in raw_reply:
             detected_global_exercise = False
+            _set_curriculum_compact_state(user["id"], global_question="", global_evidence="")
             print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=0")
         else:
             detected_global_exercise = False
             print(f"[CURRICULUM GLOBAL EXERCISE DETECT] request={request_id} has_exercise=0 source='missing_marker_fail_closed'")
-        reply=(reply or '').replace('[[GLOBAL_EXERCISE]]','').replace('[[NO_GLOBAL_EXERCISE]]','').rstrip()
+        reply = ""
 
     # Fixed curriculum flow owns the ending for Giáo trình. Legacy LESSON_END_READY remains for non-curriculum types.
     if curriculum_flow_active:
@@ -6124,6 +6174,14 @@ TIN NHẮN HIỆN TẠI:
         _set_study_end_prompt_pending(user["id"], True)
         study_session["end_prompt_pending"] = True
         print(f"[STUDY SESSION] lesson_end_ready user={user['id']} lesson={study_session.get('lesson')!r}")
+
+    if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
+        clean_note = re.sub(r"\[\[(?:CHUNK_EXERCISE|NO_CHUNK_EXERCISE|WHOLE_LESSON_EXERCISE)\]\]", "", reply or "").strip()
+        if clean_note:
+            prev = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
+            combined = (prev + "\n\n" + clean_note).strip()[-6000:]
+            _set_curriculum_compact_state(user["id"], summary_notes=combined)
+            print(f"[CURRICULUM SUMMARY NOTES] request={request_id} chars={len(combined)}")
 
     # rich_images was resolved BEFORE Gemini from the exact text chunks.
     # Do not perform any second semantic image search here.
@@ -6157,24 +6215,28 @@ TIN NHẮN HIỆN TẠI:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["global_exercise_step"]:
-            if curriculum_waiting == "global_exercise_answer":
+            if curriculum_waiting == "global_exercise_answer" and is_curriculum_answer_turn:
+                # Compact evaluation was already generated from the cached question/evidence.
+                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_exercise", exercise_answered=True)
+                eval_note = (reply or "").strip()
+                if eval_note:
+                    prev = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
+                    _set_curriculum_compact_state(user["id"], summary_notes=(prev + "\n\nBÀI TẬP TOÀN BÀI - ĐÁNH GIÁ: " + eval_note).strip()[-6000:])
+                content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+            elif detected_global_exercise:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
-                content_blocks.extend([
-                    {"type":"text","text":"✍️ Đây là bài tập chung của toàn bài. Cậu có thể trả lời ngay; nếu chưa muốn làm, cậu vẫn có thể sang phần tiếp theo nhé."},
-                    {"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"},
-                ] + _curriculum_continue_blocks(curriculum_step))
-            elif curriculum_waiting == "continue_after_global_exercise" and is_curriculum_answer_turn:
+                # Question-only turn: no teaching preamble and no extra continue prompt.
+                q = globals().get("_detected_global_question") or str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+                content_blocks.append({"type":"text","text":q or "Câu hỏi của bài học ở trên nhé."})
+            elif curriculum_waiting == "continue_after_global_exercise" and not is_curriculum_answer_turn:
                 next_summary_step = curriculum_map["summary_step"]
                 _set_curriculum_flow(user["id"], step=next_summary_step, waiting="final", exercise_answered=True)
                 study_session["curriculum_step"] = next_summary_step
                 study_session["curriculum_waiting"] = "final"
                 content_blocks.extend(_curriculum_final_blocks())
-            elif detected_global_exercise:
-                _set_curriculum_flow(user["id"], step=curriculum_step, waiting="global_exercise_answer", exercise_answered=False)
-                content_blocks.append({"type":"text","text":"✍️ Đây là bài tập chung của toàn bài. Cậu trả lời câu hỏi này trước nhé; Doraemon sẽ nhận xét rồi chúng mình tổng kết bài."})
             else:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_check", exercise_answered=True)
-                content_blocks.extend([{"type":"text","text":"✅ Mình đã kiểm tra xong phần bài tập của toàn bài. Bạn muốn sang phần tiếp theo không? 😊"}] + _curriculum_continue_blocks(curriculum_step))
+                content_blocks.extend(_curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["summary_step"]:
             _set_curriculum_flow(user["id"], step=curriculum_step, waiting="final", exercise_answered=True)
             content_blocks.extend(_curriculum_final_blocks())
