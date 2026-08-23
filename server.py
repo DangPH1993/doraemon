@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.24-intro-history-context"
+BASELINE_VERSION = "19.25-summary-intro-history-only"
 import os
 import ast
 import io
@@ -6071,17 +6071,37 @@ Nếu không: [[NO_GLOBAL_EXERCISE]]. Không tạo câu hỏi mới, không dùn
 LỊCH SỬ:
 {intro_history[-12000:]}"""
             elif curriculum_step == curriculum_map["summary_step"]:
+                # SUMMARY MUST USE ONLY THE INTRO/TEACHING HISTORY, NOT FULL KNOWLEDGE CACHE.
                 intro_history = str((study_session or {}).get("curriculum_intro_history") or "").strip()
                 global_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+                global_ev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                summary_notes = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
                 cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.
-Chỉ dùng LỊCH SỬ PHẦN MỞ ĐẦU + CÁC PHẦN GIỚI THIỆU dưới đây để tổng kết những gì Doraemon thực sự đã dạy. Không đọc lại toàn bộ Knowledge Cache, không tự thêm kiến thức.
-Tổng kết: nội dung chính đã dạy, từ vựng + cách đọc/phát âm, ngữ pháp, điểm cần nhớ và kết quả bài tập nếu có trong context. Cuối cùng hỏi: “Cậu thấy mình đã nắm được bài này chưa?”
 
-LỊCH SỬ MỞ ĐẦU + GIỚI THIỆU:
-{intro_history[-12000:]}
+QUAN TRỌNG VỀ CONTEXT:
+- CHỈ được dùng lịch sử phần MỞ ĐẦU + phần GIỚI THIỆU các chunk mà Doraemon đã thực sự nói cho học sinh.
+- KHÔNG dùng Knowledge Cache, KHÔNG dùng vision facts, KHÔNG dùng các chunk nguồn trực tiếp và KHÔNG dùng lịch sử chat chung.
+- Không được nói rằng thiếu dữ liệu nếu lịch sử bên dưới đã có nội dung; hãy tổng kết trực tiếp từ những gì Doraemon đã dạy.
 
-CÂU HỎI BÀI TẬP TOÀN BÀI (NẾU CÓ):
+Hãy tổng kết ngắn gọn nhưng đầy đủ:
+1) Nội dung chính đã học theo đúng những gì Doraemon đã giới thiệu.
+2) Từ vựng/kanji + cách đọc/phát âm đã được giới thiệu.
+3) Ngữ pháp đã được giới thiệu.
+4) Điểm cần nhớ.
+5) Kết quả bài tập toàn bài nếu có dữ liệu bên dưới.
+Cuối cùng hỏi đúng: “Cậu thấy mình đã nắm được bài này chưa?”
+
+LỊCH SỬ MỞ ĐẦU + GIỚI THIỆU ĐÃ HỌC:
+{intro_history[-12000:] or '(chưa có lịch sử giới thiệu)'}
+
+GHI CHÚ TÓM TẮT NỘI BỘ (nếu có, chỉ dùng để hỗ trợ đối chiếu):
+{summary_notes[-2500:] or '(không có)'}
+
+CÂU HỎI BÀI TẬP TOÀN BÀI (nếu có):
 {global_q or '(không có)'}
+
+BẰNG CHỨNG/CONTEXT TỐI THIỂU CỦA BÀI TẬP (nếu có):
+{global_ev or '(không có)'}
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
@@ -6096,11 +6116,32 @@ TIN NHẮN HIỆN TẠI:
             # Curriculum-specific prompt was built above. Do not overwrite it with the legacy cache prompt.
             if prompt is None:
                 raise RuntimeError("curriculum prompt was not constructed")
-            print(
-                f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
-                f"curriculum_step={curriculum_step} sections={len(cache_selected_sections)} "
-                f"prompt_chars={len(prompt)} vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
-            )
+            if curriculum_step == curriculum_map["summary_step"]:
+                _ih = str((study_session or {}).get("curriculum_intro_history") or "").strip()
+                _sq = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+                _sev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                print(
+                    f"[CURRICULUM SUMMARY CONTEXT] request={request_id} "
+                    f"mode=intro_history_only sections_sent=0 vision_facts_sent=0 "
+                    f"intro_history_chars={len(_ih[-12000:])} question_chars={len(_sq)} evidence_chars={len(_sev)} "
+                    f"prompt_chars={len(prompt)}"
+                )
+            elif curriculum_step == curriculum_map["global_exercise_step"]:
+                _ih = str((study_session or {}).get("curriculum_intro_history") or "").strip()
+                _sq = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+                _sev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                print(
+                    f"[CURRICULUM GLOBAL EXERCISE CONTEXT] request={request_id} "
+                    f"mode=intro_history_only sections_sent=0 vision_facts_sent=0 "
+                    f"intro_history_chars={len(_ih[-12000:])} question_chars={len(_sq)} evidence_chars={len(_sev)} "
+                    f"prompt_chars={len(prompt)}"
+                )
+            else:
+                print(
+                    f"[KNOWLEDGE CACHE PROMPT] request={request_id} "
+                    f"curriculum_step={curriculum_step} sections={len(cache_selected_sections)} "
+                    f"prompt_chars={len(prompt)} vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
+                )
             if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
                 print(f"[CURRICULUM CHUNK CONTEXT AUDIT] request={request_id} mode=exact_chunk_only history_in_prompt=0 selected_chunks=1 selected_vision_chars={len(vision_text)}")
         else:
