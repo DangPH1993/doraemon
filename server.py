@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.31-v19_29-study-b6-upload"
+BASELINE_VERSION = "19.32-v19_29-study-streaming-upload-ramfix"
 import os
 import ast
 import io
@@ -12,6 +12,8 @@ import json
 import base64
 import calendar
 import hashlib
+import tempfile
+import gc
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -7027,6 +7029,16 @@ def b2_put_bytes(key: str, data: bytes, content_type: str):
         return f"{B2_PUBLIC_BASE_URL}/{key}"
     return None
 
+def b2_put_file(key: str, file_path: str, content_type: str):
+    """Upload local file without loading the whole PDF into RAM."""
+    if not b2_ready():
+        raise RuntimeError("Backblaze B2 chưa được cấu hình. Cần B2_ENDPOINT, B2_KEY_ID, B2_APPLICATION_KEY và B2_BUCKET.")
+    with open(file_path, "rb") as fh:
+        b2.put_object(Bucket=B2_BUCKET, Key=key, Body=fh, ContentType=content_type)
+    if B2_PUBLIC_BASE_URL:
+        return f"{B2_PUBLIC_BASE_URL}/{key}"
+    return None
+
 def _extract_image_key(raw_key):
     """
     Normalize Pinecone image_key metadata.
@@ -7093,10 +7105,10 @@ def b2_url(key: str):
         ExpiresIn=max(60, min(B2_PRESIGN_SECONDS, 604800))
     )
 
-def render_pdf_page(raw_pdf: bytes, page_no: int, dpi: int = 150) -> bytes:
+def render_pdf_page(pdf_source, page_no: int, dpi: int = 150) -> bytes:
     if fitz is None:
         raise RuntimeError("PyMuPDF chưa được cài đặt. Thêm PyMuPDF vào requirements.")
-    doc = fitz.open(stream=raw_pdf, filetype="pdf")
+    doc = fitz.open(pdf_source) if isinstance(pdf_source, (str, os.PathLike)) else fitz.open(stream=pdf_source, filetype="pdf")
     try:
         page = doc.load_page(page_no - 1)
         pix = page.get_pixmap(dpi=dpi, alpha=False)
@@ -7468,7 +7480,7 @@ def _lesson_image_is_meaningful(doc, page, xref, info, data):
         return True
 
 
-def extract_lesson_images(raw_pdf: bytes, page_no: int, source_file: str, subject: str, page_meta, exclude_boxes=None):
+def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: str, page_meta, exclude_boxes=None):
     """Extract meaningful native lesson images as img_XX.jpg (never embedded_XX.*).
 
     Native PDF image resources are still used because they preserve the original
@@ -7480,7 +7492,7 @@ def extract_lesson_images(raw_pdf: bytes, page_no: int, source_file: str, subjec
         return []
     if not b2_ready():
         return []
-    doc = fitz.open(stream=raw_pdf, filetype="pdf")
+    doc = fitz.open(pdf_source) if isinstance(pdf_source, (str, os.PathLike)) else fitz.open(stream=pdf_source, filetype="pdf")
     stored=[]
     try:
         page=doc.load_page(page_no-1)
@@ -7754,6 +7766,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
+    background_tasks: BackgroundTasks,
     password: str = Form(""),
     file: UploadFile = File(...),
     subject: str = Form(""),
@@ -7776,33 +7789,62 @@ async def admin_knowledge_upload(
     if overlap < 0 or overlap >= chunk_size:
         raise HTTPException(400, "overlap phải >= 0 và nhỏ hơn chunk_size.")
 
-    raw=await file.read()
-    if len(raw)>50*1024*1024:
-        raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
-    try:
-        reader=PdfReader(io.BytesIO(raw))
-        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
-    except ValueError as e:
-        raise HTTPException(400,str(e))
-    except Exception as e:
-        raise HTTPException(400,f"Không đọc được PDF: {e}")
-
     source_file=os.path.basename(file.filename)
     namespace="__default__"
+    temp_pdf_path = None
+    raw_size = 0
+    sha = hashlib.sha256()
+    try:
+        # Stream the upload to disk instead of keeping the whole PDF in RAM.
+        with tempfile.NamedTemporaryFile(prefix="doraemon_upload_", suffix=".pdf", delete=False) as tf:
+            temp_pdf_path = tf.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                raw_size += len(chunk)
+                if raw_size > 50 * 1024 * 1024:
+                    raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
+                sha.update(chunk)
+                tf.write(chunk)
+        source_hash = sha.hexdigest()
+        if not temp_pdf_path:
+            raise HTTPException(400, "Không nhận được file PDF.")
+        reader=PdfReader(temp_pdf_path)
+        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
+    except HTTPException:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise
+    except ValueError as e:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise HTTPException(400,str(e))
+    except Exception as e:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise HTTPException(400,f"Không đọc được PDF: {e}")
 
-    # Save original PDF to B2 when configured.
+    # Save original PDF to B2 without copying the full PDF into RAM.
     pdf_key = f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"
     pdf_url = None
     if b2_ready():
         try:
-            pdf_url = b2_put_bytes(pdf_key, raw, "application/pdf")
+            pdf_url = b2_put_file(pdf_key, temp_pdf_path, "application/pdf")
         except Exception as e:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
             raise HTTPException(500, f"Không lưu được PDF vào B2: {e}")
 
     # Extract text normally; scanned/empty pages go through Gemini OCR.
     try:
-        page_texts, page_images, page_units = process_pdf_pages(raw, reader, records_meta, source_file, subject)
+        page_texts, page_images, page_units = process_pdf_pages(temp_pdf_path, reader, records_meta, source_file, subject)
     except Exception as e:
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500, f"OCR Gemini/xử lý ảnh thất bại: {e}")
 
     vectors=[]
@@ -7810,7 +7852,6 @@ async def admin_knowledge_upload(
     image_vectors_total=0
     knowledge_cache_text_records=[]
     knowledge_cache_image_records=[]
-    source_hash=hashlib.sha256(raw).hexdigest()
     try:
         # Khi re-upload cùng source_file, xóa các vector cũ của tài liệu này
         # để tránh record V1 cũ tiếp tục cạnh tranh với record V2 mới.
@@ -8031,6 +8072,8 @@ async def admin_knowledge_upload(
             index.upsert(vectors=vectors,namespace=namespace)
 
     except Exception as e:
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500,f"Lỗi embedding/Pinecone: {e}")
 
     conn=db()
@@ -8054,13 +8097,29 @@ async def admin_knowledge_upload(
         )
     except Exception as exc:
         print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500, f"Tạo Knowledge Cache thất bại: {exc}")
 
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
+    page_count = len(reader.pages)
+    record_count = len(records_meta)
+    # Explicitly release upload-time working sets before returning to Render.
+    try:
+        del page_texts, page_images, page_units, knowledge_cache_text_records, knowledge_cache_image_records, vectors, reader, records_meta
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        if temp_pdf_path:
+            os.unlink(temp_pdf_path)
+    except Exception:
+        pass
+
     return {"success":True,"filename":source_file,"subject":subject,
-            "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
+            "pages":page_count,"scanned_pages_ocr":scanned_pages,"chunks":total,"records":record_count,
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
             "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
