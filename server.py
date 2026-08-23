@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.36-global-language-router"
+BASELINE_VERSION = "19.37-kb-strict-id-delete-verify"
 import os
 import ast
 import io
@@ -81,8 +81,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.7-canonical-lesson-nocontent-fastpath")
-SERVER_VERSION = "2026-08-22-baseline-v19-7-canonical-lesson-nocontent-fastpath"
+print("[DORAEMON SERVER FINGERPRINT] 19.37-kb-strict-id-delete-verify")
+SERVER_VERSION = "2026-08-23-kb-strict-id-delete-verify"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -6697,50 +6697,108 @@ def _pinecone_scope_filter(source_file: str, content_type: str | None = None,
     return filt
 
 
-def _pinecone_scope_exists(namespace: str, pine_filter: dict) -> bool:
-    """Return True when at least one vector still matches the exact delete scope.
+def _pinecone_scope_candidates(namespace: str, pine_filter: dict, *, top_k: int = 10000):
+    """Return every currently query-visible vector ID in the exact scope.
 
-    Pinecone delete operations may be eventually consistent. We only need one
-    matching vector to prove that the scope is not fully removed, so top_k=1 is
-    enough and avoids pulling large result sets.
+    Pinecone supports metadata-filtered delete directly, but for admin deletes we
+    want a stronger safety/verification path: enumerate matching IDs, defensively
+    re-check their metadata, then delete those exact IDs in batches.
     """
     if not index:
         raise RuntimeError("Pinecone chưa được khởi tạo.")
     probe = index.query(
         vector=[0.0] * 768,
-        top_k=1,
-        include_metadata=False,
+        top_k=max(1, min(int(top_k), 10000)),
+        include_metadata=True,
         namespace=namespace,
         filter=pine_filter,
     )
-    return bool(getattr(probe, "matches", None))
+    return list(getattr(probe, "matches", None) or [])
 
 
-def _delete_pinecone_scope_exact(namespace: str, pine_filter: dict, *, attempts: int = 5):
-    """Delete and verify an exact metadata scope, retrying for eventual consistency."""
+def _pinecone_scope_matches_metadata(md: dict, expected: dict) -> bool:
+    """Defensive exact identity check before an ID is deleted."""
+    def norm(v):
+        return str(v or "").strip().casefold()
+    for key, expected_value in expected.items():
+        if expected_value is None:
+            continue
+        if norm(md.get(key)) != norm(expected_value):
+            return False
+    return True
+
+
+def _delete_pinecone_scope_exact(namespace: str, pine_filter: dict, *,
+                                 source_file: str, content_type: str | None = None,
+                                 lesson: str | None = None, topic: str | None = None,
+                                 attempts: int = 8):
+    """Delete an exact scope by enumerated IDs, then verify until clean.
+
+    We intentionally do not trust one filter-delete call as proof of removal.
+    Each pass:
+      1) query all currently visible matches for the exact filter;
+      2) re-check every candidate's identity in Python;
+      3) delete exact IDs in batches of <=1000;
+      4) wait for Pinecone eventual consistency and query again.
+    """
+    expected = {
+        "source_file": source_file,
+        "content_type": content_type,
+        "lesson": lesson,
+        "topic": topic,
+    }
+    deleted_ids = []
     last_error = None
+
     for attempt in range(1, attempts + 1):
         try:
-            index.delete(filter=pine_filter, namespace=namespace)
+            matches = _pinecone_scope_candidates(namespace, pine_filter, top_k=10000)
+            safe_ids = []
+            unsafe_ids = []
+            for m in matches:
+                md = getattr(m, "metadata", None) or {}
+                mid = str(getattr(m, "id", "") or "").strip()
+                if not mid:
+                    continue
+                if _pinecone_scope_matches_metadata(md, expected):
+                    safe_ids.append(mid)
+                else:
+                    unsafe_ids.append(mid)
+
+            if unsafe_ids:
+                raise RuntimeError(
+                    "Pinecone returned vectors outside the requested exact identity scope; "
+                    f"refusing to delete {len(unsafe_ids)} candidate(s)."
+                )
+
+            # Nothing left in the exact scope -> success.
+            if not safe_ids:
+                return {
+                    "namespace": namespace,
+                    "attempts": attempt,
+                    "verified_empty": True,
+                    "deleted_ids": deleted_ids,
+                }
+
+            # Pinecone documents up to 1000 IDs per delete-by-ID request.
+            for i in range(0, len(safe_ids), 1000):
+                batch = safe_ids[i:i + 1000]
+                index.delete(ids=batch, namespace=namespace)
+                deleted_ids.extend(batch)
+
+            # Allow the index to converge, then loop and verify again.
+            time.sleep(min(8.0, 0.75 * attempt))
         except Exception as exc:
             last_error = exc
             break
 
-        # Pinecone deletion is eventually consistent. Give the index a short
-        # window to converge, then probe the SAME exact filter again.
-        for probe_no in range(1, 5):
-            time.sleep(0.7 * probe_no)
-            try:
-                if not _pinecone_scope_exists(namespace, pine_filter):
-                    return {"namespace": namespace, "attempts": attempt, "verified_empty": True}
-            except Exception as exc:
-                last_error = exc
-                break
-
     if last_error:
-        raise RuntimeError(f"Pinecone delete/verify failed: {type(last_error).__name__}: {last_error}")
-    raise RuntimeError(f"Pinecone vẫn còn vector trong scope sau {attempts} lần xóa/kiểm tra.")
-
+        raise RuntimeError(
+            f"Pinecone strict delete/verify failed: {type(last_error).__name__}: {last_error}"
+        )
+    raise RuntimeError(
+        f"Pinecone vẫn còn vector trong exact scope sau {attempts} vòng xóa/kiểm tra."
+    )
 
 def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None,
                              lesson: str | None = None, topic: str | None = None):
@@ -6750,8 +6808,10 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
     topic = str(topic or "").strip() or None
     if not source_file:
         raise HTTPException(400, "source_file là bắt buộc.")
-    if topic and not lesson:
-        raise HTTPException(400, "Xóa Chủ đề cần có Bài học.")
+    if lesson and not content_type:
+        raise HTTPException(400, "Xóa Bài học cần có Loại nội dung.")
+    if topic and (not lesson or not content_type):
+        raise HTTPException(400, "Xóa Chủ đề cần có Loại nội dung và Bài học.")
     if not index:
         raise HTTPException(500, "Pinecone chưa được khởi tạo.")
 
@@ -6807,7 +6867,13 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
         # If verification fails, the DB catalog/cache remains intact so we never
         # create the opposite inconsistency (DB says gone while vectors remain).
         for ns in namespaces:
-            pinecone_results.append(_delete_pinecone_scope_exact(ns, pine_filter))
+            pinecone_results.append(_delete_pinecone_scope_exact(
+                ns, pine_filter,
+                source_file=source_file,
+                content_type=content_type,
+                lesson=lesson,
+                topic=topic,
+            ))
 
         with conn.cursor() as cur:
             cur.execute(f"DELETE FROM knowledge_documents WHERE {ws}", tuple(params))
@@ -6910,6 +6976,34 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
     }
 
 
+@app.post("/admin/api/knowledge/pinecone-probe")
+def admin_knowledge_pinecone_probe(payload: dict):
+    """Admin-only probe for cleaning Pinecone vectors that have become orphaned from PostgreSQL catalog."""
+    check_admin(str(payload.get("password") or ""))
+    source_file = os.path.basename(str(payload.get("source_file") or "").strip())
+    content_type = str(payload.get("content_type") or "").strip() or None
+    lesson = str(payload.get("lesson") or "").strip() or None
+    topic = str(payload.get("topic") or "").strip() or None
+    if not source_file:
+        raise HTTPException(400, "source_file là bắt buộc.")
+    if lesson and not content_type:
+        raise HTTPException(400, "Probe Bài học cần có Loại nội dung.")
+    if topic and (not lesson or not content_type):
+        raise HTTPException(400, "Probe Chủ đề cần có Loại nội dung và Bài học.")
+    pine_filter = _pinecone_scope_filter(source_file, content_type, lesson, topic)
+    namespaces = ["__default__"]
+    rows = []
+    for ns in namespaces:
+        matches = _pinecone_scope_candidates(ns, pine_filter, top_k=10000)
+        for m in matches:
+            rows.append({
+                "id": str(getattr(m, "id", "") or ""),
+                "score": float(getattr(m, "score", 0) or 0),
+                "metadata": dict(getattr(m, "metadata", None) or {}),
+            })
+    return {"success": True, "namespace": namespaces, "pinecone_filter": pine_filter, "count": len(rows), "matches": rows[:200]}
+
+
 @app.post("/admin/api/knowledge/delete")
 def admin_knowledge_delete(payload: dict):
     check_admin(str(payload.get("password") or ""))
@@ -6987,6 +7081,22 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 <h3>🗂️ Quản lý tài liệu / bài học / chủ đề</h3>
 <div class="small" style="margin-bottom:10px">Xóa tại đây sẽ xóa cả Pinecone vector và Knowledge Cache PostgreSQL tương ứng.</div>
 <div id="knowledgeCatalogAdmin">Đang tải...</div>
+</div>
+
+<div class="card">
+<h3>🧹 Dọn vector Pinecone mồ côi</h3>
+<div class="small" style="margin-bottom:10px">Dùng khi PostgreSQL đã xóa mục nhưng Pinecone vẫn còn chunk. Rule: Tài liệu = source_file; Bài học = source_file + Loại nội dung + Bài học; Chủ đề = thêm Chủ đề.</div>
+<div style="display:grid;grid-template-columns:1.4fr 1fr 1fr 1fr;gap:8px">
+  <input id="orphanSource" placeholder="source_file, ví dụ bai3.pdf">
+  <input id="orphanContentType" placeholder="Loại nội dung">
+  <input id="orphanLesson" placeholder="Bài học">
+  <input id="orphanTopic" placeholder="Chủ đề">
+</div>
+<div style="margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+  <button class="gray" onclick="probeOrphanKnowledge()">🔎 Kiểm tra</button>
+  <button class="red" onclick="deleteOrphanKnowledge()">🗑️ Xóa vector mồ côi</button>
+  <span id="orphanProbeResult" class="small"></span>
+</div>
 </div>
 
 <div class="card">
@@ -7155,6 +7265,32 @@ function renderKnowledgeCatalog(nodes){
 async function loadKnowledgeCatalog(){const box=document.getElementById("knowledgeCatalogAdmin");try{const d=await api("/admin/api/knowledge/catalog?password="+encodeURIComponent(pw));renderKnowledgeCatalog(d.documents||[]);}catch(e){box.innerHTML='<span style="color:#c00">Không tải được catalog: '+esc(e.message)+'</span>';}}
 async function deleteKnowledgeScope(scope){const what=scope.topic?`chủ đề "${scope.topic}"`:scope.lesson?`bài học "${scope.lesson}"`:`tài liệu "${scope.source_file}"`;if(!confirm(`Xóa ${what}?\n\nSẽ xóa vector/chunk Pinecone và Knowledge Cache liên quan. Thao tác này không thể hoàn tác.`))return;try{const d=await api("/admin/api/knowledge/delete",{method:"POST",body:JSON.stringify({...scope,password:pw})});alert("✅ "+d.message);await loadKnowledgeCatalog();}catch(e){alert("❌ Xóa thất bại: "+e.message);}}
 
+async function probeOrphanKnowledge(){
+  const source_file=document.getElementById("orphanSource").value.trim();
+  const content_type=document.getElementById("orphanContentType").value.trim();
+  const lesson=document.getElementById("orphanLesson").value.trim();
+  const topic=document.getElementById("orphanTopic").value.trim();
+  if(!source_file){alert("Nhập source_file trước.");return;}
+  try{
+    const d=await api("/admin/api/knowledge/pinecone-probe",{method:"POST",body:JSON.stringify({password:pw,source_file,content_type,lesson,topic})});
+    document.getElementById("orphanProbeResult").textContent=`Pinecone còn ${d.count} vector trong exact scope.`;
+  }catch(e){document.getElementById("orphanProbeResult").textContent="❌ "+e.message;}
+}
+async function deleteOrphanKnowledge(){
+  const source_file=document.getElementById("orphanSource").value.trim();
+  const content_type=document.getElementById("orphanContentType").value.trim();
+  const lesson=document.getElementById("orphanLesson").value.trim();
+  const topic=document.getElementById("orphanTopic").value.trim();
+  if(!source_file){alert("Nhập source_file trước.");return;}
+  const what=topic?`chủ đề "${topic}"`:lesson?`bài học "${lesson}"`:content_type?`loại nội dung "${content_type}"`: `tài liệu "${source_file}"`;
+  if(!confirm(`Xóa vector Pinecone mồ côi của ${what}?\n\nServer chỉ xóa exact identity scope và phải verify Pinecone sạch mới báo thành công.`))return;
+  try{
+    const d=await api("/admin/api/knowledge/delete",{method:"POST",body:JSON.stringify({password:pw,source_file,content_type,lesson,topic})});
+    alert("✅ "+d.message);
+    await probeOrphanKnowledge();
+    await loadKnowledgeCatalog();
+  }catch(e){alert("❌ Xóa thất bại: "+e.message);}
+}
 async function loadPaymentPackages(){
   try{
     const d=await api("/admin/api/payment-packages?password="+encodeURIComponent(pw));
