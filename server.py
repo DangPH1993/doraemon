@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.27-b0-b1-and-full-knowledge-exercise"
+BASELINE_VERSION = "19.28-study-session-insert-fix"
 import os
 import ast
 import io
@@ -2918,7 +2918,7 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
                     study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','',NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','','',NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
