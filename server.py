@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.25-summary-intro-history-only"
+BASELINE_VERSION = "19.27-b0-b1-and-full-knowledge-exercise"
 import os
 import ast
 import io
@@ -317,6 +317,8 @@ def init_db():
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_global_exercise_evidence TEXT NOT NULL DEFAULT '';",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_summary_notes TEXT NOT NULL DEFAULT '';",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_intro_history TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_intro_b0b1_history TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_global_exercise_result TEXT NOT NULL DEFAULT '';",
             ]:
                 cur.execute(sql)
             cur.execute("ALTER TABLE user_learning_state ALTER COLUMN curriculum_waiting TYPE VARCHAR(50)")
@@ -2864,7 +2866,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 SELECT study_session_active,study_session_content_type,study_session_course,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending,study_session_chatbox_id,
-                       curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history
+                       curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
@@ -2890,6 +2892,8 @@ def _get_study_session(user_id, chatbox_id=None):
                 "curriculum_global_exercise_evidence": str(row.get("curriculum_global_exercise_evidence") or ""),
                 "curriculum_summary_notes": str(row.get("curriculum_summary_notes") or ""),
                 "curriculum_intro_history": str(row.get("curriculum_intro_history") or ""),
+                "curriculum_intro_b0b1_history": str(row.get("curriculum_intro_b0b1_history") or ""),
+                "curriculum_global_exercise_result": str(row.get("curriculum_global_exercise_result") or ""),
             }
     finally:
         conn.close()
@@ -2913,8 +2917,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
-                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','',NOW())
+                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,updated_at
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','',NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
@@ -2931,6 +2935,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     curriculum_global_exercise_evidence='',
                     curriculum_summary_notes='',
                     curriculum_intro_history='',
+                    curriculum_intro_b0b1_history='',
+                    curriculum_global_exercise_result='',
                     updated_at=NOW()
             """, (
                 user_id,content_type,course,lesson,topic,chatbox,
@@ -2989,6 +2995,8 @@ def _finish_study_session(user_id):
                     curriculum_global_exercise_evidence='',
                     curriculum_summary_notes='',
                     curriculum_intro_history='',
+                    curriculum_intro_b0b1_history='',
+                    curriculum_global_exercise_result='',
                     updated_at=NOW()
                 WHERE user_id=%s
             """, (user_id,))
@@ -3045,6 +3053,34 @@ def _append_curriculum_intro_history(user_id, text):
             # Keep only the teaching history, not exercise answers or full lesson source.
             combined = combined[-12000:]
             cur.execute("UPDATE user_learning_state SET curriculum_intro_history=%s, updated_at=NOW() WHERE user_id=%s", (combined, user_id))
+            conn.commit()
+    finally:
+        conn.close()
+
+def _append_curriculum_intro_b0b1_history(user_id, step, text):
+    """Store only B0 + B1 teaching replies for global exercise detection and final summary."""
+    if int(step) not in (0, 1):
+        return
+    text = re.sub(r"\[\[(?:CHUNK_EXERCISE|NO_CHUNK_EXERCISE|WHOLE_LESSON_EXERCISE)(?:_[^\]]+)?\]\]", "", str(text or "")).strip()
+    if not text:
+        return
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT curriculum_intro_b0b1_history FROM user_learning_state WHERE user_id=%s", (user_id,))
+            row = cur.fetchone()
+            prev = str((row[0] if row else "") or "").strip()
+            combined = (prev + "\n\n" + text).strip()[-5000:]
+            cur.execute("UPDATE user_learning_state SET curriculum_intro_b0b1_history=%s, updated_at=NOW() WHERE user_id=%s", (combined, user_id))
+            conn.commit()
+    finally:
+        conn.close()
+
+def _set_curriculum_global_exercise_result(user_id, text):
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE user_learning_state SET curriculum_global_exercise_result=%s, updated_at=NOW() WHERE user_id=%s", (str(text or "")[:4000], user_id))
             conn.commit()
     finally:
         conn.close()
@@ -6042,69 +6078,26 @@ TIN NHẮN HIỆN TẠI:
             elif curriculum_step == curriculum_map["global_exercise_step"]:
                 saved_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 saved_ev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
-                intro_history = str((study_session or {}).get("curriculum_intro_history") or "").strip()
-                if curriculum_waiting == "global_exercise_answer" and saved_q:
-                    cache_prompt=f"""Bạn là Doraemon chấm bài.
-CÂU HỎI NGUỒN: {saved_q}
-BẰNG CHỨNG NGUỒN:
-{saved_ev}
-
-Đánh giá NGẮN GỌN câu trả lời của học sinh: đúng/sai, lý do theo nguồn, và đáp án đúng nếu cần. Không nhắc lại toàn bài, không thêm kiến thức ngoài nguồn, không tạo câu hỏi mới.
-
-CÂU TRẢ LỜI:
-{query_text}"""
+                core_history = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
+                _global_answer_turn = bool(saved_q) and bool((query_text or "").strip()) and not bool(data.action) and curriculum_waiting in {"global_exercise_answer", "continue_after_global_exercise", "continue_after_global_check"}
+                if _global_answer_turn:
+                    # Answer/evaluation/follow-up turn: USE THE FULL KNOWLEDGE of the lesson.
+                    full_sections = []
+                    for i, sec2 in enumerate(runtime_lesson_cache.get("sections") or []):
+                        full_sections.append(f"[CHUNK_{i}]\n" + str(sec2.get("text") or ""))
+                    full_vision = json.dumps([x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if x.get("vision")], ensure_ascii=False, separators=(",", ":"))[:12000]
+                    cache_prompt=f"""Bạn là Doraemon, chấm và giải bài tập cuối bài.\n\nCÂU HỎI: {saved_q}\n\nBẰNG CHỨNG BAN ĐẦU: {saved_ev}\n\nKNOWLEDGE ĐẦY ĐỦ CỦA TOÀN BÀI:\n{chr(10).join(full_sections)}\n\nVISION FACTS CỦA TOÀN BÀI:\n{full_vision}\n\nCÂU TRẢ LỜI / YÊU CẦU HIỆN TẠI CỦA HỌC SINH:\n{query_text}\n\nNHIỆM VỤ:\n- Dùng TOÀN BỘ Knowledge + Vision Facts để giải và kiểm tra.\n- Nếu học sinh hỏi “đáp án là gì?”, “không biết”, hoặc hỏi lại đáp án, hãy tự giải và đưa ra đáp án đúng.\n- Nếu học sinh đã trả lời, đánh giá đúng/sai và giải thích ngắn gọn dựa trên toàn bộ nguồn.\n- TUYỆT ĐỐI không nói “giáo trình không có đáp án” chỉ vì không thấy một answer key riêng; hãy tự suy luận từ dữ kiện nguồn khi đủ dữ kiện.\n- Nếu dữ kiện không đủ để kết luận, nói rõ phần dữ kiện nào còn thiếu; không bịa đáp án.\n- Không tạo câu hỏi mới."""
                 else:
-                    intro_history = str((study_session or {}).get("curriculum_intro_history") or "").strip()
                     if saved_q:
-                        cache_prompt=f"""Chỉ kiểm tra câu hỏi đã được Doraemon xác định trước đây có phải là bài tập TOÀN BÀI chưa giải không. Nếu đúng, trả nguyên câu hỏi:
-[[GLOBAL_EXERCISE]]
-Q: {saved_q}
-E: {intro_history[-1800:]}
-Nếu không đủ căn cứ: [[NO_GLOBAL_EXERCISE]]."""
+                        cache_prompt=f"""Chỉ kiểm tra câu hỏi đã được Doraemon xác định trước đây có phải là bài tập TOÀN BÀI chưa giải không. Chỉ dùng context B0+B1.\n[[GLOBAL_EXERCISE]]\nQ: {saved_q}\nE: {core_history[-1200:]}\nNếu không đủ căn cứ: [[NO_GLOBAL_EXERCISE]]."""
                     else:
-                        cache_prompt=f"""Bạn là Doraemon. Chỉ dùng LỊCH SỬ MỞ ĐẦU + CÁC PHẦN GIỚI THIỆU dưới đây để xác định có câu hỏi/bài tập TOÀN BÀI chưa giải hay không. Nếu có, trả:
-[[GLOBAL_EXERCISE]]
-Q: <đúng câu hỏi>
-E: <bằng chứng ngắn>
-Nếu không: [[NO_GLOBAL_EXERCISE]]. Không tạo câu hỏi mới, không dùng toàn bộ Knowledge Cache.
-
-LỊCH SỬ:
-{intro_history[-12000:]}"""
+                        cache_prompt=f"""Bạn là Doraemon. Chỉ dùng CONTEXT B0 + B1 bên dưới để xác định có câu hỏi/bài tập TOÀN BÀI chưa giải hay không.\nNếu có, trả:\n[[GLOBAL_EXERCISE]]\nQ: <đúng câu hỏi>\nE: <bằng chứng ngắn>\nNếu không: [[NO_GLOBAL_EXERCISE]]. Không tạo câu hỏi mới và không dùng Knowledge khác.\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}"""
             elif curriculum_step == curriculum_map["summary_step"]:
-                # SUMMARY MUST USE ONLY THE INTRO/TEACHING HISTORY, NOT FULL KNOWLEDGE CACHE.
-                intro_history = str((study_session or {}).get("curriculum_intro_history") or "").strip()
+                # Summary uses ONLY B0+B1 teaching context, plus the already stored exercise result.
+                core_history = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
                 global_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
-                global_ev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
-                summary_notes = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
-                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.
-
-QUAN TRỌNG VỀ CONTEXT:
-- CHỈ được dùng lịch sử phần MỞ ĐẦU + phần GIỚI THIỆU các chunk mà Doraemon đã thực sự nói cho học sinh.
-- KHÔNG dùng Knowledge Cache, KHÔNG dùng vision facts, KHÔNG dùng các chunk nguồn trực tiếp và KHÔNG dùng lịch sử chat chung.
-- Không được nói rằng thiếu dữ liệu nếu lịch sử bên dưới đã có nội dung; hãy tổng kết trực tiếp từ những gì Doraemon đã dạy.
-
-Hãy tổng kết ngắn gọn nhưng đầy đủ:
-1) Nội dung chính đã học theo đúng những gì Doraemon đã giới thiệu.
-2) Từ vựng/kanji + cách đọc/phát âm đã được giới thiệu.
-3) Ngữ pháp đã được giới thiệu.
-4) Điểm cần nhớ.
-5) Kết quả bài tập toàn bài nếu có dữ liệu bên dưới.
-Cuối cùng hỏi đúng: “Cậu thấy mình đã nắm được bài này chưa?”
-
-LỊCH SỬ MỞ ĐẦU + GIỚI THIỆU ĐÃ HỌC:
-{intro_history[-12000:] or '(chưa có lịch sử giới thiệu)'}
-
-GHI CHÚ TÓM TẮT NỘI BỘ (nếu có, chỉ dùng để hỗ trợ đối chiếu):
-{summary_notes[-2500:] or '(không có)'}
-
-CÂU HỎI BÀI TẬP TOÀN BÀI (nếu có):
-{global_q or '(không có)'}
-
-BẰNG CHỨNG/CONTEXT TỐI THIỂU CỦA BÀI TẬP (nếu có):
-{global_ev or '(không có)'}
-
-TIN NHẮN HIỆN TẠI:
-{query_text}"""
+                global_result = str((study_session or {}).get("curriculum_global_exercise_result") or "").strip()
+                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.\n\nCONTEXT ĐƯỢC PHÉP DÙNG:\n- CHỈ dùng phần Doraemon đã nói ở B0 (mở đầu) và B1 (chunk 1).\n- Không dùng các chunk 2+, Vision Facts hay Knowledge Cache trực tiếp.\n- Nếu có kết quả bài tập cuối bài đã được lưu bên dưới, dùng nó để nêu kết quả.\n- Không nói rằng “giáo trình không có đáp án” nếu bài tập đã có kết quả/đáp án được lưu; giữ cách diễn đạt tự nhiên và dựa trên dữ liệu được cung cấp.\n\nHãy tổng kết ngắn gọn theo context trên, nêu mục tiêu, từ vựng/phát âm, ngữ pháp, các điểm chính đã được giới thiệu ở B0+B1, và kết quả bài tập nếu có. Cuối cùng hỏi: “Cậu thấy mình đã nắm được bài này chưa?”\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}\n\nCÂU HỎI BÀI TẬP CUỐI BÀI (nếu có):\n{global_q or '(không có)'}\n\nKẾT QUẢ BÀI TẬP ĐÃ LƯU (nếu có):\n{global_result or '(chưa có)'}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             else:
                 cache_prompt=None
             if cache_prompt is not None:
@@ -6117,23 +6110,27 @@ TIN NHẮN HIỆN TẠI:
             if prompt is None:
                 raise RuntimeError("curriculum prompt was not constructed")
             if curriculum_step == curriculum_map["summary_step"]:
-                _ih = str((study_session or {}).get("curriculum_intro_history") or "").strip()
+                _ih = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
                 _sq = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 _sev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                _res = str((study_session or {}).get("curriculum_global_exercise_result") or "").strip()
                 print(
                     f"[CURRICULUM SUMMARY CONTEXT] request={request_id} "
-                    f"mode=intro_history_only sections_sent=0 vision_facts_sent=0 "
-                    f"intro_history_chars={len(_ih[-12000:])} question_chars={len(_sq)} evidence_chars={len(_sev)} "
+                    f"mode=b0_b1_only sections_sent=0 vision_facts_sent=0 "
+                    f"b0b1_history_chars={len(_ih[-5000:])} question_chars={len(_sq)} result_chars={len(_res)} "
                     f"prompt_chars={len(prompt)}"
                 )
             elif curriculum_step == curriculum_map["global_exercise_step"]:
-                _ih = str((study_session or {}).get("curriculum_intro_history") or "").strip()
+                _ih = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
                 _sq = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 _sev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
+                _full_answer_turn = bool((study_session or {}).get("curriculum_global_exercise_question")) and bool((query_text or "").strip()) and not bool(data.action) and curriculum_waiting in {"global_exercise_answer", "continue_after_global_exercise", "continue_after_global_check"}
                 print(
                     f"[CURRICULUM GLOBAL EXERCISE CONTEXT] request={request_id} "
-                    f"mode=intro_history_only sections_sent=0 vision_facts_sent=0 "
-                    f"intro_history_chars={len(_ih[-12000:])} question_chars={len(_sq)} evidence_chars={len(_sev)} "
+                    f"mode={'full_knowledge_answer' if _full_answer_turn else 'b0_b1_detection'} "
+                    f"sections_sent={len(cache_selected_sections) if _full_answer_turn else 0} "
+                    f"vision_facts_sent={len(vision_text) if _full_answer_turn else 0} "
+                    f"b0b1_history_chars={len(_ih[-5000:])} question_chars={len(_sq)} evidence_chars={len(_sev)} "
                     f"prompt_chars={len(prompt)}"
                 )
             else:
@@ -6257,8 +6254,10 @@ TIN NHẮN HIỆN TẠI:
         intro_piece = re.sub(r"\[\[(?:CHUNK_EXERCISE|NO_CHUNK_EXERCISE|WHOLE_LESSON_EXERCISE|GLOBAL_LESSON_EXERCISE_Q)(?:_[^\]]+)?\]\]", "", reply or "").strip()
         if intro_piece:
             _append_curriculum_intro_history(user["id"], intro_piece)
+            _append_curriculum_intro_b0b1_history(user["id"], curriculum_step, intro_piece)
             study_session = _get_study_session(user["id"], chatbox_id=getattr(data, "chatbox_id", None)) or study_session
             print(f"[CURRICULUM INTRO HISTORY] request={request_id} step={curriculum_step} chars={len(study_session.get('curriculum_intro_history','')) if study_session else 0}")
+            print(f"[CURRICULUM B0B1 HISTORY] request={request_id} step={curriculum_step} chars={len(study_session.get('curriculum_intro_b0b1_history','')) if study_session else 0}")
 
     if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
         clean_note = re.sub(r"\[\[(?:CHUNK_EXERCISE|NO_CHUNK_EXERCISE|WHOLE_LESSON_EXERCISE)\]\]", "", reply or "").strip()
@@ -6305,6 +6304,8 @@ TIN NHẮN HIỆN TẠI:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_exercise", exercise_answered=True)
                 eval_note = (reply or "").strip()
                 if eval_note:
+                    _set_curriculum_global_exercise_result(user["id"], eval_note)
+                    study_session = _get_study_session(user["id"], chatbox_id=getattr(data, "chatbox_id", None)) or study_session
                     prev = str((study_session or {}).get("curriculum_summary_notes") or "").strip()
                     _set_curriculum_compact_state(user["id"], summary_notes=(prev + "\n\nBÀI TẬP TOÀN BÀI - ĐÁNH GIÁ: " + eval_note).strip()[-6000:])
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
