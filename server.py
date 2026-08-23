@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.29-global-exercise-full-knowledge-answer"
+BASELINE_VERSION = "19.30-upload-memory-safe-deferred-curriculum"
 import os
 import ast
 import io
@@ -6,6 +6,8 @@ import uuid
 import re
 import time
 import threading
+import tempfile
+import gc
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
@@ -2580,7 +2582,7 @@ def _cache_jsonable(value):
     return str(value)
 
 
-def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
+def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records, *, defer_curriculum_plan=False):
     """Persist the complete upload-time knowledge asset and reusable vision cache."""
     grouped = {}
     for rec in text_records:
@@ -2641,8 +2643,14 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 payload["images"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
                 # Tiny immutable overview for the runtime prompt; full source remains in sections.
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
+                curriculum_plan = None
+                if ct == "Giáo trình" and not defer_curriculum_plan:
+                    curriculum_plan = _build_curriculum_plan(
+                        {**payload, "source_file": source_file, "content_type": ct, "lesson": lesson, "topic": topic},
+                        request_label=f"{source_file}:{lesson}:{topic or ''}"
+                    )
                 package = {
-                    "version": 1,
+                    "version": 2,
                     "source_file": source_file,
                     "content_hash": source_hash,
                     "subject": subject,
@@ -2652,9 +2660,11 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "overview": overview,
                     "sections": payload["sections"],
                     "images": payload["images"],
+                    "curriculum_plan": curriculum_plan,
                 }
-                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
-                    (asset_id, source_file, subject, ct, lesson, topic, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                cache_status = 'PLANNING' if (defer_curriculum_plan and ct == "Giáo trình") else 'READY'
+                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s::jsonb,NOW())""",
+                    (asset_id, source_file, subject, ct, lesson, topic, cache_status, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
                     image_key = str(img.get("image_key") or "").strip()
                     image_hash = str(img.get("image_hash") or "").strip() or None
@@ -2669,6 +2679,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         conn.close()
     print(f"[KNOWLEDGE CACHE READY] source={source_file!r} lessons={len(grouped)} images={len(image_records)} hash={source_hash[:12]}...")
     return len(grouped)
+
 
 
 def _canonical_lesson_key(value: str) -> str:
@@ -7027,6 +7038,17 @@ def b2_put_bytes(key: str, data: bytes, content_type: str):
         return f"{B2_PUBLIC_BASE_URL}/{key}"
     return None
 
+def b2_put_file(key: str, file_path: str, content_type: str):
+    """Upload a local file without loading the entire file into RAM."""
+    if not b2_ready():
+        raise RuntimeError("Backblaze B2 chưa được cấu hình. Cần B2_ENDPOINT, B2_KEY_ID, B2_APPLICATION_KEY và B2_BUCKET.")
+    with open(file_path, "rb") as fh:
+        b2.put_object(Bucket=B2_BUCKET, Key=key, Body=fh, ContentType=content_type)
+    if B2_PUBLIC_BASE_URL:
+        return f"{B2_PUBLIC_BASE_URL}/{key}"
+    return None
+
+
 def _extract_image_key(raw_key):
     """
     Normalize Pinecone image_key metadata.
@@ -7567,7 +7589,7 @@ def extract_lesson_images(raw_pdf: bytes, page_no: int, source_file: str, subjec
         doc.close()
     return stored
 
-def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, subject: str):
+def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
 
     IMPORTANT: no table OCR/grid reconstruction is performed here. For a page
@@ -7588,11 +7610,11 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # A low-cost local visual check is used only to detect whether an
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
-            preview = render_pdf_page(raw_pdf, page_no, dpi=90)
+            preview = render_pdf_page(pdf_source, page_no, dpi=72)
             table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
-                lesson_images = extract_lesson_images(raw_pdf, page_no, source_file, subject, page_meta)
+                lesson_images = extract_lesson_images(pdf_source, page_no, source_file, subject, page_meta)
                 if lesson_images:
                     page_images[page_no] = lesson_images
                 continue
@@ -7600,7 +7622,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             table_page = False
 
         # Scan/low-text pages retain the old Gemini OCR behavior.
-        png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
+        png = render_pdf_page(pdf_source, page_no, dpi=140 if table_page else 120)
         ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
@@ -7650,7 +7672,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # created separately by _store_table_source_image below.
             table_boxes = [item.get("box") for item in table_items if isinstance(item, dict) and isinstance(item.get("box"), (list, tuple))]
             lesson_images = extract_lesson_images(
-                raw_pdf, page_no, source_file, subject, page_meta, exclude_boxes=table_boxes
+                pdf_source, page_no, source_file, subject, page_meta, exclude_boxes=table_boxes
             )
             if lesson_images:
                 for emb in lesson_images:
@@ -7750,10 +7772,26 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         if stored:
             page_images[page_no] = stored
+        # Release large rendered buffers before processing the next page.
+        try:
+            del preview
+        except Exception:
+            pass
+        try:
+            del png
+        except Exception:
+            pass
+        try:
+            del page
+        except Exception:
+            pass
+        gc.collect()
     return page_texts, page_images, page_units
+
 
 @app.post("/admin/api/knowledge/upload")
 async def admin_knowledge_upload(
+    background_tasks: BackgroundTasks,
     password: str = Form(""),
     file: UploadFile = File(...),
     subject: str = Form(""),
@@ -7776,33 +7814,62 @@ async def admin_knowledge_upload(
     if overlap < 0 or overlap >= chunk_size:
         raise HTTPException(400, "overlap phải >= 0 và nhỏ hơn chunk_size.")
 
-    raw=await file.read()
-    if len(raw)>50*1024*1024:
-        raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
-    try:
-        reader=PdfReader(io.BytesIO(raw))
-        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
-    except ValueError as e:
-        raise HTTPException(400,str(e))
-    except Exception as e:
-        raise HTTPException(400,f"Không đọc được PDF: {e}")
-
     source_file=os.path.basename(file.filename)
     namespace="__default__"
+    temp_pdf_path = None
+    raw_size = 0
+    sha = hashlib.sha256()
+    try:
+        # Stream the upload to disk instead of keeping the whole PDF in RAM.
+        with tempfile.NamedTemporaryFile(prefix="doraemon_upload_", suffix=".pdf", delete=False) as tf:
+            temp_pdf_path = tf.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                raw_size += len(chunk)
+                if raw_size > 50 * 1024 * 1024:
+                    raise HTTPException(400, "File quá lớn. Giới hạn 50 MB.")
+                sha.update(chunk)
+                tf.write(chunk)
+        source_hash = sha.hexdigest()
+        if not temp_pdf_path:
+            raise HTTPException(400, "Không nhận được file PDF.")
+        reader=PdfReader(temp_pdf_path)
+        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
+    except HTTPException:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise
+    except ValueError as e:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise HTTPException(400,str(e))
+    except Exception as e:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise HTTPException(400,f"Không đọc được PDF: {e}")
 
-    # Save original PDF to B2 when configured.
+    # Save original PDF to B2 without copying the full PDF into RAM.
     pdf_key = f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"
     pdf_url = None
     if b2_ready():
         try:
-            pdf_url = b2_put_bytes(pdf_key, raw, "application/pdf")
+            pdf_url = b2_put_file(pdf_key, temp_pdf_path, "application/pdf")
         except Exception as e:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
             raise HTTPException(500, f"Không lưu được PDF vào B2: {e}")
 
     # Extract text normally; scanned/empty pages go through Gemini OCR.
     try:
-        page_texts, page_images, page_units = process_pdf_pages(raw, reader, records_meta, source_file, subject)
+        page_texts, page_images, page_units = process_pdf_pages(temp_pdf_path, reader, records_meta, source_file, subject)
     except Exception as e:
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500, f"OCR Gemini/xử lý ảnh thất bại: {e}")
 
     vectors=[]
@@ -7810,7 +7877,6 @@ async def admin_knowledge_upload(
     image_vectors_total=0
     knowledge_cache_text_records=[]
     knowledge_cache_image_records=[]
-    source_hash=hashlib.sha256(raw).hexdigest()
     try:
         # Khi re-upload cùng source_file, xóa các vector cũ của tài liệu này
         # để tránh record V1 cũ tiếp tục cạnh tranh với record V2 mới.
@@ -8031,6 +8097,8 @@ async def admin_knowledge_upload(
             index.upsert(vectors=vectors,namespace=namespace)
 
     except Exception as e:
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500,f"Lỗi embedding/Pinecone: {e}")
 
     conn=db()
@@ -8050,20 +8118,42 @@ async def admin_knowledge_upload(
     try:
         cache_lessons = _upsert_upload_knowledge_cache(
             source_file, source_hash, subject, len(reader.pages),
-            knowledge_cache_text_records, knowledge_cache_image_records
+            knowledge_cache_text_records, knowledge_cache_image_records,
+            defer_curriculum_plan=True
         )
     except Exception as exc:
         print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
+        try: os.unlink(temp_pdf_path)
+        except Exception: pass
         raise HTTPException(500, f"Tạo Knowledge Cache thất bại: {exc}")
 
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
+    if cache_lessons:
+        print(f"[CURRICULUM PLAN DEFERRED] source={source_file!r} lessons={cache_lessons}; HIGH planner will run lazily on first curriculum use")
+
+    page_count = len(reader.pages)
+    record_count = len(records_meta)
+    # Explicitly release upload-time working sets before returning to Render.
+    try:
+        del page_texts, page_images, page_units, knowledge_cache_text_records, knowledge_cache_image_records, vectors, reader, records_meta
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        if temp_pdf_path:
+            os.unlink(temp_pdf_path)
+    except Exception:
+        pass
+
     return {"success":True,"filename":source_file,"subject":subject,
-            "pages":len(reader.pages),"scanned_pages_ocr":scanned_pages,"chunks":total,"records":len(records_meta),
+            "pages":page_count,"scanned_pages_ocr":scanned_pages,"chunks":total,"records":record_count,
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
             "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
+            "curriculum_plan_status": "PLANNING" if cache_lessons else "READY",
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
+
 
 @app.get("/admin/api/knowledge/images")
 def admin_knowledge_images(password: str, source_file: str = ""):
