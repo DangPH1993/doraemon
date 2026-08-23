@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.38-kb-chunk-order-cache-fix"
+BASELINE_VERSION = "19.41-global-lesson-chunk-index"
 import os
 import ast
 import io
@@ -2604,6 +2604,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
         grouped[key]["sections"].append({
             "chunk_index": int(md.get("chunk_index") or 0),
+            "page_chunk_index": int(md.get("page_chunk_index") or 0),
             "page": md.get("page"),
             "content_unit_id": md.get("content_unit_id"),
             "text": str(rec.get("text") or ""),
@@ -2649,8 +2650,9 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 lesson = payload.get("lesson_display") or lesson_key
                 topic_display = payload.get("topic_display") or topic
                 payload["sections"].sort(key=lambda x: (
+                    int(x.get("chunk_index") if x.get("chunk_index") not in (None, "") else 10**9),
                     int(x.get("page") or 0),
-                    int(x.get("chunk_index") or 0),
+                    int(x.get("page_chunk_index") or 0),
                     str(x.get("content_unit_id") or ""),
                 ))
                 for new_idx, section in enumerate(payload["sections"]):
@@ -2701,6 +2703,9 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
     finally:
         conn.close()
     print(f"[KNOWLEDGE CACHE READY] source={source_file!r} lessons={len(grouped)} images={len(image_records)} hash={source_hash[:12]}...")
+    for _gk, _pl in grouped.items():
+        _idxs = [int(x.get("chunk_index") or 0) for x in (_pl.get("sections") or [])]
+        print(f"[KNOWLEDGE CACHE CHUNK AUDIT GLOBAL] lesson={_pl.get('lesson_display')!r} indexes={_idxs}")
     return len(grouped)
 
 
@@ -8547,6 +8552,7 @@ async def admin_knowledge_upload(
         except Exception as e:
             print("Pinecone old-source cleanup skipped:", type(e).__name__, str(e))
 
+        lesson_chunk_counters = {}
         for page_no in range(1, len(reader.pages)+1):
             text = page_texts.get(page_no, "")
             page_meta=metadata_for_page(records_meta,page_no)
@@ -8579,9 +8585,15 @@ async def admin_knowledge_upload(
                         ))
                         if unit_image_keys:
                             print(f"[LESSON IMAGE CHUNK FALLBACK] page={page_no} keys={unit_image_keys}")
+                    lesson_key_for_index = _canonical_lesson_key((page_meta[0] if page_meta else {}).get("lesson") if page_meta else "")
+                    if not lesson_key_for_index:
+                        lesson_key_for_index = "__unassigned__"
                     for local_no, chunk in enumerate(unit_chunks):
+                        global_idx = lesson_chunk_counters.get(lesson_key_for_index, 0)
+                        lesson_chunk_counters[lesson_key_for_index] = global_idx + 1
                         chunk_records.append({
-                            "chunk_index": len(chunk_records),
+                            "chunk_index": global_idx,
+                            "page_chunk_index": len(chunk_records),
                             "local_index": local_no,
                             "unit_id": unit_id,
                             "text": chunk,
@@ -8689,7 +8701,12 @@ async def admin_knowledge_upload(
             # Non-table pages: keep the original V16/V16.3 chunk and image
             # mapping path unchanged.
             chunks=kb_chunk_text(text,chunk_size,overlap)
-            for chunk_no,chunk in enumerate(chunks):
+            lesson_key_for_index = _canonical_lesson_key((primary or {}).get("lesson") if primary else "")
+            if not lesson_key_for_index:
+                lesson_key_for_index = "__unassigned__"
+            for page_chunk_no,chunk in enumerate(chunks):
+                chunk_no = lesson_chunk_counters.get(lesson_key_for_index, 0)
+                lesson_chunk_counters[lesson_key_for_index] = chunk_no + 1
                 md_list=[{
                     "content_type":r["content_type"],"lesson":r["lesson"],"lesson_pages":r["lesson_pages"],
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
@@ -8698,7 +8715,7 @@ async def admin_knowledge_upload(
                 md={
                     "record_type":"text",
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
-                    "source_file":source_file,"page":page_no,"chunk_index":chunk_no,
+                    "source_file":source_file,"page":page_no,"chunk_index":chunk_no,"page_chunk_index":page_chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
                     "image_keys":json.dumps([],ensure_ascii=False)
                 }
