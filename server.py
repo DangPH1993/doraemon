@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.41-global-lesson-chunk-index"
+BASELINE_VERSION = "19.42-chunk-image-provenance-fix"
 import os
 import ast
 import io
@@ -8712,12 +8712,20 @@ async def admin_knowledge_upload(
                     "topic":r["topic"],"topic_pages":r["topic_pages"],
                     "question_pages":r["question_pages"],"answer_pages":r["answer_pages"]
                 } for r in page_meta]
+                # Preserve lesson-scope illustration provenance on non-table text chunks.
+                # The previous path hard-coded image_keys=[] and dropped cached lesson images.
+                lesson_image_keys = list(dict.fromkeys(
+                    str(x.get("key") or "").strip()
+                    for x in (page_images.get(page_no, []) or [])
+                    if str(x.get("image_scope") or "").strip().lower() == "lesson"
+                    and str(x.get("key") or "").strip()
+                ))
                 md={
                     "record_type":"text",
                     "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,"page_chunk_index":page_chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
-                    "image_keys":json.dumps([],ensure_ascii=False)
+                    "image_keys":json.dumps(lesson_image_keys,ensure_ascii=False)
                 }
                 if primary:
                     md.update({
@@ -8725,7 +8733,7 @@ async def admin_knowledge_upload(
                         "topic":primary["topic"],"topic_pages":primary["topic_pages"],
                         "question_pages":primary["question_pages"],"answer_pages":primary["answer_pages"]
                     })
-                knowledge_cache_text_records.append({"text": chunk, "metadata": dict(md), "image_keys": []})
+                knowledge_cache_text_records.append({"text": chunk, "metadata": dict(md), "image_keys": lesson_image_keys})
                 vectors.append({"id":uuid.uuid4().hex,"values":embed_text(chunk),"metadata":md})
                 total+=1
 
