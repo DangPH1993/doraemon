@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.28-study-session-insert-fix"
+BASELINE_VERSION = "19.29-global-exercise-full-knowledge-answer"
 import os
 import ast
 import io
@@ -6079,7 +6079,7 @@ TIN NHẮN HIỆN TẠI:
                 saved_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 saved_ev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
                 core_history = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
-                _global_answer_turn = bool(saved_q) and bool((query_text or "").strip()) and not bool(data.action) and curriculum_waiting in {"global_exercise_answer", "continue_after_global_exercise", "continue_after_global_check"}
+                _global_answer_turn = bool(saved_q) and bool((query_text or "").strip()) and not bool(data.action) and not _is_continue_confirmation(query_text)
                 if _global_answer_turn:
                     # Answer/evaluation/follow-up turn: USE THE FULL KNOWLEDGE of the lesson.
                     full_sections = []
@@ -6124,7 +6124,7 @@ TIN NHẮN HIỆN TẠI:
                 _ih = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
                 _sq = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 _sev = str((study_session or {}).get("curriculum_global_exercise_evidence") or "").strip()
-                _full_answer_turn = bool((study_session or {}).get("curriculum_global_exercise_question")) and bool((query_text or "").strip()) and not bool(data.action) and curriculum_waiting in {"global_exercise_answer", "continue_after_global_exercise", "continue_after_global_check"}
+                _full_answer_turn = bool((study_session or {}).get("curriculum_global_exercise_question")) and bool((query_text or "").strip()) and not bool(data.action) and not _is_continue_confirmation(query_text)
                 print(
                     f"[CURRICULUM GLOBAL EXERCISE CONTEXT] request={request_id} "
                     f"mode={'full_knowledge_answer' if _full_answer_turn else 'b0_b1_detection'} "
@@ -6299,8 +6299,10 @@ TIN NHẮN HIỆN TẠI:
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue", exercise_answered=False)
                 content_blocks.extend([{"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"}] + _curriculum_continue_blocks(curriculum_step))
         elif curriculum_step == curriculum_map["global_exercise_step"]:
-            if curriculum_waiting == "global_exercise_answer" and is_curriculum_answer_turn:
-                # Compact evaluation was already generated from the cached question/evidence.
+            _saved_global_q_now = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+            _is_global_answer_turn_now = bool(_saved_global_q_now) and is_curriculum_answer_turn and not _is_continue_confirmation(query_text)
+            if _is_global_answer_turn_now:
+                # Any user answer/question about the whole-lesson exercise is a FULL-KNOWLEDGE turn.
                 _set_curriculum_flow(user["id"], step=curriculum_step, waiting="continue_after_global_exercise", exercise_answered=True)
                 eval_note = (reply or "").strip()
                 if eval_note:
