@@ -6695,7 +6695,7 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(f"SELECT DISTINCT namespace FROM knowledge_documents WHERE {ws}",tuple(params)); namespaces=[str(r.get("namespace") or "__default__") for r in cur.fetchall() or []] or ["__default__"]
             cur.execute(f"SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}",tuple(params)); matching_lessons=[dict(r) for r in cur.fetchall() or []]
-            cur.execute(f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} AND image_key IS NOT NULL AND TRIM(image_key)<>''",tuple(params)); image_keys=[str(r[0]).strip() for r in cur.fetchall() if r[0]]
+            cur.execute(f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} AND image_key IS NOT NULL AND TRIM(image_key)<>''",tuple(params)); image_keys=[str(r.get("image_key") or "").strip() for r in cur.fetchall() if r.get("image_key")]
         if not index: raise HTTPException(500,"Pinecone chưa được khởi tạo.")
         pine_filter={"source_file":{"$eq":source_file}}
         if content_type: pine_filter["content_type"]={"$eq":content_type}
@@ -6712,10 +6712,15 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
             if not content_type and not lesson and not topic:
                 cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s",(source_file,)); deleted_assets=cur.rowcount
             else:
-                cur.execute("SELECT COUNT(*) FROM knowledge_documents WHERE source_file=%s",(source_file,))
-                if int(cur.fetchone()[0] or 0)==0:
-                    cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s",(source_file,)); deleted_assets=cur.rowcount
-                else: deleted_assets=0
+                # Use a named column + RealDictCursor here so this path is immune to
+                # tuple/dict cursor differences (the production bug manifested as KeyError: 0).
+                with conn.cursor(cursor_factory=RealDictCursor) as count_cur:
+                    count_cur.execute("SELECT COUNT(*) AS row_count FROM knowledge_documents WHERE source_file=%s", (source_file,))
+                    row_count = count_cur.fetchone() or {}
+                if int(row_count.get("row_count") or 0) == 0:
+                    cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s", (source_file,)); deleted_assets=cur.rowcount
+                else:
+                    deleted_assets=0
             for lr in matching_lessons:
                 ls=str(lr.get("lesson") or "").strip(); ct=str(lr.get("content_type") or "").strip()
                 if not ls: continue
@@ -6927,10 +6932,55 @@ async function uploadKnowledge(event){
   finally{btn.disabled=false}
 }
 
+function toggleKbSection(id,btn){
+  const el=document.getElementById(id);
+  if(!el) return;
+  const hidden=el.style.display==="none";
+  el.style.display=hidden?"":"none";
+  if(btn) btn.textContent=hidden?"▾ Thu gọn":"▸ Mở rộng";
+}
+function setAllKbDocuments(collapse){
+  document.querySelectorAll('#knowledgeCatalogAdmin .kb-collapsible').forEach(el=>{ el.style.display=collapse?'none':''; });
+  document.querySelectorAll('#knowledgeCatalogAdmin .kb-doc-toggle').forEach(btn=>{ btn.textContent=collapse?'▸ Mở rộng':'▾ Thu gọn'; });
+}
 function renderKnowledgeCatalog(nodes){
   const box=document.getElementById("knowledgeCatalogAdmin");
   if(!nodes||!nodes.length){box.innerHTML='<div class="small">Chưa có tài liệu.</div>';return;}
-  box.innerHTML=nodes.map(doc=>{const cts=doc.content_types||[];return `<div style="border:1px solid #ddd;border-radius:10px;padding:12px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div><b>📄 ${esc(doc.source_file)}</b><div class="small">${esc(doc.subject||"")} · ${esc(doc.namespace||"__default__")}</div></div><button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file})})'>🗑️ Xóa tài liệu</button></div>${cts.map(ct=>`<div style="border-top:1px solid #eee;margin-top:9px;padding-top:9px"><b>Loại nội dung:</b> ${esc(ct.content_type)}${(ct.lessons||[]).map(ls=>`<div style="margin:7px 0 7px 14px;background:#f8fafc;border-radius:8px;padding:8px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""}</div><button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button></div>${(ls.topics||[]).length?`<div class="small" style="margin:6px 0 0 14px"><b>Chủ đề:</b> ${(ls.topics||[]).map(t=>`<span style='display:inline-flex;align-items:center;gap:4px;border:1px solid #ddd;border-radius:999px;padding:3px 7px;margin:3px 4px 0 0;background:#fff'>${esc(t.topic)} <button class='red' style='padding:2px 6px' onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson,topic:t.topic})})'>×</button></span>`).join("")}</div>`:""}</div>`).join("")}</div>`).join("")}</div>`;}).join("");
+  box.innerHTML=nodes.map((doc,di)=>{
+    const cts=doc.content_types||[];
+    const docId=`kb-doc-${di}`;
+    return `<div style="border:1px solid #ddd;border-radius:10px;padding:12px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="gray kb-toggle kb-doc-toggle" style="padding:5px 10px;min-width:110px;font-weight:700" onclick="toggleKbSection('${docId}',this)">▾ Thu gọn</button>
+          <div><b>📄 ${esc(doc.source_file)}</b><div class="small">${esc(doc.subject||"")} · ${esc(doc.namespace||"__default__")}</div></div>
+        </div>
+        <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file})})'>🗑️ Xóa tài liệu</button>
+      </div>
+      <div id="${docId}" class="kb-collapsible" style="margin-top:8px">${cts.map((ct,ci)=>{
+        const ctId=`${docId}-ct-${ci}`;
+        return `<div style="border-top:1px solid #eee;margin-top:9px;padding-top:9px">
+          <div style="display:flex;align-items:center;gap:7px">
+            <button class="gray" style="padding:4px 8px" onclick="toggleKbSection('${ctId}',this)">▾</button>
+            <b>Loại nội dung:</b> ${esc(ct.content_type)}
+          </div>
+          <div id="${ctId}" style="margin-top:5px">${(ct.lessons||[]).map((ls,li)=>{
+            const lsId=`${ctId}-ls-${li}`;
+            return `<div style="margin:7px 0 7px 18px;background:#f8fafc;border-radius:8px;padding:8px">
+              <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
+                <div style="display:flex;align-items:center;gap:7px">
+                  <button class="gray" style="padding:4px 8px" onclick="toggleKbSection('${lsId}',this)">▾</button>
+                  <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""}</div>
+                </div>
+                <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
+              </div>
+              <div id="${lsId}" style="margin-top:6px">${(ls.topics||[]).length?`<div class="small" style="margin-left:26px"><b>Chủ đề:</b> ${(ls.topics||[]).map(t=>`<span style='display:inline-flex;align-items:center;gap:4px;border:1px solid #ddd;border-radius:999px;padding:3px 7px;margin:3px 4px 0 0;background:#fff'>${esc(t.topic)} <button class='red' style='padding:2px 6px' onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson,topic:t.topic})})'>×</button></span>`).join("")}</div>`:`<div class="small" style="margin-left:26px;color:#999">Không có chủ đề.</div>`}</div>
+            </div>`;
+          }).join("")}</div>
+        </div>`;
+      }).join("")}</div>
+    </div>`;
+  }).join("");
 }
 async function loadKnowledgeCatalog(){const box=document.getElementById("knowledgeCatalogAdmin");try{const d=await api("/admin/api/knowledge/catalog?password="+encodeURIComponent(pw));renderKnowledgeCatalog(d.documents||[]);}catch(e){box.innerHTML='<span style="color:#c00">Không tải được catalog: '+esc(e.message)+'</span>';}}
 async function deleteKnowledgeScope(scope){const what=scope.topic?`chủ đề "${scope.topic}"`:scope.lesson?`bài học "${scope.lesson}"`:`tài liệu "${scope.source_file}"`;if(!confirm(`Xóa ${what}?\n\nSẽ xóa vector/chunk Pinecone và Knowledge Cache liên quan. Thao tác này không thể hoàn tác.`))return;try{const d=await api("/admin/api/knowledge/delete",{method:"POST",body:JSON.stringify({...scope,password:pw})});alert("✅ "+d.message);await loadKnowledgeCatalog();}catch(e){alert("❌ Xóa thất bại: "+e.message);}}
