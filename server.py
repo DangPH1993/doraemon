@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.33-v19_29-study-streaming-upload-imagehash-fix"
+BASELINE_VERSION = "19.34-v19_29-study-v20_5-upload-memory-safe"
 import os
 import ast
 import io
@@ -2582,7 +2582,7 @@ def _cache_jsonable(value):
     return str(value)
 
 
-def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records):
+def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count, text_records, image_records, *, defer_curriculum_plan=False):
     """Persist the complete upload-time knowledge asset and reusable vision cache."""
     grouped = {}
     for rec in text_records:
@@ -7588,7 +7588,7 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
         doc.close()
     return stored
 
-def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, subject: str):
+def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
 
     IMPORTANT: no table OCR/grid reconstruction is performed here. For a page
@@ -7609,11 +7609,11 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # A low-cost local visual check is used only to detect whether an
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
-            preview = render_pdf_page(raw_pdf, page_no, dpi=90)
+            preview = render_pdf_page(pdf_source, page_no, dpi=72)
             table_page = _page_has_table_grid(page, preview, extracted)
             if not table_page:
                 page_texts[page_no] = extracted
-                lesson_images = extract_lesson_images(raw_pdf, page_no, source_file, subject, page_meta)
+                lesson_images = extract_lesson_images(pdf_source, page_no, source_file, subject, page_meta)
                 if lesson_images:
                     page_images[page_no] = lesson_images
                 continue
@@ -7621,7 +7621,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             table_page = False
 
         # Scan/low-text pages retain the old Gemini OCR behavior.
-        png = render_pdf_page(raw_pdf, page_no, dpi=170 if table_page else 150)
+        png = render_pdf_page(pdf_source, page_no, dpi=140 if table_page else 120)
         ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
@@ -7671,7 +7671,7 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
             # created separately by _store_table_source_image below.
             table_boxes = [item.get("box") for item in table_items if isinstance(item, dict) and isinstance(item.get("box"), (list, tuple))]
             lesson_images = extract_lesson_images(
-                raw_pdf, page_no, source_file, subject, page_meta, exclude_boxes=table_boxes
+                pdf_source, page_no, source_file, subject, page_meta, exclude_boxes=table_boxes
             )
             if lesson_images:
                 for emb in lesson_images:
@@ -7771,6 +7771,20 @@ def process_pdf_pages(raw_pdf: bytes, reader, records_meta, source_file: str, su
 
         if stored:
             page_images[page_no] = stored
+        # Release large rendered buffers before processing the next page.
+        try:
+            del preview
+        except Exception:
+            pass
+        try:
+            del png
+        except Exception:
+            pass
+        try:
+            del page
+        except Exception:
+            pass
+        gc.collect()
     return page_texts, page_images, page_units
 
 @app.post("/admin/api/knowledge/upload")
@@ -8102,7 +8116,8 @@ async def admin_knowledge_upload(
     try:
         cache_lessons = _upsert_upload_knowledge_cache(
             source_file, source_hash, subject, len(reader.pages),
-            knowledge_cache_text_records, knowledge_cache_image_records
+            knowledge_cache_text_records, knowledge_cache_image_records,
+            defer_curriculum_plan=True
         )
     except Exception as exc:
         print("[KNOWLEDGE CACHE] build failed:", type(exc).__name__, str(exc))
@@ -8113,6 +8128,9 @@ async def admin_knowledge_upload(
     image_count=sum(len(v) for v in page_images.values())
     scanned_pages=sum(1 for p in range(1,len(reader.pages)+1) if len(re.sub(r"\s+","",(reader.pages[p-1].extract_text() or ""))) < 30)
     table_source_images=sum(1 for imgs in page_images.values() for img in imgs if str(img.get("kind") or "") == "table_source")
+    if cache_lessons:
+        print(f"[CURRICULUM PLAN DEFERRED] source={source_file!r} lessons={cache_lessons}; HIGH planner will run lazily on first curriculum use")
+
     page_count = len(reader.pages)
     record_count = len(records_meta)
     # Explicitly release upload-time working sets before returning to Render.
@@ -8131,6 +8149,7 @@ async def admin_knowledge_upload(
             "pages":page_count,"scanned_pages_ocr":scanned_pages,"chunks":total,"records":record_count,
             "images":image_count,"image_vectors":image_vectors_total,"table_source_images":table_source_images,
             "knowledge_cache_lessons": cache_lessons, "knowledge_cache_hash": source_hash,
+            "curriculum_plan_status": "PLANNING" if cache_lessons else "READY",
             "pdf_url":pdf_url,"dimension":768,"index":PINECONE_INDEX,"namespace":namespace}
 
 @app.get("/admin/api/knowledge/images")
