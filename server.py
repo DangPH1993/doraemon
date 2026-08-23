@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.35-japanese-language-auto-reply"
+BASELINE_VERSION = "19.36-global-language-router"
 import os
 import ast
 import io
@@ -3908,13 +3908,51 @@ def _local_casual_reply(text: str) -> str:
         return "Hehe, Doraemon đây 🤖"
     return "Ừ nha 😄"
 
-def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float):
+def _preferred_response_language(user_text: str) -> str:
+    """Choose response language from the latest user message."""
+    text = str(user_text or "").strip()
+    low = text.casefold()
+    if any(x in low for x in ("bằng tiếng việt", "tiếng việt nhé", "trả lời bằng tiếng việt", "vietnamese")):
+        return "vi"
+    if any(x in low for x in ("bằng tiếng anh", "tiếng anh nhé", "trả lời bằng tiếng anh", "english")):
+        return "en"
+    if any(x in low for x in ("日本語で", "日本語で答えて", "日本語で話して", "日本語で返して")):
+        return "ja"
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    return "vi"
+
+
+def _with_global_language_directive(prompt: str, user_text: str) -> str:
+    lang = _preferred_response_language(user_text)
+    if lang == "ja":
+        directive = (
+            "GLOBAL RESPONSE-LANGUAGE DIRECTIVE (HIGHEST PRIORITY):\n"
+            "The user's latest message is Japanese. Your ENTIRE response MUST be in Japanese. "
+            "Do not answer in Vietnamese and do not translate into Vietnamese unless the user explicitly asks for Vietnamese. "
+            "Preserve Japanese examples and terminology naturally.\n\n"
+        )
+    elif lang == "en":
+        directive = (
+            "GLOBAL RESPONSE-LANGUAGE DIRECTIVE (HIGHEST PRIORITY):\n"
+            "The user explicitly requested English. Your ENTIRE response MUST be in English unless they ask for another language.\n\n"
+        )
+    else:
+        directive = (
+            "GLOBAL RESPONSE-LANGUAGE DIRECTIVE (HIGHEST PRIORITY):\n"
+            "The latest user message is Vietnamese or has no clear Japanese signal. Reply in Vietnamese unless another language is explicitly requested.\n\n"
+        )
+    return directive + prompt
+
+
+def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float, user_text: str = ""):
     """
     Provider-neutral chat adapter.
     Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
     for the same final prompt so RAG, Study Plan, chat history, routing and
     content_blocks stay unchanged.
     """
+    prompt = _with_global_language_directive(prompt, user_text)
     # Runtime audit: this adapter receives a text-only prompt. If image_parts=0,
     # no binary/image payload is being sent to Gemini from the chat generation path.
     print(f"[GEMINI INPUT AUDIT] request={request_id} prompt_chars={len(prompt)} image_parts=0")
@@ -4538,7 +4576,7 @@ Nếu câu hỏi yêu cầu dữ liệu thời gian thực mà hệ thống khô
 Câu hỏi của người dùng:
 {query_text}"""
         gen_started = time.perf_counter()
-        reply, model_used, _ = _generate_chat_reply(minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started)
+        reply, model_used, _ = _generate_chat_reply(minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=query_text)
         return {"reply": reply, "model": model_used, "sources": [], "images": [], "content_blocks": [{"type":"text","text":reply}], "learning_progress": None}
 
     # Conversational memory / CURRENT CHAT THREAD:
@@ -4659,7 +4697,7 @@ Tin nhắn hiện tại:
         )
         gen_started = time.perf_counter()
         reply, model_used, _ = _generate_chat_reply(
-            minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started
+            minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=query_text
         )
         return {
             "reply": reply,
@@ -4861,7 +4899,7 @@ Tin nhắn hiện tại:
                 f"{h.get('role')}: {str(h.get('text') or '')[-350:]}" for h in light_history
             )
             minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
-Đây là cuộc trò chuyện chưa mở bài học. Trả lời trực tiếp, tự nhiên, ngắn gọn bằng tiếng Việt.
+Đây là cuộc trò chuyện chưa mở bài học. Trả lời trực tiếp, tự nhiên và ngắn gọn. Quy tắc ngôn ngữ toàn cục ở đầu prompt quyết định ngôn ngữ trả lời.
 Không tự mở bài học, không dùng RAG/Pinecone, không đính kèm ảnh học tập.
 Nếu người dùng muốn học một bài cụ thể, hãy yêu cầu họ nêu tên bài để Doraemon xác nhận Có/Không trước khi bắt đầu.
 
@@ -4873,7 +4911,7 @@ Tin nhắn hiện tại:
             print("[CHAT ROUTING] no active study session: lightweight chat; no embedding/Pinecone/RAG/images")
             gen_started = time.perf_counter()
             reply, model_used, _ = _generate_chat_reply(
-                minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started
+                minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=query_text
             )
             return {"reply":reply,"model":model_used,"sources":[],"images":[],"content_blocks":[{"type":"text","text":reply}],"learning_progress":None}
 
@@ -6217,6 +6255,7 @@ TIN NHẮN HIỆN TẠI:
         content_type=requested_content_type,
         request_id=request_id,
         gen_started=gen_started,
+        user_text=query_text,
     )
     perf_gen = time.perf_counter()
 
