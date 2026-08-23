@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.32-v19_29-study-streaming-upload-ramfix"
+BASELINE_VERSION = "19.33-v19_29-study-streaming-upload-imagehash-fix"
 import os
 import ast
 import io
@@ -2637,6 +2637,10 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 asset_id = cur.fetchone()["id"]
             cur.execute("DELETE FROM knowledge_vision_cache WHERE source_file=%s", (source_file,))
             cur.execute("DELETE FROM knowledge_lesson_cache WHERE source_file=%s", (source_file,))
+            # image_hash is globally unique. The same visual asset may be referenced
+            # by more than one cached lesson/topic package, so de-duplicate it
+            # within the upload transaction and tolerate an existing global row.
+            seen_image_hashes = set()
             for key, payload in grouped.items():
                 ct, lesson, topic = key
                 payload["sections"].sort(key=lambda x: (int(x.get("page") or 0), int(x.get("chunk_index") or 0)))
@@ -2663,8 +2667,13 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     if image_hash is None and image_key:
                         import hashlib
                         image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()
+                    if image_hash and image_hash in seen_image_hashes:
+                        print(f"[KNOWLEDGE CACHE IMAGE DEDUPE] source={source_file!r} image_hash={image_hash[:12]}...")
+                        continue
+                    if image_hash:
+                        seen_image_hashes.add(image_hash)
                     __IMAGE_HASH__ = image_hash
-                    cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_hash,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                    cur.execute("""INSERT INTO knowledge_vision_cache(\n                        asset_id,source_file,content_type,lesson,topic,page,chunk_index,image_key,image_hash,image_url,vision_json\n                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)\n                    ON CONFLICT (image_hash) DO NOTHING""",
                         (asset_id,source_file,ct,lesson,topic,img.get("page"),img.get("chunk_index"),img.get("image_key"),__IMAGE_HASH__,img.get("image_url"),json.dumps(_cache_jsonable(img.get("vision") or {}), ensure_ascii=False)))
         conn.commit()
     finally:
