@@ -6634,6 +6634,113 @@ def check_admin(password: str):
         raise HTTPException(401, "Admin password không đúng.")
 
 
+def _knowledge_catalog_rows():
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT source_file, subject, content_type, lesson, lesson_pages,
+                       topic, topic_pages, question_pages, answer_pages, namespace
+                FROM knowledge_documents
+                ORDER BY source_file, subject, content_type, lesson, topic, id
+            """)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _knowledge_catalog_tree(rows):
+    by_source = {}; tree = []
+    for row in rows:
+        sf = str(row.get("source_file") or "").strip()
+        if not sf: continue
+        doc = by_source.get(sf)
+        if doc is None:
+            doc = {"source_file":sf,"subject":row.get("subject") or "","namespace":row.get("namespace") or "__default__","content_types":{}}
+            by_source[sf]=doc; tree.append(doc)
+        ct=str(row.get("content_type") or "Từ vựng").strip() or "Từ vựng"
+        ctn=doc["content_types"].setdefault(ct,{})
+        lesson=str(row.get("lesson") or "").strip()
+        if not lesson: continue
+        ln=ctn.setdefault(lesson,{"lesson":lesson,"lesson_pages":row.get("lesson_pages"),"topics":{}})
+        topic=str(row.get("topic") or "").strip()
+        if topic:
+            ln["topics"][topic]={"topic":topic,"topic_pages":row.get("topic_pages"),"question_pages":row.get("question_pages"),"answer_pages":row.get("answer_pages")}
+    for doc in tree:
+        doc["content_types"]=[{"content_type":ct,"lessons":[{**ln,"topics":list(ln["topics"].values())} for ln in lessons.values()]} for ct,lessons in doc["content_types"].items()]
+    return tree
+
+
+@app.get("/admin/api/knowledge/catalog")
+def admin_knowledge_catalog(password: str):
+    check_admin(password)
+    rows=_knowledge_catalog_rows()
+    return {"success":True,"documents":_knowledge_catalog_tree(rows),"raw_count":len(rows)}
+
+
+def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None, lesson: str | None = None, topic: str | None = None):
+    source_file=os.path.basename(str(source_file or "").strip())
+    content_type=str(content_type or "").strip() or None
+    lesson=str(lesson or "").strip() or None
+    topic=str(topic or "").strip() or None
+    if not source_file: raise HTTPException(400,"source_file là bắt buộc.")
+    if topic and not lesson: raise HTTPException(400,"Xóa Chủ đề cần có Bài học.")
+    where=["source_file=%s"]; params=[source_file]
+    for col,val in (("content_type",content_type),("lesson",lesson),("topic",topic)):
+        if val:
+            where.append(f"lower(trim({col}))=lower(trim(%s))"); params.append(val)
+    ws=" AND ".join(where)
+    conn=db(); image_keys=[]; namespaces=[]; matching_lessons=[]
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"SELECT DISTINCT namespace FROM knowledge_documents WHERE {ws}",tuple(params)); namespaces=[str(r.get("namespace") or "__default__") for r in cur.fetchall() or []] or ["__default__"]
+            cur.execute(f"SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}",tuple(params)); matching_lessons=[dict(r) for r in cur.fetchall() or []]
+            cur.execute(f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} AND image_key IS NOT NULL AND TRIM(image_key)<>''",tuple(params)); image_keys=[str(r[0]).strip() for r in cur.fetchall() if r[0]]
+        if not index: raise HTTPException(500,"Pinecone chưa được khởi tạo.")
+        pine_filter={"source_file":{"$eq":source_file}}
+        if content_type: pine_filter["content_type"]={"$eq":content_type}
+        if lesson: pine_filter["lesson"]={"$eq":lesson}
+        if topic: pine_filter["topic"]={"$eq":topic}
+        for ns in namespaces:
+            try: index.delete(filter=pine_filter,namespace=ns)
+            except Exception as exc: raise HTTPException(500,f"Không xóa được chunk Pinecone: {type(exc).__name__}: {exc}")
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM knowledge_documents WHERE {ws}",tuple(params)); deleted_documents=cur.rowcount
+            cur.execute(f"DELETE FROM knowledge_lesson_cache WHERE {ws}",tuple(params)); deleted_lesson_cache=cur.rowcount
+            cur.execute(f"DELETE FROM knowledge_vision_cache WHERE {ws}",tuple(params)); deleted_vision_cache=cur.rowcount
+            cur.execute(f"DELETE FROM knowledge_images WHERE {ws}",tuple(params)); deleted_images=cur.rowcount
+            if not content_type and not lesson and not topic:
+                cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s",(source_file,)); deleted_assets=cur.rowcount
+            else:
+                cur.execute("SELECT COUNT(*) FROM knowledge_documents WHERE source_file=%s",(source_file,))
+                if int(cur.fetchone()[0] or 0)==0:
+                    cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s",(source_file,)); deleted_assets=cur.rowcount
+                else: deleted_assets=0
+            for lr in matching_lessons:
+                ls=str(lr.get("lesson") or "").strip(); ct=str(lr.get("content_type") or "").strip()
+                if not ls: continue
+                cur.execute("""UPDATE user_learning_state SET study_session_active=FALSE,study_session_content_type=NULL,study_session_course=NULL,study_session_lesson=NULL,study_session_topic=NULL,study_session_started_at=NULL,study_end_prompt_pending=FALSE,curriculum_step=0,curriculum_waiting='continue',curriculum_exercise_answered=FALSE,curriculum_global_exercise_question='',curriculum_global_exercise_evidence='',curriculum_summary_notes='',curriculum_intro_history='',curriculum_intro_b0b1_history='',curriculum_global_exercise_result='' WHERE lower(trim(coalesce(study_session_content_type,'')))=lower(trim(%s)) AND lower(trim(coalesce(study_session_lesson,'')))=lower(trim(%s))""",(ct,ls))
+        conn.commit()
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback(); raise HTTPException(500,f"Lỗi xóa Knowledge Base: {type(exc).__name__}: {exc}")
+    finally:
+        conn.close()
+    _invalidate_catalog_cache(); b2_deleted=0
+    if not content_type and not lesson and not topic:
+        if b2_delete_key(f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"): b2_deleted+=1
+        for key in image_keys:
+            if b2_delete_key(key): b2_deleted+=1
+    return {"source_file":source_file,"content_type":content_type,"lesson":lesson,"topic":topic,"deleted_documents":deleted_documents,"deleted_lesson_cache":deleted_lesson_cache,"deleted_vision_cache":deleted_vision_cache,"deleted_images":deleted_images,"deleted_assets":deleted_assets,"b2_deleted":b2_deleted,"namespaces":namespaces,"pinecone_filter":pine_filter}
+
+
+@app.post("/admin/api/knowledge/delete")
+def admin_knowledge_delete(payload: dict):
+    check_admin(str(payload.get("password") or ""))
+    return {"success":True,"message":"Đã xóa Knowledge Base scope.","result":_delete_knowledge_scope(source_file=payload.get("source_file"),content_type=payload.get("content_type"),lesson=payload.get("lesson"),topic=payload.get("topic"))}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
@@ -6702,6 +6809,12 @@ Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __d
 </div>
 
 <div class="card">
+<h3>🗂️ Quản lý tài liệu / bài học / chủ đề</h3>
+<div class="small" style="margin-bottom:10px">Xóa tại đây sẽ xóa cả Pinecone vector và Knowledge Cache PostgreSQL tương ứng.</div>
+<div id="knowledgeCatalogAdmin">Đang tải...</div>
+</div>
+
+<div class="card">
 <h3>💳 Cấu hình gói thanh toán</h3>
 <div class="small" style="margin-bottom:10px">Thiết lập giá và QR code cho 1 tháng / 3 tháng / 6 tháng. Sau khi user chuyển khoản, Admin xác nhận rồi cấp gói tương ứng.</div>
 <div id="paymentPackagesAdmin"></div>
@@ -6750,6 +6863,7 @@ async function login(){
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadUsers();
     await loadPaymentPackages();
+    await loadKnowledgeCatalog();
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
 }
@@ -6812,6 +6926,14 @@ async function uploadKnowledge(event){
   }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
   finally{btn.disabled=false}
 }
+
+function renderKnowledgeCatalog(nodes){
+  const box=document.getElementById("knowledgeCatalogAdmin");
+  if(!nodes||!nodes.length){box.innerHTML='<div class="small">Chưa có tài liệu.</div>';return;}
+  box.innerHTML=nodes.map(doc=>{const cts=doc.content_types||[];return `<div style="border:1px solid #ddd;border-radius:10px;padding:12px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div><b>📄 ${esc(doc.source_file)}</b><div class="small">${esc(doc.subject||"")} · ${esc(doc.namespace||"__default__")}</div></div><button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file})})'>🗑️ Xóa tài liệu</button></div>${cts.map(ct=>`<div style="border-top:1px solid #eee;margin-top:9px;padding-top:9px"><b>Loại nội dung:</b> ${esc(ct.content_type)}${(ct.lessons||[]).map(ls=>`<div style="margin:7px 0 7px 14px;background:#f8fafc;border-radius:8px;padding:8px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""}</div><button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button></div>${(ls.topics||[]).length?`<div class="small" style="margin:6px 0 0 14px"><b>Chủ đề:</b> ${(ls.topics||[]).map(t=>`<span style='display:inline-flex;align-items:center;gap:4px;border:1px solid #ddd;border-radius:999px;padding:3px 7px;margin:3px 4px 0 0;background:#fff'>${esc(t.topic)} <button class='red' style='padding:2px 6px' onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson,topic:t.topic})})'>×</button></span>`).join("")}</div>`:""}</div>`).join("")}</div>`).join("")}</div>`;}).join("");
+}
+async function loadKnowledgeCatalog(){const box=document.getElementById("knowledgeCatalogAdmin");try{const d=await api("/admin/api/knowledge/catalog?password="+encodeURIComponent(pw));renderKnowledgeCatalog(d.documents||[]);}catch(e){box.innerHTML='<span style="color:#c00">Không tải được catalog: '+esc(e.message)+'</span>';}}
+async function deleteKnowledgeScope(scope){const what=scope.topic?`chủ đề "${scope.topic}"`:scope.lesson?`bài học "${scope.lesson}"`:`tài liệu "${scope.source_file}"`;if(!confirm(`Xóa ${what}?\n\nSẽ xóa vector/chunk Pinecone và Knowledge Cache liên quan. Thao tác này không thể hoàn tác.`))return;try{const d=await api("/admin/api/knowledge/delete",{method:"POST",body:JSON.stringify({...scope,password:pw})});alert("✅ "+d.message);await loadKnowledgeCatalog();}catch(e){alert("❌ Xóa thất bại: "+e.message);}}
 
 async function loadPaymentPackages(){
   try{
@@ -7109,6 +7231,18 @@ def b2_put_file(key: str, file_path: str, content_type: str):
     if B2_PUBLIC_BASE_URL:
         return f"{B2_PUBLIC_BASE_URL}/{key}"
     return None
+
+def b2_delete_key(key: str):
+    """Best-effort delete for an object already stored in Backblaze B2."""
+    if not key or not b2_ready():
+        return False
+    try:
+        b2.delete_object(Bucket=B2_BUCKET, Key=key)
+        return True
+    except Exception as exc:
+        print(f"[B2 DELETE] key={key!r} skipped: {type(exc).__name__}: {exc}")
+        return False
+
 
 def _extract_image_key(raw_key):
     """
@@ -8164,6 +8298,7 @@ async def admin_knowledge_upload(
     conn=db()
     try:
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM knowledge_documents WHERE source_file=%s", (source_file,))
             for r in records_meta:
                 cur.execute("""INSERT INTO knowledge_documents
                     (source_file,subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
