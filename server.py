@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.34-v19_29-study-v20_5-upload-memory-safe"
+BASELINE_VERSION = "19.35-japanese-language-auto-reply"
 import os
 import ast
 import io
@@ -4530,6 +4530,8 @@ def proxy_chat(
     if general_non_learning_request:
         print("[CHAT ROUTING] general non-learning request: bypass study RAG/images/suggestions")
         minimal_prompt = f"""Bạn là Doraemon. Đây là câu hỏi đời thường, không phải yêu cầu học tiếng Nhật.
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+
 Trả lời trực tiếp, ngắn gọn và thân thiện. Không giới thiệu bài học, không gợi ý bài tập, không nhắc lộ trình, không đính kèm ảnh học tập.
 Nếu câu hỏi yêu cầu dữ liệu thời gian thực mà hệ thống không có công cụ truy cập dữ liệu đó, hãy nói rõ bạn chưa có dữ liệu thời gian thực thay vì đoán.
 
@@ -4638,6 +4640,8 @@ Câu hỏi của người dùng:
                 thread_hint = f"\nNgữ cảnh nhẹ của boxchat hiện tại: {scope_label}."
 
         minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+
 Đây là câu trò chuyện đời thường/cảm xúc, KHÔNG phải yêu cầu truy xuất hay dạy bài học.
 Trả lời tự nhiên, ngắn gọn, đồng cảm và không tự mở bài học mới.
 Không gọi lại giáo trình, không đề xuất bài tập, không đính kèm ảnh học tập.
@@ -5959,6 +5963,11 @@ QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
 
     prompt = f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân.
 
+QUY TẮC NGÔN NGỮ:
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, hãy trả lời bằng tiếng Nhật, trừ khi người dùng yêu cầu ngôn ngữ khác.
+- Nếu người dùng đang dùng tiếng Việt, tiếp tục trả lời bằng tiếng Việt.
+
+
 NGUYÊN TẮC:
 - Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
 - Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
@@ -6025,7 +6034,9 @@ TIN NHẮN HIỆN TẠI:
             if curriculum_step == 0:
                 all_text="\n\n".join(f"[CHUNK_{i}] {str(sec.get('text') or '')}" for i,sec in enumerate(secs))
                 all_text=all_text[:14000]
-                cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân. Đây là BƯỚC 0 — GIỚI THIỆU của bài {runtime_lesson_cache.get('lesson','')}.
+                cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật cá nhân. Đây là BƯỚC 0 — GIỚI THIỆU
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ của bài {runtime_lesson_cache.get('lesson','')}.
 Dựa CHỈ trên các chunk nguồn bên dưới. Hãy:
 1) giới thiệu bài học và mục tiêu chính;
 2) liệt kê các từ vựng cần học, kèm cách đọc/kana và cách phát âm nếu nguồn có dữ kiện;
@@ -6040,7 +6051,9 @@ SOURCE CHUNKS:\n{all_text}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             elif 1 <= curriculum_step <= len(secs):
                 sec=secs[curriculum_step-1]
                 if curriculum_waiting == "chunk_answer":
-                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây vẫn là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây vẫn là PHẦN {curriculum_step}
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ của bài {runtime_lesson_cache.get('lesson','')}.
 Đây là lượt HỌC SINH TRẢ LỜI CÂU HỎI/BÀI TẬP THỰC SỰ NẰM TRONG CHUNK NÀY.
 CHỈ sử dụng đúng chunk bên dưới và vision facts của chính chunk này.
 Hãy đánh giá đáp án của học sinh, chỉ ra đúng/sai, giải thích ngắn gọn dựa trên nguồn, và nếu cần cho biết đáp án đúng.
@@ -6058,7 +6071,9 @@ LỊCH SỬ HỘI THOẠI: KHÔNG DÙNG LẠI LỊCH SỬ DÀI. Chỉ xem câu t
 ĐÁP ÁN CỦA HỌC SINH:
 {query_text}"""
                 else:
-                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step} của bài {runtime_lesson_cache.get('lesson','')}.
+                    cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là PHẦN {curriculum_step}
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ của bài {runtime_lesson_cache.get('lesson','')}.
 CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, dữ kiện, hình/bảng hoặc ví dụ từ bất kỳ chunk nào khác. Không tóm tắt các chunk khác và không dạy trước phần sau.
 - Giải thích rõ ràng, dễ hiểu.
 - Khai thác từ vựng/kanji/grammar có trong chính chunk này khi phù hợp; từ vựng phải kèm cách đọc và hướng dẫn phát âm nếu nguồn có.
@@ -6097,18 +6112,26 @@ TIN NHẮN HIỆN TẠI:
                     for i, sec2 in enumerate(runtime_lesson_cache.get("sections") or []):
                         full_sections.append(f"[CHUNK_{i}]\n" + str(sec2.get("text") or ""))
                     full_vision = json.dumps([x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if x.get("vision")], ensure_ascii=False, separators=(",", ":"))[:12000]
-                    cache_prompt=f"""Bạn là Doraemon, chấm và giải bài tập cuối bài.\n\nCÂU HỎI: {saved_q}\n\nBẰNG CHỨNG BAN ĐẦU: {saved_ev}\n\nKNOWLEDGE ĐẦY ĐỦ CỦA TOÀN BÀI:\n{chr(10).join(full_sections)}\n\nVISION FACTS CỦA TOÀN BÀI:\n{full_vision}\n\nCÂU TRẢ LỜI / YÊU CẦU HIỆN TẠI CỦA HỌC SINH:\n{query_text}\n\nNHIỆM VỤ:\n- Dùng TOÀN BỘ Knowledge + Vision Facts để giải và kiểm tra.\n- Nếu học sinh hỏi “đáp án là gì?”, “không biết”, hoặc hỏi lại đáp án, hãy tự giải và đưa ra đáp án đúng.\n- Nếu học sinh đã trả lời, đánh giá đúng/sai và giải thích ngắn gọn dựa trên toàn bộ nguồn.\n- TUYỆT ĐỐI không nói “giáo trình không có đáp án” chỉ vì không thấy một answer key riêng; hãy tự suy luận từ dữ kiện nguồn khi đủ dữ kiện.\n- Nếu dữ kiện không đủ để kết luận, nói rõ phần dữ kiện nào còn thiếu; không bịa đáp án.\n- Không tạo câu hỏi mới."""
+                    cache_prompt=f"""Bạn là Doraemon, chấm và giải bài tập cuối bài.
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+\n\nCÂU HỎI: {saved_q}\n\nBẰNG CHỨNG BAN ĐẦU: {saved_ev}\n\nKNOWLEDGE ĐẦY ĐỦ CỦA TOÀN BÀI:\n{chr(10).join(full_sections)}\n\nVISION FACTS CỦA TOÀN BÀI:\n{full_vision}\n\nCÂU TRẢ LỜI / YÊU CẦU HIỆN TẠI CỦA HỌC SINH:\n{query_text}\n\nNHIỆM VỤ:\n- Dùng TOÀN BỘ Knowledge + Vision Facts để giải và kiểm tra.\n- Nếu học sinh hỏi “đáp án là gì?”, “không biết”, hoặc hỏi lại đáp án, hãy tự giải và đưa ra đáp án đúng.\n- Nếu học sinh đã trả lời, đánh giá đúng/sai và giải thích ngắn gọn dựa trên toàn bộ nguồn.\n- TUYỆT ĐỐI không nói “giáo trình không có đáp án” chỉ vì không thấy một answer key riêng; hãy tự suy luận từ dữ kiện nguồn khi đủ dữ kiện.\n- Nếu dữ kiện không đủ để kết luận, nói rõ phần dữ kiện nào còn thiếu; không bịa đáp án.\n- Không tạo câu hỏi mới."""
                 else:
                     if saved_q:
-                        cache_prompt=f"""Chỉ kiểm tra câu hỏi đã được Doraemon xác định trước đây có phải là bài tập TOÀN BÀI chưa giải không. Chỉ dùng context B0+B1.\n[[GLOBAL_EXERCISE]]\nQ: {saved_q}\nE: {core_history[-1200:]}\nNếu không đủ căn cứ: [[NO_GLOBAL_EXERCISE]]."""
+                        cache_prompt=f"""Chỉ kiểm tra câu hỏi đã được Doraemon xác định trước đây có phải là bài tập TOÀN BÀI chưa giải không.
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ Chỉ dùng context B0+B1.\n[[GLOBAL_EXERCISE]]\nQ: {saved_q}\nE: {core_history[-1200:]}\nNếu không đủ căn cứ: [[NO_GLOBAL_EXERCISE]]."""
                     else:
-                        cache_prompt=f"""Bạn là Doraemon. Chỉ dùng CONTEXT B0 + B1 bên dưới để xác định có câu hỏi/bài tập TOÀN BÀI chưa giải hay không.\nNếu có, trả:\n[[GLOBAL_EXERCISE]]\nQ: <đúng câu hỏi>\nE: <bằng chứng ngắn>\nNếu không: [[NO_GLOBAL_EXERCISE]]. Không tạo câu hỏi mới và không dùng Knowledge khác.\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}"""
+                        cache_prompt=f"""Bạn là Doraemon. Chỉ dùng CONTEXT B0 + B1
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ bên dưới để xác định có câu hỏi/bài tập TOÀN BÀI chưa giải hay không.\nNếu có, trả:\n[[GLOBAL_EXERCISE]]\nQ: <đúng câu hỏi>\nE: <bằng chứng ngắn>\nNếu không: [[NO_GLOBAL_EXERCISE]]. Không tạo câu hỏi mới và không dùng Knowledge khác.\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}"""
             elif curriculum_step == curriculum_map["summary_step"]:
                 # Summary uses ONLY B0+B1 teaching context, plus the already stored exercise result.
                 core_history = str((study_session or {}).get("curriculum_intro_b0b1_history") or "").strip()
                 global_q = str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
                 global_result = str((study_session or {}).get("curriculum_global_exercise_result") or "").strip()
-                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT bài {runtime_lesson_cache.get('lesson','')}.\n\nCONTEXT ĐƯỢC PHÉP DÙNG:\n- CHỈ dùng phần Doraemon đã nói ở B0 (mở đầu) và B1 (chunk 1).\n- Không dùng các chunk 2+, Vision Facts hay Knowledge Cache trực tiếp.\n- Nếu có kết quả bài tập cuối bài đã được lưu bên dưới, dùng nó để nêu kết quả.\n- Không nói rằng “giáo trình không có đáp án” nếu bài tập đã có kết quả/đáp án được lưu; giữ cách diễn đạt tự nhiên và dựa trên dữ liệu được cung cấp.\n\nHãy tổng kết ngắn gọn theo context trên, nêu mục tiêu, từ vựng/phát âm, ngữ pháp, các điểm chính đã được giới thiệu ở B0+B1, và kết quả bài tập nếu có. Cuối cùng hỏi: “Cậu thấy mình đã nắm được bài này chưa?”\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}\n\nCÂU HỎI BÀI TẬP CUỐI BÀI (nếu có):\n{global_q or '(không có)'}\n\nKẾT QUẢ BÀI TẬP ĐÃ LƯU (nếu có):\n{global_result or '(chưa có)'}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
+                cache_prompt=f"""Bạn là Doraemon. Đây là BƯỚC CUỐI — TỔNG KẾT
+- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
+ bài {runtime_lesson_cache.get('lesson','')}.\n\nCONTEXT ĐƯỢC PHÉP DÙNG:\n- CHỈ dùng phần Doraemon đã nói ở B0 (mở đầu) và B1 (chunk 1).\n- Không dùng các chunk 2+, Vision Facts hay Knowledge Cache trực tiếp.\n- Nếu có kết quả bài tập cuối bài đã được lưu bên dưới, dùng nó để nêu kết quả.\n- Không nói rằng “giáo trình không có đáp án” nếu bài tập đã có kết quả/đáp án được lưu; giữ cách diễn đạt tự nhiên và dựa trên dữ liệu được cung cấp.\n\nHãy tổng kết ngắn gọn theo context trên, nêu mục tiêu, từ vựng/phát âm, ngữ pháp, các điểm chính đã được giới thiệu ở B0+B1, và kết quả bài tập nếu có. Cuối cùng hỏi: “Cậu thấy mình đã nắm được bài này chưa?”\n\nCONTEXT B0 + B1:\n{core_history[-5000:] or '(chưa có context B0+B1)'}\n\nCÂU HỎI BÀI TẬP CUỐI BÀI (nếu có):\n{global_q or '(không có)'}\n\nKẾT QUẢ BÀI TẬP ĐÃ LƯU (nếu có):\n{global_result or '(chưa có)'}\n\nTIN NHẮN HIỆN TẠI:\n{query_text}"""
             else:
                 cache_prompt=None
             if cache_prompt is not None:
