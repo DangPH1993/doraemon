@@ -6678,66 +6678,236 @@ def admin_knowledge_catalog(password: str):
     return {"success":True,"documents":_knowledge_catalog_tree(rows),"raw_count":len(rows)}
 
 
-def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None, lesson: str | None = None, topic: str | None = None):
-    source_file=os.path.basename(str(source_file or "").strip())
-    content_type=str(content_type or "").strip() or None
-    lesson=str(lesson or "").strip() or None
-    topic=str(topic or "").strip() or None
-    if not source_file: raise HTTPException(400,"source_file là bắt buộc.")
-    if topic and not lesson: raise HTTPException(400,"Xóa Chủ đề cần có Bài học.")
-    where=["source_file=%s"]; params=[source_file]
-    for col,val in (("content_type",content_type),("lesson",lesson),("topic",topic)):
+def _pinecone_scope_filter(source_file: str, content_type: str | None = None,
+                            lesson: str | None = None, topic: str | None = None):
+    """Build an exact Pinecone metadata identity filter.
+
+    Deletion scope is hierarchical and intentionally NEVER uses semantic similarity:
+      DOCUMENT = source_file
+      LESSON   = source_file + content_type + lesson
+      TOPIC    = source_file + content_type + lesson + topic
+    """
+    filt = {"source_file": {"$eq": source_file}}
+    if content_type:
+        filt["content_type"] = {"$eq": content_type}
+    if lesson:
+        filt["lesson"] = {"$eq": lesson}
+    if topic:
+        filt["topic"] = {"$eq": topic}
+    return filt
+
+
+def _pinecone_scope_exists(namespace: str, pine_filter: dict) -> bool:
+    """Return True when at least one vector still matches the exact delete scope.
+
+    Pinecone delete operations may be eventually consistent. We only need one
+    matching vector to prove that the scope is not fully removed, so top_k=1 is
+    enough and avoids pulling large result sets.
+    """
+    if not index:
+        raise RuntimeError("Pinecone chưa được khởi tạo.")
+    probe = index.query(
+        vector=[0.0] * 768,
+        top_k=1,
+        include_metadata=False,
+        namespace=namespace,
+        filter=pine_filter,
+    )
+    return bool(getattr(probe, "matches", None))
+
+
+def _delete_pinecone_scope_exact(namespace: str, pine_filter: dict, *, attempts: int = 5):
+    """Delete and verify an exact metadata scope, retrying for eventual consistency."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            index.delete(filter=pine_filter, namespace=namespace)
+        except Exception as exc:
+            last_error = exc
+            break
+
+        # Pinecone deletion is eventually consistent. Give the index a short
+        # window to converge, then probe the SAME exact filter again.
+        for probe_no in range(1, 5):
+            time.sleep(0.7 * probe_no)
+            try:
+                if not _pinecone_scope_exists(namespace, pine_filter):
+                    return {"namespace": namespace, "attempts": attempt, "verified_empty": True}
+            except Exception as exc:
+                last_error = exc
+                break
+
+    if last_error:
+        raise RuntimeError(f"Pinecone delete/verify failed: {type(last_error).__name__}: {last_error}")
+    raise RuntimeError(f"Pinecone vẫn còn vector trong scope sau {attempts} lần xóa/kiểm tra.")
+
+
+def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None,
+                             lesson: str | None = None, topic: str | None = None):
+    source_file = os.path.basename(str(source_file or "").strip())
+    content_type = str(content_type or "").strip() or None
+    lesson = str(lesson or "").strip() or None
+    topic = str(topic or "").strip() or None
+    if not source_file:
+        raise HTTPException(400, "source_file là bắt buộc.")
+    if topic and not lesson:
+        raise HTTPException(400, "Xóa Chủ đề cần có Bài học.")
+    if not index:
+        raise HTTPException(500, "Pinecone chưa được khởi tạo.")
+
+    # Normalize the requested values before any destructive operation.
+    where = ["source_file=%s"]
+    params = [source_file]
+    for col, val in (("content_type", content_type), ("lesson", lesson), ("topic", topic)):
         if val:
-            where.append(f"lower(trim({col}))=lower(trim(%s))"); params.append(val)
-    ws=" AND ".join(where)
-    conn=db(); image_keys=[]; namespaces=[]; matching_lessons=[]
+            where.append(f"lower(trim({col}))=lower(trim(%s))")
+            params.append(val)
+    ws = " AND ".join(where)
+
+    conn = db()
+    image_keys = []
+    namespaces = []
+    matching_lessons = []
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(f"SELECT DISTINCT namespace FROM knowledge_documents WHERE {ws}",tuple(params)); namespaces=[str(r.get("namespace") or "__default__") for r in cur.fetchall() or []] or ["__default__"]
-            cur.execute(f"SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}",tuple(params)); matching_lessons=[dict(r) for r in cur.fetchall() or []]
-            cur.execute(f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} AND image_key IS NOT NULL AND TRIM(image_key)<>''",tuple(params)); image_keys=[str(r.get("image_key") or "").strip() for r in cur.fetchall() if r.get("image_key")]
-        if not index: raise HTTPException(500,"Pinecone chưa được khởi tạo.")
-        pine_filter={"source_file":{"$eq":source_file}}
-        if content_type: pine_filter["content_type"]={"$eq":content_type}
-        if lesson: pine_filter["lesson"]={"$eq":lesson}
-        if topic: pine_filter["topic"]={"$eq":topic}
+            cur.execute(
+                f"SELECT DISTINCT namespace FROM knowledge_documents WHERE {ws}",
+                tuple(params),
+            )
+            namespaces = [str(r.get("namespace") or "__default__") for r in (cur.fetchall() or [])]
+
+            # If the DB row was already removed in a previous partial attempt,
+            # the production uploader still uses __default__; use it as the safe
+            # fallback so an orphan Pinecone scope can be cleaned explicitly.
+            if not namespaces:
+                namespaces = ["__default__"]
+
+            cur.execute(
+                f"SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}",
+                tuple(params),
+            )
+            matching_lessons = [dict(r) for r in (cur.fetchall() or [])]
+
+            cur.execute(
+                f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} "
+                "AND image_key IS NOT NULL AND TRIM(image_key)<>''",
+                tuple(params),
+            )
+            image_keys = [str(r.get("image_key") or "").strip() for r in (cur.fetchall() or []) if r.get("image_key")]
+
+        pine_filter = _pinecone_scope_filter(
+            source_file,
+            content_type=content_type,
+            lesson=lesson,
+            topic=topic,
+        )
+
+        pinecone_results = []
+        # IMPORTANT: Pinecone is deleted AND verified BEFORE PostgreSQL is mutated.
+        # If verification fails, the DB catalog/cache remains intact so we never
+        # create the opposite inconsistency (DB says gone while vectors remain).
         for ns in namespaces:
-            try: index.delete(filter=pine_filter,namespace=ns)
-            except Exception as exc: raise HTTPException(500,f"Không xóa được chunk Pinecone: {type(exc).__name__}: {exc}")
+            pinecone_results.append(_delete_pinecone_scope_exact(ns, pine_filter))
+
         with conn.cursor() as cur:
-            cur.execute(f"DELETE FROM knowledge_documents WHERE {ws}",tuple(params)); deleted_documents=cur.rowcount
-            cur.execute(f"DELETE FROM knowledge_lesson_cache WHERE {ws}",tuple(params)); deleted_lesson_cache=cur.rowcount
-            cur.execute(f"DELETE FROM knowledge_vision_cache WHERE {ws}",tuple(params)); deleted_vision_cache=cur.rowcount
-            cur.execute(f"DELETE FROM knowledge_images WHERE {ws}",tuple(params)); deleted_images=cur.rowcount
-            if not content_type and not lesson and not topic:
-                cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s",(source_file,)); deleted_assets=cur.rowcount
+            cur.execute(f"DELETE FROM knowledge_documents WHERE {ws}", tuple(params))
+            deleted_documents = cur.rowcount
+
+            cur.execute(f"DELETE FROM knowledge_lesson_cache WHERE {ws}", tuple(params))
+            deleted_lesson_cache = cur.rowcount
+
+            cur.execute(f"DELETE FROM knowledge_vision_cache WHERE {ws}", tuple(params))
+            deleted_vision_cache = cur.rowcount
+
+            cur.execute(f"DELETE FROM knowledge_images WHERE {ws}", tuple(params))
+            deleted_images = cur.rowcount
+
+            # Assets are document-level. Remove them only when the entire source
+            # file no longer has any catalog rows; never remove a shared asset while
+            # another lesson/topic from the same PDF remains.
+            cur.execute(
+                "SELECT COUNT(*) AS row_count FROM knowledge_documents WHERE source_file=%s",
+                (source_file,),
+            )
+            row = cur.fetchone()
+            row_count = int((row[0] if isinstance(row, tuple) else row.get("row_count")) or 0)
+            if row_count == 0:
+                cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s", (source_file,))
+                deleted_assets = cur.rowcount
             else:
-                # Use a named column + RealDictCursor here so this path is immune to
-                # tuple/dict cursor differences (the production bug manifested as KeyError: 0).
-                with conn.cursor(cursor_factory=RealDictCursor) as count_cur:
-                    count_cur.execute("SELECT COUNT(*) AS row_count FROM knowledge_documents WHERE source_file=%s", (source_file,))
-                    row_count = count_cur.fetchone() or {}
-                if int(row_count.get("row_count") or 0) == 0:
-                    cur.execute("DELETE FROM knowledge_assets WHERE source_file=%s", (source_file,)); deleted_assets=cur.rowcount
-                else:
-                    deleted_assets=0
+                deleted_assets = 0
+
+            # Close only sessions that belong to the exact lesson(s) being removed.
+            # A topic deletion does not accidentally terminate another lesson.
             for lr in matching_lessons:
-                ls=str(lr.get("lesson") or "").strip(); ct=str(lr.get("content_type") or "").strip()
-                if not ls: continue
-                cur.execute("""UPDATE user_learning_state SET study_session_active=FALSE,study_session_content_type=NULL,study_session_course=NULL,study_session_lesson=NULL,study_session_topic=NULL,study_session_started_at=NULL,study_end_prompt_pending=FALSE,curriculum_step=0,curriculum_waiting='continue',curriculum_exercise_answered=FALSE,curriculum_global_exercise_question='',curriculum_global_exercise_evidence='',curriculum_summary_notes='',curriculum_intro_history='',curriculum_intro_b0b1_history='',curriculum_global_exercise_result='' WHERE lower(trim(coalesce(study_session_content_type,'')))=lower(trim(%s)) AND lower(trim(coalesce(study_session_lesson,'')))=lower(trim(%s))""",(ct,ls))
+                ls = str(lr.get("lesson") or "").strip()
+                ct = str(lr.get("content_type") or "").strip()
+                if not ls:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE user_learning_state SET
+                        study_session_active=FALSE,
+                        study_session_content_type=NULL,
+                        study_session_course=NULL,
+                        study_session_lesson=NULL,
+                        study_session_topic=NULL,
+                        study_session_started_at=NULL,
+                        study_end_prompt_pending=FALSE,
+                        curriculum_step=0,
+                        curriculum_waiting='continue',
+                        curriculum_exercise_answered=FALSE,
+                        curriculum_global_exercise_question='',
+                        curriculum_global_exercise_evidence='',
+                        curriculum_summary_notes='',
+                        curriculum_intro_history='',
+                        curriculum_intro_b0b1_history='',
+                        curriculum_global_exercise_result=''
+                    WHERE lower(trim(coalesce(study_session_content_type,'')))=lower(trim(%s))
+                      AND lower(trim(coalesce(study_session_lesson,'')))=lower(trim(%s))
+                      AND lower(trim(coalesce(study_session_lesson,'')))<>''
+                    """,
+                    (ct, ls),
+                )
         conn.commit()
+
     except HTTPException:
-        conn.rollback(); raise
+        conn.rollback()
+        raise
     except Exception as exc:
-        conn.rollback(); raise HTTPException(500,f"Lỗi xóa Knowledge Base: {type(exc).__name__}: {exc}")
+        conn.rollback()
+        raise HTTPException(500, f"Lỗi xóa Knowledge Base: {type(exc).__name__}: {exc}")
     finally:
         conn.close()
-    _invalidate_catalog_cache(); b2_deleted=0
+
+    _invalidate_catalog_cache()
+
+    # B2 deletion is conservative. A topic/lesson may reference an image key that
+    # is shared elsewhere, so only delete physical objects automatically when the
+    # entire source document is removed.
+    b2_deleted = 0
     if not content_type and not lesson and not topic:
-        if b2_delete_key(f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}"): b2_deleted+=1
+        if b2_delete_key(f"pdf/{re.sub(r'[^A-Za-z0-9_.-]+','_', source_file)}"):
+            b2_deleted += 1
         for key in image_keys:
-            if b2_delete_key(key): b2_deleted+=1
-    return {"source_file":source_file,"content_type":content_type,"lesson":lesson,"topic":topic,"deleted_documents":deleted_documents,"deleted_lesson_cache":deleted_lesson_cache,"deleted_vision_cache":deleted_vision_cache,"deleted_images":deleted_images,"deleted_assets":deleted_assets,"b2_deleted":b2_deleted,"namespaces":namespaces,"pinecone_filter":pine_filter}
+            if b2_delete_key(key):
+                b2_deleted += 1
+
+    return {
+        "source_file": source_file,
+        "content_type": content_type,
+        "lesson": lesson,
+        "topic": topic,
+        "deleted_documents": deleted_documents,
+        "deleted_lesson_cache": deleted_lesson_cache,
+        "deleted_vision_cache": deleted_vision_cache,
+        "deleted_images": deleted_images,
+        "deleted_assets": deleted_assets,
+        "b2_deleted": b2_deleted,
+        "namespaces": namespaces,
+        "pinecone_filter": pine_filter,
+        "pinecone_verified": pinecone_results,
+    }
 
 
 @app.post("/admin/api/knowledge/delete")
