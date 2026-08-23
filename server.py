@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.19-curriculum-waiting-50-fix"
+BASELINE_VERSION = "19.20-curriculum-chunk-context-only"
 import os
 import ast
 import io
@@ -5944,11 +5944,10 @@ Sau khi nhận xét xong, hỏi học sinh có muốn sang phần tiếp theo kh
 CHUNK SOURCE:
 {str(sec.get('text') or '')}
 
-VISION FACTS:
+VISION FACTS CỦA CHUNK NÀY:
 {vision_text}
 
-RECENT CHAT:
-{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}
+LỊCH SỬ HỘI THOẠI: KHÔNG DÙNG LẠI LỊCH SỬ DÀI. Chỉ xem câu trả lời hiện tại bên dưới.
 
 ĐÁP ÁN CỦA HỌC SINH:
 {query_text}"""
@@ -5968,14 +5967,13 @@ CHỈ giải thích đúng MỘT CHUNK dưới đây. Không lấy nội dung, d
 - Marker phải xuất hiện đúng 1 lần ở CUỐI câu trả lời: `[[CHUNK_EXERCISE]]`, `[[WHOLE_LESSON_EXERCISE]]` hoặc `[[NO_CHUNK_EXERCISE]]`. Không giải thích marker cho học sinh.
 - Nếu không có bài tập tại chunk này, kết thúc phần giải thích bằng một lời mời sang phần tiếp theo; backend sẽ thêm nút “Bạn muốn sang phần tiếp theo không?”.
 
-CHUNK SOURCE:
+CHUNK SOURCE DUY NHẤT:
 {str(sec.get('text') or '')}
 
-VISION FACTS:
+VISION FACTS CỦA CHUNK DUY NHẤT:
 {vision_text}
 
-RECENT CHAT:
-{json.dumps(prompt_history, ensure_ascii=False, separators=(',', ':'))}
+QUY TẮC CONTEXT: Không dùng lịch sử chat dài, không lấy dữ kiện từ chunk khác, không lấy context của phần trước. Chỉ sử dụng chunk hiện tại + vision facts của chunk hiện tại.
 
 TIN NHẮN HIỆN TẠI:
 {query_text}"""
@@ -6042,6 +6040,8 @@ TIN NHẮN:\n{query_text}"""
                 f"curriculum_step={curriculum_step} sections={len(cache_selected_sections)} "
                 f"prompt_chars={len(prompt)} vision_fact_chars={len(vision_text)} image_parts_sent_to_gemini=0"
             )
+            if curriculum_flow_active and 1 <= curriculum_step <= len(curriculum_map["sections"]):
+                print(f"[CURRICULUM CHUNK CONTEXT AUDIT] request={request_id} mode=exact_chunk_only history_in_prompt=0 selected_chunks=1 selected_vision_chars={len(vision_text)}")
         else:
             marker_rule = ""
             if rich_images:
