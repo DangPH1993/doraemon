@@ -5252,10 +5252,39 @@ Tin nhắn hiện tại:
     curriculum_flow_active = bool(
         runtime_cache_hit and requested_content_type == "Giáo trình" and study_session
     )
+    # Refresh durable curriculum state once more after the runtime cache lookup so
+    # questions captured at B0/B1 are visible before deciding whether a global
+    # exercise checkpoint is actually needed.
+    if curriculum_flow_active:
+        refreshed_session = _get_study_session(user["id"], chatbox_id=getattr(data, "chatbox_id", None))
+        if refreshed_session:
+            study_session = refreshed_session
     curriculum_map = _curriculum_step_map(runtime_lesson_cache) if curriculum_flow_active else None
     curriculum_step = int((study_session or {}).get("curriculum_step") or 0) if curriculum_flow_active else None
     curriculum_waiting = str((study_session or {}).get("curriculum_waiting") or "continue") if curriculum_flow_active else None
     curriculum_exercise_answered = bool((study_session or {}).get("curriculum_exercise_answered")) if curriculum_flow_active else False
+
+    # Do not expose a visible no-op checkpoint when the lesson has no saved
+    # whole-lesson exercise. After the last teaching chunk, jump directly to the
+    # final summary in the same Continue request. This keeps the UI one-click-per
+    # meaningful-step and avoids an extra low-value Gemini detection turn.
+    if (
+        curriculum_flow_active
+        and curriculum_step == curriculum_map["global_exercise_step"]
+        and not str((study_session or {}).get("curriculum_global_exercise_question") or "").strip()
+    ):
+        next_step = curriculum_map["summary_step"]
+        _set_curriculum_flow(user["id"], step=next_step, waiting="final", exercise_answered=False)
+        study_session["curriculum_step"] = next_step
+        study_session["curriculum_waiting"] = "final"
+        study_session["curriculum_exercise_answered"] = False
+        curriculum_step = next_step
+        curriculum_waiting = "final"
+        curriculum_exercise_answered = False
+        print(
+            f"[CURRICULUM FLOW] skip_empty_global_exercise_step "
+            f"global_step={curriculum_map['global_exercise_step']} -> summary_step={next_step}"
+        )
 
     # In the curriculum flow, the Continue button is always available—even when
     # a chunk/global exercise is still unanswered. Pressing Continue advances one
