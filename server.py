@@ -1,4 +1,4 @@
-# VERSION: v19_61 — vocabulary/exercise DB-first fix
+# VERSION: v19_62 — vocabulary pronunciation + GenAI follow-up flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
 import ast
@@ -2846,7 +2846,9 @@ def _published_curriculum_vocabulary_text(step):
         example=pick(item,"example","content")
         if writing or reading or meaning:
             row=[f"{i}. {writing}" if writing else f"{i}."]
-            if reading: row.append(f"   📖 Cách đọc: {reading}")
+            if reading:
+                row.append(f"   📖 Cách đọc: {reading}")
+                row.append(f"   🔊 Phát âm: {reading}")
             if meaning: row.append(f"   🇻🇳 Nghĩa: {meaning}")
             if example: row.append(f"   Ví dụ: {example}")
             lines.append("\n".join(row))
@@ -5529,15 +5531,71 @@ Tin nhắn hiện tại:
                 study_session["curriculum_exercise_answered"]=False
                 print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} text_advance={current_step}")
 
-            # Exercise answer turn: show the exact B2 answer stored in DB.
-            # 'mình không biết' follows the same path; there is deliberately no LLM.
-            elif requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
+            step=_published_curriculum_step(runtime_lesson_cache,current_step)
+
+            # Exercise submission uses GenAI for evaluation/explanation, but the
+            # official answer shown to the learner always comes verbatim from DB.
+            if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
+                answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
+                official_answer=str((answer_step or {}).get("text") or "").strip()
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Học sinh vừa nộp câu trả lời cho bài tập.
+
+BÀI: {requested_lesson}
+CÂU HỎI/BƯỚC HIỆN TẠI:
+{step.get('text','')}
+
+CÂU TRẢ LỜI HỌC SINH:
+{query_text.strip()}
+
+ĐÁP ÁN CHÍNH THỨC TRONG DB:
+{official_answer}
+
+Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức. Nếu chưa đủ dữ liệu để chấm chắc chắn, nói rõ điều đó."""
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+                gen_started=time.perf_counter()
+                evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=query_text.strip())
                 answered=True
                 waiting="continue"
-                # Keep the state on the question step so the button advances once.
                 _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=True)
                 study_session["curriculum_exercise_answered"]=True
-                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json")
+                blocks=[{"type":"text","text":evaluation or ""}]
+                if official_answer:
+                    blocks.append({"type":"text","text":"📘 **Đáp án chính thức trong DB:**\n\n"+official_answer})
+                blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                blocks.extend(_curriculum_continue_blocks(current_step))
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1")
+                return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
+
+            # Any other ordinary learner question in the active lesson is a
+            # separate GenAI teacher turn, grounded by the current DB step.
+            if not data.action and str(query_text or "").strip():
+                question_text=query_text.strip()
+                db_text=_published_curriculum_vocabulary_text(step) if requested_content_type == "Từ vựng" else str(step.get("text") or "").strip()
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật trong bài học đang mở.
+Chỉ dùng dữ liệu PUBLISHED trong DB dưới đây làm nguồn sự thật. Được phép giải thích và trả lời câu hỏi tự nhiên của học sinh, nhưng không được bịa dữ kiện ngoài nguồn.
+
+LOẠI: {requested_content_type}
+BÀI: {requested_lesson}
+BƯỚC: {step.get('code')} - {step.get('title')}
+
+NỘI DUNG DB:
+{db_text}
+
+CÂU HỎI HỌC SINH:
+{question_text}
+
+Nếu câu hỏi liên quan đến từ vựng, luôn dạy đủ chữ Nhật + cách đọc/kana + phát âm dựa trên reading trong DB + nghĩa tiếng Việt khi DB có. Nếu DB không có thông tin cần thiết, nói rõ thay vì đoán."""
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+                gen_started=time.perf_counter()
+                answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
+                blocks=[{"type":"text","text":answer or ""}]
+                for im in step.get("images") or []:
+                    if im.get("url"): blocks.append({"type":"image","key":im.get("key"),"url":im.get("url"),"page":im.get("page"),"caption":im.get("caption","")})
+                if not step.get("is_final"):
+                    blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                    blocks.extend(_curriculum_continue_blocks(current_step))
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} genai=1 embedding=0 pinecone=0")
+                return {"reply":answer or "","model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
             if requested_content_type == "Bài tập" and answered:
@@ -7743,8 +7801,22 @@ def _curriculum_step_plan(content_type, source_digest):
     return steps
 
 def _curriculum_generate_step(content_type, lesson, step, source_digest):
-    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.\n\nTrả JSON với schema: {{\"title\":\"...\",\"content\":\"...\",\"source_refs\":[{{\"page\":1,\"reason\":\"...\"}}],\"images\":[{{\"image_url\":\"...\",\"image_key\":\"...\",\"caption\":\"...\"}}],\"items\":[]}}\n\nNGUỒN:\n{source_digest}"""
-    return _curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
+    extra_rules=""
+    if str(content_type or "").strip() == "Từ vựng":
+        extra_rules="""\n\nQUY TẮC BẮT BUỘC CHO TỪ VỰNG:
+- Mỗi item phải có writing/word, reading/kana, pronunciation và meaning khi nguồn có.
+- pronunciation phải là cách phát âm dựa trên reading/kana ĐÚNG TỪ NGUỒN; không tự đoán IPA/romaji.
+- Nếu nguồn có reading thì tuyệt đối không được để thiếu reading/pronunciation.
+- Ưu tiên schema item: {{"writing":"...","reading":"...","pronunciation":"...","meaning":"...","example":"..."}}.
+- Nếu nguồn thật sự không có reading thì để reading/pronunciation rỗng, không bịa.
+"""
+    elif str(content_type or "").strip() == "Giáo trình":
+        extra_rules="""\n\nQUY TẮC KHI BƯỚC NÀY DẠY TỪ VỰNG:
+- Mọi từ mới phải kèm chữ Nhật + cách đọc/kana + phát âm dựa trên reading trong nguồn + nghĩa tiếng Việt nếu nguồn có.
+- Không chỉ liệt kê nghĩa và không tự đoán reading/phát âm.
+"""
+    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
+    return _curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}" )
 
 @app.post('/admin/api/curriculum/draft-upload')
 async def admin_curriculum_draft_upload(
