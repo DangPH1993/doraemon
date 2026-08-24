@@ -1,4 +1,4 @@
-# VERSION: v19_65 — strict whole-message Japanese response language fix
+# VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
@@ -83,8 +83,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.44-ai-curriculum-db-first-fix")
-SERVER_VERSION = "2026-08-24-curriculum-step-delete-image-state"
+print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
+SERVER_VERSION = "2026-08-24-v19_66-one-exchange-genai-context"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3855,6 +3855,33 @@ def _normalize_chat_history(chat_history, max_messages=20):
     return recent
 
 
+def _last_chat_exchange(recent_history):
+    """Return only the latest user+assistant/model exchange for lightweight GenAI turns.
+
+    This is deliberately separate from the larger routing/history window used by
+    Study Plan and lesson routing. Vocabulary/Exercise GenAI teacher turns only
+    need one preceding exchange, plus the current user message.
+    """
+    hist=list(recent_history or [])
+    if not hist:
+        return []
+    latest_model_idx=None
+    for i in range(len(hist)-1, -1, -1):
+        if str(hist[i].get("role") or "").strip().lower() == "model":
+            latest_model_idx=i
+            break
+    if latest_model_idx is not None:
+        user_idx=None
+        for i in range(latest_model_idx-1, -1, -1):
+            if str(hist[i].get("role") or "").strip().lower() == "user":
+                user_idx=i
+                break
+        if user_idx is not None:
+            return [hist[user_idx], hist[latest_model_idx]]
+    # Fallback: one latest message only. Never return a larger history window.
+    return [hist[-1]]
+
+
 def _infer_plan_content_type_from_history(recent_history):
     """Infer a pending plan subtype from the most recent explicit user request.
 
@@ -5745,20 +5772,22 @@ Tin nhắn hiện tại:
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
                 official_answer=str((answer_step or {}).get("text") or "").strip()
-                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Học sinh vừa nộp câu trả lời cho bài tập.
+                one_exchange=_last_chat_exchange(recent_history)
+                one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một lượt hỏi đáp ngắn trong bài tập.
+Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại; không cần toàn bộ lịch sử chat.
 
-BÀI: {requested_lesson}
-CÂU HỎI/BƯỚC HIỆN TẠI:
-{step.get('text','')}
+LƯỢT HỘI THOẠI TRƯỚC:
+{one_exchange_text}
 
-CÂU TRẢ LỜI HỌC SINH:
+TIN NHẮN HIỆN TẠI / CÂU TRẢ LỜI CỦA HỌC SINH:
 {query_text.strip()}
 
 ĐÁP ÁN CHÍNH THỨC TRONG DB:
 {official_answer}
 
-Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức. Nếu chưa đủ dữ liệu để chấm chắc chắn, nói rõ điều đó."""
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức."""
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=query_text.strip())
                 answered=True
@@ -5789,22 +5818,19 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
             # separate GenAI teacher turn, grounded by the current DB step.
             if not data.action and str(query_text or "").strip():
                 question_text=query_text.strip()
-                db_text=_published_curriculum_vocabulary_text(step) if requested_content_type == "Từ vựng" else str(step.get("text") or "").strip()
-                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật trong bài học đang mở.
-Chỉ dùng dữ liệu PUBLISHED trong DB dưới đây làm nguồn sự thật. Được phép giải thích và trả lời câu hỏi tự nhiên của học sinh, nhưng không được bịa dữ kiện ngoài nguồn.
+                one_exchange=_last_chat_exchange(recent_history)
+                one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi tiếp nối trong bài {requested_content_type}.
+Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không gửi/không cần toàn bộ lịch sử chat hay toàn bộ lesson context.
 
-LOẠI: {requested_content_type}
-BÀI: {requested_lesson}
-BƯỚC: {step.get('code')} - {step.get('title')}
+LƯỢT HỘI THOẠI TRƯỚC:
+{one_exchange_text}
 
-NỘI DUNG DB:
-{db_text}
-
-CÂU HỎI HỌC SINH:
+CÂU HỎI HIỆN TẠI:
 {question_text}
 
-Nếu câu hỏi liên quan đến từ vựng, luôn dạy đủ chữ Nhật + cách đọc/kana + phát âm dựa trên reading trong DB + nghĩa tiếng Việt khi DB có. Nếu DB không có thông tin cần thiết, nói rõ thay vì đoán."""
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đến từ vựng, giữ đúng chữ Nhật, cách đọc/phát âm và nghĩa đã xuất hiện trong lượt trước; không tự bịa. Nếu lượt trước không đủ dữ kiện thì nói rõ điều đó."""
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
                 blocks=[{"type":"text","text":answer or ""}]
