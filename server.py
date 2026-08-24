@@ -7765,28 +7765,42 @@ def admin_curriculum_drafts(password: str):
     finally: conn.close()
 
 @app.post('/admin/api/curriculum/drafts/{draft_id}/delete')
-def admin_curriculum_draft_delete_post(draft_id:int,payload:dict):
-    """Reliable POST delete endpoint for Admin UI; DELETE remains supported for compatibility."""
-    password=str((payload or {}).get('password') or '')
-    check_admin(password)
+async def admin_curriculum_draft_delete_post(draft_id:int, password:str = '', payload:dict | None = None):
+    """Robust Draft delete: accepts password from query OR JSON body."""
+    # Prefer explicit query password; fall back to JSON body for older clients.
+    pw = str(password or '').strip()
+    if not pw and isinstance(payload, dict):
+        pw = str(payload.get('password') or '').strip()
+    check_admin(pw)
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT status,source_file,content_type,lesson FROM curriculum_drafts WHERE id=%s",(draft_id,))
+            cur.execute("SELECT id,status,source_file,content_type,lesson FROM curriculum_drafts WHERE id=%s FOR UPDATE",(draft_id,))
             row=cur.fetchone()
             if not row:
                 raise HTTPException(404,'Draft không tồn tại.')
-            if str(row.get('status') or '').upper() == 'PUBLISHED':
+            status=str(row.get('status') or '').upper()
+            if status == 'PUBLISHED':
                 raise HTTPException(400,'Draft đã publish, không thể xóa khỏi danh sách Draft.')
-            cur.execute("DELETE FROM curriculum_drafts WHERE id=%s",(draft_id,))
+            # Explicitly remove only this draft. Other drafts for the same PDF/lesson remain untouched.
+            cur.execute("DELETE FROM curriculum_drafts WHERE id=%s AND status <> 'PUBLISHED' RETURNING id",(draft_id,))
+            deleted=cur.fetchone()
+            if not deleted:
+                raise HTTPException(409,'Draft không còn ở trạng thái có thể xóa.')
         conn.commit()
     except HTTPException:
         conn.rollback(); raise
-    except Exception:
-        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, f'Xóa Draft thất bại: {type(exc).__name__}: {exc}')
     finally:
         conn.close()
     return {'success':True,'draft_id':draft_id,'message':'Đã xóa Draft.'}
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}/remove')
+async def admin_curriculum_draft_remove(draft_id:int, password:str = ''):
+    """Simple query-password endpoint used by the Admin UI to avoid body/proxy ambiguity."""
+    return await admin_curriculum_draft_delete_post(draft_id=draft_id, password=password, payload=None)
 
 @app.get('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_get(draft_id:int,password:str):
@@ -8250,7 +8264,7 @@ async function deleteCurriculumDraft(id,lesson){
   const label=String(lesson||'Draft #'+id);
   if(!confirm(`Xóa Draft "${label}"?\n\nChỉ xóa bản Draft này, không ảnh hưởng giáo trình PUBLISHED của Doraemon.`)) return;
   try{
-    await api('/admin/api/curriculum/drafts/'+id+'/delete',{method:'POST',body:JSON.stringify({password:pw})});
+    await api('/admin/api/curriculum/drafts/'+id+'/remove?password='+encodeURIComponent(pw),{method:'POST'});
     if(Number(window.currentCurriculumDraftId||0)===Number(id)){const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}
     await loadCurriculumDrafts();
     const st=document.getElementById('curStatus'); if(st) st.textContent=`✅ Đã xóa Draft #${id}.`;
