@@ -385,6 +385,7 @@ def startup():
         print("WARNING: Backblaze B2 chưa được cấu hình; ảnh/PDF sẽ không được lưu cloud.")
     if DATABASE_URL:
         init_db()
+        init_curriculum_db()
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
@@ -7127,6 +7128,266 @@ def admin_knowledge_delete(payload: dict):
     return {"success":True,"message":"Đã xóa Knowledge Base scope.","result":_delete_knowledge_scope(source_file=payload.get("source_file"),content_type=payload.get("content_type"),lesson=payload.get("lesson"),topic=payload.get("topic"))}
 
 
+
+
+def init_curriculum_db():
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_drafts (
+                id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
+                content_type VARCHAR(30) NOT NULL, lesson VARCHAR(255) NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'AI_DRAFT',
+                version INTEGER NOT NULL DEFAULT 1, draft_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(source_file, content_type, lesson, version)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_lessons (
+                id BIGSERIAL PRIMARY KEY, draft_id BIGINT, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
+                content_type VARCHAR(30) NOT NULL, lesson VARCHAR(255) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'PUBLISHED',
+                version INTEGER NOT NULL DEFAULT 1, raw_source_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(source_file, content_type, lesson, version)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_steps (
+                id BIGSERIAL PRIMARY KEY, lesson_id BIGINT NOT NULL REFERENCES curriculum_lessons(id) ON DELETE CASCADE,
+                step_code VARCHAR(20) NOT NULL, step_order INTEGER NOT NULL, title VARCHAR(500) NOT NULL DEFAULT '',
+                step_type VARCHAR(50) NOT NULL DEFAULT 'lesson', content_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(lesson_id, step_code)
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_scope ON curriculum_lessons(content_type, lesson, status);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_steps_lesson ON curriculum_steps(lesson_id, step_order);")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+CURRICULUM_STEP_RULES = {
+    'Giáo trình': [
+        {'code':'B0','title':'Giới thiệu mục đích bài học','type':'intro'},
+        {'code':'B1','title':'Giới thiệu từ vựng và ngữ pháp, câu hỏi toàn bài nếu có','type':'overview'},
+        {'code':'SECTION','title':'Các section và câu hỏi từng section nếu có','type':'section'},
+        {'code':'FINAL','title':'Tổng kết','type':'summary'},
+    ],
+    'Từ vựng': [
+        {'code':'B0','title':'Giới thiệu từ vựng: cách đọc, nghĩa, cách viết','type':'vocabulary'},
+        {'code':'B1','title':'Một số ví dụ','type':'examples'},
+        {'code':'B2','title':'Một số bài tập','type':'exercise'},
+    ],
+    'Ngữ pháp': [
+        {'code':'B0','title':'Giới thiệu cấu trúc ngữ pháp','type':'grammar'},
+        {'code':'B1','title':'Một số ví dụ','type':'examples'},
+        {'code':'B2','title':'Một số bài tập','type':'exercise'},
+    ],
+    'Bài tập': [
+        {'code':'B0','title':'Giới thiệu bài tập','type':'exercise_intro'},
+        {'code':'B1','title':'Đánh giá câu trả lời user','type':'evaluation'},
+        {'code':'B2','title':'Đáp án','type':'answer'},
+        {'code':'B3','title':'Bài tập tương tự','type':'similar_exercise'},
+    ],
+    'Truyện đọc': [
+        {'code':'B0','title':'Nội dung truyện','type':'story'},
+        {'code':'B1','title':'Bản dịch tiếng Việt','type':'translation'},
+        {'code':'B2','title':'Từ vựng','type':'vocabulary'},
+        {'code':'B3','title':'Ngữ pháp','type':'grammar'},
+    ],
+}
+
+def _normalize_curriculum_steps(content_type, steps, source_digest):
+    raw=[s for s in (steps or []) if isinstance(s,dict)]
+    if content_type == 'Giáo trình':
+        b0=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B0'), {'code':'B0','title':'Giới thiệu mục đích bài học','type':'intro'})
+        b1=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B1'), {'code':'B1','title':'Giới thiệu từ vựng và ngữ pháp, câu hỏi toàn bài nếu có','type':'overview'})
+        final=next((dict(s) for s in raw if str(s.get('code') or '').upper() in {'FINAL','SUMMARY'}), {'code':'FINAL','title':'Tổng kết','type':'summary'})
+        sections=[dict(s) for s in raw if str(s.get('code') or '').upper() not in {'B0','B1','FINAL','SUMMARY'}]
+        for i,s in enumerate(sections,1):
+            s['code']=f'B{i+1}'
+            s.setdefault('type','section')
+            s.setdefault('title',f'Section {i}')
+        return [b0,b1,*sections,final]
+    rules=CURRICULUM_STEP_RULES.get(content_type) or []
+    out=[]
+    for rule in rules:
+        code=rule['code']; found=next((dict(s) for s in raw if str(s.get('code') or '').upper()==code.upper()),{})
+        found['code']=code; found.setdefault('title',rule['title']); found.setdefault('type',rule['type']); out.append(found)
+    return out
+
+def _curriculum_source_digest(pages):
+    parts=[]
+    for p in pages:
+        text=str(p.get('text') or '').strip()
+        if text:
+            parts.append(f"[TRANG {p.get('page')}]\n{text[:6000]}")
+        for img in (p.get('images') or []):
+            vision=img.get('vision') or {}
+            desc='; '.join(str(vision.get(k) or '').strip() for k in ('term','reading','meaning','associated_text','description','explanation') if str(vision.get(k) or '').strip())
+            if desc:
+                parts.append(f"[OCR/VISION ẢNH TRANG {p.get('page')}] {desc}")
+    return '\n\n'.join(parts)[:50000]
+
+def _curriculum_ai_json(prompt, operation):
+    if not gemini:
+        raise HTTPException(500, 'Gemini chưa được khởi tạo.')
+    response=gemini.models.generate_content(
+        model=GEMINI_MODEL, contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.1, thinking_config=types.ThinkingConfig(thinking_level='low'), response_mime_type='application/json')
+    )
+    _log_gemini_usage(response, operation=operation)
+    return _parse_gemini_json(response.text or '{}')
+
+def _curriculum_step_plan(content_type, source_digest):
+    rule=json.dumps(CURRICULUM_STEP_RULES.get(content_type) or [], ensure_ascii=False)
+    prompt=f"""Bạn là AI biên soạn giáo trình cho Doraemon.\nLoại nội dung: {content_type}\n\nQUY TẮC BƯỚC BẮT BUỘC:\n{rule}\n\nNguồn tài liệu dưới đây là nguồn sự thật. Không được tạo ra kiến thức không có trong nguồn. Với Giáo trình, phải biến marker SECTION thành số section thực tế được tìm thấy; luôn giữ B0, B1 và bước cuối FINAL. Các loại khác phải giữ đúng số bước và mã bước đã quy định.\n\nNGUỒN:\n{source_digest}\n\nTrả JSON: {{\"steps\":[{{\"code\":\"B0\",\"title\":\"...\",\"instruction\":\"...\"}}]}}"""
+    data=_curriculum_ai_json(prompt, 'curriculum_step_plan')
+    steps=data.get('steps') if isinstance(data.get('steps'),list) else []
+    if not steps: raise HTTPException(500,'AI không tạo được số bước.')
+    return steps
+
+def _curriculum_generate_step(content_type, lesson, step, source_digest):
+    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.\n\nTrả JSON với schema: {{\"title\":\"...\",\"content\":\"...\",\"source_refs\":[{{\"page\":1,\"reason\":\"...\"}}],\"images\":[{{\"image_url\":\"...\",\"image_key\":\"...\",\"caption\":\"...\"}}],\"items\":[]}}\n\nNGUỒN:\n{source_digest}"""
+    return _curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
+
+@app.post('/admin/api/curriculum/draft-upload')
+async def admin_curriculum_draft_upload(password: str = Form(''), file: UploadFile = File(...), subject: str = Form(''), content_type: str = Form(''), lesson: str = Form(''), metadata_json: str = Form('[]')):
+    check_admin(password)
+    content_type=_normalize_content_type(content_type)
+    if content_type not in CONTENT_TYPES: raise HTTPException(400,'Loại nội dung không hợp lệ.')
+    subject=subject.strip(); lesson=lesson.strip()
+    if not subject or not lesson: raise HTTPException(400,'Môn học và bài học là bắt buộc.')
+    if not file.filename or not file.filename.lower().endswith('.pdf'): raise HTTPException(400,'Vui lòng chọn file PDF.')
+    if not gemini: raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
+    if not b2_ready(): raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
+    source_file=os.path.basename(file.filename); temp_pdf_path=None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='doraemon_curriculum_',suffix='.pdf',delete=False) as tf:
+            temp_pdf_path=tf.name
+            while True:
+                chunk=await file.read(1024*1024)
+                if not chunk: break
+                tf.write(chunk)
+        reader=PdfReader(temp_pdf_path)
+        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
+        lessons={str(r.get('lesson') or '').strip() for r in records_meta if str(r.get('lesson') or '').strip()}
+        if lessons and lesson not in lessons and len(lessons)==1: lesson=next(iter(lessons))
+        page_texts,page_images,page_units=process_pdf_pages(temp_pdf_path,reader,records_meta,source_file,subject)
+        pages=[]
+        for page_no in range(1,len(reader.pages)+1):
+            imgs=[]
+            for img in page_images.get(page_no,[]) or []:
+                vision={k:v for k,v in img.items() if k not in {'key','url','image_url'}}
+                imgs.append({'image_key':str(img.get('key') or ''),'image_url':b2_url(str(img.get('key') or '')),'vision':vision})
+            pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
+        digest=_curriculum_source_digest(pages)
+        plan=_normalize_curriculum_steps(content_type,_curriculum_step_plan(content_type,digest),digest)
+        normalized_steps=[]
+        for s in plan:
+            code=str(s.get('code') or '').strip()
+            title=str(s.get('title') or '').strip()
+            if not code or not title: continue
+            content=_curriculum_generate_step(content_type,lesson,{'code':code,'title':title},digest)
+            normalized_steps.append({'code':code,'title':title,'type':s.get('type') or 'lesson','content':content})
+        payload={'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'page_count':len(pages),'pages':pages,'steps':normalized_steps}
+        conn=db()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,content_type,lesson))
+                version=int(cur.fetchone()['next_version'])
+                cur.execute("INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json) VALUES(%s,%s,%s,%s,'AI_DRAFT',%s,%s::jsonb) RETURNING id",(source_file,subject,content_type,lesson,version,json.dumps(payload,ensure_ascii=False)))
+                draft_id=int(cur.fetchone()['id'])
+            conn.commit()
+        finally: conn.close()
+        return {'success':True,'draft_id':draft_id,'status':'AI_DRAFT','version':version,'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'steps':normalized_steps,'pages':len(pages)}
+    except HTTPException: raise
+    except Exception as exc:
+        raise HTTPException(500,f'Không tạo được AI Draft: {type(exc).__name__}: {exc}')
+    finally:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+
+@app.get('/admin/api/curriculum/drafts')
+def admin_curriculum_drafts(password: str):
+    check_admin(password); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,source_file,subject,content_type,lesson,status,version,created_at,updated_at FROM curriculum_drafts ORDER BY id DESC LIMIT 100")
+            return {'success':True,'drafts':[dict(r) for r in cur.fetchall()]}
+    finally: conn.close()
+
+@app.get('/admin/api/curriculum/drafts/{draft_id}')
+def admin_curriculum_draft_get(draft_id:int,password:str):
+    check_admin(password); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+            if not row: raise HTTPException(404,'Draft không tồn tại.')
+            return dict(row)
+    finally: conn.close()
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}')
+def admin_curriculum_draft_save(draft_id:int,payload:dict):
+    check_admin(str(payload.get('password') or '')); draft=payload.get('draft')
+    if not isinstance(draft,dict): raise HTTPException(400,'draft phải là object.')
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
+            if cur.rowcount==0: raise HTTPException(404,'Draft không tồn tại.')
+        conn.commit()
+    finally: conn.close()
+    return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW'}
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}/regenerate-step')
+def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
+    check_admin(str(payload.get('password') or '')); step_code=str(payload.get('step_code') or '').strip()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT draft_json FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+        if not row: raise HTTPException(404,'Draft không tồn tại.')
+        draft=dict(row['draft_json'] or {}); step=next((s for s in draft.get('steps',[]) if str(s.get('code'))==step_code),None)
+        if not step: raise HTTPException(404,'Step không tồn tại.')
+        digest=_curriculum_source_digest(draft.get('pages') or [])
+        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest)
+        step['content']=new_content; draft['steps']=[s if s is not step else step for s in draft['steps']]
+        with conn.cursor() as cur: cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
+        conn.commit(); return {'success':True,'step':step}
+    finally: conn.close()
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}/publish')
+def admin_curriculum_publish(draft_id:int,payload:dict):
+    check_admin(str(payload.get('password') or '')); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s',(draft_id,)); dr=cur.fetchone()
+            if not dr: raise HTTPException(404,'Draft không tồn tại.')
+            draft=dict(dr['draft_json'] or {})
+            source_file=str(draft.get('source_file') or dr['source_file']).strip(); ct=str(draft.get('content_type') or dr['content_type']).strip(); lesson=str(draft.get('lesson') or dr['lesson']).strip(); subject=str(draft.get('subject') or dr['subject']).strip()
+            cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND status='PUBLISHED'",(source_file,ct,lesson))
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,lesson)); version=int(cur.fetchone()['next_version'])
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,subject,ct,lesson,version,json.dumps({'pages':draft.get('pages') or []},ensure_ascii=False)))
+            lesson_id=int(cur.fetchone()['id'])
+            for order,step in enumerate(draft.get('steps') or [],1):
+                cur.execute("INSERT INTO curriculum_steps(lesson_id,step_code,step_order,title,step_type,content_json) VALUES(%s,%s,%s,%s,%s,%s::jsonb)",(lesson_id,str(step.get('code') or f'B{order-1}'),order,str(step.get('title') or ''),str(step.get('type') or 'lesson'),json.dumps(step.get('content') or {},ensure_ascii=False)))
+            cur.execute("UPDATE curriculum_drafts SET status='PUBLISHED',updated_at=NOW() WHERE id=%s",(draft_id,))
+        conn.commit()
+    finally: conn.close()
+    # Index only published material into Pinecone.
+    if index:
+        try:
+            vectors=[]
+            for step in draft.get('steps') or []:
+                content=step.get('content') or {}; text='\n'.join(str(content.get(k) or '') for k in ('title','content'))
+                if not text.strip(): continue
+                vec=embed_text(text[:8000])
+                vectors.append({'id':f'curriculum:{lesson_id}:{step.get("code")}', 'values':vec, 'metadata':{'record_type':'curriculum_step','content_id':str(lesson_id),'lesson_id':str(lesson_id),'step_code':str(step.get('code') or ''),'source_file':source_file,'content_type':ct,'lesson':lesson,'text':text[:6000]}})
+                if len(vectors)>=50:
+                    index.upsert(vectors=vectors,namespace='__default__'); vectors=[]
+            if vectors: index.upsert(vectors=vectors,namespace='__default__')
+        except Exception as exc:
+            print('[CURRICULUM PINECONE INDEX] failed:',type(exc).__name__,str(exc))
+    return {'success':True,'lesson_id':lesson_id,'version':version,'status':'PUBLISHED'}
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
@@ -7167,6 +7428,21 @@ button.gray{background:#666}button.red{background:#d93025}
 </div>
 
 <div id="panel" style="display:none">
+<div class="card">
+<h3>🧠 AI Curriculum Studio</h3>
+<div class="small" style="margin-bottom:10px">Upload 1 bài học → Gemini OCR/Vision → AI dựng số bước → AI soạn từng bước → Admin sửa/duyệt → Publish vào PostgreSQL và Pinecone.</div>
+<form onsubmit="createCurriculumDraft(event)">
+<input id="curPdf" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<input id="curSubject" value="Tiếng Nhật" placeholder="Môn học" required style="flex:1;min-width:180px">
+<select id="curType" required style="padding:9px;border-radius:7px;border:1px solid #ccc"><option>Giáo trình</option><option>Từ vựng</option><option>Ngữ pháp</option><option>Bài tập</option><option>Truyện đọc</option></select>
+<input id="curLesson" placeholder="Tên bài học" required style="flex:1;min-width:180px">
+</div>
+<button id="curGenBtn" style="margin-top:10px">🤖 AI tạo Draft</button>
+</form>
+<div id="curStatus" class="small" style="margin-top:8px"></div>
+<div id="curDraftEditor" style="margin-top:15px"></div>
+</div>
 <div class="card">
 <h3>📚 Knowledge Base</h3>
 <div class="small" style="margin-bottom:10px">
@@ -7328,6 +7604,18 @@ async function uploadKnowledge(event){
   }catch(e){status.textContent="❌ Upload lỗi: "+e.message}
   finally{btn.disabled=false}
 }
+
+
+async function createCurriculumDraft(event){
+ event.preventDefault(); const btn=document.getElementById('curGenBtn'); const st=document.getElementById('curStatus'); const file=document.getElementById('curPdf').files[0]; if(!file)return; btn.disabled=true; st.textContent='⏳ Đang OCR/Vision và AI dựng từng bước...';
+ try{const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('subject',document.getElementById('curSubject').value.trim()); fd.append('content_type',document.getElementById('curType').value); fd.append('lesson',document.getElementById('curLesson').value.trim()); fd.append('metadata_json','[]'); const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Draft #${d.draft_id}: ${d.steps.length} bước. Admin có thể sửa từng bước trước khi publish.`; renderCurriculumDraft(d.draft_id,d); }catch(e){st.textContent='❌ '+e.message;} finally{btn.disabled=false;}
+}
+function escJson(v){return esc(JSON.stringify(v||{}));}
+function renderCurriculumDraft(id,data){const box=document.getElementById('curDraftEditor'); const steps=data.steps||[]; box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)}<div id="curSteps">${steps.map((s,i)=>`<div class="card" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.code)} · <input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></b><button class="gray" onclick="regenerateCurriculumStep(${id},'${esc(s.code)}')">🤖 Gen lại</button></div><textarea class="cur-json" data-code="${esc(s.code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`; }
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const d=base.draft_json||{}; const cards=[...document.querySelectorAll('#curSteps .cur-json')]; d.steps=(d.steps||[]).map((s)=>{const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(s.code))}"]`); const titleEl=ta?.closest('.card')?.querySelector('.cur-title'); let content=s.content||{}; try{content=JSON.parse(ta.value)}catch(e){} return {...s,title:titleEl?.value||s.title,content};}); return d;}
+async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id); await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})}); alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
+async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})}); const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(code))}"]`); if(ta)ta.value=JSON.stringify(d.step.content||{},null,2); alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
+async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id); if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return; const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})}); alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`); loadKnowledgeCatalog();}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
   const el=document.getElementById(id);
