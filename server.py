@@ -7798,9 +7798,15 @@ async def admin_curriculum_draft_delete_post(draft_id:int, password:str = '', pa
     return {'success':True,'draft_id':draft_id,'message':'Đã xóa Draft.'}
 
 @app.post('/admin/api/curriculum/drafts/{draft_id}/remove')
-async def admin_curriculum_draft_remove(draft_id:int, password:str = ''):
-    """Simple query-password endpoint used by the Admin UI to avoid body/proxy ambiguity."""
-    return await admin_curriculum_draft_delete_post(draft_id=draft_id, password=password, payload=None)
+async def admin_curriculum_draft_remove(draft_id:int, password:str = '', request: Request | None = None):
+    """Robust Draft delete endpoint: query password is preferred; JSON body is accepted as fallback."""
+    payload=None
+    if not str(password or '').strip() and request is not None:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+    return await admin_curriculum_draft_delete_post(draft_id=draft_id, password=password, payload=payload)
 
 @app.get('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_get(draft_id:int,password:str):
@@ -8269,9 +8275,9 @@ async function deleteCurriculumDraft(id,lesson){
       if(st) st.textContent='';
       return;
     }
-    const url='/admin/api/curriculum/drafts/'+encodeURIComponent(String(id))+'/remove';
+    const url='/admin/api/curriculum/drafts/'+encodeURIComponent(String(id))+'/remove?password='+encodeURIComponent(pw);
     console.log('[CURRICULUM DRAFT DELETE] request', {id, url});
-    const d=await api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    const d=await api(url,{method:'POST'});
     console.log('[CURRICULUM DRAFT DELETE] response', d);
     if(Number(window.currentCurriculumDraftId||0)===Number(id)){const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}
     await loadCurriculumDrafts();
