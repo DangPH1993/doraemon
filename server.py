@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -6822,7 +6822,11 @@ def _knowledge_catalog_tree(rows):
 def admin_knowledge_catalog(password: str):
     check_admin(password)
     rows=_knowledge_catalog_rows()
-    return {"success":True,"documents":_knowledge_catalog_tree(rows),"raw_count":len(rows)}
+    tree=_knowledge_catalog_tree(rows)
+    published_curriculum=sum(1 for r in rows if str(r.get("content_type") or "").strip()=="Giáo trình" and r.get("lesson"))
+    resp=JSONResponse({"success":True,"documents":tree,"raw_count":len(rows),"published_curriculum_count":published_curriculum,"server_time":datetime.now(timezone.utc).isoformat()})
+    resp.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 def _pinecone_scope_filter(source_file: str, content_type: str | None = None,
@@ -7391,7 +7395,7 @@ async def admin_curriculum_draft_upload(password: str = Form(''), file: UploadFi
                 draft_id=int(cur.fetchone()['id'])
             conn.commit()
         finally: conn.close()
-        return {'success':True,'draft_id':draft_id,'status':'AI_DRAFT','version':version,'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'steps':normalized_steps,'pages':len(pages)}
+        return {'success':True,'draft_id':draft_id,'status':'AI_DRAFT','version':version,'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'steps':normalized_steps,'pages':pages,'page_count':len(pages)}
     except HTTPException: raise
     except Exception as exc:
         raise HTTPException(500,f'Không tạo được AI Draft: {type(exc).__name__}: {exc}')
@@ -7723,11 +7727,14 @@ async function createCurriculumDraft(event){
 function escJson(v){return esc(JSON.stringify(v||{}));}
 function curriculumImageGallery(step, pages){
   const imgs=Array.isArray(step?.content?.images)?step.content.images:[];
+  // Older draft responses returned pages as an integer count. New responses return the
+  // actual page objects. Normalize both shapes so the gallery never crashes.
+  if(!Array.isArray(pages)) pages=[];
   const inv={};
-  (pages||[]).forEach(pg=>(pg.images||[]).forEach(im=>{const k=String(im.image_key||'').trim(); if(k)inv[k]=im;}));
+  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||'').trim(); if(k)inv[k]=im;}));
   const selectedKeys=new Set(imgs.map(im=>String(im.image_key||im.key||'').trim()).filter(Boolean));
   const allSource=[];
-  (pages||[]).forEach(pg=>(pg.images||[]).forEach(im=>{const key=String(im.image_key||'').trim(); if(key && !allSource.some(x=>x.key===key)) allSource.push({key,page:pg.page,src:String(im.image_url||'').trim(),vision:im.vision||{}});}));
+  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const key=String(im.image_key||'').trim(); if(key && !allSource.some(x=>x.key===key)) allSource.push({key,page:pg.page,src:String(im.image_url||'').trim(),vision:im.vision||{}});}));
   const card=(im,idx,selected)=>{const key=String(im.image_key||im.key||'').trim(); const src=String(im.image_url||inv[key]?.image_url||im.src||'').trim(); const page=im.page||inv[key]?.page||''; const vision=im.vision||inv[key]?.vision||{}; const caption=im.caption||vision.caption||vision.description||vision.explanation||''; return `<div style="border:2px solid ${selected?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="position:relative;height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" alt="${esc(caption||key)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:12px;text-align:center;color:#888">Không tải được ảnh</div>${selected?'<span style="position:absolute;top:6px;right:6px;background:#1677ff;color:#fff;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700">✓ AI chọn</span>':''}</div><div style="padding:9px"><div style="font-weight:700">Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</div><div class="small" style="word-break:break-all">${esc(key)}</div>${caption?`<div class="small" style="margin-top:5px">${esc(caption)}</div>`:''}</div></div>`;};
   if(!imgs.length && !allSource.length) return '<div class="small" style="margin-top:8px;color:#999">🖼️ Chưa có ảnh nguồn được lưu.</div>';
   const selectedHtml=imgs.map((im,idx)=>card(im,idx,true)).join('');
@@ -7791,7 +7798,7 @@ function renderKnowledgeCatalog(nodes){
     </div>`;
   }).join("");
 }
-async function loadKnowledgeCatalog(){const box=document.getElementById("knowledgeCatalogAdmin");try{const d=await api("/admin/api/knowledge/catalog?password="+encodeURIComponent(pw));renderKnowledgeCatalog(d.documents||[]);}catch(e){box.innerHTML='<span style="color:#c00">Không tải được catalog: '+esc(e.message)+'</span>';}}
+async function loadKnowledgeCatalog(){const box=document.getElementById("knowledgeCatalogAdmin");try{const d=await api("/admin/api/knowledge/catalog?password="+encodeURIComponent(pw)+"&t="+Date.now());renderKnowledgeCatalog(d.documents||[]);}catch(e){box.innerHTML='<span style="color:#c00">Không tải được catalog: '+esc(e.message)+'</span>';}}
 async function deleteKnowledgeScope(scope){const what=scope.topic?`chủ đề "${scope.topic}"`:scope.lesson?`bài học "${scope.lesson}"`:`tài liệu "${scope.source_file}"`;if(!confirm(`Xóa ${what}?\n\nSẽ xóa vector/chunk Pinecone và Knowledge Cache liên quan. Thao tác này không thể hoàn tác.`))return;try{const d=await api("/admin/api/knowledge/delete",{method:"POST",body:JSON.stringify({...scope,password:pw})});alert("✅ "+d.message);await loadKnowledgeCatalog();}catch(e){alert("❌ Xóa thất bại: "+e.message);}}
 
 async function probeOrphanKnowledge(){
