@@ -8654,17 +8654,63 @@ def render_pdf_page(pdf_source, page_no: int, dpi: int = 150) -> bytes:
         doc.close()
 
 def _parse_gemini_json(text: str):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if m:
-            return json.loads(m.group(0))
-        raise ValueError("Gemini OCR không trả về JSON hợp lệ.")
+    """Parse Gemini JSON robustly, including raw control chars inside string values.
+
+    Gemini occasionally emits literal newlines/tabs inside a JSON string even when
+    response_mime_type="application/json" is requested. Python's default json.loads
+    rejects those with `Invalid control character`. `strict=False` intentionally allows
+    those control characters and is safe here because this parser is only consuming
+    model output that we immediately validate structurally.
+    """
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw)
+    if not raw:
+        raise ValueError("Gemini không trả về nội dung JSON.")
+
+    last_error = None
+    for candidate in (raw,):
+        try:
+            return json.loads(candidate, strict=False)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+
+    # Fallback: extract the outermost JSON object when Gemini adds prose around it.
+    start = raw.find("{")
+    if start >= 0:
+        depth = 0
+        in_string = False
+        escaped = False
+        end = None
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is not None:
+            candidate = raw[start:end]
+            try:
+                return json.loads(candidate, strict=False)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+    detail = f"; {last_error}" if last_error else ""
+    raise ValueError(f"Gemini không trả về JSON hợp lệ{detail}")
 
 def gemini_ocr_page(page_png: bytes, page_no: int, source_file: str = ""):
     if not gemini:
