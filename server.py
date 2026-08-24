@@ -7784,6 +7784,31 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
     return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW','steps':draft.get('steps') or []}
 
 
+@app.delete('/admin/api/curriculum/drafts/{draft_id}')
+def admin_curriculum_draft_delete(draft_id:int,password:str):
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status,source_file,content_type,lesson FROM curriculum_drafts WHERE id=%s",(draft_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,'Draft không tồn tại.')
+            if str(row[0] or '').upper() == 'PUBLISHED':
+                raise HTTPException(400,'Draft đã publish, không thể xóa khỏi danh sách Draft.')
+            cur.execute("DELETE FROM curriculum_drafts WHERE id=%s",(draft_id,))
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {'success':True,'draft_id':draft_id,'message':'Đã xóa Draft.'}
+
+
 @app.post('/admin/api/curriculum/drafts/{draft_id}/delete-step')
 def admin_curriculum_delete_step(draft_id:int,payload:dict):
     check_admin(str(payload.get('password') or ''))
@@ -8159,7 +8184,7 @@ async function loadCurriculumDrafts(){
       const label=status==='ADMIN_REVIEW'?'Đang chỉnh sửa':'AI_DRAFT';
       return `<div class="cur-draft-row" style="display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid #ddd;border-radius:8px;padding:9px;margin-top:7px;background:#fafafa">
         <div><b>Draft #${esc(x.id)}</b> · ${esc(x.content_type)} · ${esc(x.lesson)}<div class="small">${esc(x.source_file||'')} · ${esc(label)} · v${esc(x.version||1)}</div></div>
-        <button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button>
+        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="red" onclick="deleteCurriculumDraft(${Number(x.id)},${JSON.stringify(x.lesson||'')})">🗑️ Xóa Draft</button></div>
       </div>`;
     }).join('')}</div>`;
   }catch(e){
@@ -8167,6 +8192,16 @@ async function loadCurriculumDrafts(){
   }
 }
 
+async function deleteCurriculumDraft(id,lesson){
+  const label=String(lesson||'Draft #'+id);
+  if(!confirm(`Xóa Draft "${label}"?\n\nChỉ xóa bản Draft này, không ảnh hưởng giáo trình PUBLISHED của Doraemon.`)) return;
+  try{
+    await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw),{method:'DELETE'});
+    if(Number(window.currentCurriculumDraftId||0)===Number(id)){const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}
+    await loadCurriculumDrafts();
+    const st=document.getElementById('curStatus'); if(st) st.textContent=`✅ Đã xóa Draft #${id}.`;
+  }catch(e){alert('❌ '+e.message);}
+}
 async function openCurriculumDraft(id){
  try{const d=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const dj=d.draft_json||{}; renderCurriculumDraft(id,{...dj,draft_id:id,status:d.status,version:d.version});}
  catch(e){alert('❌ '+e.message)}
@@ -8208,12 +8243,12 @@ function changeCurriculumImage(code,key,add){
 function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(`Xóa bước ${label} khỏi DRAFT? Giáo trình PUBLISHED của Doraemon KHÔNG bị ảnh hưởng cho tới khi bạn Publish lại.`))return;api('/admin/api/curriculum/drafts/'+id+'/delete-step',{method:'POST',body:JSON.stringify({password:pw,step_code:label})}).then(d=>{renderCurriculumDraft(id,d);const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Đã xóa ${label} khỏi Draft. Các bước sau đã được đánh lại.`;}).catch(e=>alert('❌ '+e.message));}
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
-  window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
+  window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
   box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
 function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}sections.forEach((x,i)=>{x.code='B'+(i+2);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
 async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const ta=_findCurriculumTextarea(code);const titleEl=ta?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(ta){try{content=JSON.parse(ta.value||JSON.stringify(content));}catch(e){}}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
-async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});renderCurriculumDraft(id,{...d,...saved,steps:saved.steps||d.steps});await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
+async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const ta=_findCurriculumTextarea(String(code));if(ta)ta.value=JSON.stringify(d.step.content||{},null,2);_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
 async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;await saveCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';}catch(e){alert('❌ '+e.message);}}
 
