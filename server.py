@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.46-db-first-published-curriculum"
+BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
 import ast
 import io
@@ -82,7 +82,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.44-ai-curriculum-db-first-fix")
-SERVER_VERSION = "2026-08-24-db-first-published-curriculum"
+SERVER_VERSION = "2026-08-24-curriculum-step-delete-image-state"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7409,6 +7409,78 @@ def _normalize_curriculum_steps(content_type, steps, source_digest):
         found['code']=code; found.setdefault('title',rule['title']); found.setdefault('type',rule['type']); out.append(found)
     return out
 
+def _reindex_curriculum_draft_steps(content_type, steps):
+    """Reindex draft step codes without touching any published lesson.
+
+    Giáo trình keeps B0, B1 and FINAL as structural anchors; only section
+    steps are renumbered B2, B3, ... . Other content types are re-numbered
+    by current draft order so deleting a step shifts following steps up.
+    This function operates on draft_json only.
+    """
+    raw=[dict(x) for x in (steps or []) if isinstance(x,dict)]
+    ct=str(content_type or '').strip()
+    if ct == 'Giáo trình':
+        b0=next((x for x in raw if str(x.get('code') or '').upper()=='B0'), None)
+        b1=next((x for x in raw if str(x.get('code') or '').upper()=='B1'), None)
+        final=next((x for x in raw if str(x.get('code') or '').upper() in {'FINAL','SUMMARY'}), None)
+        sections=[x for x in raw if str(x.get('code') or '').upper() not in {'B0','B1','FINAL','SUMMARY'}]
+        out=[]
+        if b0 is not None:
+            b0['code']='B0'; out.append(b0)
+        if b1 is not None:
+            b1['code']='B1'; out.append(b1)
+        for i,x in enumerate(sections,start=2):
+            x['code']=f'B{i}'; out.append(x)
+        if final is not None:
+            final['code']='FINAL'; out.append(final)
+        return out
+    out=[]
+    for i,x in enumerate(raw):
+        x['code']=f'B{i}'; out.append(x)
+    return out
+
+def _parse_curriculum_page_ranges(value, max_page):
+    """Parse page ranges like '1-3,5,7-8' into sorted unique PDF page numbers."""
+    raw=str(value or "").strip()
+    if not raw:
+        raise ValueError("Số trang là bắt buộc, ví dụ 7-8 hoặc 7,9-10.")
+    pages=set()
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a,b=part.split("-",1)
+            if not a.isdigit() or not b.isdigit():
+                raise ValueError(f"Khoảng trang không hợp lệ: {part}")
+            a,b=int(a),int(b)
+            if a<1 or b<a or b>int(max_page):
+                raise ValueError(f"Khoảng trang ngoài phạm vi PDF: {part} (1-{max_page})")
+            pages.update(range(a,b+1))
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Trang không hợp lệ: {part}")
+            n=int(part)
+            if n<1 or n>int(max_page):
+                raise ValueError(f"Trang ngoài phạm vi PDF: {n} (1-{max_page})")
+            pages.add(n)
+    if not pages:
+        raise ValueError("Không có trang hợp lệ.")
+    return sorted(pages)
+
+def _curriculum_page_range_label(pages):
+    vals=[int(x) for x in (pages or [])]
+    if not vals:
+        return ""
+    out=[]; start=prev=vals[0]
+    for n in vals[1:]:
+        if n==prev+1:
+            prev=n
+        else:
+            out.append(str(start) if start==prev else f"{start}-{prev}")
+            start=prev=n
+    out.append(str(start) if start==prev else f"{start}-{prev}")
+    return ",".join(out)
+
 def _curriculum_source_digest(pages):
     parts=[]
     for p in pages:
@@ -7504,16 +7576,59 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest):
     return _curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
 
 @app.post('/admin/api/curriculum/draft-upload')
-async def admin_curriculum_draft_upload(password: str = Form(''), file: UploadFile = File(...), subject: str = Form(''), content_type: str = Form(''), lesson: str = Form(''), metadata_json: str = Form('[]')):
+async def admin_curriculum_draft_upload(
+    password: str = Form(''),
+    file: UploadFile = File(...),
+    subject: str = Form(''),
+    content_type: str = Form(''),
+    lesson: str = Form(''),
+    metadata_json: str = Form('[]'),
+    articles_json: str = Form('[]'),
+):
+    """Create one or many AI curriculum drafts from selected page ranges only.
+
+    A single PDF can define multiple lessons, each with its own page range. Pages
+    not belonging to any configured lesson are never processed by OCR/Vision,
+    never saved to B2, and never included in the AI source digest.
+    """
     check_admin(password)
-    content_type=_normalize_content_type(content_type)
-    if content_type not in CONTENT_TYPES: raise HTTPException(400,'Loại nội dung không hợp lệ.')
-    subject=subject.strip(); lesson=lesson.strip()
-    if not subject or not lesson: raise HTTPException(400,'Môn học và bài học là bắt buộc.')
-    if not file.filename or not file.filename.lower().endswith('.pdf'): raise HTTPException(400,'Vui lòng chọn file PDF.')
-    if not gemini: raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
-    if not b2_ready(): raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
-    source_file=os.path.basename(file.filename); temp_pdf_path=None
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(400,'Vui lòng chọn file PDF.')
+    if not gemini:
+        raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
+    if not b2_ready():
+        raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
+    subject=subject.strip()
+    if not subject:
+        raise HTTPException(400,'Môn học là bắt buộc.')
+
+    # Backward compatible single-lesson configuration.
+    configs=[]
+    try:
+        parsed=json.loads(articles_json or '[]')
+        if isinstance(parsed,list):
+            configs=[x for x in parsed if isinstance(x,dict)]
+    except Exception:
+        configs=[]
+    if not configs:
+        content_type=_normalize_content_type(content_type)
+        single_lesson=str(lesson or '').strip()
+        if not single_lesson:
+            raise HTTPException(400,'Tên bài học là bắt buộc.')
+        configs=[{'content_type':content_type,'lesson':single_lesson,'pages':str('') if False else ''}]
+    else:
+        normalized=[]
+        for idx,cfg in enumerate(configs,1):
+            ct=_normalize_content_type(cfg.get('content_type'))
+            ls=str(cfg.get('lesson') or '').strip()
+            pg=str(cfg.get('pages') or cfg.get('page_ranges') or '').strip()
+            if not ls:
+                raise HTTPException(400,f'Bài #{idx}: Tên bài học là bắt buộc.')
+            normalized.append({'content_type':ct,'lesson':ls,'pages':pg})
+        configs=normalized
+
+    source_file=os.path.basename(file.filename)
+    temp_pdf_path=None
     try:
         with tempfile.NamedTemporaryFile(prefix='doraemon_curriculum_',suffix='.pdf',delete=False) as tf:
             temp_pdf_path=tf.name
@@ -7522,39 +7637,102 @@ async def admin_curriculum_draft_upload(password: str = Form(''), file: UploadFi
                 if not chunk: break
                 tf.write(chunk)
         reader=PdfReader(temp_pdf_path)
-        records_meta=normalize_kb_records(metadata_json,len(reader.pages))
-        lessons={str(r.get('lesson') or '').strip() for r in records_meta if str(r.get('lesson') or '').strip()}
-        if lessons and lesson not in lessons and len(lessons)==1: lesson=next(iter(lessons))
-        page_texts,page_images,page_units=process_pdf_pages(temp_pdf_path,reader,records_meta,source_file,subject)
-        pages=[]
-        for page_no in range(1,len(reader.pages)+1):
-            imgs=[]
-            for img in page_images.get(page_no,[]) or []:
-                vision={k:v for k,v in img.items() if k not in {'key','url','image_url'}}
-                imgs.append({'image_key':str(img.get('key') or ''),'image_url':b2_url(str(img.get('key') or '')),'vision':vision})
-            pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
-        digest=_curriculum_source_digest(pages)
-        plan=_normalize_curriculum_steps(content_type,_curriculum_step_plan(content_type,digest),digest)
-        normalized_steps=[]
-        for s in plan:
-            code=str(s.get('code') or '').strip()
-            title=str(s.get('title') or '').strip()
-            if not code or not title: continue
-            content=_curriculum_generate_step(content_type,lesson,{'code':code,'title':title},digest)
-            content=_resolve_curriculum_step_images(content, pages)
-            normalized_steps.append({'code':code,'title':title,'type':s.get('type') or 'lesson','content':content})
-        payload={'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'page_count':len(pages),'pages':pages,'steps':normalized_steps}
-        conn=db()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,content_type,lesson))
-                version=int(cur.fetchone()['next_version'])
-                cur.execute("INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json) VALUES(%s,%s,%s,%s,'AI_DRAFT',%s,%s::jsonb) RETURNING id",(source_file,subject,content_type,lesson,version,json.dumps(payload,ensure_ascii=False)))
-                draft_id=int(cur.fetchone()['id'])
-            conn.commit()
-        finally: conn.close()
-        return {'success':True,'draft_id':draft_id,'status':'AI_DRAFT','version':version,'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'steps':normalized_steps,'pages':pages,'page_count':len(pages)}
-    except HTTPException: raise
+        total_pages=len(reader.pages)
+        if total_pages<=0:
+            raise HTTPException(400,'PDF không có trang.')
+
+        # Parse the selected page ranges before touching OCR/Vision.
+        for idx,cfg in enumerate(configs,1):
+            if not str(cfg.get('pages') or '').strip():
+                raise HTTPException(400,f'Bài #{idx} ({cfg.get("lesson") or ""}): phải nhập số trang, ví dụ 7-8.')
+            try:
+                cfg['selected_pages']=_parse_curriculum_page_ranges(cfg['pages'], total_pages)
+            except ValueError as exc:
+                raise HTTPException(400,f'Bài #{idx} ({cfg.get("lesson") or ""}): {exc}')
+            cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+
+        # Do not allow overlapping configured pages. One PDF page should have one
+        # curriculum owner, otherwise B2/image provenance would become ambiguous.
+        owners={}
+        overlaps=[]
+        for idx,cfg in enumerate(configs,1):
+            for pg in cfg['selected_pages']:
+                if pg in owners:
+                    overlaps.append(f"trang {pg} (bài #{owners[pg]} và #{idx})")
+                else:
+                    owners[pg]=idx
+        if overlaps:
+            raise HTTPException(400,'Phạm vi trang bị chồng lấn: '+', '.join(overlaps)+'. Hãy tách trang cho từng bài.')
+
+        records_meta=normalize_kb_records(metadata_json,total_pages)
+        results=[]
+        for idx,cfg in enumerate(configs,1):
+            ct=str(cfg['content_type']).strip()
+            ls=str(cfg['lesson']).strip()
+            selected_pages=cfg['selected_pages']
+            page_texts,page_images,page_units=process_pdf_pages(
+                temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
+            )
+            pages=[]
+            for page_no in selected_pages:
+                imgs=[]
+                for img in page_images.get(page_no,[]) or []:
+                    vision={k:v for k,v in img.items() if k not in {'key','url','image_url'}}
+                    key=str(img.get('key') or '')
+                    if not key: continue
+                    imgs.append({'image_key':key,'image_url':b2_url(key),'vision':vision})
+                pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
+
+            digest=_curriculum_source_digest(pages)
+            plan=_normalize_curriculum_steps(ct,_curriculum_step_plan(ct,digest),digest)
+            normalized_steps=[]
+            for st in plan:
+                code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                if not code or not title: continue
+                content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
+                content=_resolve_curriculum_step_images(content,pages)
+                normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+
+            payload={
+                'source_file':source_file,
+                'subject':subject,
+                'content_type':ct,
+                'lesson':ls,
+                'page_ranges':cfg['pages_label'],
+                'selected_pages':selected_pages,
+                'page_count':len(pages),
+                'pages':pages,
+                'steps':normalized_steps,
+            }
+            conn=db()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,ls))
+                    version=int(cur.fetchone()['next_version'])
+                    cur.execute("INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json) VALUES(%s,%s,%s,%s,'AI_DRAFT',%s,%s::jsonb) RETURNING id",(source_file,subject,ct,ls,version,json.dumps(payload,ensure_ascii=False)))
+                    draft_id=int(cur.fetchone()['id'])
+                conn.commit()
+            finally:
+                conn.close()
+            results.append({
+                'draft_id':draft_id,'status':'AI_DRAFT','version':version,
+                'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
+                'page_ranges':cfg['pages_label'],'selected_pages':selected_pages,
+                'steps':normalized_steps,'pages':pages,'page_count':len(pages),
+            })
+
+        return {
+            'success':True,
+            'source_file':source_file,
+            'subject':subject,
+            'pdf_page_count':total_pages,
+            'configured_articles':len(results),
+            'drafts':results,
+            # Backward compatible single-result keys.
+            **(results[0] if len(results)==1 else {'draft_id':results[0]['draft_id'] if results else None}),
+        }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500,f'Không tạo được AI Draft: {type(exc).__name__}: {exc}')
     finally:
@@ -7587,12 +7765,41 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
     if not isinstance(draft,dict): raise HTTPException(400,'draft phải là object.')
     conn=db()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT content_type FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+            if not row: raise HTTPException(404,'Draft không tồn tại.')
+            ct=str(draft.get('content_type') or row.get('content_type') or '').strip()
+            draft['steps']=_reindex_curriculum_draft_steps(ct,draft.get('steps') or [])
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
-            if cur.rowcount==0: raise HTTPException(404,'Draft không tồn tại.')
         conn.commit()
     finally: conn.close()
-    return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW'}
+    return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW','steps':draft.get('steps') or []}
+
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}/delete-step')
+def admin_curriculum_delete_step(draft_id:int,payload:dict):
+    check_admin(str(payload.get('password') or ''))
+    step_code=str(payload.get('step_code') or '').strip().upper()
+    if not step_code: raise HTTPException(400,'step_code là bắt buộc.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT content_type,draft_json FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+            if not row: raise HTTPException(404,'Draft không tồn tại.')
+            ct=str(row.get('content_type') or '').strip()
+            draft=dict(row.get('draft_json') or {})
+            steps=[dict(x) for x in (draft.get('steps') or []) if isinstance(x,dict)]
+            target=next((x for x in steps if str(x.get('code') or '').strip().upper()==step_code),None)
+            if target is None: raise HTTPException(404,f'Không tìm thấy bước {step_code}.')
+            if ct == 'Giáo trình' and step_code in {'B0','B1','FINAL','SUMMARY'}:
+                raise HTTPException(400,f'{step_code} là bước cấu trúc bắt buộc của Giáo trình, không thể xóa.')
+            steps=[x for x in steps if str(x.get('code') or '').strip().upper()!=step_code]
+            draft['steps']=_reindex_curriculum_draft_steps(ct,steps)
+            cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
+        conn.commit()
+    finally: conn.close()
+    return {'success':True,'draft_id':draft_id,'steps':draft.get('steps') or []}
+
 
 @app.post('/admin/api/curriculum/drafts/{draft_id}/regenerate-step')
 def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
@@ -7707,10 +7914,17 @@ button.gray{background:#666}button.red{background:#d93025}
 <input id="curPdf" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap">
 <input id="curSubject" value="Tiếng Nhật" placeholder="Môn học" required style="flex:1;min-width:180px">
-<select id="curType" required style="padding:9px;border-radius:7px;border:1px solid #ccc"><option>Giáo trình</option><option>Từ vựng</option><option>Ngữ pháp</option><option>Bài tập</option><option>Truyện đọc</option></select>
-<input id="curLesson" placeholder="Tên bài học" required style="flex:1;min-width:180px">
 </div>
-<button id="curGenBtn" style="margin-top:10px">🤖 AI tạo Draft</button>
+<div style="margin-top:12px;padding:10px;border:1px solid #ddd;border-radius:9px;background:#fafafa">
+  <div style="font-weight:700;margin-bottom:6px">📚 Cấu hình các bài trong PDF</div>
+  <div class="small" style="margin-bottom:8px">Một PDF có thể tạo nhiều bài. Với mỗi bài, nhập <b>loại nội dung</b>, <b>tên bài</b> và <b>số trang</b> (ví dụ <b>7-8</b> hoặc <b>7,9-10</b>). Chỉ các trang được cấu hình mới được OCR/Vision, lưu ảnh và đưa vào AI Draft.</div>
+  <div id="curArticleRows"></div>
+  <button type="button" class="gray" onclick="addCurriculumArticleRow()" style="margin-top:8px">＋ Thêm bài</button>
+</div>
+<div style="display:flex;gap:8px;margin-top:10px">
+  <button id="curGenBtn">🤖 AI tạo Draft</button>
+  <button type="button" class="gray" onclick="clearCurriculumArticleRows()">↺ Đặt lại</button>
+</div>
 </form>
 <div id="curStatus" class="small" style="margin-top:8px"></div>
 <div id="curDraftEditor" style="margin-top:15px"></div>
@@ -7878,65 +8092,101 @@ async function uploadKnowledge(event){
 }
 
 
+function curriculumTypeOptions(selected){
+  const types=['Giáo trình','Từ vựng','Ngữ pháp','Bài tập','Truyện đọc'];
+  return types.map(t=>`<option value="${esc(t)}" ${t===selected?'selected':''}>${esc(t)}</option>`).join('');
+}
+function addCurriculumArticleRow(values={}){
+  const wrap=document.getElementById('curArticleRows'); if(!wrap)return;
+  const row=document.createElement('div'); row.className='cur-article-row';
+  row.style.cssText='display:grid;grid-template-columns:1.1fr 1.5fr 1fr auto;gap:7px;margin-bottom:7px;align-items:center';
+  const ct=values.content_type||'Giáo trình';
+  row.innerHTML=`<select class="cur-a-type" style="min-width:0">${curriculumTypeOptions(ct)}</select>
+  <input class="cur-a-lesson" placeholder="Tên bài học" value="${esc(values.lesson||'')}">
+  <input class="cur-a-pages" placeholder="Số trang, ví dụ 7-8" value="${esc(values.pages||'')}">
+  <button type="button" class="red" title="Xóa dòng" onclick="this.parentElement.remove()">✕</button>`;
+  wrap.appendChild(row);
+}
+function clearCurriculumArticleRows(){
+  const wrap=document.getElementById('curArticleRows'); if(!wrap)return; wrap.innerHTML=''; addCurriculumArticleRow();
+}
+function getCurriculumArticleRows(){
+  return [...document.querySelectorAll('#curArticleRows .cur-article-row')].map((row,idx)=>({
+    index:idx+1,
+    content_type:row.querySelector('.cur-a-type')?.value||'Giáo trình',
+    lesson:(row.querySelector('.cur-a-lesson')?.value||'').trim(),
+    pages:(row.querySelector('.cur-a-pages')?.value||'').trim()
+  }));
+}
+addCurriculumArticleRow();
+
 async function createCurriculumDraft(event){
- event.preventDefault(); const btn=document.getElementById('curGenBtn'); const st=document.getElementById('curStatus'); const file=document.getElementById('curPdf').files[0]; if(!file)return; btn.disabled=true; st.textContent='⏳ Đang OCR/Vision và AI dựng từng bước...';
- try{const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('subject',document.getElementById('curSubject').value.trim()); fd.append('content_type',document.getElementById('curType').value); fd.append('lesson',document.getElementById('curLesson').value.trim()); fd.append('metadata_json','[]'); const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Draft #${d.draft_id}: ${d.steps.length} bước. Admin có thể sửa từng bước trước khi publish.`; renderCurriculumDraft(d.draft_id,d); }catch(e){st.textContent='❌ '+e.message;} finally{btn.disabled=false;}
+ event.preventDefault(); const btn=document.getElementById('curGenBtn'); const st=document.getElementById('curStatus'); const file=document.getElementById('curPdf').files[0]; if(!file)return;
+ const rows=getCurriculumArticleRows().filter(x=>x.lesson||x.pages);
+ if(!rows.length){st.textContent='❌ Hãy thêm ít nhất 1 bài và nhập tên bài + số trang.';return;}
+ for(const r of rows){if(!r.lesson||!r.pages){st.textContent=`❌ Bài #${r.index}: cần đủ tên bài và số trang.`;return;}}
+ btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài, chỉ OCR/Vision các trang đã cấu hình...`;
+ try{
+   const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('subject',document.getElementById('curSubject').value.trim()); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
+   const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
+   const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status));
+   const drafts=Array.isArray(d.drafts)?d.drafts:[];
+   st.textContent=`✅ Đã tạo ${drafts.length} Draft từ ${d.pdf_page_count||'?'} trang PDF. Chỉ các trang cấu hình được xử lý.`;
+   if(drafts.length===1){renderCurriculumDraft(drafts[0].draft_id,drafts[0]);}
+   else{
+     const box=document.getElementById('curDraftEditor');
+     box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>✅ ${drafts.length} Draft đã tạo</b><div class="small" style="margin:6px 0 10px">Mỗi bài là một Draft riêng để Admin duyệt/chỉnh sửa.</div>${drafts.map(x=>`<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;border:1px solid #ddd;border-radius:8px;padding:9px;margin-top:7px"><div><b>Draft #${x.draft_id}</b> · ${esc(x.content_type)} · ${esc(x.lesson)}<div class="small">Trang: ${esc(x.page_ranges||'')}</div></div><button type="button" onclick="openCurriculumDraft(${x.draft_id})">✏️ Mở & sửa</button></div>`).join('')}</div>`;
+   }
+ }catch(e){st.textContent='❌ '+e.message;} finally{btn.disabled=false;}
+}
+async function openCurriculumDraft(id){
+ try{const d=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const dj=d.draft_json||{}; renderCurriculumDraft(id,{...dj,draft_id:id,status:d.status,version:d.version});}
+ catch(e){alert('❌ '+e.message)}
 }
 function escJson(v){return esc(JSON.stringify(v||{}));}
+function _curriculumStepStateKey(code){return String(code||'').trim();}
+function _curriculumGetStepState(code,fallbackContent){
+  window.currentCurriculumImageState=window.currentCurriculumImageState||{};
+  const k=_curriculumStepStateKey(code);
+  if(!window.currentCurriculumImageState[k]) window.currentCurriculumImageState[k]=JSON.parse(JSON.stringify(fallbackContent||{}));
+  const st=window.currentCurriculumImageState[k]||{}; if(!Array.isArray(st.images)) st.images=[]; return st;
+}
+function _curriculumSetStepState(code,content){
+  window.currentCurriculumImageState=window.currentCurriculumImageState||{};
+  window.currentCurriculumImageState[_curriculumStepStateKey(code)]=JSON.parse(JSON.stringify(content||{}));
+}
 function curriculumImageGallery(step,pages){
-  if(!Array.isArray(pages)) pages=[];
-  const code=String(step?.code||""); const imgs=Array.isArray(step?.content?.images)?step.content.images:[];
-  const inv={}; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||"").trim(); if(k)inv[k]=im;}));
-  const selected=new Set(imgs.map(im=>String(im.image_key||im.key||"").trim()).filter(Boolean));
-  const all=[]; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||"").trim(); if(k&&!all.some(x=>x.key===k))all.push({key:k,page:pg.page,src:String(im.image_url||"").trim(),vision:im.vision||{}});}));
-  const action=({code,key,add})=>`<button type="button" class="${add?'':'red'}" style="margin-top:7px" data-cur-image-action="1" data-code="${esc(code)}" data-image-key="${esc(key)}" data-add="${add?'1':'0'}">${add?'＋ Thêm ảnh':'🗑️ Bỏ ảnh'}</button>`;
-  const card=(im,idx,isSel)=>{const key=String(im.image_key||im.key||"").trim(); const src=String(im.image_url||inv[key]?.image_url||im.src||"").trim(); const page=im.page||inv[key]?.page||""; const v=im.vision||inv[key]?.vision||{}; const cap=im.caption||v.caption||v.description||v.explanation||""; return `<div style="border:2px solid ${isSel?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:10px;color:#888">Ảnh không tải được</div></div><div style="padding:9px"><b>Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</b><div class="small" style="word-break:break-all">${esc(key)}</div>${cap?`<div class="small" style="margin-top:4px">${esc(cap)}</div>`:''}${action({code,key,add:!isSel})}</div></div>`};
+  pages=Array.isArray(pages)?pages:[]; const code=String(step?.code||''); const content=_curriculumGetStepState(code,step?.content||{}); const imgs=Array.isArray(content.images)?content.images:[];
+  const inv={}; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||'').trim();if(k)inv[k]=im;}));
+  const selected=new Set(imgs.map(im=>String(im?.image_key||im?.key||'').trim()).filter(Boolean)); const all=[];
+  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||'').trim();if(k&&!all.some(x=>x.key===k))all.push({key:k,page:pg.page,src:String(im.image_url||'').trim(),vision:im.vision||{}});}));
+  const action=(key,add)=>`<button type="button" class="${add?'':'red'}" style="margin-top:7px" data-cur-image-action="1" data-code="${esc(code)}" data-image-key="${esc(key)}" data-add="${add?'1':'0'}" onclick='changeCurriculumImage(${JSON.stringify(code)},${JSON.stringify(key)},${add?'true':'false'});return false;'>${add?'＋ Thêm ảnh':'🗑️ Bỏ ảnh'}</button>`;
+  const card=(im,idx,isSel)=>{const key=String(im?.image_key||im?.key||'').trim();const src=String(im?.image_url||inv[key]?.image_url||im?.src||'').trim();const page=im?.page||inv[key]?.page||'';const v=im?.vision||inv[key]?.vision||{};const cap=im?.caption||v.caption||v.description||v.explanation||'';return `<div style="border:2px solid ${isSel?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:10px;color:#888">Ảnh không tải được</div></div><div style="padding:9px"><b>Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</b><div class="small" style="word-break:break-all">${esc(key)}</div>${cap?`<div class="small" style="margin-top:4px">${esc(cap)}</div>`:''}${action(key,!isSel)}</div></div>`};
   const selectedHtml=imgs.map((im,i)=>card(im,i,true)).join(''); const remaining=all.filter(x=>!selected.has(x.key));
   return `<div id="cur-gallery-${encodeURIComponent(code)}" style="margin-top:10px"><b>🖼️ Ảnh của bước</b>${selectedHtml?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${selectedHtml}</div>`:`<div class="small" style="margin-top:6px;color:#b76b00">⚠️ Chưa chọn ảnh</div>`}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">＋ Thêm ảnh từ nguồn (${remaining.length})</summary>${remaining.length?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${remaining.map((im,i)=>card(im,i,false)).join('')}</div>`:`<div class="small" style="padding:7px">Không còn ảnh nguồn khác.</div>`}</details></div>`;
 }
-function _findCurriculumTextarea(code){
-  const wanted=String(code||'');
-  for(const ta of document.querySelectorAll('#curSteps .cur-json')){
-    if(String(ta.getAttribute('data-code')||'')===wanted) return ta;
-  }
-  return null;
-}
+function _findCurriculumTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-json'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
 function changeCurriculumImage(code,key,add){
-  const ta=_findCurriculumTextarea(code);
-  if(!ta){alert('❌ Không tìm thấy nội dung bước '+String(code)+'.');return;}
-  let c={};
-  try{c=JSON.parse(ta.value||'{}')}catch(e){alert('❌ Nội dung JSON của bước đang lỗi.');return;}
-  const pages=Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[];
-  const inv={};
-  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||'').trim();if(k)inv[k]=im;}));
-  const k=String(key||'').trim();
-  let imgs=Array.isArray(c.images)?c.images.slice():[];
-  if(add){
-    if(!imgs.some(im=>String(im?.image_key||im?.key||'').trim()===k)){
-      const src=inv[k]||{}; const v=src.vision||{};
-      imgs.push({image_key:k,image_url:src.image_url||'',page:src.page||null,caption:v.caption||v.description||v.explanation||''});
-    }
-  }else{
-    imgs=imgs.filter(im=>String(im?.image_key||im?.key||'').trim()!==k);
-  }
-  c.images=imgs;
-  ta.value=JSON.stringify(c,null,2);
-  ta.dispatchEvent(new Event('input',{bubbles:true}));
-  const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));
-  if(host) host.outerHTML=curriculumImageGallery({code,content:c},pages);
+  const wanted=String(code||'').trim(), k=String(key||'').trim(); if(!wanted||!k)return false;
+  let c=_curriculumGetStepState(wanted,{}); const ta=_findCurriculumTextarea(wanted);
+  if(ta){try{c=JSON.parse(ta.value||'{}');}catch(e){}}
+  if(!Array.isArray(c.images))c.images=[]; const pages=Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]; const inv={};
+  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const ik=String(im.image_key||'').trim();if(ik)inv[ik]=im;}));
+  if(add){if(!c.images.some(im=>String(im?.image_key||im?.key||'').trim()===k)){const src=inv[k]||{};const v=src.vision||{};c.images.push({image_key:k,image_url:src.image_url||'',page:src.page||null,caption:v.caption||v.description||v.explanation||''});}}
+  else c.images=c.images.filter(im=>String(im?.image_key||im?.key||'').trim()!==k);
+  _curriculumSetStepState(wanted,c); if(ta){ta.value=JSON.stringify(c,null,2);ta.dispatchEvent(new Event('input',{bubbles:true}));}
+  const host=document.getElementById('cur-gallery-'+encodeURIComponent(wanted)); if(host)host.outerHTML=curriculumImageGallery({code:wanted,content:c},pages); return false;
 }
-document.addEventListener('click',function(ev){
-  const btn=ev.target.closest && ev.target.closest('[data-cur-image-action]');
-  if(!btn) return;
-  ev.preventDefault(); ev.stopPropagation();
-  changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');
-});
-
-function renderCurriculumDraft(id,data){window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)}<div id="curSteps">${steps.map((s,i)=>`<div class="card" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.code)} · <input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></b><button class="gray" onclick="regenerateCurriculumStep(${id},'${esc(s.code)}')">🤖 Gen lại</button></div>${curriculumImageGallery(s,data.pages||[])}<textarea class="cur-json" data-code="${esc(s.code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`; }
-async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const d=base.draft_json||{}; const cards=[...document.querySelectorAll('#curSteps .cur-json')]; d.steps=(d.steps||[]).map((s)=>{const ta=_findCurriculumTextarea(String(s.code)); const titleEl=ta?.closest('.card')?.querySelector('.cur-title'); let content=s.content||{}; try{content=JSON.parse(ta?.value||JSON.stringify(content))}catch(e){} if(!Array.isArray(content.images)) content.images=[]; content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key); return {...s,title:titleEl?.value||s.title,content};}); return d;}
-async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id); await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})}); alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
-async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})}); const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(code))}"]`); if(ta){ta.value=JSON.stringify(d.step.content||{},null,2); const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code))); if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);} alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
-async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id); if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return; const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})}); alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`); await loadKnowledgeCatalog(); const st=document.getElementById('curStatus'); if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Đã cập nhật danh sách bài học.`;}catch(e){alert('❌ '+e.message);}}
+function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(`Xóa bước ${label} khỏi DRAFT? Giáo trình PUBLISHED của Doraemon KHÔNG bị ảnh hưởng cho tới khi bạn Publish lại.`))return;api('/admin/api/curriculum/drafts/'+id+'/delete-step',{method:'POST',body:JSON.stringify({password:pw,step_code:label})}).then(d=>{renderCurriculumDraft(id,d);const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Đã xóa ${label} khỏi Draft. Các bước sau đã được đánh lại.`;}).catch(e=>alert('❌ '+e.message));}
+document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
+function renderCurriculumDraft(id,data){
+  window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
+  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
+}
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const ta=_findCurriculumTextarea(code);const titleEl=ta?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(ta){try{content=JSON.parse(ta.value||JSON.stringify(content));}catch(e){}}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=_reindex_curriculum_draft_steps(String(d.content_type||''),d.steps||[]);return d;}
+async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});renderCurriculumDraft(id,{...d,...saved,steps:saved.steps||d.steps});alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
+async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const ta=_findCurriculumTextarea(String(code));if(ta)ta.value=JSON.stringify(d.step.content||{},null,2);_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
+async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id);if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Đã cập nhật danh sách bài học.`;}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
   const el=document.getElementById(id);
@@ -8866,7 +9116,7 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
         doc.close()
     return stored
 
-def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str):
+def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
 
     IMPORTANT: no table OCR/grid reconstruction is performed here. For a page
@@ -8877,7 +9127,10 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
     page_texts = {}
     page_images = {}
     page_units = {}
+    selected = {int(x) for x in (selected_pages or [])} if selected_pages else None
     for page_no, page in enumerate(reader.pages, 1):
+        if selected is not None and page_no not in selected:
+            continue
         page_meta = metadata_for_page(records_meta, page_no)
         extracted = (page.extract_text() or "").strip()
         text_len = len(re.sub(r"\s+", "", extracted))
