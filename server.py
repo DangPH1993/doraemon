@@ -1,3 +1,4 @@
+# VERSION: v19_61 — vocabulary/exercise DB-first fix
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
 import ast
@@ -2793,7 +2794,7 @@ def _published_curriculum_runtime_payload(lesson_row, step_rows):
         page=None
         if isinstance(refs,list) and refs and isinstance(refs[0],dict): page=refs[0].get("page")
         text=_published_curriculum_step_text(content) or str(row.get("title") or "").strip()
-        sections.append({"chunk_index":order,"page":page or order+1,"content_unit_id":f"curriculum:{row.get('step_code')}","step_code":str(row.get("step_code") or ""),"step_title":str(row.get("title") or ""),"step_type":str(row.get("step_type") or "lesson"),"text":text,"image_keys":keys})
+        sections.append({"chunk_index":order,"page":page or order+1,"content_unit_id":f"curriculum:{row.get('step_code')}","step_code":str(row.get("step_code") or ""),"step_title":str(row.get("title") or ""),"step_type":str(row.get("step_type") or "lesson"),"text":text,"content":content,"image_keys":keys})
     return {"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
 
 
@@ -2806,7 +2807,109 @@ def _published_curriculum_step(cache,index):
     for key in sec.get("image_keys") or []:
         im=by_key.get(str(key))
         if im: imgs.append({"key":str(key),"url":im.get("image_url") or b2_url(str(key)),"page":im.get("page"),"caption":str((im.get("vision") or {}).get("caption") or "")})
-    return {"index":index,"code":sec.get("step_code") or f"B{index}","title":sec.get("step_title") or "","text":sec.get("text") or "","images":imgs,"is_final":str(sec.get("step_code") or "").upper()=="FINAL" or index==len(sections)-1}
+    return {
+        "index":index,
+        "code":sec.get("step_code") or f"B{index}",
+        "title":sec.get("step_title") or "",
+        "text":sec.get("text") or "",
+        "content":sec.get("content") if isinstance(sec.get("content"),dict) else {},
+        "images":imgs,
+        "is_final":str(sec.get("step_code") or "").upper()=="FINAL" or index==len(sections)-1
+    }
+
+
+def _published_curriculum_vocabulary_text(step):
+    """Render vocabulary fields exactly as stored in curriculum_steps.content_json.
+    Never ask Gemini to reconstruct spelling/reading/meaning at runtime.
+    """
+    content=step.get("content") if isinstance(step,dict) else {}
+    content=content if isinstance(content,dict) else {}
+    items=content.get("items") if isinstance(content.get("items"),list) else []
+    if not items:
+        return str(step.get("text") or "").strip()
+
+    def pick(item, *keys):
+        for key in keys:
+            value=item.get(key) if isinstance(item,dict) else None
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    lines=[]
+    for i,item in enumerate(items,1):
+        if not isinstance(item,dict):
+            if str(item).strip(): lines.append(f"{i}. {str(item).strip()}")
+            continue
+        writing=pick(item,"writing","word","term","kanji","title","text")
+        reading=pick(item,"reading","hiragana","kana","pronunciation","yomikata")
+        meaning=pick(item,"meaning","definition","translation","vietnamese_meaning")
+        example=pick(item,"example","content")
+        if writing or reading or meaning:
+            row=[f"{i}. {writing}" if writing else f"{i}."]
+            if reading: row.append(f"   📖 Cách đọc: {reading}")
+            if meaning: row.append(f"   🇻🇳 Nghĩa: {meaning}")
+            if example: row.append(f"   Ví dụ: {example}")
+            lines.append("\n".join(row))
+        else:
+            fallback=pick(item,"question","pattern","answer")
+            if fallback: lines.append(f"{i}. {fallback}")
+    intro=str(content.get("content") or "").strip()
+    # If the content is only a generic intro, keep it; the structured rows are the
+    # authoritative spelling/reading/meaning payload.
+    return "\n\n".join([x for x in (intro,"\n".join(lines)) if x]).strip() or str(step.get("text") or "").strip()
+
+
+def _published_curriculum_answer_step(cache):
+    sections=list((cache or {}).get("sections") or [])
+    for idx,sec in enumerate(sections):
+        if str(sec.get("step_code") or "").upper() in {"B2","ANSWER"}:
+            return _published_curriculum_step(cache,idx)
+    return None
+
+
+def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False):
+    """Deterministic DB-first UI for Từ vựng/Bài tập.
+
+    All visible teaching/answer text comes from curriculum_steps.content_json.
+    The only generated UI text is navigation chrome (labels/prompts).
+    """
+    if not step: return []
+    ct=str(content_type or "").strip()
+    blocks=[]
+    title=f"**{step['code']} · {step['title']}**" if step.get("title") else f"**{step['code']}**"
+    text=_published_curriculum_vocabulary_text(step) if ct == "Từ vựng" else str(step.get("text") or "").strip()
+    if text:
+        blocks.append({"type":"text","text":(title+"\n\n"+text).strip()})
+    for im in step.get("images") or []:
+        if im.get("url"):
+            blocks.append({"type":"image","key":im.get("key"),"url":im.get("url"),"page":im.get("page"),"caption":im.get("caption","")})
+
+    sections=list((cache or {}).get("sections") or [])
+    is_exercise = ct == "Bài tập"
+    is_answer_step = str(step.get("code") or "").upper() in {"B2","ANSWER"}
+    is_question_step = (ct == "Bài tập" and str(step.get("code") or "").upper() == "B0") or (ct == "Từ vựng" and str(step.get("code") or "").upper() == "B2")
+
+    if answered and is_exercise:
+        answer_step=_published_curriculum_answer_step(cache)
+        if answer_step and answer_step.get("index") != step.get("index"):
+            answer_text=str(answer_step.get("text") or "").strip()
+            if answer_text:
+                blocks.append({"type":"text","text":"📘 **Đáp án trong DB:**\n\n"+answer_text})
+            for im in answer_step.get("images") or []:
+                if im.get("url"):
+                    blocks.append({"type":"image","key":im.get("key"),"url":im.get("url"),"page":im.get("page"),"caption":im.get("caption","")})
+            step=answer_step
+            is_answer_step=True
+
+    if is_question_step and not answered:
+        blocks.append({"type":"text","text":"✍️ Cậu hãy trả lời câu hỏi trên nhé. Nếu chưa biết, cứ nói **mình không biết**; Doraemon sẽ hiển thị đáp án đã lưu trong DB."})
+
+    if step.get("is_final"):
+        blocks.extend(_curriculum_final_blocks())
+    else:
+        blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+        blocks.extend(_curriculum_continue_blocks(int(step.get("index") or 0)))
+    return blocks
 
 
 def _published_curriculum_db_only_turn(query_text, action, study_session):
@@ -5387,6 +5490,70 @@ Tin nhắn hiện tại:
         f"embedding_will_run={int(study_retrieval_allowed and not runtime_cache_hit)} "
         f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
+
+    # DB-FIRST path for published Vocabulary/Exercise. These content types are
+    # authoritative in curriculum_steps.content_json: do not let Gemini rewrite
+    # spelling, reading, meaning, questions, or answer keys.
+    if (runtime_cache_hit and (runtime_lesson_cache or {}).get("published_curriculum")
+            and requested_content_type in {"Từ vựng", "Bài tập"} and study_session):
+        sections=list((runtime_lesson_cache or {}).get("sections") or [])
+        if sections:
+            current_step=max(0,min(int((study_session or {}).get("curriculum_step") or 0),len(sections)-1))
+            waiting=str((study_session or {}).get("curriculum_waiting") or "continue")
+            answered=bool((study_session or {}).get("curriculum_exercise_answered"))
+
+            # Button navigation is deterministic and costs 0 Gemini/embedding/Pinecone.
+            if ui_action == "curriculum_next":
+                try:
+                    expected=int(action_plan_id or -1)
+                except Exception:
+                    expected=-1
+                if expected == current_step and current_step < len(sections)-1:
+                    current_step += 1
+                    answered=False
+                    waiting="continue"
+                    _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=False)
+                    study_session["curriculum_step"]=current_step
+                    study_session["curriculum_waiting"]=waiting
+                    study_session["curriculum_exercise_answered"]=False
+                    print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} advance={current_step}")
+
+            # Text 'tiếp' is also a pure DB navigation turn.
+            elif not data.action and _is_continue_confirmation(query_text) and current_step < len(sections)-1:
+                current_step += 1
+                answered=False
+                waiting="continue"
+                _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=False)
+                study_session["curriculum_step"]=current_step
+                study_session["curriculum_waiting"]=waiting
+                study_session["curriculum_exercise_answered"]=False
+                print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} text_advance={current_step}")
+
+            # Exercise answer turn: show the exact B2 answer stored in DB.
+            # 'mình không biết' follows the same path; there is deliberately no LLM.
+            elif requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
+                answered=True
+                waiting="continue"
+                # Keep the state on the question step so the button advances once.
+                _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=True)
+                study_session["curriculum_exercise_answered"]=True
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json")
+
+            step=_published_curriculum_step(runtime_lesson_cache,current_step)
+            if requested_content_type == "Bài tập" and answered:
+                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=True)
+            else:
+                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False)
+
+            # A question step waits for an answer but still exposes Tiếp theo, as requested.
+            if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B0" and not answered:
+                _set_curriculum_flow(user["id"],step=current_step,waiting="exercise_answer",exercise_answered=False)
+                study_session["curriculum_waiting"]="exercise_answer"
+            elif not step.get("is_final") and waiting != "continue":
+                _set_curriculum_flow(user["id"],step=current_step,waiting="continue",exercise_answered=answered)
+
+            print(f"[CURRICULUM DB-FIRST] request={request_id} type={requested_content_type} step={step.get('code')} genai=0 embedding=0 pinecone=0")
+            return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":GEMINI_MODEL,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
     # DB-first path for newly published AI Curriculum. A navigation/Continue turn
     # renders the already-published step directly from PostgreSQL: no embedding,
