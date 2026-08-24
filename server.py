@@ -7678,6 +7678,7 @@ async def admin_curriculum_draft_upload(
                 temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
             )
             pages=[]
+            selected_set=set(int(x) for x in selected_pages)
             for page_no in selected_pages:
                 imgs=[]
                 for img in page_images.get(page_no,[]) or []:
@@ -7686,6 +7687,10 @@ async def admin_curriculum_draft_upload(
                     if not key: continue
                     imgs.append({'image_key':key,'image_url':b2_url(key),'vision':vision})
                 pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
+            # Hard invariant: the AI Draft payload may contain ONLY configured pages.
+            page_keys={int(pg.get('page')) for pg in pages if str(pg.get('page')).isdigit()}
+            if page_keys != selected_set:
+                raise HTTPException(500, f'Page-scope lỗi cho bài {ls}: expected={sorted(selected_set)} actual={sorted(page_keys)}')
 
             digest=_curriculum_source_digest(pages)
             plan=_normalize_curriculum_steps(ct,_curriculum_step_plan(ct,digest),digest)
@@ -7722,6 +7727,7 @@ async def admin_curriculum_draft_upload(
                 'draft_id':draft_id,'status':'AI_DRAFT','version':version,
                 'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
                 'page_ranges':cfg['pages_label'],'selected_pages':selected_pages,
+                'selected_page_count':len(selected_pages),
                 'steps':normalized_steps,'pages':pages,'page_count':len(pages),
             })
 
@@ -7731,6 +7737,7 @@ async def admin_curriculum_draft_upload(
             'subject':subject,
             'pdf_page_count':total_pages,
             'configured_articles':len(results),
+            'selected_page_count':sum(int(x.get('selected_page_count') or 0) for x in results),
             'drafts':results,
             # Backward compatible single-result keys.
             **(results[0] if len(results)==1 else {'draft_id':results[0]['draft_id'] if results else None}),
@@ -7756,6 +7763,30 @@ def admin_curriculum_drafts(password: str):
             rows=[dict(r) for r in cur.fetchall()]
             return {'success':True,'drafts':rows,'count':len(rows)}
     finally: conn.close()
+
+@app.post('/admin/api/curriculum/drafts/{draft_id}/delete')
+def admin_curriculum_draft_delete_post(draft_id:int,payload:dict):
+    """Reliable POST delete endpoint for Admin UI; DELETE remains supported for compatibility."""
+    password=str((payload or {}).get('password') or '')
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT status,source_file,content_type,lesson FROM curriculum_drafts WHERE id=%s",(draft_id,))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,'Draft không tồn tại.')
+            if str(row.get('status') or '').upper() == 'PUBLISHED':
+                raise HTTPException(400,'Draft đã publish, không thể xóa khỏi danh sách Draft.')
+            cur.execute("DELETE FROM curriculum_drafts WHERE id=%s",(draft_id,))
+        conn.commit()
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return {'success':True,'draft_id':draft_id,'message':'Đã xóa Draft.'}
 
 @app.get('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_get(draft_id:int,password:str):
@@ -7854,32 +7885,54 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
 
 @app.post('/admin/api/curriculum/drafts/{draft_id}/publish')
 def admin_curriculum_publish(draft_id:int,payload:dict):
-    check_admin(str(payload.get('password') or '')); conn=db()
+    check_admin(str(payload.get('password') or ''))
+    client_draft = payload.get('draft')
+    conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s',(draft_id,)); dr=cur.fetchone()
+            cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s FOR UPDATE',(draft_id,)); dr=cur.fetchone()
             if not dr: raise HTTPException(404,'Draft không tồn tại.')
-            draft=dict(dr['draft_json'] or {})
-            source_file=str(draft.get('source_file') or dr['source_file']).strip(); ct=str(draft.get('content_type') or dr['content_type']).strip(); lesson=str(draft.get('lesson') or dr['lesson']).strip(); subject=str(draft.get('subject') or dr['subject']).strip()
+            if str(dr.get('status') or '').upper() == 'PUBLISHED':
+                raise HTTPException(400,'Draft này đã được publish.')
+
+            # CRITICAL: publish the exact draft currently present in the Admin editor.
+            # The browser sends the fully collected draft so a last-second text edit
+            # cannot be lost between Save and Publish. Server-side normalization still
+            # runs before anything is persisted/published.
+            draft = dict(client_draft) if isinstance(client_draft, dict) else dict(dr.get('draft_json') or {})
+            ct = str(draft.get('content_type') or dr.get('content_type') or '').strip()
+            steps = draft.get('steps') or []
+            draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
+            source_file=str(draft.get('source_file') or dr['source_file']).strip()
+            lesson=str(draft.get('lesson') or dr['lesson']).strip()
+            subject=str(draft.get('subject') or dr['subject']).strip()
+            draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=subject; draft['content_type']=ct
+
+            # Persist the exact edited draft first. Publish and DB step insertion happen
+            # in the same transaction, so the published content is byte-for-byte sourced
+            # from this normalized draft snapshot.
+            cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
             cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND status='PUBLISHED'",(source_file,ct,lesson))
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,lesson)); version=int(cur.fetchone()['next_version'])
             cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,subject,ct,lesson,version,json.dumps({'pages':draft.get('pages') or []},ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
-                cur.execute("INSERT INTO curriculum_steps(lesson_id,step_code,step_order,title,step_type,content_json) VALUES(%s,%s,%s,%s,%s,%s::jsonb)",(lesson_id,str(step.get('code') or f'B{order-1}'),order,str(step.get('title') or ''),str(step.get('type') or 'lesson'),json.dumps(step.get('content') or {},ensure_ascii=False)))
+                content=dict(step.get('content') or {})
+                # Keep the editable text/content exactly as saved by Admin. Do not
+                # regenerate or reconstruct it from source pages during publish.
+                cur.execute("INSERT INTO curriculum_steps(lesson_id,step_code,step_order,title,step_type,content_json) VALUES(%s,%s,%s,%s,%s,%s::jsonb)",(lesson_id,str(step.get('code') or f'B{order-1}'),order,str(step.get('title') or content.get('title') or ''),str(step.get('type') or 'lesson'),json.dumps(content,ensure_ascii=False)))
             cur.execute("UPDATE curriculum_drafts SET status='PUBLISHED',updated_at=NOW() WHERE id=%s",(draft_id,))
         conn.commit()
-    finally: conn.close()
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
 
-    # The chat router keeps a short-lived catalog cache. Publishing a new lesson
-    # must invalidate it immediately; otherwise the new lesson can be invisible
-    # for up to CATALOG_CACHE_TTL seconds after a successful publish.
     _invalidate_catalog_cache()
 
-    # Index only the currently published lesson into Pinecone. Remove any older
-    # published vectors for the same exact lesson identity first, otherwise a
-    # re-publish would leave old curriculum_step vectors competing with the new
-    # version because they share the same source_file/content_type/lesson.
+    # Index exactly the just-published edited content, never the original AI draft/source.
     if index:
         try:
             _delete_pinecone_scope_exact(
@@ -7889,7 +7942,8 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             )
             vectors=[]
             for step in draft.get('steps') or []:
-                content=step.get('content') or {}; text='\n'.join(str(content.get(k) or '') for k in ('title','content'))
+                content=step.get('content') or {}
+                text='\n'.join(str(content.get(k) or '') for k in ('title','content'))
                 if not text.strip(): continue
                 vec=embed_text(text[:8000])
                 vectors.append({'id':f'curriculum:{lesson_id}:{step.get("code")}', 'values':vec, 'metadata':{'record_type':'curriculum_step','content_id':str(lesson_id),'lesson_id':str(lesson_id),'step_code':str(step.get('code') or ''),'source_file':source_file,'content_type':ct,'lesson':lesson,'text':text[:6000]}})
@@ -8166,7 +8220,7 @@ async function createCurriculumDraft(event){
    const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
    const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status));
    const drafts=Array.isArray(d.drafts)?d.drafts:[];
-   st.textContent=`✅ Đã tạo ${drafts.length} Draft từ ${d.pdf_page_count||'?'} trang PDF. Chỉ các trang cấu hình được xử lý.`;
+   st.textContent=`✅ Đã tạo ${drafts.length} Draft. PDF có ${d.pdf_page_count||'?'} trang; chỉ các trang đã cấu hình được OCR/Vision và lưu vào Draft.`;
    await loadCurriculumDrafts();
    if(drafts.length===1){await openCurriculumDraft(drafts[0].draft_id);}
    else if(drafts.length){document.getElementById('curStatus').textContent += ` · ${drafts.length} bài đang chờ duyệt.`;}
@@ -8196,7 +8250,7 @@ async function deleteCurriculumDraft(id,lesson){
   const label=String(lesson||'Draft #'+id);
   if(!confirm(`Xóa Draft "${label}"?\n\nChỉ xóa bản Draft này, không ảnh hưởng giáo trình PUBLISHED của Doraemon.`)) return;
   try{
-    await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw),{method:'DELETE'});
+    await api('/admin/api/curriculum/drafts/'+id+'/delete',{method:'POST',body:JSON.stringify({password:pw})});
     if(Number(window.currentCurriculumDraftId||0)===Number(id)){const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}
     await loadCurriculumDrafts();
     const st=document.getElementById('curStatus'); if(st) st.textContent=`✅ Đã xóa Draft #${id}.`;
@@ -8250,7 +8304,7 @@ function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.i
 async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const ta=_findCurriculumTextarea(code);const titleEl=ta?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(ta){try{content=JSON.parse(ta.value||JSON.stringify(content));}catch(e){}}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const ta=_findCurriculumTextarea(String(code));if(ta)ta.value=JSON.stringify(d.step.content||{},null,2);_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
-async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;await saveCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';}catch(e){alert('❌ '+e.message);}}
+async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;const draft=await collectCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw,draft})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
   const el=document.getElementById(id);
@@ -9237,7 +9291,12 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
     page_texts = {}
     page_images = {}
     page_units = {}
-    selected = {int(x) for x in (selected_pages or [])} if selected_pages else None
+    if selected_pages is not None:
+        selected = {int(x) for x in (selected_pages or [])}
+        if not selected:
+            raise ValueError('selected_pages không được rỗng khi tạo AI Draft.')
+    else:
+        selected = None
     for page_no, page in enumerate(reader.pages, 1):
         if selected is not None and page_no not in selected:
             continue
