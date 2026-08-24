@@ -8252,7 +8252,7 @@ async function loadCurriculumDrafts(){
       const label=status==='ADMIN_REVIEW'?'Đang chỉnh sửa':'AI_DRAFT';
       return `<div class="cur-draft-row" style="display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid #ddd;border-radius:8px;padding:9px;margin-top:7px;background:#fafafa">
         <div><b>Draft #${esc(x.id)}</b> · ${esc(x.content_type)} · ${esc(x.lesson)}<div class="small">${esc(x.source_file||'')} · ${esc(label)} · v${esc(x.version||1)}</div></div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="red" onclick="deleteCurriculumDraft(${Number(x.id)},${JSON.stringify(x.lesson||'')})">🗑️ Xóa Draft</button></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="red js-delete-draft" data-draft-id="${Number(x.id)}" data-draft-label="${esc(x.lesson||('Draft #'+x.id))}">🗑️ Xóa Draft</button></div>
       </div>`;
     }).join('')}</div>`;
   }catch(e){
@@ -8262,14 +8262,37 @@ async function loadCurriculumDrafts(){
 
 async function deleteCurriculumDraft(id,lesson){
   const label=String(lesson||'Draft #'+id);
-  if(!confirm(`Xóa Draft "${label}"?\n\nChỉ xóa bản Draft này, không ảnh hưởng giáo trình PUBLISHED của Doraemon.`)) return;
+  const st=document.getElementById('curStatus');
+  if(st) st.textContent=`⏳ Đang xóa Draft #${id}...`;
   try{
-    await api('/admin/api/curriculum/drafts/'+id+'/remove?password='+encodeURIComponent(pw),{method:'POST'});
+    if(!window.confirm(`Xóa Draft "${label}"?\n\nChỉ xóa bản Draft này, không ảnh hưởng giáo trình PUBLISHED của Doraemon.`)){
+      if(st) st.textContent='';
+      return;
+    }
+    const url='/admin/api/curriculum/drafts/'+encodeURIComponent(String(id))+'/remove';
+    console.log('[CURRICULUM DRAFT DELETE] request', {id, url});
+    const d=await api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    console.log('[CURRICULUM DRAFT DELETE] response', d);
     if(Number(window.currentCurriculumDraftId||0)===Number(id)){const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}
     await loadCurriculumDrafts();
-    const st=document.getElementById('curStatus'); if(st) st.textContent=`✅ Đã xóa Draft #${id}.`;
-  }catch(e){alert('❌ '+e.message);}
+    if(st) st.textContent=`✅ Đã xóa Draft #${id}.`;
+  }catch(e){
+    console.error('[CURRICULUM DRAFT DELETE] failed', e);
+    if(st) st.textContent=`❌ Xóa Draft thất bại: ${e.message}`;
+    alert('❌ Xóa Draft thất bại: '+e.message);
+  }
 }
+
+document.addEventListener('click', async (event)=>{
+  const btn=event.target.closest('.js-delete-draft');
+  if(!btn) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const id=Number(btn.dataset.draftId||0);
+  const label=btn.dataset.draftLabel||('Draft #'+id);
+  if(!id) return;
+  await deleteCurriculumDraft(id,label);
+});
 async function openCurriculumDraft(id){
  try{const d=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const dj=d.draft_json||{}; renderCurriculumDraft(id,{...dj,draft_id:id,status:d.status,version:d.version});}
  catch(e){alert('❌ '+e.message)}
