@@ -1,4 +1,4 @@
-BASELINE_VERSION = "19.42-chunk-image-provenance-fix"
+BASELINE_VERSION = "19.44-ai-curriculum-db-first-fix"
 import os
 import ast
 import io
@@ -81,8 +81,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.38-kb-chunk-order-cache-fix")
-SERVER_VERSION = "2026-08-23-kb-chunk-order-cache-fix"
+print("[DORAEMON SERVER FINGERPRINT] 19.44-ai-curriculum-db-first-fix")
+SERVER_VERSION = "2026-08-24-ai-curriculum-db-first-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -784,7 +784,13 @@ async def ws_admin(websocket: WebSocket):
         admin_connections.discard(websocket)
 
 def _load_catalog_cached():
-    """Load the full knowledge catalog once per short TTL instead of per chat."""
+    """Load both legacy Knowledge Base rows and PUBLISHED curriculum rows.
+
+    PostgreSQL is the routing source of truth: a newly published Curriculum
+    lesson must become visible to the same catalog router immediately, even
+    when it was created through AI Curriculum Studio rather than the legacy
+    knowledge_documents uploader.
+    """
     global _catalog_cache, _catalog_cache_at
     now = time.monotonic()
     if _catalog_cache is not None and (now - _catalog_cache_at) < CATALOG_CACHE_TTL:
@@ -801,7 +807,14 @@ def _load_catalog_cached():
                     SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
                            question_pages,answer_pages,source_file,namespace
                     FROM knowledge_documents
-                    ORDER BY subject,content_type,lesson,topic,id
+                    UNION ALL
+                    SELECT subject,content_type,lesson,NULL::VARCHAR AS lesson_pages,
+                           NULL::VARCHAR AS topic,NULL::VARCHAR AS topic_pages,
+                           NULL::VARCHAR AS question_pages,NULL::VARCHAR AS answer_pages,
+                           source_file,'__default__'::VARCHAR AS namespace
+                    FROM curriculum_lessons
+                    WHERE status='PUBLISHED'
+                    ORDER BY subject,content_type,lesson,topic,source_file
                 """)
                 _catalog_cache = [dict(x) for x in cur.fetchall()]
                 _catalog_cache_at = now
@@ -6740,7 +6753,16 @@ def learning_catalog(authorization: Optional[str] = Header(default=None)):
     require_active_user(authorization); conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,source_file,namespace FROM knowledge_documents ORDER BY subject,lesson,topic,id")
+            cur.execute("""
+                SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,source_file,namespace
+                FROM knowledge_documents
+                UNION ALL
+                SELECT subject,content_type,lesson,NULL::VARCHAR AS lesson_pages,NULL::VARCHAR AS topic,
+                       NULL::VARCHAR AS topic_pages,NULL::VARCHAR AS question_pages,NULL::VARCHAR AS answer_pages,
+                       source_file,'__default__'::VARCHAR AS namespace
+                FROM curriculum_lessons WHERE status='PUBLISHED'
+                ORDER BY subject,lesson,topic,source_file
+            """)
             return {"success":True,"documents":[dict(x) for x in cur.fetchall()]}
     finally: conn.close()
 
@@ -6760,7 +6782,14 @@ def _knowledge_catalog_rows():
                 SELECT source_file, subject, content_type, lesson, lesson_pages,
                        topic, topic_pages, question_pages, answer_pages, namespace
                 FROM knowledge_documents
-                ORDER BY source_file, subject, content_type, lesson, topic, id
+                UNION ALL
+                SELECT source_file, subject, content_type, lesson, NULL::VARCHAR AS lesson_pages,
+                       NULL::VARCHAR AS topic, NULL::VARCHAR AS topic_pages,
+                       NULL::VARCHAR AS question_pages, NULL::VARCHAR AS answer_pages,
+                       '__default__'::VARCHAR AS namespace
+                FROM curriculum_lessons
+                WHERE status='PUBLISHED'
+                ORDER BY source_file, subject, content_type, lesson, topic
             """)
             return [dict(r) for r in cur.fetchall()]
     finally:
@@ -6961,8 +6990,10 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
                 namespaces = ["__default__"]
 
             cur.execute(
-                f"SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}",
-                tuple(params),
+                f"""SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}
+                    UNION
+                    SELECT DISTINCT lesson,content_type FROM curriculum_lessons WHERE {ws} AND status='PUBLISHED'""",
+                tuple(params) * 2,
             )
             matching_lessons = [dict(r) for r in (cur.fetchall() or [])]
 
@@ -6996,6 +7027,9 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
         with conn.cursor() as cur:
             cur.execute(f"DELETE FROM knowledge_documents WHERE {ws}", tuple(params))
             deleted_documents = cur.rowcount
+
+            cur.execute(f"DELETE FROM curriculum_lessons WHERE {ws}", tuple(params))
+            deleted_curriculum_lessons = cur.rowcount
 
             cur.execute(f"DELETE FROM knowledge_lesson_cache WHERE {ws}", tuple(params))
             deleted_lesson_cache = cur.rowcount
@@ -7083,6 +7117,7 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
         "lesson": lesson,
         "topic": topic,
         "deleted_documents": deleted_documents,
+        "deleted_curriculum_lessons": deleted_curriculum_lessons,
         "deleted_lesson_cache": deleted_lesson_cache,
         "deleted_vision_cache": deleted_vision_cache,
         "deleted_images": deleted_images,
@@ -7220,10 +7255,69 @@ def _curriculum_source_digest(pages):
             parts.append(f"[TRANG {p.get('page')}]\n{text[:6000]}")
         for img in (p.get('images') or []):
             vision=img.get('vision') or {}
-            desc='; '.join(str(vision.get(k) or '').strip() for k in ('term','reading','meaning','associated_text','description','explanation') if str(vision.get(k) or '').strip())
+            desc='; '.join(str(vision.get(k) or '').strip() for k in ('term','reading','meaning','associated_text','description','explanation','caption') if str(vision.get(k) or '').strip())
+            image_key=str(img.get('image_key') or '').strip()
+            image_url=str(img.get('image_url') or '').strip()
+            image_line=f"[ẢNH NGUỒN trang {p.get('page')}] image_key={image_key} image_url={image_url}"
             if desc:
-                parts.append(f"[OCR/VISION ẢNH TRANG {p.get('page')}] {desc}")
+                image_line += f" vision={desc}"
+            if image_line.strip():
+                parts.append(image_line)
     return '\n\n'.join(parts)[:50000]
+
+def _resolve_curriculum_step_images(step_content, pages):
+    """Normalize step image references against the uploaded page/image inventory.
+
+    AI may return image_key only; the Admin must still see the actual B2 URL.
+    We never invent URLs: an image can only resolve when its key exists in the
+    original extracted pages.
+    """
+    content=dict(step_content or {})
+    raw=list(content.get('images') or [])
+    inventory={}
+    for page in pages or []:
+        for img in page.get('images') or []:
+            key=str(img.get('image_key') or '').strip()
+            if key:
+                inventory[key]={
+                    'image_key':key,
+                    'image_url':str(img.get('image_url') or '').strip(),
+                    'page':page.get('page'),
+                    'vision':img.get('vision') or {},
+                }
+    resolved=[]
+    seen=set()
+    for item in raw:
+        if not isinstance(item,dict):
+            continue
+        key=str(item.get('image_key') or item.get('key') or '').strip()
+        base=inventory.get(key)
+        if not base:
+            # Safe visual fallback: map an AI-selected image to the source
+            # inventory only when its caption exactly matches a stored Vision
+            # caption/description/explanation. Never map by vector similarity.
+            wanted=str(item.get('caption') or '').strip().casefold()
+            if wanted:
+                for cand in inventory.values():
+                    vision=cand.get('vision') or {}
+                    candidates=[vision.get('caption'),vision.get('description'),vision.get('explanation'),vision.get('associated_text')]
+                    if any(str(v or '').strip().casefold()==wanted for v in candidates if str(v or '').strip()):
+                        base=cand; key=str(cand.get('image_key') or '').strip(); break
+        if base:
+            row=dict(item)
+            row['image_key']=key or str(base.get('image_key') or '').strip()
+            row['image_url']=str(row.get('image_url') or base.get('image_url') or '').strip()
+            row['page']=row.get('page') or base.get('page')
+            if not row.get('caption'):
+                vision=base.get('vision') or {}
+                row['caption']=str(vision.get('caption') or vision.get('description') or vision.get('explanation') or '').strip()
+        else:
+            row=dict(item)
+        if key and key not in seen:
+            seen.add(key); resolved.append(row)
+    content['images']=resolved
+    return content
+
 
 def _curriculum_ai_json(prompt, operation):
     if not gemini:
@@ -7285,6 +7379,7 @@ async def admin_curriculum_draft_upload(password: str = Form(''), file: UploadFi
             title=str(s.get('title') or '').strip()
             if not code or not title: continue
             content=_curriculum_generate_step(content_type,lesson,{'code':code,'title':title},digest)
+            content=_resolve_curriculum_step_images(content, pages)
             normalized_steps.append({'code':code,'title':title,'type':s.get('type') or 'lesson','content':content})
         payload={'source_file':source_file,'subject':subject,'content_type':content_type,'lesson':lesson,'page_count':len(pages),'pages':pages,'steps':normalized_steps}
         conn=db()
@@ -7349,6 +7444,7 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
         if not step: raise HTTPException(404,'Step không tồn tại.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
         new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest)
+        new_content=_resolve_curriculum_step_images(new_content, draft.get('pages') or [])
         step['content']=new_content; draft['steps']=[s if s is not step else step for s in draft['steps']]
         with conn.cursor() as cur: cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
         conn.commit(); return {'success':True,'step':step}
@@ -7372,9 +7468,23 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             cur.execute("UPDATE curriculum_drafts SET status='PUBLISHED',updated_at=NOW() WHERE id=%s",(draft_id,))
         conn.commit()
     finally: conn.close()
-    # Index only published material into Pinecone.
+
+    # The chat router keeps a short-lived catalog cache. Publishing a new lesson
+    # must invalidate it immediately; otherwise the new lesson can be invisible
+    # for up to CATALOG_CACHE_TTL seconds after a successful publish.
+    _invalidate_catalog_cache()
+
+    # Index only the currently published lesson into Pinecone. Remove any older
+    # published vectors for the same exact lesson identity first, otherwise a
+    # re-publish would leave old curriculum_step vectors competing with the new
+    # version because they share the same source_file/content_type/lesson.
     if index:
         try:
+            _delete_pinecone_scope_exact(
+                '__default__',
+                _pinecone_scope_filter(source_file, content_type=ct, lesson=lesson),
+                source_file=source_file, content_type=ct, lesson=lesson, topic=None,
+            )
             vectors=[]
             for step in draft.get('steps') or []:
                 content=step.get('content') or {}; text='\n'.join(str(content.get(k) or '') for k in ('title','content'))
@@ -7611,11 +7721,25 @@ async function createCurriculumDraft(event){
  try{const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('subject',document.getElementById('curSubject').value.trim()); fd.append('content_type',document.getElementById('curType').value); fd.append('lesson',document.getElementById('curLesson').value.trim()); fd.append('metadata_json','[]'); const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Draft #${d.draft_id}: ${d.steps.length} bước. Admin có thể sửa từng bước trước khi publish.`; renderCurriculumDraft(d.draft_id,d); }catch(e){st.textContent='❌ '+e.message;} finally{btn.disabled=false;}
 }
 function escJson(v){return esc(JSON.stringify(v||{}));}
-function renderCurriculumDraft(id,data){const box=document.getElementById('curDraftEditor'); const steps=data.steps||[]; box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)}<div id="curSteps">${steps.map((s,i)=>`<div class="card" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.code)} · <input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></b><button class="gray" onclick="regenerateCurriculumStep(${id},'${esc(s.code)}')">🤖 Gen lại</button></div><textarea class="cur-json" data-code="${esc(s.code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`; }
+function curriculumImageGallery(step, pages){
+  const imgs=Array.isArray(step?.content?.images)?step.content.images:[];
+  const inv={};
+  (pages||[]).forEach(pg=>(pg.images||[]).forEach(im=>{const k=String(im.image_key||'').trim(); if(k)inv[k]=im;}));
+  const selectedKeys=new Set(imgs.map(im=>String(im.image_key||im.key||'').trim()).filter(Boolean));
+  const allSource=[];
+  (pages||[]).forEach(pg=>(pg.images||[]).forEach(im=>{const key=String(im.image_key||'').trim(); if(key && !allSource.some(x=>x.key===key)) allSource.push({key,page:pg.page,src:String(im.image_url||'').trim(),vision:im.vision||{}});}));
+  const card=(im,idx,selected)=>{const key=String(im.image_key||im.key||'').trim(); const src=String(im.image_url||inv[key]?.image_url||im.src||'').trim(); const page=im.page||inv[key]?.page||''; const vision=im.vision||inv[key]?.vision||{}; const caption=im.caption||vision.caption||vision.description||vision.explanation||''; return `<div style="border:2px solid ${selected?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="position:relative;height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" alt="${esc(caption||key)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:12px;text-align:center;color:#888">Không tải được ảnh</div>${selected?'<span style="position:absolute;top:6px;right:6px;background:#1677ff;color:#fff;border-radius:999px;padding:3px 8px;font-size:12px;font-weight:700">✓ AI chọn</span>':''}</div><div style="padding:9px"><div style="font-weight:700">Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</div><div class="small" style="word-break:break-all">${esc(key)}</div>${caption?`<div class="small" style="margin-top:5px">${esc(caption)}</div>`:''}</div></div>`;};
+  if(!imgs.length && !allSource.length) return '<div class="small" style="margin-top:8px;color:#999">🖼️ Chưa có ảnh nguồn được lưu.</div>';
+  const selectedHtml=imgs.map((im,idx)=>card(im,idx,true)).join('');
+  const remaining=allSource.filter(im=>!selectedKeys.has(im.key));
+  const sourceHtml=remaining.length?`<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">🔎 Xem tất cả ảnh nguồn còn lại (${remaining.length})</summary><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${remaining.map((im,idx)=>card(im,idx,false)).join('')}</div></details>`:'';
+  return `<div style="margin-top:10px"><div style="font-weight:700;margin-bottom:6px">🖼️ Ảnh nguồn</div>${selectedHtml?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">${selectedHtml}</div>`:'<div class="small" style="color:#b76b00">⚠️ AI chưa gắn được ảnh nguồn nào vào step này.</div>'}${sourceHtml}</div>`;
+}
+function renderCurriculumDraft(id,data){const box=document.getElementById('curDraftEditor'); const steps=data.steps||[]; box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)}<div id="curSteps">${steps.map((s,i)=>`<div class="card" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.code)} · <input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></b><button class="gray" onclick="regenerateCurriculumStep(${id},'${esc(s.code)}')">🤖 Gen lại</button></div>${curriculumImageGallery(s,data.pages||[])}<textarea class="cur-json" data-code="${esc(s.code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`; }
 async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const d=base.draft_json||{}; const cards=[...document.querySelectorAll('#curSteps .cur-json')]; d.steps=(d.steps||[]).map((s)=>{const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(s.code))}"]`); const titleEl=ta?.closest('.card')?.querySelector('.cur-title'); let content=s.content||{}; try{content=JSON.parse(ta.value)}catch(e){} return {...s,title:titleEl?.value||s.title,content};}); return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id); await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})}); alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})}); const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(code))}"]`); if(ta)ta.value=JSON.stringify(d.step.content||{},null,2); alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
-async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id); if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return; const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})}); alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`); loadKnowledgeCatalog();}catch(e){alert('❌ '+e.message);}}
+async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id); if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return; const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})}); alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`); await loadKnowledgeCatalog(); const st=document.getElementById('curStatus'); if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Đã cập nhật danh sách bài học.`;}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
   const el=document.getElementById(id);
