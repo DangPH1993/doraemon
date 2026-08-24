@@ -1,4 +1,4 @@
-# VERSION: v19_62 — vocabulary pronunciation + GenAI follow-up flow
+# VERSION: v19_63 — vocabulary direct DB factual answers + GenAI explanatory follow-up
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
 import ast
@@ -83,7 +83,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.44-ai-curriculum-db-first-fix")
-SERVER_VERSION = "2026-08-24-curriculum-step-delete-image-state"
+SERVER_VERSION = "2026-08-24-v19_63-vocab-db-direct"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
