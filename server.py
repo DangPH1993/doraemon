@@ -1,4 +1,5 @@
-# VERSION: v19_63 — vocabulary direct DB factual answers + GenAI explanatory follow-up
+# VERSION: v19_65 — strict whole-message Japanese response language fix
+# VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
 import os
 import ast
@@ -83,7 +84,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.44-ai-curriculum-db-first-fix")
-SERVER_VERSION = "2026-08-24-v19_63-vocab-db-direct"
+SERVER_VERSION = "2026-08-24-curriculum-step-delete-image-state"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2861,6 +2862,110 @@ def _published_curriculum_vocabulary_text(step):
     return "\n\n".join([x for x in (intro,"\n".join(lines)) if x]).strip() or str(step.get("text") or "").strip()
 
 
+
+def _vocab_direct_answer(step, question_text):
+    """Cheap DB-only answers for factual vocabulary lookups.
+
+    Returns a response when the learner only asks for spelling/reading/pronunciation/
+    meaning of a vocabulary item already present in the published DB. Returns None
+    for comparison, explanation, examples, or anything that needs GenAI.
+    """
+    if not isinstance(step, dict):
+        return None
+    q = str(question_text or "").strip()
+    if not q:
+        return None
+    q_fold = q.casefold()
+    direct_markers = (
+        "phát âm", "phat am", "đọc như nào", "đọc thế nào", "đọc sao", "đọc là gì",
+        "cách đọc", "cach doc", "đọc như thế nào", "nghĩa là gì", "nghĩa gì",
+        "nghĩa tiếng việt", "tiếng việt là gì", "dịch nghĩa", "viết như nào",
+        "viết thế nào", "chữ gì", "cách viết", "意味", "読み方", "発音", "どう読む",
+        "何の意味", "ベトナム語"
+    )
+    if not any(m in q_fold for m in direct_markers):
+        return None
+    # Explicit explanatory/comparison requests must remain GenAI turns.
+    complex_markers = ("khác nhau", "so sánh", "tại sao", "vì sao", "giải thích", "ví dụ", "đặt câu", "phân biệt")
+    if any(m in q_fold for m in complex_markers):
+        return None
+
+    content = step.get("content") if isinstance(step.get("content"), dict) else {}
+    items = content.get("items") if isinstance(content.get("items"), list) else []
+    if not items:
+        return None
+
+    def pick(item, *keys):
+        for key in keys:
+            value = item.get(key) if isinstance(item, dict) else None
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    # Match the Japanese token/reading appearing in the user's question.
+    candidates = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        writing = pick(item, "writing", "word", "term", "kanji", "title", "text")
+        reading = pick(item, "reading", "hiragana", "kana", "pronunciation", "yomikata")
+        meaning = pick(item, "meaning", "definition", "translation", "vietnamese_meaning")
+        pronunciation = pick(item, "pronunciation", "reading", "hiragana", "kana", "yomikata")
+        if not (writing or reading or meaning):
+            continue
+        candidates.append((writing, reading, pronunciation, meaning))
+
+    # Prefer an exact token; otherwise only use a unique contained Japanese token.
+    matched = None
+    for row in candidates:
+        writing, reading, pronunciation, meaning = row
+        if writing and writing.casefold() in q_fold:
+            matched = row
+            break
+        if reading and reading.casefold() in q_fold:
+            matched = row
+            break
+    if matched is None:
+        return None
+
+    writing, reading, pronunciation, meaning = matched
+    asks_meaning = any(x in q_fold for x in ("nghĩa", "意味", "ベトナム語", "tiếng việt", "dịch"))
+    asks_reading = any(x in q_fold for x in ("đọc", "cách đọc", "読み方", "どう読む"))
+    asks_pron = any(x in q_fold for x in ("phát âm", "phat am", "発音"))
+    asks_writing = any(x in q_fold for x in ("viết", "cách viết", "chữ", "書き方"))
+
+    lines = []
+    if writing:
+        lines.append(f"📝 **Chữ:** {writing}")
+    if reading and (asks_reading or asks_pron or not (asks_meaning or asks_writing)):
+        lines.append(f"📖 **Cách đọc:** {reading}")
+    if pronunciation and asks_pron:
+        lines.append(f"🔊 **Phát âm:** {pronunciation}")
+    if meaning and asks_meaning:
+        lines.append(f"🇻🇳 **Nghĩa:** {meaning}")
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def _vocab_direct_answer_from_cache(cache, current_step, question_text):
+    """Search all published vocabulary steps, not only the currently displayed B0/B1 step."""
+    sections=list((cache or {}).get("sections") or [])
+    order=[]
+    if current_step is not None:
+        try: order.append(int(current_step))
+        except Exception: pass
+    order.extend(i for i in range(len(sections)) if i not in order)
+    for idx in order:
+        try:
+            sec=_published_curriculum_step(cache, idx)
+        except Exception:
+            continue
+        ans=_vocab_direct_answer(sec, question_text)
+        if ans:
+            return ans
+    return None
+
 def _published_curriculum_answer_step(cache):
     sections=list((cache or {}).get("sections") or [])
     for idx,sec in enumerate(sections):
@@ -3511,6 +3616,56 @@ def _is_study_followup(text):
     return False
 
 
+
+def _exercise_simple_direct_answer(query_text, step, cache=None, current_step=None):
+    """Deterministic no-LLM handling for casual/simple exercise-session turns."""
+    q=str(query_text or '').strip().casefold()
+    if not q or not isinstance(step, dict):
+        return None
+
+    # Off-topic/casual chat while the learner is inside an exercise session.
+    casual_markers=(
+        'hôm nay nóng', 'hôm nay lạnh', 'thời tiết', 'trời nóng', 'trời lạnh',
+        'haha', 'hihi', 'hehe', 'ẹc', 'ặc', 'ôi', 'mệt quá', 'chán quá',
+        'khó thế', 'khó thật', 'khó quá', 'khó ghê', 'nản quá', 'bó tay',
+        'mình chịu', 'chịu rồi', 'không làm được', 'khó quá mình chịu',
+    )
+    if any(x in q for x in casual_markers):
+        # On an answer/review step, a learner saying they cannot do it should
+        # reveal the official DB answer instead of spending a GenAI turn.
+        code=str(step.get('code') or '').upper()
+        if code in {'B0','B1'} and any(x in q for x in ('khó','chịu','không làm được','bó tay')):
+            ans=_published_curriculum_answer_step(cache or {}) if cache else None
+            at=str((ans or {}).get('text') or '').strip()
+            if at:
+                return ('answer_db', 'Được nhé 😄 Không sao. Đây là **đáp án chính thức trong DB**:\n\n'+at)
+        return ('casual', '😄 Ừ, bài này hơi khó thật. Cậu cứ bình tĩnh nhé. Muốn tiếp tục bài tập thì bấm **Tiếp theo**.')
+
+    # Common progress/status questions are deterministic.
+    if any(x in q for x in ('hết chưa', 'xong chưa', 'còn câu nào', 'còn bài nào')):
+        sections=list((cache or {}).get('sections') or [])
+        if sections and current_step is not None:
+            remaining=max(0, len(sections)-int(current_step)-1)
+            if remaining:
+                return ('progress', f'📌 Chưa hết nhé, còn khoảng **{remaining} bước** trong bài tập này. Cậu bấm **Tiếp theo** để sang phần tiếp.')
+            return ('progress', '✅ Gần hết rồi. Cậu đang ở phần cuối của bài tập này.')
+        return ('progress', '📌 Mình đang ở trong bài tập hiện tại. Cậu bấm **Tiếp theo** để xem phần tiếp theo nhé.')
+
+    # Asking what exercise material is available can be answered from the lesson catalog,
+    # without asking Gemini to invent a list.
+    if any(x in q for x in ('cậu có bài nào', 'có bài nào', 'có bài tập nào', 'bài tập nào có')):
+        try:
+            lessons=_unique_lessons_for_scope('Bài tập', '')
+        except Exception:
+            lessons=[]
+        if lessons:
+            shown=lessons[:10]
+            suffix='...' if len(lessons)>10 else ''
+            return ('catalog', '📚 Hiện có các bài tập: **'+', '.join(shown)+suffix+'**')
+        return ('catalog', '📚 Mình chưa tìm thấy danh sách bài tập khác trong DB.')
+
+    return None
+
 def _is_off_topic_during_study(text):
     q = str(text or "").strip().casefold()
     if not q:
@@ -3519,6 +3674,8 @@ def _is_off_topic_during_study(text):
         "mệt", "chán", "buồn", "nản", "stress", "bực", "khó chịu", "kiệt sức",
         "quá mệt mỏi", "mệt mỏi với", "cảm ơn", "thanks", "thank you", "haha",
         "hihi", "hehe", "huhu", "hic", "nghỉ", "dừng lại", "thôi",
+        "hôm nay nóng", "hôm nay lạnh", "thời tiết", "trời nóng", "trời lạnh",
+        "ẹc", "ặc", "ôi",
     )
     if any(x in q for x in emotional):
         return True
@@ -4226,8 +4383,41 @@ def _local_casual_reply(text: str) -> str:
         return "Hehe, Doraemon đây 🤖"
     return "Ừ nha 😄"
 
+def _is_japanese_only_message(text: str) -> bool:
+    """Return True only when the whole user message is Japanese text.
+
+    Japanese script alone is not enough: a mixed message such as
+    "いろ phát âm như nào ?" must stay Vietnamese. We allow Japanese
+    Hiragana/Katakana/Kanji, punctuation, whitespace, and digits, but reject
+    Latin alphabet / Vietnamese text. Explicit language requests are handled
+    separately by _preferred_response_language().
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if not re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", s):
+        return False
+    # Any Latin letter means the message is mixed/non-Japanese for automatic
+    # detection. This intentionally makes the rule strict.
+    if re.search(r"[A-Za-z]", s):
+        return False
+    # Vietnamese and other Latin-based accented letters are also rejected.
+    # Keep Unicode punctuation, digits, spaces, and Japanese scripts allowed.
+    if re.search(r"[À-ỹà-ỹ]", s, flags=re.IGNORECASE):
+        return False
+    # Reject other obvious non-Japanese alphabetic scripts.
+    if re.search(r"[\u0370-\u03ff\u0400-\u04ff\u0530-\u058f\u0600-\u06ff\u0900-\u097f]", s):
+        return False
+    return True
+
+
 def _preferred_response_language(user_text: str) -> str:
-    """Choose response language from the latest user message."""
+    """Choose response language from the latest user message.
+
+    Automatic Japanese mode is strict: the entire message must be Japanese.
+    A single Japanese word embedded in Vietnamese must never switch the reply
+    language to Japanese.
+    """
     text = str(user_text or "").strip()
     low = text.casefold()
     if any(x in low for x in ("bằng tiếng việt", "tiếng việt nhé", "trả lời bằng tiếng việt", "vietnamese")):
@@ -4236,7 +4426,7 @@ def _preferred_response_language(user_text: str) -> str:
         return "en"
     if any(x in low for x in ("日本語で", "日本語で答えて", "日本語で話して", "日本語で返して")):
         return "ja"
-    if re.search(r"[\u3040-\u30ff]", text):
+    if _is_japanese_only_message(text):
         return "ja"
     return "vi"
 
@@ -5533,6 +5723,23 @@ Tin nhắn hiện tại:
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
 
+            # Deterministic simple/casual exercise turns must not invoke GenAI.
+            if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip():
+                direct_ex = _exercise_simple_direct_answer(query_text.strip(), step, runtime_lesson_cache, current_step)
+                if direct_ex:
+                    mode, msg = direct_ex
+                    blocks=[{"type":"text","text":msg}]
+                    if mode == "answer_db":
+                        _set_curriculum_flow(user["id"], step=current_step, waiting="continue", exercise_answered=True)
+                        study_session["curriculum_exercise_answered"]=True
+                        blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                        blocks.extend(_curriculum_continue_blocks(current_step))
+                    elif not step.get("is_final"):
+                        blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                        blocks.extend(_curriculum_continue_blocks(current_step))
+                    print(f"[CURRICULUM DB QUESTION DIRECT] request={request_id} type=Bài tập mode={mode} genai=0 embedding=0 pinecone=0")
+                    return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":"db-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
+
             # Exercise submission uses GenAI for evaluation/explanation, but the
             # official answer shown to the learner always comes verbatim from DB.
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
@@ -5565,6 +5772,18 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                 blocks.extend(_curriculum_continue_blocks(current_step))
                 print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
+
+            # Cheap DB-only factual vocabulary questions must never spend Gemini
+            # tokens. More complex questions still use the separate GenAI teacher turn.
+            if not data.action and str(query_text or "").strip() and requested_content_type == "Từ vựng":
+                direct_answer = _vocab_direct_answer_from_cache(runtime_lesson_cache, current_step, query_text.strip())
+                if direct_answer:
+                    blocks=[{"type":"text","text":direct_answer}]
+                    if not step.get("is_final"):
+                        blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                        blocks.extend(_curriculum_continue_blocks(current_step))
+                    print(f"[CURRICULUM DB QUESTION DIRECT] request={request_id} type=Từ vựng mode=direct_db genai=0 embedding=0 pinecone=0")
+                    return {"reply":direct_answer,"model":"db-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
             # Any other ordinary learner question in the active lesson is a
             # separate GenAI teacher turn, grounded by the current DB step.
