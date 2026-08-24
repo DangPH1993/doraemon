@@ -7889,21 +7889,51 @@ function curriculumImageGallery(step,pages){
   const inv={}; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||"").trim(); if(k)inv[k]=im;}));
   const selected=new Set(imgs.map(im=>String(im.image_key||im.key||"").trim()).filter(Boolean));
   const all=[]; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||"").trim(); if(k&&!all.some(x=>x.key===k))all.push({key:k,page:pg.page,src:String(im.image_url||"").trim(),vision:im.vision||{}});}));
-  const card=(im,idx,isSel)=>{const key=String(im.image_key||im.key||"").trim(); const src=String(im.image_url||inv[key]?.image_url||im.src||"").trim(); const page=im.page||inv[key]?.page||""; const v=im.vision||inv[key]?.vision||{}; const cap=im.caption||v.caption||v.description||v.explanation||""; const btn=isSel?`<button type="button" class="red" style="margin-top:7px" onclick="changeCurriculumImage(${JSON.stringify(code)},${JSON.stringify(key)},false)">🗑️ Bỏ ảnh</button>`:`<button type="button" style="margin-top:7px" onclick="changeCurriculumImage(${JSON.stringify(code)},${JSON.stringify(key)},true)">＋ Thêm ảnh</button>`; return `<div style="border:2px solid ${isSel?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:10px;color:#888">Ảnh không tải được</div></div><div style="padding:9px"><b>Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</b><div class="small" style="word-break:break-all">${esc(key)}</div>${cap?`<div class="small" style="margin-top:4px">${esc(cap)}</div>`:''}${btn}</div></div>`};
+  const action=({code,key,add})=>`<button type="button" class="${add?'':'red'}" style="margin-top:7px" data-cur-image-action="1" data-code="${esc(code)}" data-image-key="${esc(key)}" data-add="${add?'1':'0'}">${add?'＋ Thêm ảnh':'🗑️ Bỏ ảnh'}</button>`;
+  const card=(im,idx,isSel)=>{const key=String(im.image_key||im.key||"").trim(); const src=String(im.image_url||inv[key]?.image_url||im.src||"").trim(); const page=im.page||inv[key]?.page||""; const v=im.vision||inv[key]?.vision||{}; const cap=im.caption||v.caption||v.description||v.explanation||""; return `<div style="border:2px solid ${isSel?'#1677ff':'#ddd'};border-radius:10px;overflow:hidden;background:#fff"><div style="height:150px;background:#f6f7f9;display:flex;align-items:center;justify-content:center">${src?`<img src="${esc(src)}" style="width:100%;height:150px;object-fit:contain" onerror="this.style.display='none';this.nextElementSibling.style.display='block'">`:''}<div style="display:${src?'none':'block'};padding:10px;color:#888">Ảnh không tải được</div></div><div style="padding:9px"><b>Ảnh ${idx+1}${page?` · Trang ${esc(page)}`:''}</b><div class="small" style="word-break:break-all">${esc(key)}</div>${cap?`<div class="small" style="margin-top:4px">${esc(cap)}</div>`:''}${action({code,key,add:!isSel})}</div></div>`};
   const selectedHtml=imgs.map((im,i)=>card(im,i,true)).join(''); const remaining=all.filter(x=>!selected.has(x.key));
   return `<div id="cur-gallery-${encodeURIComponent(code)}" style="margin-top:10px"><b>🖼️ Ảnh của bước</b>${selectedHtml?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${selectedHtml}</div>`:`<div class="small" style="margin-top:6px;color:#b76b00">⚠️ Chưa chọn ảnh</div>`}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">＋ Thêm ảnh từ nguồn (${remaining.length})</summary>${remaining.length?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${remaining.map((im,i)=>card(im,i,false)).join('')}</div>`:`<div class="small" style="padding:7px">Không còn ảnh nguồn khác.</div>`}</details></div>`;
 }
-function changeCurriculumImage(code,key,add){
-  const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(code))}"]`); if(!ta)return; let c={}; try{c=JSON.parse(ta.value||'{}')}catch(e){alert('❌ Nội dung JSON của bước đang lỗi.');return;}
-  const pages=Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]; const inv={}; pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||"").trim();if(k)inv[k]=im;}));
-  const k=String(key||"").trim(); let imgs=Array.isArray(c.images)?c.images.slice():[];
-  if(add&&!imgs.some(im=>String(im?.image_key||im?.key||"").trim()===k)){const src=inv[k]||{};const v=src.vision||{};imgs.push({image_key:k,image_url:src.image_url||'',page:src.page||null,caption:v.caption||v.description||v.explanation||''});}
-  if(!add)imgs=imgs.filter(im=>String(im?.image_key||im?.key||"").trim()!==k);
-  c.images=imgs; ta.value=JSON.stringify(c,null,2); const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code))); if(host)host.outerHTML=curriculumImageGallery({code,content:c},pages);
+function _findCurriculumTextarea(code){
+  const wanted=String(code||'');
+  for(const ta of document.querySelectorAll('#curSteps .cur-json')){
+    if(String(ta.getAttribute('data-code')||'')===wanted) return ta;
+  }
+  return null;
 }
+function changeCurriculumImage(code,key,add){
+  const ta=_findCurriculumTextarea(code);
+  if(!ta){alert('❌ Không tìm thấy nội dung bước '+String(code)+'.');return;}
+  let c={};
+  try{c=JSON.parse(ta.value||'{}')}catch(e){alert('❌ Nội dung JSON của bước đang lỗi.');return;}
+  const pages=Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[];
+  const inv={};
+  pages.forEach(pg=>(Array.isArray(pg?.images)?pg.images:[]).forEach(im=>{const k=String(im.image_key||'').trim();if(k)inv[k]=im;}));
+  const k=String(key||'').trim();
+  let imgs=Array.isArray(c.images)?c.images.slice():[];
+  if(add){
+    if(!imgs.some(im=>String(im?.image_key||im?.key||'').trim()===k)){
+      const src=inv[k]||{}; const v=src.vision||{};
+      imgs.push({image_key:k,image_url:src.image_url||'',page:src.page||null,caption:v.caption||v.description||v.explanation||''});
+    }
+  }else{
+    imgs=imgs.filter(im=>String(im?.image_key||im?.key||'').trim()!==k);
+  }
+  c.images=imgs;
+  ta.value=JSON.stringify(c,null,2);
+  ta.dispatchEvent(new Event('input',{bubbles:true}));
+  const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));
+  if(host) host.outerHTML=curriculumImageGallery({code,content:c},pages);
+}
+document.addEventListener('click',function(ev){
+  const btn=ev.target.closest && ev.target.closest('[data-cur-image-action]');
+  if(!btn) return;
+  ev.preventDefault(); ev.stopPropagation();
+  changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');
+});
 
 function renderCurriculumDraft(id,data){window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)}<div id="curSteps">${steps.map((s,i)=>`<div class="card" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.code)} · <input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></b><button class="gray" onclick="regenerateCurriculumStep(${id},'${esc(s.code)}')">🤖 Gen lại</button></div>${curriculumImageGallery(s,data.pages||[])}<textarea class="cur-json" data-code="${esc(s.code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></div>`).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`; }
-async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const d=base.draft_json||{}; const cards=[...document.querySelectorAll('#curSteps .cur-json')]; d.steps=(d.steps||[]).map((s)=>{const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(s.code))}"]`); const titleEl=ta?.closest('.card')?.querySelector('.cur-title'); let content=s.content||{}; try{content=JSON.parse(ta.value)}catch(e){} return {...s,title:titleEl?.value||s.title,content};}); return d;}
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw)); const d=base.draft_json||{}; const cards=[...document.querySelectorAll('#curSteps .cur-json')]; d.steps=(d.steps||[]).map((s)=>{const ta=_findCurriculumTextarea(String(s.code)); const titleEl=ta?.closest('.card')?.querySelector('.cur-title'); let content=s.content||{}; try{content=JSON.parse(ta?.value||JSON.stringify(content))}catch(e){} if(!Array.isArray(content.images)) content.images=[]; content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key); return {...s,title:titleEl?.value||s.title,content};}); return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id); await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})}); alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})}); const ta=document.querySelector(`#curSteps .cur-json[data-code="${CSS.escape(String(code))}"]`); if(ta){ta.value=JSON.stringify(d.step.content||{},null,2); const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code))); if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);} alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
 async function publishCurriculumDraft(id){try{await saveCurriculumDraft(id); if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return; const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw})}); alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`); await loadKnowledgeCatalog(); const st=document.getElementById('curStatus'); if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Đã cập nhật danh sách bài học.`;}catch(e){alert('❌ '+e.message);}}
