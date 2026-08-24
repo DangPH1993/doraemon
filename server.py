@@ -1,3 +1,4 @@
+# VERSION: v19_67 grammar DB-first + one-exchange context
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -2975,7 +2976,7 @@ def _published_curriculum_answer_step(cache):
 
 
 def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False):
-    """Deterministic DB-first UI for Từ vựng/Bài tập.
+    """Deterministic DB-first UI for Từ vựng/Ngữ pháp/Bài tập.
 
     All visible teaching/answer text comes from curriculum_steps.content_json.
     The only generated UI text is navigation chrome (labels/prompts).
@@ -5710,11 +5711,11 @@ Tin nhắn hiện tại:
         f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
 
-    # DB-FIRST path for published Vocabulary/Exercise. These content types are
+    # DB-FIRST path for published Vocabulary/Grammar/Exercise. These content types are
     # authoritative in curriculum_steps.content_json: do not let Gemini rewrite
-    # spelling, reading, meaning, questions, or answer keys.
+    # vocabulary/grammar text, questions, or answer keys.
     if (runtime_cache_hit and (runtime_lesson_cache or {}).get("published_curriculum")
-            and requested_content_type in {"Từ vựng", "Bài tập"} and study_session):
+            and requested_content_type in {"Từ vựng", "Bài tập", "Ngữ pháp"} and study_session):
         sections=list((runtime_lesson_cache or {}).get("sections") or [])
         if sections:
             current_step=max(0,min(int((study_session or {}).get("curriculum_step") or 0),len(sections)-1))
@@ -5803,7 +5804,8 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Cheap DB-only factual vocabulary questions must never spend Gemini
-            # tokens. More complex questions still use the separate GenAI teacher turn.
+            # tokens. Grammar questions and other non-trivial questions use the separate
+            # GenAI teacher turn with exactly one prior exchange as context.
             if not data.action and str(query_text or "").strip() and requested_content_type == "Từ vựng":
                 direct_answer = _vocab_direct_answer_from_cache(runtime_lesson_cache, current_step, query_text.strip())
                 if direct_answer:
@@ -5839,7 +5841,7 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đế
                 if not step.get("is_final"):
                     blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
                     blocks.extend(_curriculum_continue_blocks(current_step))
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} genai=1 embedding=0 pinecone=0")
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} context=1_exchange genai=1 embedding=0 pinecone=0")
                 return {"reply":answer or "","model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
@@ -6724,6 +6726,14 @@ QUY TẮC RIÊNG CHO BÀI TẬP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC)
 - Nếu học sinh sai: chỉ ra chính xác bước sai, giải thích lỗi và làm mẫu lại từ đầu/đến bước cần thiết. Nếu đúng: vẫn giải thích vì sao đúng, không chỉ nói “đúng”.
 - Không yêu cầu học sinh tự kiểm tra lại khi nguồn đã đủ dữ kiện để chấm.
 - Sau khi giải xong, có thể đưa câu tiếp theo hoặc bài luyện tương tự ngắn nếu phù hợp, nhưng không làm mất trọng tâm bài đang học.
+"""
+    elif requested_content_type == "Ngữ pháp":
+        mode_specific_rules = """
+QUY TẮC RIÊNG CHO NGỮ PHÁP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
+- Luồng chính của bài dùng nội dung đã publish trong DB và luôn có nút **Tiếp tục** ở mỗi bước, không gọi Gemini chỉ để chuyển bước.
+- Nếu học sinh hỏi/giải thích thêm ngoài luồng chính, chỉ dùng đúng **1 lượt hội thoại ngay trước đó** + câu hiện tại làm context cho Gemini. Không gửi toàn bộ lịch sử chat, không gửi toàn bộ lesson/RAG context.
+- Trả lời ngắn gọn, đúng trọng tâm, bám nội dung bài ngữ pháp đang học.
+- Nếu câu hỏi chỉ hỏi cách đọc/nghĩa của một ví dụ đã xuất hiện, ưu tiên dữ kiện DB/lượt chat trước; không bịa lại nội dung.
 """
     elif requested_content_type == "Giáo trình":
         mode_specific_rules = """
