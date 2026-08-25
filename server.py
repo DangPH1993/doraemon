@@ -1,4 +1,4 @@
-# VERSION: v19_68 — robust AI Draft JSON shape normalization (Truyện đọc upload fix)
+# VERSION: v19_69 — story DB-first flow + one-exchange teacher context + casual fastpath
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -2976,7 +2976,7 @@ def _published_curriculum_answer_step(cache):
 
 
 def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False):
-    """Deterministic DB-first UI for Từ vựng/Ngữ pháp/Bài tập.
+    """Deterministic DB-first UI for Từ vựng/Ngữ pháp/Bài tập/Truyện đọc.
 
     All visible teaching/answer text comes from curriculum_steps.content_json.
     The only generated UI text is navigation chrome (labels/prompts).
@@ -5711,11 +5711,12 @@ Tin nhắn hiện tại:
         f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
 
-    # DB-FIRST path for published Vocabulary/Grammar/Exercise. These content types are
-    # authoritative in curriculum_steps.content_json: do not let Gemini rewrite
-    # vocabulary/grammar text, questions, or answer keys.
+    # DB-FIRST path for published non-Giáo-trình curriculum.
+    # Từ vựng / Ngữ pháp / Bài tập / Truyện đọc all use the same deterministic
+    # lesson-step navigation. Gemini is reserved for genuine learner questions,
+    # and those turns receive only one prior chat exchange as context.
     if (runtime_cache_hit and (runtime_lesson_cache or {}).get("published_curriculum")
-            and requested_content_type in {"Từ vựng", "Bài tập", "Ngữ pháp"} and study_session):
+            and requested_content_type in {"Từ vựng", "Bài tập", "Ngữ pháp", "Truyện đọc"} and study_session):
         sections=list((runtime_lesson_cache or {}).get("sections") or [])
         if sections:
             current_step=max(0,min(int((study_session or {}).get("curriculum_step") or 0),len(sections)-1))
