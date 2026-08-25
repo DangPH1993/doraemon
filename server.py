@@ -1,4 +1,4 @@
-# VERSION: v19_70 — story B0 keeps original Japanese; B1 translation; B2 vocab; B3 grammar
+# VERSION: v19_71 — story upload low-token: fixed plan + direct B0 + GenAI only B1/B2/B3
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -8217,14 +8217,43 @@ async def admin_curriculum_draft_upload(
                 raise HTTPException(500, f'Page-scope lỗi cho bài {ls}: expected={sorted(selected_set)} actual={sorted(page_keys)}')
 
             digest=_curriculum_source_digest(pages)
-            plan=_normalize_curriculum_steps(ct,_curriculum_step_plan(ct,digest),digest)
             normalized_steps=[]
-            for st in plan:
-                code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
-                if not code or not title: continue
-                content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
-                content=_resolve_curriculum_step_images(content,pages)
-                normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+            if ct == 'Truyện đọc':
+                # Story has fixed steps. Skip the planning call and copy B0 from source directly.
+                story_text = "\n\n".join(
+                    str(pg.get('text') or '').strip()
+                    for pg in pages
+                    if str(pg.get('text') or '').strip()
+                ).strip()
+                story_b0 = {
+                    'title': 'Nội dung truyện',
+                    'content': story_text,
+                    'source_refs': [
+                        {'page': pg.get('page'), 'reason': 'Văn bản truyện gốc từ OCR/text nguồn'}
+                        for pg in pages if pg.get('text')
+                    ],
+                    'images': [],
+                    'items': [],
+                }
+                story_b0 = _resolve_curriculum_step_images(story_b0, pages)
+                normalized_steps.append({'code':'B0','title':'Nội dung truyện','type':'story','content':story_b0})
+                for code,title,step_type in [
+                    ('B1','Bản dịch tiếng Việt','translation'),
+                    ('B2','Từ vựng','vocabulary'),
+                    ('B3','Ngữ pháp','grammar'),
+                ]:
+                    content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
+                    content=_resolve_curriculum_step_images(content,pages)
+                    normalized_steps.append({'code':code,'title':title,'type':step_type,'content':content})
+                print('[CURRICULUM STORY LOWTOKEN] step_plan_genai=0 B0_genai=0 B1_B2_B3_genai=1_each total_calls=3')
+            else:
+                plan=_normalize_curriculum_steps(ct,_curriculum_step_plan(ct,digest),digest)
+                for st in plan:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    if not code or not title: continue
+                    content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
+                    content=_resolve_curriculum_step_images(content,pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
 
             payload={
                 'source_file':source_file,
