@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-25-v19_77_content_reasoning_tier_fix"
+SERVER_VERSION = "2026-08-25-v19_78-all-curriculum-one-exchange-context"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5954,87 +5954,29 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                 question_text=query_text.strip()
                 one_exchange=_last_chat_exchange(recent_history)
                 one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
-                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi tiếp nối trong bài {requested_content_type}.
-Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không gửi/không cần toàn bộ lịch sử chat hay toàn bộ lesson context.
-
-LƯỢT HỘI THOẠI TRƯỚC:
-{one_exchange_text}
-
-CÂU HỎI HIỆN TẠI:
-{question_text}
-
-Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đến từ vựng, giữ đúng chữ Nhật, cách đọc/phát âm và nghĩa đã xuất hiện trong lượt trước; không tự bịa. Nếu lượt trước không đủ dữ kiện thì nói rõ điều đó."""
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
-                gen_started=time.perf_counter()
-                answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
-                blocks=[{"type":"text","text":answer or ""}]
-                for im in step.get("images") or []:
-                    if im.get("url"): blocks.append({"type":"image","key":im.get("key"),"url":im.get("url"),"page":im.get("page"),"caption":im.get("caption","")})
-                if not step.get("is_final"):
-                    blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
-                    blocks.extend(_curriculum_continue_blocks(current_step))
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} context=1_exchange genai=1 embedding=0 pinecone=0")
-                return {"reply":answer or "","model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
-
-            step=_published_curriculum_step(runtime_lesson_cache,current_step)
-            if requested_content_type == "Bài tập" and answered:
-                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=True)
-            else:
-                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False)
-
-            # A question step waits for an answer but still exposes Tiếp theo, as requested.
-            if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B0" and not answered:
-                _set_curriculum_flow(user["id"],step=current_step,waiting="exercise_answer",exercise_answered=False)
-                study_session["curriculum_waiting"]="exercise_answer"
-            elif not step.get("is_final") and waiting != "continue":
-                _set_curriculum_flow(user["id"],step=current_step,waiting="continue",exercise_answered=answered)
-
-            print(f"[CURRICULUM DB-FIRST] request={request_id} type={requested_content_type} step={step.get('code')} genai=0 embedding=0 pinecone=0")
-            return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":GEMINI_MODEL,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
-
-    # DB-first path for newly published AI Curriculum. A navigation/Continue turn
-    # renders the already-published step directly from PostgreSQL: no embedding,
-    # no Pinecone and no Gemini. A real learner question uses Gemini with the current
-    # DB step as context, still without embedding/Pinecone.
-    if runtime_cache_hit and (runtime_lesson_cache or {}).get("published_curriculum") and requested_content_type == "Giáo trình" and study_session:
-        current_step=int((study_session or {}).get("curriculum_step") or 0)
-        if current_step < 0: current_step=0
-        step=_published_curriculum_step(runtime_lesson_cache,current_step)
-        if _published_curriculum_db_only_turn(query_text,ui_action,study_session):
-            blocks=_published_curriculum_blocks(step,runtime_lesson_cache)
-            _set_curriculum_flow(user["id"],step=int(step["index"]),waiting="final" if step.get("is_final") else "continue",exercise_answered=False)
-            print(f"[CURRICULUM DB-FIRST] request={request_id} step={step.get('code')} genai=0 embedding=0 pinecone=0")
-            return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":GEMINI_MODEL,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
-
-        question_text=query_text.strip()
-        # Giáo trình dùng cùng follow-up policy với Từ vựng/Bài tập/Ngữ pháp/Truyện đọc:
-        # chỉ lấy đúng 1 exchange ngay trước đó, không gửi toàn bộ history.
+                # Giáo trình dùng cùng follow-up policy với mọi content type:
+        # chỉ lấy đúng 1 exchange gần nhất; KHÔNG gửi full step/lesson context.
         one_exchange = _last_chat_exchange(recent_history)
         one_exchange_text = "\n".join(
             f"{h.get('role')}: {str(h.get('text') or '')[-900:]}"
             for h in one_exchange
         )
-        q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi trong bài học Giáo trình.
-Chỉ dùng dữ liệu PUBLISHED trong DB bên dưới để trả lời. Nếu dữ liệu không đủ, nói rõ là chưa có thông tin trong bài học; không bịa.
 
+        q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi tiếp nối trong bài học Giáo trình.
 Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không dùng các lượt cũ hơn.
+Không tự động đưa toàn bộ nội dung bước/bài học vào ngữ cảnh. Chỉ dựa vào lượt hội thoại trước và câu hỏi hiện tại; nếu thiếu dữ kiện thì nói rõ.
 
 LƯỢT HỘI THOẠI TRƯỚC:
 {one_exchange_text}
 
-BÀI: {requested_lesson}
-BƯỚC: {step.get('code')} - {step.get('title')}
-
-NỘI DUNG BƯỚC:
-{step.get('text','')}
-
 CÂU HỎI HIỆN TẠI:
 {question_text}
 
-Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái này", "ý là phần trên", "dịch hết", hãy hiểu nó là câu tiếp nối trực tiếp của lượt hội thoại trước."""
+Nếu câu hiện tại là câu ngắn/thiếu chủ thể như "mẫu 4", "cái này", "ý là phần trên", "dịch hết", hãy hiểu nó là câu tiếp nối trực tiếp của lượt hội thoại trước."""
         print(
             f"[CURRICULUM DB QUESTION] request={request_id} step={step.get('code')} "
-            f"context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0"
+            f"context=1_exchange step_context=0 prompt_chars={len(q_prompt)} "
+            f"embedding=0 pinecone=0"
         )
         gen_started=time.perf_counter()
         answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
