@@ -1,4 +1,4 @@
-# VERSION: v19_69 — story DB-first flow + one-exchange teacher context + casual fastpath
+# VERSION: v19_70 — story B0 keeps original Japanese; B1 translation; B2 vocab; B3 grammar
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -8079,7 +8079,17 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest):
 - Mọi từ mới phải kèm chữ Nhật + cách đọc/kana + phát âm dựa trên reading trong nguồn + nghĩa tiếng Việt nếu nguồn có.
 - Không chỉ liệt kê nghĩa và không tự đoán reading/phát âm.
 """
-    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
+    elif str(content_type or "").strip() == "Truyện đọc":
+        extra_rules="""\n\nQUY TẮC BẮT BUỘC CHO TRUYỆN ĐỌC:
+- B0 = NỘI DUNG TRUYỆN GỐC. Phải giữ nguyên tiếng Nhật từ nguồn, không dịch sang tiếng Việt, không viết lại theo ý mình, không tóm tắt và không diễn giải thay cho bản gốc.
+- Với B0, trường content phải ưu tiên chép nguyên văn phần tiếng Nhật của truyện từ nguồn. Giữ nguyên câu, đoạn, dấu câu và thứ tự nội dung; chỉ sửa lỗi OCR rõ ràng khi có bằng chứng trực tiếp từ nguồn.
+- Tuyệt đối không đưa bản dịch tiếng Việt vào B0. Bản dịch chỉ thuộc B1.
+- B1 = BẢN DỊCH TIẾNG VIỆT của chính B0; không được thay đổi nội dung B0.
+- B2 = TỪ VỰNG lấy từ chính B0, gồm writing/word, reading/kana, pronunciation và meaning tiếng Việt khi nguồn có; không tự đoán reading/phát âm.
+- B3 = NGỮ PHÁP dựa trên chính B0, không thay nội dung truyện gốc.
+- Nếu nguồn không có bản tiếng Nhật rõ ràng cho một đoạn, không tự sáng tác lại; giữ nguyên dữ liệu nguồn và để phần thiếu rỗng hoặc ghi rõ không xác định.
+"""
+    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}\n\nQUY TẮC ƯU TIÊN: nếu loại nội dung là Truyện đọc và bước là B0, tuyệt đối ưu tiên văn bản tiếng Nhật nguyên gốc trong NGUỒN; không được chuyển ngữ sang tiếng Việt ở B0.\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
     data=_curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
     if isinstance(data, list):
         data=next((x for x in data if isinstance(x,dict)), {})
