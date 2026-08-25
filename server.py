@@ -67,6 +67,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_LOW = os.getenv("OPENAI_MODEL_LOW", "gpt-4.1-mini")
 OPENAI_MODEL_MEDIUM = os.getenv("OPENAI_MODEL_MEDIUM", "gpt-5-mini")
+OPENAI_REASONING_LOW = os.getenv("OPENAI_REASONING_LOW", "minimal")
 OPENAI_REASONING_MEDIUM = os.getenv("OPENAI_REASONING_MEDIUM", "medium")
 
 GEMINI_MODEL = "gemini-3.6-flash"
@@ -85,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-24-v19_66-one-exchange-genai-context"
+SERVER_VERSION = "2026-08-25-v19_74-followup-router-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -393,7 +394,7 @@ def startup():
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
     print("LLM provider:", LLM_PROVIDER)
-    print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning:", OPENAI_REASONING_MEDIUM)
+    print("OpenAI models:", OPENAI_MODEL_LOW, "/", OPENAI_MODEL_MEDIUM, "reasoning_low:", OPENAI_REASONING_LOW, "reasoning_medium:", OPENAI_REASONING_MEDIUM)
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
 
 class RegisterRequest(BaseModel):
@@ -4557,10 +4558,13 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
                 "hoặc package openai chưa được cài."
             )
         model = _chat_model_for_content(content_type, "openai")
+        reasoning_effort = None
+        if model.startswith("gpt-5"):
+            reasoning_effort = (OPENAI_REASONING_MEDIUM if content_type == "Bài tập" else OPENAI_REASONING_LOW)
         print(
             f"[CHAT THINKING] request={request_id} provider='openai' "
             f"content_type={content_type!r} model={model!r} "
-            f"reasoning={OPENAI_REASONING_MEDIUM if content_type == 'Bài tập' else 'none'!r}"
+            f"reasoning={reasoning_effort if model.startswith('gpt-5') else 'none'!r}"
         )
         kwargs = {
             "model": model,
@@ -4572,9 +4576,14 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
             ],
         }
         if model.startswith("gpt-5"):
-            kwargs["reasoning"] = {
-                "effort": OPENAI_REASONING_MEDIUM if content_type == "Bài tập" else "none"
-            }
+            # GPT-5-family models do not support reasoning.effort="none".
+            # Ordinary chat uses the lowest supported effort; Bài tập uses medium.
+            reasoning_effort = (
+                OPENAI_REASONING_MEDIUM
+                if content_type == "Bài tập"
+                else OPENAI_REASONING_LOW
+            )
+            kwargs["reasoning"] = {"effort": reasoning_effort}
         response = openai_client.responses.create(**kwargs)
         _log_openai_usage(response, operation="chat_generation", request_id=request_id)
         reply = getattr(response, "output_text", "") or ""
@@ -5476,32 +5485,60 @@ Tin nhắn hiện tại:
                   ]}]
         return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
-    # If there is no active confirmed study session and the current turn is not
-    # opening/confirming a lesson, answer as lightweight conversation. This is the
-    # second cost barrier: non-study chat never reaches the large teacher prompt,
-    # Pinecone, embedding, or image stack.
+    # Lightweight chat routing: explicit discovery requests stay in the catalog/routing
+    # path; short conversational turns get exactly one previous exchange; standalone
+    # turns stay history-free to minimize tokens.
     if not active_session_scope and not lesson_confirmed_scope and not forced_plan_scope and not data.action:
-        if not (named_lesson_topic or _is_specific_lesson_request(query_text) or requested_content_type):
-            light_history = recent_history[-2:]
-            light_context = "\n".join(
-                f"{h.get('role')}: {str(h.get('text') or '')[-350:]}" for h in light_history
+        current_text = str(query_text or '').strip()
+        low_current = current_text.lower()
+        discovery_words = (
+            'học gì', 'học gì hôm nay', 'hôm nay học gì', 'gợi ý', 'đề xuất',
+            'chọn bài', 'nên học', 'có gì để dạy', 'có gì để học', 'dạy gì',
+            'học được gì', 'bạn dạy gì', 'bạn có bài nào', 'có bài nào',
+            'mình muốn học', 'tôi muốn học', 'muốn học bài', 'bài nào về', 'học về'
+        )
+        wants_discovery = any(w in low_current for w in discovery_words)
+        if not wants_discovery:
+            recent_exchange = _last_chat_exchange(recent_history)
+            prev_text = '\n'.join(
+                f"{h.get('role')}: {str(h.get('text') or '')[-900:]}" for h in recent_exchange
             )
-            minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
-Đây là cuộc trò chuyện chưa mở bài học. Trả lời trực tiếp, tự nhiên và ngắn gọn. Quy tắc ngôn ngữ toàn cục ở đầu prompt quyết định ngôn ngữ trả lời.
-Không tự mở bài học, không dùng RAG/Pinecone, không đính kèm ảnh học tập.
-Nếu người dùng muốn học một bài cụ thể, hãy yêu cầu họ nêu tên bài để Doraemon xác nhận Có/Không trước khi bắt đầu.
+            followup_markers = (
+                'có', 'không', 'đúng', 'ừ', 'ok', 'okay', 'toàn bộ', 'cái này',
+                'cái đó', 'phần này', 'phần kia', 'thế còn', 'vậy sao', 'sao vậy',
+                'ý là', 'như trên', 'bên trên', 'tiếp', 'tiếp tục', 'dịch hết',
+                'dịch toàn bộ'
+            )
+            likely_followup = bool(prev_text) and (len(current_text) <= 60 or any(m in low_current for m in followup_markers))
+            if likely_followup:
+                followup_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
+Đây là một tin nhắn tiếp nối. Chỉ dùng đúng MỘT lượt hội thoại ngay trước đó
+(User + Assistant) làm ngữ cảnh. Không dùng các lượt cũ hơn.
 
-Lịch sử rất ngắn của boxchat (chỉ để hiểu đại từ nếu cần):
-{light_context}
+LƯỢT HỘI THOẠI TRƯỚC:
+{prev_text}
+
+TIN NHẮN HIỆN TẠI:
+{current_text}
+
+Hãy hiểu tin nhắn hiện tại là phần tiếp nối của lượt ngay trước đó. Nếu là câu
+ngắn như 'có', 'toàn bộ', 'ý là...', 'dịch hết', 'cái này' thì suy ra ý định
+từ đúng lượt trước; không tự đổi chủ đề."""
+                print('[CHAT ROUTING] lightweight follow-up: context=1_exchange')
+                gen_started=time.perf_counter()
+                reply,model_used,_=_generate_chat_reply(followup_prompt,content_type=None,request_id=request_id,gen_started=gen_started,user_text=current_text)
+                return {'reply':reply,'model':model_used,'sources':[],'images':[],'content_blocks':[{'type':'text','text':reply}],'learning_progress':None}
+            minimal_prompt=f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
+Trả lời trực tiếp, tự nhiên, ngắn gọn bằng tiếng Việt.
+Không tự mở bài học, không dùng RAG/Pinecone, không đính kèm ảnh học tập.
 
 Tin nhắn hiện tại:
-{query_text}"""
-            print("[CHAT ROUTING] no active study session: lightweight chat; no embedding/Pinecone/RAG/images")
-            gen_started = time.perf_counter()
-            reply, model_used, _ = _generate_chat_reply(
-                minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=query_text
-            )
-            return {"reply":reply,"model":model_used,"sources":[],"images":[],"content_blocks":[{"type":"text","text":reply}],"learning_progress":None}
+{current_text}"""
+            print('[CHAT ROUTING] no active study session: lightweight standalone chat')
+            gen_started=time.perf_counter()
+            reply,model_used,_=_generate_chat_reply(minimal_prompt,content_type=None,request_id=request_id,gen_started=gen_started,user_text=current_text)
+            return {'reply':reply,'model':model_used,'sources':[],'images':[],'content_blocks':[{'type':'text','text':reply}],'learning_progress':None}
+        print('[CHAT ROUTING] discovery request: route by study catalog; no follow-up history')
 
     # Continue the most recent in-progress lesson for short follow-ups. This
     # applies to ALL content types (especially exercises), not only Kanji/Bộ thủ.
@@ -5509,7 +5546,9 @@ Tin nhắn hiện tại:
     recommendation_words = (
         "học gì", "học gì hôm nay", "hôm nay học gì",
         "gợi ý", "đề xuất", "chọn bài", "nên học",
-        "có gì để dạy", "có gì để học", "dạy gì", "học được gì"
+        "có gì để dạy", "có gì để học", "dạy gì", "học được gì",
+        "bạn dạy gì", "bạn có bài nào", "có bài nào", "mình muốn học",
+        "tôi muốn học", "muốn học bài", "bài nào về", "học về"
     )
     wants_recommendation = any(w in low for w in recommendation_words) or ambiguous_study_request
 
