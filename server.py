@@ -1,4 +1,4 @@
-# VERSION: v19_67 grammar DB-first + one-exchange context
+# VERSION: v19_68 — robust AI Draft JSON shape normalization (Truyện đọc upload fix)
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -8051,7 +8051,15 @@ def _curriculum_step_plan(content_type, source_digest):
     rule=json.dumps(CURRICULUM_STEP_RULES.get(content_type) or [], ensure_ascii=False)
     prompt=f"""Bạn là AI biên soạn giáo trình cho Doraemon.\nLoại nội dung: {content_type}\n\nQUY TẮC BƯỚC BẮT BUỘC:\n{rule}\n\nNguồn tài liệu dưới đây là nguồn sự thật. Không được tạo ra kiến thức không có trong nguồn. Với Giáo trình, phải biến marker SECTION thành số section thực tế được tìm thấy; luôn giữ B0, B1 và bước cuối FINAL. Các loại khác phải giữ đúng số bước và mã bước đã quy định.\n\nNGUỒN:\n{source_digest}\n\nTrả JSON: {{\"steps\":[{{\"code\":\"B0\",\"title\":\"...\",\"instruction\":\"...\"}}]}}"""
     data=_curriculum_ai_json(prompt, 'curriculum_step_plan')
-    steps=data.get('steps') if isinstance(data.get('steps'),list) else []
+    # Gemini đôi khi trả thẳng JSON array dù schema yêu cầu object.
+    if isinstance(data, list):
+        steps=data
+        print(f"[CURRICULUM STEP PLAN NORMALIZE] content_type={content_type!r} response_shape=list steps={len(steps)}")
+    elif isinstance(data, dict):
+        raw_steps=data.get('steps')
+        steps=raw_steps if isinstance(raw_steps,list) else []
+    else:
+        steps=[]
     if not steps: raise HTTPException(500,'AI không tạo được số bước.')
     return steps
 
@@ -8071,7 +8079,18 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest):
 - Không chỉ liệt kê nghĩa và không tự đoán reading/phát âm.
 """
     prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
-    return _curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}" )
+    data=_curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
+    if isinstance(data, list):
+        data=next((x for x in data if isinstance(x,dict)), {})
+        print(f"[CURRICULUM STEP CONTENT NORMALIZE] content_type={content_type!r} step={step.get('code')} response_shape=list")
+    if not isinstance(data, dict):
+        data={}
+    data.setdefault('title', step.get('title') or '')
+    data.setdefault('content', '')
+    data.setdefault('items', [])
+    data.setdefault('source_refs', [])
+    data.setdefault('images', [])
+    return data
 
 @app.post('/admin/api/curriculum/draft-upload')
 async def admin_curriculum_draft_upload(
