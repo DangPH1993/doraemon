@@ -2824,7 +2824,7 @@ def _published_curriculum_images(content, pages=None):
         vision=item.get("vision") or base.get("vision") or {}
         out.append({
             "key":key,
-            "url":str(item.get("image_url") or base.get("image_url") or b2_url(key) or "").strip(),
+            "url":str(b2_url(key) or item.get("image_url") or base.get("image_url") or "").strip(),
             "page":item.get("page") or base.get("page"),
             "caption":str(item.get("caption") or vision.get("caption") or vision.get("description") or vision.get("explanation") or "").strip()
         })
@@ -2861,7 +2861,7 @@ def _published_curriculum_step(cache,index):
     imgs=[]
     for key in sec.get("image_keys") or []:
         im=by_key.get(str(key))
-        if im: imgs.append({"key":str(key),"url":im.get("image_url") or b2_url(str(key)),"page":im.get("page"),"caption":str((im.get("vision") or {}).get("caption") or "")})
+        if im: imgs.append({"key":str(key),"url":b2_url(str(key)) or im.get("image_url"),"page":im.get("page"),"caption":str((im.get("vision") or {}).get("caption") or "")})
     return {
         "index":index,
         "code":sec.get("step_code") or f"B{index}",
@@ -3285,7 +3285,7 @@ def _curriculum_chunk_images(cache, selected_section):
             continue
         vision=item.get("vision") or {}
         out.append({
-            "key": key, "url": item.get("image_url") or b2_url(key),
+            "key": key, "url": b2_url(key) or item.get("image_url"),
             "term": vision.get("term", ""), "reading": vision.get("reading", ""),
             "meaning": vision.get("meaning", ""), "page": item.get("page"),
             "_chunk_order": 0,
@@ -3310,7 +3310,7 @@ def _runtime_cache_images(cache, selected_sections):
             item=images_by_key[key]
             vision=item.get("vision") or {}
             out.append({
-                "key": key, "url": item.get("image_url") or b2_url(key),
+                "key": key, "url": b2_url(key) or item.get("image_url"),
                 "term": vision.get("term", ""), "reading": vision.get("reading", ""),
                 "meaning": vision.get("meaning", ""), "page": item.get("page"),
                 "_chunk_order": order,
@@ -9526,16 +9526,24 @@ def _extract_image_key(raw_key):
     return value.strip().strip('"').strip("'")
 
 def b2_url(key: str):
+    """Return a browser-safe image URL. Prefer a fresh presigned URL when B2
+    credentials are available; public S3-style base URLs can return 401/403 in
+    deployments where the bucket/object is not actually public."""
+    key = str(key or "").strip()
     if not key:
         return None
+    if b2_ready():
+        try:
+            return b2.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": B2_BUCKET, "Key": key},
+                ExpiresIn=max(60, min(B2_PRESIGN_SECONDS, 604800)),
+            )
+        except Exception as exc:
+            print(f"[B2 PRESIGN FALLBACK] key={key!r} error={type(exc).__name__}: {exc}")
     if B2_PUBLIC_BASE_URL:
         return f"{B2_PUBLIC_BASE_URL}/{key}"
-    if not b2_ready():
-        return None
-    return b2.generate_presigned_url(
-        "get_object", Params={"Bucket": B2_BUCKET, "Key": key},
-        ExpiresIn=max(60, min(B2_PRESIGN_SECONDS, 604800))
-    )
+    return None
 
 def render_pdf_page(pdf_source, page_no: int, dpi: int = 150) -> bytes:
     if fitz is None:
