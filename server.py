@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-25-v19_77_content_reasoning_tier_fix"
+SERVER_VERSION = "2026-08-25-v19_79_selected_text_context"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -415,6 +415,7 @@ class ChatRequest(BaseModel):
     chatbox_new: bool = False
     chatbox_id: str | None = None
     image_base64: str | None = None
+    selected_context: str | None = None
     use_knowledge_base: bool = True
     knowledge_namespace: str = "default"
     top_k: int = 8
@@ -3001,86 +3002,6 @@ def _vocab_direct_answer(step, question_text):
     return "\n".join(lines)
 
 
-def _db_vocab_direct_answer(question_text, preferred_lesson=None):
-    """Return a deterministic vocabulary answer directly from published DB rows.
-
-    Used by an active Giáo trình session when the learner asks a simple factual
-    vocabulary question (writing/reading/pronunciation/meaning). No Gemini,
-    embedding, Pinecone, or lesson history is needed.
-    """
-    q = str(question_text or "").strip()
-    if not q:
-        return None
-    # Reuse the exact marker/matching rules already used by the vocabulary DB path.
-    probe = {"content": {"items": []}}
-    # Fast path: vocabulary items in published curriculum DB.
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if preferred_lesson:
-                cur.execute("""
-                    SELECT cs.content_json
-                    FROM curriculum_steps cs
-                    JOIN curriculum_lessons cl ON cl.id=cs.lesson_id
-                    WHERE cl.status='PUBLISHED' AND cl.content_type='Từ vựng'
-                      AND lower(cl.lesson)=lower(%s)
-                    ORDER BY cs.step_order
-                """, (preferred_lesson,))
-                rows = cur.fetchall() or []
-            else:
-                rows = []
-            if not rows:
-                cur.execute("""
-                    SELECT cs.content_json
-                    FROM curriculum_steps cs
-                    JOIN curriculum_lessons cl ON cl.id=cs.lesson_id
-                    WHERE cl.status='PUBLISHED' AND cl.content_type='Từ vựng'
-                    ORDER BY cl.lesson, cs.step_order
-                    LIMIT 200
-                """)
-                rows = cur.fetchall() or []
-
-            items = []
-            for row in rows:
-                payload = row.get("content_json") if isinstance(row, dict) else None
-                if isinstance(payload, dict):
-                    vals = payload.get("items")
-                    if isinstance(vals, list):
-                        items.extend([x for x in vals if isinstance(x, dict)])
-                elif isinstance(payload, list):
-                    items.extend([x for x in payload if isinstance(x, dict)])
-
-            if items:
-                probe["content"]["items"] = items
-                return _vocab_direct_answer(probe, q)
-
-            # Legacy DB fallback: vocabulary facts may also live in knowledge_images.
-            cur.execute("""
-                SELECT term, reading, meaning
-                FROM knowledge_images
-                WHERE content_type='Từ vựng'
-                  AND (%s IS NULL OR lower(coalesce(lesson,''))=lower(%s))
-                  AND (coalesce(term,'')<>'' OR coalesce(reading,'')<>'' OR coalesce(meaning,'')<>'')
-                ORDER BY id DESC
-                LIMIT 300
-            """, (preferred_lesson, preferred_lesson))
-            image_rows = cur.fetchall() or []
-            legacy_items=[]
-            for r in image_rows:
-                legacy_items.append({
-                    "writing": str(r.get("term") or "").strip(),
-                    "reading": str(r.get("reading") or "").strip(),
-                    "pronunciation": str(r.get("reading") or "").strip(),
-                    "meaning": str(r.get("meaning") or "").strip(),
-                })
-            if legacy_items:
-                probe["content"]["items"] = legacy_items
-                return _vocab_direct_answer(probe, q)
-    finally:
-        conn.close()
-    return None
-
-
 def _vocab_direct_answer_from_cache(cache, current_step, question_text):
     """Search all published vocabulary steps, not only the currently displayed B0/B1 step."""
     sections=list((cache or {}).get("sections") or [])
@@ -5341,11 +5262,24 @@ Câu hỏi của người dùng:
                 "learning_progress": None,
             }
 
-        # Casual/emotional messages deliberately use NO chat history or study scope.
-        # This keeps turns like “nóng quá”, “mệt quá”, “hic” at the cheapest possible
-        # context size and prevents stale lesson context from leaking into casual replies.
-        casual_context = ""
+        casual_history = recent_history[-4:]
+        casual_context_parts = []
+        for h in casual_history:
+            role = str(h.get("role") or "user")
+            txt = str(h.get("text") or "").strip()
+            if txt:
+                casual_context_parts.append(f"{role}: {txt[-450:]}")
+        casual_context = "\n".join(casual_context_parts)
         thread_hint = ""
+        if thread_scope:
+            scope_parts = [
+                str(thread_scope.get("content_type") or ""),
+                str(thread_scope.get("lesson") or ""),
+                str(thread_scope.get("topic") or ""),
+            ]
+            scope_label = " / ".join(x for x in scope_parts if x)
+            if scope_label:
+                thread_hint = f"\nNgữ cảnh nhẹ của boxchat hiện tại: {scope_label}."
 
         minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
 - Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
@@ -5902,20 +5836,6 @@ Tin nhắn hiện tại:
         f"lesson={requested_lesson!r} topic={requested_topic!r} content_type={requested_content_type!r}"
     )
 
-    # Giáo trình vocabulary factual shortcut: search the vocabulary DB directly.
-    # This runs only for simple writing/reading/pronunciation/meaning questions and
-    # returns immediately with 0 Gemini / 0 embedding / 0 Pinecone.
-    if (study_retrieval_allowed
-        and requested_content_type == "Giáo trình"
-        and not data.action
-        and not _is_continue_confirmation(query_text)
-        and not casual_conversation_request):
-        vocab_direct = _db_vocab_direct_answer(query_text, preferred_lesson=requested_lesson)
-        if vocab_direct:
-            print(f"[CURRICULUM VOCAB DB DIRECT] request={request_id} lesson={requested_lesson!r} genai=0 embedding=0 pinecone=0")
-            blocks=[{"type":"text","text":vocab_direct}]
-            return {"reply":vocab_direct,"model":"db-vocabulary-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
-
     # DB-FIRST path for published non-Giáo-trình curriculum.
     # Từ vựng / Ngữ pháp / Bài tập / Truyện đọc all use the same deterministic
     # lesson-step navigation. Gemini is reserved for genuine learner questions,
@@ -5981,11 +5901,13 @@ Tin nhắn hiện tại:
                 official_answer=str((answer_step or {}).get("text") or "").strip()
                 one_exchange=_last_chat_exchange(recent_history)
                 one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
+                exercise_context = selected_context or one_exchange_text
+                exercise_context_label = "ĐOẠN ĐƯỢC CHỌN" if selected_context else "LƯỢT HỘI THOẠI TRƯỚC"
                 q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một lượt hỏi đáp ngắn trong bài tập.
-Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại; không cần toàn bộ lịch sử chat.
+Chỉ dùng đúng một context: đoạn user chọn hoặc một lượt hội thoại gần nhất; không cần toàn bộ lịch sử chat.
 
-LƯỢT HỘI THOẠI TRƯỚC:
-{one_exchange_text}
+{exercise_context_label}:
+{exercise_context}
 
 TIN NHẮN HIỆN TẠI / CÂU TRẢ LỜI CỦA HỌC SINH:
 {query_text.strip()}
@@ -5994,7 +5916,7 @@ TIN NHẮN HIỆN TẠI / CÂU TRẢ LỜI CỦA HỌC SINH:
 {official_answer}
 
 Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức."""
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
                     q_prompt,
@@ -6035,17 +5957,19 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                 question_text=query_text.strip()
                 one_exchange=_last_chat_exchange(recent_history)
                 one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
+                teacher_context = selected_context or one_exchange_text
+                teacher_context_label = "ĐOẠN ĐƯỢC CHỌN" if selected_context else "LƯỢT HỘI THOẠI TRƯỚC"
                 q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi tiếp nối trong bài {requested_content_type}.
-Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không gửi/không cần toàn bộ lịch sử chat hay toàn bộ lesson context.
+Chỉ dùng đúng một context: đoạn user chọn hoặc một lượt hội thoại gần nhất. Không dùng Knowledge, không dùng các lượt cũ hơn và không dùng lesson/step context ngoài context này.
 
-LƯỢT HỘI THOẠI TRƯỚC:
-{one_exchange_text}
+{teacher_context_label}:
+{teacher_context}
 
 CÂU HỎI HIỆN TẠI:
 {question_text}
 
-Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đến từ vựng, giữ đúng chữ Nhật, cách đọc/phát âm và nghĩa đã xuất hiện trong lượt trước; không tự bịa. Nếu lượt trước không đủ dữ kiện thì nói rõ điều đó."""
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ kiện thì nói rõ điều đó."""
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type={requested_content_type} step={step.get('code')} context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
                 blocks=[{"type":"text","text":answer or ""}]
@@ -6095,24 +6019,18 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đế
             f"{h.get('role')}: {str(h.get('text') or '')[-900:]}"
             for h in one_exchange
         )
+        teacher_context = selected_context or one_exchange_text
+        teacher_context_label = "ĐOẠN ĐƯỢC CHỌN" if selected_context else "LƯỢT HỘI THOẠI TRƯỚC"
         q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi trong bài học Giáo trình.
-Chỉ dùng dữ liệu PUBLISHED trong DB bên dưới để trả lời. Nếu dữ liệu không đủ, nói rõ là chưa có thông tin trong bài học; không bịa.
+Chỉ dùng đúng một context: đoạn user chọn hoặc một lượt hội thoại gần nhất. Không dùng Knowledge, không dùng các lượt cũ hơn và không dùng toàn bộ step/lesson context ngoài context này.
 
-Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không dùng các lượt cũ hơn.
-
-LƯỢT HỘI THOẠI TRƯỚC:
-{one_exchange_text}
-
-BÀI: {requested_lesson}
-BƯỚC: {step.get('code')} - {step.get('title')}
-
-NỘI DUNG BƯỚC:
-{step.get('text','')}
+{teacher_context_label}:
+{teacher_context}
 
 CÂU HỎI HIỆN TẠI:
 {question_text}
 
-Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái này", "ý là phần trên", "dịch hết", hãy hiểu nó là câu tiếp nối trực tiếp của lượt hội thoại trước."""
+Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ kiện thì nói rõ điều đó. Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái này", "ý là phần trên", "dịch hết", hãy hiểu nó là câu tiếp nối trực tiếp của context."""
         print(
             f"[CURRICULUM DB QUESTION] request={request_id} step={step.get('code')} "
             f"context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0"
@@ -6127,6 +6045,10 @@ Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái 
             blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
             blocks.extend(_curriculum_continue_blocks(step["index"]))
         return {"reply":answer or "","model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
+
+    selected_context = str(getattr(data, "selected_context", "") or "").strip()
+    if selected_context:
+        print(f"[CURRICULUM SELECTED CONTEXT] request={request_id} chars={len(selected_context)} mode=selected_text")
 
     curriculum_flow_active = bool(
         runtime_cache_hit and requested_content_type == "Giáo trình" and study_session
@@ -6641,9 +6563,7 @@ Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái 
     if runtime_cache_hit:
         if curriculum_flow_active:
             secs=curriculum_map["sections"]
-            if curriculum_question_turn:
-                pass
-            elif curriculum_step == 0:
+            if curriculum_step == 0:
                 cache_selected_sections=[]
             elif 1 <= curriculum_step <= len(secs):
                 # Exactly one source chunk per teaching step.
@@ -7059,47 +6979,6 @@ TIN NHẮN HIỆN TẠI:
             selected_vision = [x.get("vision", {}) for x in (runtime_lesson_cache.get("images") or []) if str(x.get("image_key") or "").strip() in selected_keys]
             vision_text = json.dumps(selected_vision, ensure_ascii=False, separators=(',', ':'))[:2600]
         marker_rule = ""
-        # Active legacy Giáo trình: a genuine learner question should use only the
-        # immediately preceding exchange plus the current chunk, never the long history.
-        # Continue/navigation and exercise-answer turns are handled by their dedicated
-        # curriculum branches below.
-        curriculum_question_turn = bool(
-            curriculum_flow_active
-            and requested_content_type == "Giáo trình"
-            and bool(query_text.strip())
-            and not data.action
-            and not _is_continue_confirmation(query_text)
-            and curriculum_step not in {0, curriculum_map["global_exercise_step"], curriculum_map["summary_step"]}
-            and curriculum_waiting not in {"chunk_answer", "global_exercise_answer"}
-            and not casual_conversation_request
-        )
-        if curriculum_question_turn:
-            one_exchange = _last_chat_exchange(recent_history)
-            one_exchange_text = "\n".join(f"{h.get('role')}: {str(h.get('text') or '')[-900:]}" for h in one_exchange)
-            sec_q = curriculum_map["sections"][curriculum_step-1] if 0 < curriculum_step <= len(curriculum_map["sections"]) else {}
-            current_chunk_text = str(sec_q.get("text") or "")
-            current_chunk_vision = vision_text
-            cache_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là câu hỏi của học sinh trong bài Giáo trình.
-- Nếu người dùng đang giao tiếp bằng tiếng Nhật, trả lời bằng tiếng Nhật, trừ khi họ yêu cầu ngôn ngữ khác.
-- Chỉ dùng MỘT lượt hội thoại ngay trước đó làm context hội thoại. Không dùng các lượt cũ hơn.
-- Dùng chunk hiện tại và Vision Facts của chunk hiện tại khi cần để trả lời. Không mở rộng sang chunk khác nếu câu hỏi không cần.
-- Nếu câu hỏi cần thông tin từ phần khác của bài, nói rõ cần đối chiếu phần nào; không bịa.
-
-LƯỢT HỘI THOẠI TRƯỚC:
-{one_exchange_text or '(không có)'}
-
-CHUNK HIỆN TẠI:
-{current_chunk_text}
-
-VISION FACTS HIỆN TẠI:
-{current_chunk_vision}
-
-CÂU HỎI HIỆN TẠI:
-{query_text}"""
-            prompt=cache_prompt
-            marker_rule="__CURRICULUM_PROMPT_READY__"
-            print(f"[CURRICULUM QUESTION CONTEXT] request={request_id} mode=1_exchange history_exchanges=1 prompt_chars={len(prompt)} embedding=0 pinecone=0")
-
         if curriculum_flow_active:
             secs=curriculum_map["sections"]
             vocab_grammar_context=""
