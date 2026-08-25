@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-25-v19_75-discovery-learning-intent"
+SERVER_VERSION = "2026-08-25-v19_76-grammar-one-exchange"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5991,7 +5991,20 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu câu hỏi liên quan đế
             return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":GEMINI_MODEL,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
         question_text=query_text.strip()
-        q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Chỉ dùng dữ liệu PUBLISHED trong DB bên dưới để trả lời câu hỏi. Nếu dữ liệu không đủ, nói rõ là chưa có thông tin trong bài học; không bịa.
+        # Giáo trình dùng cùng follow-up policy với Từ vựng/Bài tập/Ngữ pháp/Truyện đọc:
+        # chỉ lấy đúng 1 exchange ngay trước đó, không gửi toàn bộ history.
+        one_exchange = _last_chat_exchange(recent_history)
+        one_exchange_text = "\n".join(
+            f"{h.get('role')}: {str(h.get('text') or '')[-900:]}"
+            for h in one_exchange
+        )
+        q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một câu hỏi trong bài học Giáo trình.
+Chỉ dùng dữ liệu PUBLISHED trong DB bên dưới để trả lời. Nếu dữ liệu không đủ, nói rõ là chưa có thông tin trong bài học; không bịa.
+
+Chỉ dùng MỘT lượt hội thoại ngay trước đó làm ngữ cảnh hội thoại. Không dùng các lượt cũ hơn.
+
+LƯỢT HỘI THOẠI TRƯỚC:
+{one_exchange_text}
 
 BÀI: {requested_lesson}
 BƯỚC: {step.get('code')} - {step.get('title')}
@@ -5999,9 +6012,14 @@ BƯỚC: {step.get('code')} - {step.get('title')}
 NỘI DUNG BƯỚC:
 {step.get('text','')}
 
-CÂU HỎI:
-{question_text}"""
-        print(f"[CURRICULUM DB QUESTION] request={request_id} step={step.get('code')} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+CÂU HỎI HIỆN TẠI:
+{question_text}
+
+Nếu câu hiện tại ngắn hoặc thiếu chủ thể như "mẫu 4", "cái này", "ý là phần trên", "dịch hết", hãy hiểu nó là câu tiếp nối trực tiếp của lượt hội thoại trước."""
+        print(
+            f"[CURRICULUM DB QUESTION] request={request_id} step={step.get('code')} "
+            f"context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0"
+        )
         gen_started=time.perf_counter()
         answer,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=question_text)
         blocks=[{"type":"text","text":answer or ""}]
