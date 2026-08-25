@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-25-v19_76-grammar-one-exchange"
+SERVER_VERSION = "2026-08-25-v19_77_content_reasoning_tier_fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -4420,13 +4420,15 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
 
 
 
-def _chat_model_for_content(content_type: Optional[str], provider: Optional[str] = None):
-    """Resolve the chat model without changing routing/RAG decisions."""
+def _chat_model_for_content(
+    content_type: Optional[str],
+    provider: Optional[str] = None,
+    reasoning_profile: str = "low",
+):
+    """Resolve chat model tier; only explicit evaluation uses the medium model."""
     provider = (provider or LLM_PROVIDER).strip().lower()
     if provider == "openai":
-        if content_type in {"Bài tập", "Giáo trình"}:
-            return OPENAI_MODEL_MEDIUM
-        return OPENAI_MODEL_LOW
+        return OPENAI_MODEL_MEDIUM if reasoning_profile == "medium" else OPENAI_MODEL_LOW
     return GEMINI_MODEL
 
 
@@ -4533,7 +4535,15 @@ def _with_global_language_directive(prompt: str, user_text: str) -> str:
     return directive + prompt
 
 
-def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id: str, gen_started: float, user_text: str = ""):
+def _generate_chat_reply(
+    prompt: str,
+    *,
+    content_type: Optional[str],
+    request_id: str,
+    gen_started: float,
+    user_text: str = "",
+    reasoning_profile: str = "low",
+):
     """
     Provider-neutral chat adapter.
     Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
@@ -4545,10 +4555,8 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
     # no binary/image payload is being sent to Gemini from the chat generation path.
     print(f"[GEMINI INPUT AUDIT] request={request_id} prompt_chars={len(prompt)} image_parts=0")
     provider = LLM_PROVIDER
-    thinking_level = (
-        "medium" if content_type == "Bài tập"
-        else ("minimal" if content_type is None else "low")
-    )
+    effective_profile = "medium" if reasoning_profile == "medium" else "low"
+    thinking_level = "medium" if effective_profile == "medium" else ("minimal" if content_type is None else "low")
 
     if provider == "openai":
         if openai_client is None:
@@ -4557,11 +4565,12 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
                 "LLM_PROVIDER=openai nhưng OPENAI_API_KEY chưa được cấu hình "
                 "hoặc package openai chưa được cài."
             )
-        model = _chat_model_for_content(content_type, "openai")
+        model = _chat_model_for_content(content_type, "openai", effective_profile)
         print(
             f"[CHAT THINKING] request={request_id} provider='openai' "
             f"content_type={content_type!r} model={model!r} "
-            f"reasoning={OPENAI_REASONING_MEDIUM if content_type == 'Bài tập' else 'none'!r}"
+            f"reasoning_profile={effective_profile!r} "
+            f"reasoning={OPENAI_REASONING_MEDIUM if effective_profile == 'medium' else 'none'!r}"
         )
         kwargs = {
             "model": model,
@@ -4573,11 +4582,11 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
             ],
         }
         if model.startswith("gpt-5"):
-            # GPT-5-family models do not support reasoning.effort="none".
-            # Ordinary chat uses the lowest supported effort; Bài tập uses medium.
+            # GPT-5-family models require a supported reasoning effort.
+            # Ordinary chat uses minimal; only explicit evaluation uses medium.
             reasoning_effort = (
                 OPENAI_REASONING_MEDIUM
-                if content_type == "Bài tập"
+                if effective_profile == "medium"
                 else OPENAI_REASONING_LOW
             )
             kwargs["reasoning"] = {"effort": reasoning_effort}
@@ -5906,7 +5915,14 @@ TIN NHẮN HIỆN TẠI / CÂU TRẢ LỜI CỦA HỌC SINH:
 Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức."""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context=1_exchange prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
-                evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type=requested_content_type,request_id=request_id,gen_started=gen_started,user_text=query_text.strip())
+                evaluation,response_model,gen_elapsed=_generate_chat_reply(
+                    q_prompt,
+                    content_type=requested_content_type,
+                    request_id=request_id,
+                    gen_started=gen_started,
+                    user_text=query_text.strip(),
+                    reasoning_profile="medium",
+                )
                 answered=True
                 waiting="continue"
                 _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=True)
