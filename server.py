@@ -1,4 +1,4 @@
-# VERSION: v19_71 — story upload low-token: fixed plan + direct B0 + GenAI only B1/B2/B3
+# VERSION: v19_72 — v19_71 + OpenAI/GPT token usage logging
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -948,6 +948,57 @@ def _log_gemini_usage(response, operation="unknown", request_id=None):
     except Exception as exc:
         print("[GEMINI TOKENS] logging failed:", type(exc).__name__, str(exc))
 
+
+
+
+def _log_openai_usage(response, operation="chat_generation", request_id=None):
+    """Log OpenAI Responses API token usage without logging prompt content.
+
+    Handles SDK objects as well as dict-like usage payloads and keeps nested
+    cached/reasoning counters when the API exposes them.
+    """
+    try:
+        usage = getattr(response, "usage", None)
+        prefix = f" request={request_id}" if request_id else ""
+        if usage is None:
+            print(f"[OPENAI TOKENS]{prefix} operation={operation!r} usage=NONE")
+            return
+
+        def _get(obj, name, default=None):
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                return obj.get(name, default)
+            return getattr(obj, name, default)
+
+        def _num(value):
+            try:
+                return int(value) if value is not None else 0
+            except Exception:
+                return 0
+
+        input_tokens = _num(_get(usage, "input_tokens"))
+        output_tokens = _num(_get(usage, "output_tokens"))
+        total_tokens = _num(_get(usage, "total_tokens"))
+
+        input_details = _get(usage, "input_tokens_details")
+        output_details = _get(usage, "output_tokens_details")
+        cached_tokens = _num(_get(input_details, "cached_tokens"))
+        reasoning_tokens = _num(_get(output_details, "reasoning_tokens"))
+
+        if total_tokens == 0:
+            total_tokens = input_tokens + output_tokens
+
+        print(
+            f"[OPENAI TOKENS] operation={operation!r}{prefix} "
+            f"model={getattr(response, 'model', None) or 'unknown'!r} "
+            f"input={input_tokens} output={output_tokens} "
+            f"reasoning={reasoning_tokens} cached={cached_tokens} "
+            f"total={total_tokens}"
+        )
+    except Exception as exc:
+        # Token logging must never break a successful model response.
+        print("[OPENAI TOKENS] logging failed:", type(exc).__name__, str(exc))
 
 def embed_text(text):
     if not gemini:
@@ -4525,6 +4576,7 @@ def _generate_chat_reply(prompt: str, *, content_type: Optional[str], request_id
                 "effort": OPENAI_REASONING_MEDIUM if content_type == "Bài tập" else "none"
             }
         response = openai_client.responses.create(**kwargs)
+        _log_openai_usage(response, operation="chat_generation", request_id=request_id)
         reply = getattr(response, "output_text", "") or ""
         elapsed = time.perf_counter() - gen_started
         print(
