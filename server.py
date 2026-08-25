@@ -4670,6 +4670,13 @@ def proxy_chat(
             _finish_study_session(user["id"])
     study_session = _get_study_session(user["id"], data.chatbox_id)
 
+    # Selected-text context is supplied by the desktop app when the learner
+    # highlights text and chooses “Hỏi Doraemon”. Initialize it before ANY
+    # curriculum branch so early DB-first/question paths can safely use it.
+    selected_context = str(getattr(data, "selected_context", "") or "").strip()
+    if selected_context:
+        print(f"[CURRICULUM SELECTED CONTEXT] request={request_id} chars={len(selected_context)} mode=selected_text")
+
     # Safe default before routing is computed. Some confirmation/session branches
     # are evaluated earlier than the final hard-gate calculation below. Keeping
     # this initialized here prevents UnboundLocalError and, importantly, defaults
@@ -4678,6 +4685,14 @@ def proxy_chat(
 
     # End-of-lesson confirmation is a pure state transition: no Gemini,
     # embedding, Pinecone, RAG, images, or question quota.
+    # Bare content-type messages are routing text, not knowledge questions.
+    # In particular, a lone “giáo trình” should never spend an LLM call.
+    if (not data.action and not str((study_session or {}).get("lesson") or "").strip()
+            and low0 in {"giáo trình", "giao trinh"}):
+        msg = "Cậu nói rõ hơn cậu muốn học gì được không? 😊"
+        print("[CHAT ROUTING] bare_content_type_fastpath content_type='Giáo trình' genai=0 embedding=0 pinecone=0")
+        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
     if ui_action_raw := (str(data.action or "").strip() or None):
         ui_action_early = ui_action_raw.split(":",1)[0].casefold()
         if ui_action_early == "study_end_yes":
@@ -5938,10 +5953,10 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                 print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
-            # Cheap DB-only factual vocabulary questions must never spend Gemini
-            # tokens. Grammar questions and other non-trivial questions use the separate
-            # GenAI teacher turn with exactly one prior exchange as context.
-            if not data.action and str(query_text or "").strip() and requested_content_type == "Từ vựng":
+            # Cheap DB-only factual vocabulary questions must never spend LLM tokens.
+            # This lookup is allowed even while the learner is inside a Giáo trình
+            # lesson: vocabulary factual questions are a separate direct-DB lane.
+            if not data.action and str(query_text or "").strip():
                 direct_answer = _vocab_direct_answer_from_cache(runtime_lesson_cache, current_step, query_text.strip())
                 if direct_answer:
                     blocks=[{"type":"text","text":direct_answer}]
@@ -6012,6 +6027,19 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
             return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":GEMINI_MODEL,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
         question_text=query_text.strip()
+
+        # Vocabulary factual is a direct DB lane even when the active lesson is
+        # a Giáo trình. Never send simple meaning/reading/pronunciation/writing
+        # lookups through the teacher LLM.
+        direct_answer = _vocab_direct_answer_from_cache(runtime_lesson_cache, current_step, question_text)
+        if direct_answer:
+            blocks=[{"type":"text","text":direct_answer}]
+            if not step.get("is_final"):
+                blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                blocks.extend(_curriculum_continue_blocks(current_step))
+            print(f"[CURRICULUM DB QUESTION DIRECT] request={request_id} type=Từ vựng mode=direct_db genai=0 embedding=0 pinecone=0 source=active_curriculum")
+            return {"reply":direct_answer,"model":"db-direct","sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
+
         # Giáo trình dùng cùng follow-up policy với Từ vựng/Bài tập/Ngữ pháp/Truyện đọc:
         # chỉ lấy đúng 1 exchange ngay trước đó, không gửi toàn bộ history.
         one_exchange = _last_chat_exchange(recent_history)
@@ -6045,10 +6073,6 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
             blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
             blocks.extend(_curriculum_continue_blocks(step["index"]))
         return {"reply":answer or "","model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
-
-    selected_context = str(getattr(data, "selected_context", "") or "").strip()
-    if selected_context:
-        print(f"[CURRICULUM SELECTED CONTEXT] request={request_id} chars={len(selected_context)} mode=selected_text")
 
     curriculum_flow_active = bool(
         runtime_cache_hit and requested_content_type == "Giáo trình" and study_session
