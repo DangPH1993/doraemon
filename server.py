@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-25-v19_79_selected_text_context"
+SERVER_VERSION = "2026-08-26-v19_80_course_catalog_admin"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -201,6 +201,36 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(source_file, content_type, lesson, topic)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS courses (
+                id BIGSERIAL PRIMARY KEY,
+                code VARCHAR(100) UNIQUE NOT NULL,
+                name VARCHAR(255) UNIQUE NOT NULL,
+                language VARCHAR(30),
+                level VARCHAR(50),
+                status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_status_order ON courses(status,sort_order,id);")
+            # Backfill the course catalog from legacy Knowledge Base subjects once.
+            # Existing documents keep their current subject text; future uploads
+            # must select a course from this canonical catalog. Non-ASCII legacy
+            # names receive a deterministic LEGACY-* code instead of a collision-prone slug.
+            cur.execute("SELECT DISTINCT trim(subject) AS subject FROM knowledge_documents WHERE trim(coalesce(subject,'')) <> '' ORDER BY 1")
+            for legacy in cur.fetchall():
+                legacy_name = str(legacy[0] or '').strip()
+                if not legacy_name:
+                    continue
+                cur.execute("SELECT 1 FROM courses WHERE lower(trim(name))=lower(trim(%s)) LIMIT 1", (legacy_name,))
+                if cur.fetchone():
+                    continue
+                slug = re.sub(r'[^A-Za-z0-9]+', '-', legacy_name).strip('-').upper()
+                code = slug[:80] if slug else f"LEGACY-{hashlib.sha1(legacy_name.encode('utf-8')).hexdigest()[:12].upper()}"
+                cur.execute("SELECT 1 FROM courses WHERE lower(code)=lower(%s) LIMIT 1", (code,))
+                if cur.fetchone():
+                    code = f"LEGACY-{hashlib.sha1(legacy_name.encode('utf-8')).hexdigest()[:12].upper()}"
+                cur.execute("INSERT INTO courses(code,name,status,sort_order) VALUES(%s,%s,'ACTIVE',0) ON CONFLICT (code) DO NOTHING", (code, legacy_name))
             # Safe migrations for any cache tables created by intermediate builds.
             for sql in [
                 "ALTER TABLE knowledge_assets ADD COLUMN IF NOT EXISTS content_hash VARCHAR(128);",
@@ -7633,6 +7663,79 @@ def _knowledge_catalog_tree(rows):
     return tree
 
 
+@app.get("/admin/api/courses")
+def admin_courses(password: str):
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,code,name,language,level,status,sort_order,created_at,updated_at FROM courses ORDER BY sort_order,id")
+            return {"success":True,"courses":[dict(r) for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+@app.post("/admin/api/courses")
+def admin_course_create(payload: dict):
+    check_admin(str(payload.get('password') or ''))
+    code=re.sub(r"\s+","-",str(payload.get('code') or '').strip()).upper()
+    name=re.sub(r"\s+"," ",str(payload.get('name') or '').strip())
+    language=str(payload.get('language') or '').strip() or None
+    level=str(payload.get('level') or '').strip() or None
+    if not code or not name:
+        raise HTTPException(400,'Mã khóa học và tên khóa học là bắt buộc.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM courses WHERE lower(code)=lower(%s) OR lower(name)=lower(%s) LIMIT 1",(code,name))
+            if cur.fetchone(): raise HTTPException(409,'Mã hoặc tên khóa học đã tồn tại.')
+            cur.execute("INSERT INTO courses(code,name,language,level,status,updated_at) VALUES(%s,%s,%s,%s,'ACTIVE',NOW()) RETURNING id,code,name,language,level,status,sort_order,created_at,updated_at",(code,name,language,level))
+            row=dict(cur.fetchone())
+        conn.commit(); return {'success':True,'course':row}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+@app.patch("/admin/api/courses/{course_id}")
+def admin_course_update(course_id:int,payload:dict):
+    check_admin(str(payload.get('password') or ''))
+    status=str(payload.get('status') or '').strip().upper()
+    if status not in {'ACTIVE','INACTIVE'}:
+        raise HTTPException(400,'status phải là ACTIVE hoặc INACTIVE.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("UPDATE courses SET status=%s,updated_at=NOW() WHERE id=%s RETURNING id,code,name,language,level,status,sort_order,created_at,updated_at",(status,course_id))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,'Không tìm thấy khóa học.')
+        conn.commit(); return {'success':True,'course':dict(row)}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+@app.delete("/admin/api/courses/{course_id}")
+def admin_course_delete(course_id:int,payload:dict):
+    check_admin(str(payload.get('password') or ''))
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name FROM courses WHERE id=%s FOR UPDATE",(course_id,))
+            course=cur.fetchone()
+            if not course: raise HTTPException(404,'Không tìm thấy khóa học.')
+            cur.execute("SELECT COUNT(*) AS n FROM knowledge_documents WHERE lower(trim(subject))=lower(trim(%s))",(course['name'],))
+            kb=int(cur.fetchone()['n'] or 0)
+            cur.execute("SELECT COUNT(*) AS n FROM curriculum_lessons WHERE lower(trim(subject))=lower(trim(%s))",(course['name'],))
+            curriculum=int(cur.fetchone()['n'] or 0)
+            if kb or curriculum:
+                raise HTTPException(409,'Khóa học đã có tài liệu/nội dung. Hãy chuyển sang INACTIVE thay vì xóa.')
+            cur.execute("DELETE FROM courses WHERE id=%s",(course_id,))
+        conn.commit(); return {'success':True,'course_id':course_id}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
 @app.get("/admin/api/knowledge/catalog")
 def admin_knowledge_catalog(password: str):
     check_admin(password)
@@ -8283,7 +8386,7 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest):
 async def admin_curriculum_draft_upload(
     password: str = Form(''),
     file: UploadFile = File(...),
-    subject: str = Form(''),
+    course_id: int = Form(...),
     content_type: str = Form(''),
     lesson: str = Form(''),
     metadata_json: str = Form('[]'),
@@ -8302,9 +8405,19 @@ async def admin_curriculum_draft_upload(
         raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
     if not b2_ready():
         raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
-    subject=subject.strip()
-    if not subject:
-        raise HTTPException(400,'Môn học là bắt buộc.')
+    course_id=int(course_id)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(course_id,))
+            course=cur.fetchone()
+    finally:
+        conn.close()
+    if not course:
+        raise HTTPException(400,'Khóa học không tồn tại.')
+    if str(course.get('status') or '').upper() != 'ACTIVE':
+        raise HTTPException(400,'Khóa học đang tắt và không thể tạo Draft.')
+    subject=str(course['name']).strip()
 
     # Backward compatible single-lesson configuration.
     configs=[]
@@ -8747,12 +8860,24 @@ button.gray{background:#666}button.red{background:#d93025}
 
 <div id="panel" style="display:none">
 <div class="card">
+<h3>📚 Danh mục khóa học</h3>
+<div class="small" style="margin-bottom:10px">Khóa học là danh mục chuẩn dùng cho toàn bộ tài liệu. Upload PDF không nhập tên khóa học tự do.</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+  <input id="newCourseCode" placeholder="Mã khóa, ví dụ JP-N5" style="width:180px">
+  <input id="newCourseName" placeholder="Tên khóa, ví dụ Tiếng Nhật N5" style="flex:1;min-width:220px">
+  <input id="newCourseLanguage" placeholder="Ngôn ngữ, ví dụ ja" style="width:150px">
+  <input id="newCourseLevel" placeholder="Trình độ, ví dụ N5" style="width:140px">
+  <button type="button" onclick="createCourse()">＋ Thêm khóa</button>
+</div>
+<div id="courseCatalogAdmin">Đang tải...</div>
+</div>
+<div class="card">
 <h3>🧠 AI Curriculum Studio</h3>
-<div class="small" style="margin-bottom:10px">Upload 1 bài học → Gemini OCR/Vision → AI dựng số bước → AI soạn từng bước → Admin sửa/duyệt → Publish vào PostgreSQL và Pinecone.</div>
+<div class="small" style="margin-bottom:10px">Chọn khóa học từ danh mục → Upload 1 bài học → Gemini OCR/Vision → AI dựng số bước → AI soạn từng bước → Admin sửa/duyệt → Publish.</div>
 <form onsubmit="createCurriculumDraft(event)">
 <input id="curPdf" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap">
-<input id="curSubject" value="Tiếng Nhật" placeholder="Môn học" required style="flex:1;min-width:180px">
+<select id="curCourse" required style="flex:1;min-width:180px"><option value="">Đang tải danh mục khóa học...</option></select>
 </div>
 <div style="margin-top:12px;padding:10px;border:1px solid #ddd;border-radius:9px;background:#fafafa">
   <div style="font-weight:700;margin-bottom:6px">📚 Cấu hình các bài trong PDF</div>
@@ -8772,19 +8897,19 @@ button.gray{background:#666}button.red{background:#d93025}
 <div class="card">
 <h3>📚 Knowledge Base</h3>
 <div class="small" style="margin-bottom:10px">
-Upload PDF trực tiếp lên Pinecone · Gemini Embedding 768 · Namespace: __default__
+Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini Embedding 768 · Namespace: __default__
 </div>
 <form id="uploadForm" onsubmit="uploadKnowledge(event)">
 <input id="pdfFile" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-<input id="subject" value="Tiếng Nhật" placeholder="Môn học *" required style="flex:1;min-width:180px">
+<select id="courseId" required style="flex:1;min-width:220px"><option value="">Đang tải danh mục khóa học...</option></select>
 <input id="chunkSize" type="number" value="1200" min="300" max="5000" title="Kích thước chunk" style="width:120px">
 <input id="overlap" type="number" value="200" min="0" max="4900" title="Độ chồng lấn" style="width:110px">
 </div>
 <div style="margin-top:12px">
   <div style="font-weight:700;margin-bottom:7px">📚 Cấu hình nội dung trong PDF</div>
   <div class="small" style="margin-bottom:8px">
-    Một file PDF chỉ chọn <b>1 Môn học</b>. Bạn có thể tạo nhiều dòng để mô tả nhiều bài học/chủ đề/câu hỏi/đáp án trong cùng file.
+    Một file PDF chỉ chọn <b>1 Khóa học</b>. Bạn có thể tạo nhiều dòng để mô tả nhiều bài học/chủ đề/câu hỏi/đáp án trong cùng file.
   </div>
   <div id="metaRows"></div>
   <button type="button" class="gray" onclick="addMetaRow()" style="margin-top:8px">＋ Thêm bài/chủ đề</button>
@@ -8867,10 +8992,62 @@ async function login(){
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadUsers();
     await loadPaymentPackages();
+    await loadCourses();
     await loadKnowledgeCatalog();
     await loadCurriculumDrafts();
     startChatPolling();
   }catch(e){document.getElementById("err").textContent=e.message}
+}
+async function loadCourses(){
+  try{
+    const d=await api('/admin/api/courses?password='+encodeURIComponent(pw));
+    const courses=d.courses||[];
+    const selects=[document.getElementById('courseId'),document.getElementById('curCourse')].filter(Boolean);
+    selects.forEach(sel=>{
+      const prev=sel.value;
+      sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+
+        courses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>
+          `<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`
+        ).join('');
+      if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
+    });
+    const host=document.getElementById('courseCatalogAdmin');
+    if(host){
+      if(!courses.length){ host.innerHTML='<div class="small">Chưa có khóa học. Hãy tạo khóa đầu tiên.</div>'; }
+      else host.innerHTML=courses.map(c=>`<div style="display:grid;grid-template-columns:110px 1.6fr 130px 120px 1fr auto;gap:7px;align-items:center;padding:8px 0;border-bottom:1px solid #eee">
+        <b>${esc(c.code)}</b><span>${esc(c.name)}</span><span>${esc(c.language||'')}</span><span>${esc(c.level||'')}</span>
+        <span class="status-${esc(c.status||'ACTIVE')}">${esc(c.status||'ACTIVE')}</span>
+        <span style="display:flex;gap:5px;justify-content:flex-end">
+          <button class="gray" type="button" onclick="toggleCourse(${Number(c.id)},'${String(c.status||'ACTIVE').toUpperCase()}')">${String(c.status||'ACTIVE').toUpperCase()==='ACTIVE'?'Tắt':'Bật'}</button>
+          <button class="red" type="button" onclick="deleteCourse(${Number(c.id)})">Xóa</button>
+        </span>
+      </div>`).join('');
+    }
+  }catch(e){
+    const host=document.getElementById('courseCatalogAdmin'); if(host) host.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';
+  }
+}
+async function createCourse(){
+  const code=document.getElementById('newCourseCode').value.trim();
+  const name=document.getElementById('newCourseName').value.trim();
+  const language=document.getElementById('newCourseLanguage').value.trim();
+  const level=document.getElementById('newCourseLevel').value.trim();
+  if(!code||!name){alert('Vui lòng nhập mã và tên khóa học.');return;}
+  try{
+    await api('/admin/api/courses',{method:'POST',body:JSON.stringify({password:pw,code,name,language,level,status:'ACTIVE'})});
+    document.getElementById('newCourseCode').value=''; document.getElementById('newCourseName').value=''; document.getElementById('newCourseLanguage').value=''; document.getElementById('newCourseLevel').value='';
+    await loadCourses();
+  }catch(e){alert('❌ '+e.message)}
+}
+async function toggleCourse(id,status){
+  const next=String(status).toUpperCase()==='ACTIVE'?'INACTIVE':'ACTIVE';
+  try{await api('/admin/api/courses/'+id,{method:'PATCH',body:JSON.stringify({password:pw,status:next})});await loadCourses();}
+  catch(e){alert('❌ '+e.message)}
+}
+async function deleteCourse(id,name){
+  if(!confirm(`Xóa khóa học "${name}" khỏi danh mục? Chỉ khóa chưa có tài liệu mới được xóa.`))return;
+  try{await api('/admin/api/courses/'+id,{method:'DELETE',body:JSON.stringify({password:pw})});await loadCourses();}
+  catch(e){alert('❌ '+e.message)}
 }
 function addMetaRow(values={}){
   const wrap=document.getElementById("metaRows");
@@ -8913,13 +9090,15 @@ async function uploadKnowledge(event){
   if(!file)return;
   const status=document.getElementById("uploadStatus"), btn=document.getElementById("uploadBtn");
   const rows=getMetaRows();
+  const courseId=document.getElementById("courseId").value;
+  if(!courseId){status.textContent="❌ Vui lòng chọn khóa học.";return;}
   btn.disabled=true;
   status.textContent="⏳ Đang phân tích PDF... PDF scan sẽ được OCR bằng Gemini và ảnh sẽ được lưu vào Backblaze B2 nếu đã cấu hình...";
   try{
     const fd=new FormData();
     fd.append("file",file);
     fd.append("password",pw);
-    fd.append("subject",document.getElementById("subject").value.trim());
+    fd.append("course_id",document.getElementById("courseId").value);
     fd.append("metadata_json",JSON.stringify(rows));
     fd.append("chunk_size",document.getElementById("chunkSize").value||1200);
     fd.append("overlap",document.getElementById("overlap").value||200);
@@ -8968,7 +9147,7 @@ async function createCurriculumDraft(event){
  for(const r of rows){if(!r.lesson||!r.pages){st.textContent=`❌ Bài #${r.index}: cần đủ tên bài và số trang.`;return;}}
  btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài, chỉ OCR/Vision các trang đã cấu hình...`;
  try{
-   const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('subject',document.getElementById('curSubject').value.trim()); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
+   const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('course_id',document.getElementById('curCourse').value); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
    const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
    const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status));
    const drafts=Array.isArray(d.drafts)?d.drafts:[];
@@ -10277,15 +10456,25 @@ async def admin_knowledge_upload(
     background_tasks: BackgroundTasks,
     password: str = Form(""),
     file: UploadFile = File(...),
-    subject: str = Form(""),
+    course_id: int = Form(...),
     metadata_json: str = Form("[]"),
     chunk_size: int = Form(1200),
     overlap: int = Form(200)
 ):
     check_admin(password)
-    subject=subject.strip()
-    if not subject:
-        raise HTTPException(400, "Môn học là bắt buộc.")
+    course_id=int(course_id)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(course_id,))
+            course=cur.fetchone()
+    finally:
+        conn.close()
+    if not course:
+        raise HTTPException(400, "Khóa học không tồn tại.")
+    if str(course.get("status") or "").upper() != "ACTIVE":
+        raise HTTPException(400, "Khóa học đang tắt và không thể upload tài liệu.")
+    subject=str(course["name"]).strip()
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Vui lòng chọn file PDF.")
     if not gemini:
