@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-26-v19_83_course_catalog_display_fix"
+SERVER_VERSION = "2026-08-26-v19_84_course_access_and_client_course"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -133,6 +133,7 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
                 id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT,
                 plan VARCHAR(100) NOT NULL DEFAULT 'N5', started_at TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ, status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
@@ -196,7 +197,7 @@ def init_db():
             );""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_lesson_cache (
                 id BIGSERIAL PRIMARY KEY, asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE,
-                source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL, content_type VARCHAR(30) NOT NULL,
+                course_id BIGINT, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL, content_type VARCHAR(30) NOT NULL,
                 lesson VARCHAR(255) NOT NULL, topic VARCHAR(255), status VARCHAR(20) NOT NULL DEFAULT 'READY',
                 cache_json JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -214,7 +215,9 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_status_order ON courses(status,sort_order,id);")
+            cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_course ON subscriptions(user_id,course_id,status,expires_at DESC);")
             cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_documents_course ON knowledge_documents(course_id,content_type,lesson,topic);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
@@ -257,6 +260,7 @@ def init_db():
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS image_url TEXT;",
                 "ALTER TABLE knowledge_vision_cache ADD COLUMN IF NOT EXISTS vision_json JSONB DEFAULT '{}'::jsonb;",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS asset_id BIGINT REFERENCES knowledge_assets(id) ON DELETE CASCADE;",
+                "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS course_id BIGINT;",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS source_file VARCHAR(500) DEFAULT '';",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS subject VARCHAR(255);",
                 "ALTER TABLE knowledge_lesson_cache ADD COLUMN IF NOT EXISTS content_type VARCHAR(30);",
@@ -460,6 +464,7 @@ class ChatRequest(BaseModel):
     top_k: int = 8
     proactive: bool = False
     action: str | None = None
+    course_id: int | None = None
 
     @property
     def text(self) -> str:
@@ -528,38 +533,70 @@ def _vn_display(dt):
     local = _as_vn(dt)
     return local.strftime("%d/%m/%Y %H:%M GMT+7") if local else None
 
+def _authorized_courses(user_id):
+    """Return currently active paid courses for the user."""
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (s.course_id)
+                       s.course_id, c.code, c.name, c.language, c.level,
+                       s.id AS subscription_id, s.plan, s.started_at, s.expires_at
+                FROM subscriptions s
+                JOIN courses c ON c.id=s.course_id
+                WHERE s.user_id=%s
+                  AND s.course_id IS NOT NULL
+                  AND upper(coalesce(s.status,''))='ACTIVE'
+                  AND s.expires_at IS NOT NULL
+                  AND s.expires_at > %s
+                  AND upper(coalesce(c.status,'ACTIVE'))='ACTIVE'
+                ORDER BY s.course_id, s.expires_at DESC, s.id DESC
+            """, (user_id, _now_local()))
+            rows=[dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    rows.sort(key=lambda r:(str(r.get('name') or '').casefold(), int(r.get('course_id') or 0)))
+    return rows
+
+
+def _resolve_request_course(user_id, requested_course_id):
+    courses=_authorized_courses(user_id)
+    if requested_course_id not in (None, ""):
+        try: cid=int(requested_course_id)
+        except Exception: raise HTTPException(400,"course_id không hợp lệ.")
+        hit=next((c for c in courses if int(c['course_id'])==cid),None)
+        if not hit: raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
+        return int(hit['course_id']), str(hit['name']), courses
+    if len(courses)==1:
+        c=courses[0]; return int(c['course_id']), str(c['name']), courses
+    return None,None,courses
+
+
 def _package_info(user_id):
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,plan,started_at,expires_at,status FROM subscriptions
+            cur.execute("""SELECT id,plan,course_id,started_at,expires_at,status FROM subscriptions
                            WHERE user_id=%s ORDER BY id DESC LIMIT 1""", (user_id,))
             sub = cur.fetchone()
             if not sub:
-                # Defensive fallback for legacy records before the migration runs.
-                sub = {"id": None, "plan": "Free", "started_at": None, "expires_at": None, "status": "ACTIVE"}
+                sub = {"id":None,"plan":"Free","course_id":None,"started_at":None,"expires_at":None,"status":"ACTIVE"}
             cur.execute("""SELECT question_count FROM daily_question_usage
                            WHERE user_id=%s AND usage_date=%s""", (user_id, _now_local().date()))
-            row = cur.fetchone()
-            used = int(row["question_count"]) if row else 0
+            row=cur.fetchone(); used=int(row['question_count']) if row else 0
     finally:
         conn.close()
-
-    plan = str(sub.get("plan") or "Free")
-    expires_at = sub.get("expires_at")
-    active_paid = plan != "Free" and str(sub.get("status") or "").upper() == "ACTIVE" and expires_at and expires_at > _now_local()
-    if active_paid:
-        return {
-            "id": sub.get("id"), "plan": plan, "started_at": sub.get("started_at"),
-            "expires_at": expires_at, "expires_at_vn": _vn_display(expires_at), "status": "ACTIVE",
-            "daily_limit": None, "used_today": used, "remaining_today": None, "unlimited": True
-        }
-
-    return {
-        "id": sub.get("id"), "plan": "Free", "started_at": sub.get("started_at"),
-        "expires_at": None, "expires_at_vn": None, "status": "ACTIVE",
-        "daily_limit": 5, "used_today": used, "remaining_today": max(0, 5-used), "unlimited": False
-    }
+    courses=_authorized_courses(user_id)
+    if courses:
+        primary=courses[0]
+        return {"id":sub.get("id"),"plan":sub.get("plan") or "1 tháng",
+                "course_id":primary.get("course_id"),"course_name":primary.get("name"),
+                "started_at":sub.get("started_at"),"expires_at":sub.get("expires_at"),
+                "expires_at_vn":_vn_display(sub.get("expires_at")),"status":"ACTIVE",
+                "courses":courses,"daily_limit":None,"used_today":used,"remaining_today":None,"unlimited":True}
+    return {"id":sub.get("id"),"plan":"Free","course_id":None,"course_name":None,
+            "started_at":sub.get("started_at"),"expires_at":None,"expires_at_vn":None,"status":"ACTIVE",
+            "courses":[],"daily_limit":5,"used_today":used,"remaining_today":max(0,5-used),"unlimited":False}
 
 def subscription_status(user_id):
     info = _package_info(user_id)
@@ -848,17 +885,21 @@ def _load_catalog_cached():
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,
-                           question_pages,answer_pages,source_file,namespace
-                    FROM knowledge_documents
+                    SELECT kd.subject,kd.course_id,COALESCE(c.name,kd.subject) AS course_name,
+                           kd.content_type,kd.lesson,kd.lesson_pages,kd.topic,kd.topic_pages,
+                           kd.question_pages,kd.answer_pages,kd.source_file,kd.namespace
+                    FROM knowledge_documents kd
+                    LEFT JOIN courses c ON c.id=kd.course_id
                     UNION ALL
-                    SELECT subject,content_type,lesson,NULL::VARCHAR AS lesson_pages,
+                    SELECT cl.subject,cl.course_id,COALESCE(c.name,cl.subject) AS course_name,
+                           cl.content_type,cl.lesson,NULL::VARCHAR AS lesson_pages,
                            NULL::VARCHAR AS topic,NULL::VARCHAR AS topic_pages,
                            NULL::VARCHAR AS question_pages,NULL::VARCHAR AS answer_pages,
-                           source_file,'__default__'::VARCHAR AS namespace
-                    FROM curriculum_lessons
-                    WHERE status='PUBLISHED'
-                    ORDER BY subject,content_type,lesson,topic,source_file
+                           cl.source_file,'__default__'::VARCHAR AS namespace
+                    FROM curriculum_lessons cl
+                    LEFT JOIN courses c ON c.id=cl.course_id
+                    WHERE cl.status='PUBLISHED'
+                    ORDER BY course_name,content_type,lesson,topic,source_file
                 """)
                 _catalog_cache = [dict(x) for x in cur.fetchall()]
                 _catalog_cache_at = now
@@ -1402,6 +1443,7 @@ def _focus_metadata_matches(matches, query_text, lesson=None, topic=None,
 
 def _encode_lesson_confirm_scope(scope):
     payload = {
+        "course_id": scope.get("course_id"),
         "course": scope.get("course"),
         "content_type": scope.get("content_type"),
         "lesson": scope.get("lesson"),
@@ -1417,6 +1459,7 @@ def _decode_lesson_confirm_scope(value):
         raw += "=" * (-len(raw) % 4)
         data = json.loads(base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8"))
         return {
+            "course_id": int(data.get("course_id")) if data.get("course_id") not in (None, "") else None,
             "course": str(data.get("course") or "").strip() or None,
             "content_type": _normalize_content_type(data.get("content_type")) if data.get("content_type") else None,
             "lesson": str(data.get("lesson") or "").strip() or None,
@@ -2710,7 +2753,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         key = _group_key(md)
         if not key[1]:
             continue
-        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "course_id": md.get("course_id"), "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
         grouped[key]["sections"].append({
             "chunk_index": int(md.get("chunk_index") or 0),
             "page_chunk_index": int(md.get("page_chunk_index") or 0),
@@ -2728,7 +2771,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
         key = _group_key(md)
         if not key[1]:
             continue
-        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
+        grouped.setdefault(key, {"sections": [], "images": [], "source_file": source_file, "subject": subject, "course_id": md.get("course_id"), "lesson_display": str(md.get("lesson") or "").strip(), "topic_display": str(md.get("topic") or "").strip() or None})
         vision = {k:v for k,v in md.items() if k not in {"image_key","image_url"}}
         grouped[key]["images"].append({
             "image_key": md.get("image_key"), "image_url": md.get("image_url"),
@@ -2782,6 +2825,7 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                 overview = " ".join(x["text"] for x in payload["sections"][:2]).strip()[:2400]
                 package = {
                     "version": 1,
+                    "course_id": payload.get("course_id"),
                     "source_file": source_file,
                     "content_hash": source_hash,
                     "subject": subject,
@@ -2792,8 +2836,10 @@ def _upsert_upload_knowledge_cache(source_file, source_hash, subject, page_count
                     "sections": payload["sections"],
                     "images": payload["images"],
                 }
-                cur.execute("""INSERT INTO knowledge_lesson_cache(\n                    asset_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at\n                ) VALUES(%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
-                    (asset_id, source_file, subject, ct, lesson, topic_display, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
+                cur.execute("""INSERT INTO knowledge_lesson_cache(
+                    asset_id,course_id,source_file,subject,content_type,lesson,topic,status,cache_json,updated_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,'READY',%s::jsonb,NOW())""",
+                    (asset_id, package.get('course_id'), source_file, subject, ct, lesson, topic_display, json.dumps(_cache_jsonable(package), ensure_ascii=False)))
                 for img in payload["images"]:
                     image_key = str(img.get("image_key") or "").strip()
                     image_hash = str(img.get("image_hash") or "").strip() or None
@@ -3135,7 +3181,7 @@ def _published_curriculum_blocks(step, cache):
     return blocks
 
 
-def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=None):
+def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, course_id=None, request_id=None):
     """Load runtime lesson cache and merge compatible legacy rows deterministically."""
     if not lesson:
         return None
@@ -3154,9 +3200,10 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                   AND lower(trim(content_type))=lower(trim(%s))
                   AND (lower(trim(lesson))=lower(trim(%s)) OR
                        regexp_replace(lower(trim(lesson)), '^bài\s+', '', 'g')=regexp_replace(lower(trim(%s)), '^bài\s+', '', 'g'))
+                  AND (%s IS NULL OR course_id=%s)
                 ORDER BY version DESC,id DESC
                 LIMIT 1
-            """,(ct,ls,ls))
+            """,(ct,ls,ls,course_id,course_id))
             curriculum_row=cur.fetchone()
             if curriculum_row:
                 cur.execute("SELECT id,step_code,step_order,title,step_type,content_json FROM curriculum_steps WHERE lesson_id=%s ORDER BY step_order,id",(curriculum_row['id'],))
@@ -3167,12 +3214,13 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, request_id=N
                     return payload
 
             cur.execute(
-                """SELECT id,source_file,subject,content_type,lesson,topic,status,updated_at,cache_json
+                """SELECT id,course_id,source_file,subject,content_type,lesson,topic,status,updated_at,cache_json
                    FROM knowledge_lesson_cache
                    WHERE status='READY'
                      AND lower(trim(content_type))=lower(trim(%s))
+                     AND (%s IS NULL OR course_id=%s)
                    ORDER BY updated_at DESC,id DESC""",
-                (ct,),
+                (ct,course_id,course_id),
             )
             all_rows = cur.fetchall() or []
             lesson_rows = [r for r in all_rows if _canonical_lesson_key(r.get('lesson')) == canonical_ls]
@@ -4708,6 +4756,16 @@ def proxy_chat(
             print(f"[CHATBOX RESET] new_chatbox=1 legacy session -> closing previous lesson={old_session.get('lesson')!r}")
             _finish_study_session(user["id"])
     study_session = _get_study_session(user["id"], data.chatbox_id)
+    selected_course_id, selected_course_name, authorized_courses = _resolve_request_course(user["id"], data.course_id)
+    if selected_course_id is None and study_session and study_session.get("course"):
+        session_name=str(study_session.get("course") or "").strip().casefold()
+        hit=next((c for c in authorized_courses if str(c.get("name") or "").strip().casefold()==session_name),None)
+        if hit:
+            selected_course_id=int(hit['course_id']); selected_course_name=str(hit['name'])
+    early_action=str(data.action or "").strip().casefold()
+    if selected_course_id is None and early_action:
+        if early_action.startswith(("curriculum_","lesson_confirm_","study_end_")) and study_session:
+            raise HTTPException(403,"Quyền học khóa hiện tại không còn hiệu lực. Vui lòng chọn khóa học đang được cấp quyền trong Cấu hình.")
 
     # Selected-text context is supplied by the desktop app when the learner
     # highlights text and chooses “Hỏi Doraemon”. Initialize it before ANY
@@ -5195,6 +5253,9 @@ def proxy_chat(
     finally:
         conn.close()
     catalog = _load_catalog_cached()
+    if selected_course_id is not None:
+        catalog=[x for x in catalog if str(x.get("course_id") or "") == str(selected_course_id)]
+        print(f"[COURSE SCOPE] user={user['id']} course_id={selected_course_id} course={selected_course_name!r} catalog_rows={len(catalog)}")
     perf_state = time.perf_counter()
 
     # Force retrieval to the exact unit from the ACTIVE Study Plan when the
@@ -5405,7 +5466,10 @@ Tin nhắn hiện tại:
             requested_scope["lesson"] = "Kanji"
 
     requested_content_type = requested_scope.get("content_type")
-    requested_course = requested_scope.get("course")
+    requested_course = selected_course_name or requested_scope.get("course")
+    requested_course_id = selected_course_id
+    requested_scope["course"] = requested_course
+    requested_scope["course_id"] = requested_course_id
     requested_lesson = requested_scope.get("lesson")
     requested_topic = requested_scope.get("topic")
 
@@ -5553,7 +5617,8 @@ Tin nhắn hiện tại:
     lesson_confirmation_scope = lesson_confirmed_scope
     if lesson_confirmation_scope is None and next_lesson_scope:
         lesson_confirmation_scope = {
-            "course": str(next_lesson_scope.get("course") or next_lesson_scope.get("course_name") or "").strip() or None,
+            "course_id": selected_course_id,
+            "course": selected_course_name or str(next_lesson_scope.get("course") or next_lesson_scope.get("course_name") or "").strip() or None,
             "content_type": _normalize_content_type(next_lesson_scope.get("content_type")),
             "lesson": str(next_lesson_scope.get("lesson") or "").strip() or None,
             "topic": str(next_lesson_scope.get("topic") or "").strip() or None,
@@ -5563,7 +5628,8 @@ Tin nhắn hiện tại:
     if lesson_confirmation_scope is None and (named_lesson_topic or _is_specific_lesson_request(query_text)) and not forced_plan_scope and not data.action:
         if named_lesson_topic:
             lesson_confirmation_scope = {
-                "course": str(named_lesson_topic.get("course") or named_lesson_topic.get("course_name") or "").strip() or None,
+                "course_id": selected_course_id,
+                "course": selected_course_name or str(named_lesson_topic.get("course") or named_lesson_topic.get("course_name") or "").strip() or None,
                 "content_type": _normalize_content_type(named_lesson_topic.get("content_type")),
                 "lesson": str(named_lesson_topic.get("lesson") or "").strip() or None,
                 "topic": str(named_lesson_topic.get("topic") or "").strip() or None,
@@ -5704,7 +5770,8 @@ Tin nhắn hiện tại:
 
         if active_learning:
             requested_content_type = _normalize_content_type(active_learning.get("content_type")) or None
-            requested_course = str(active_learning.get("subject") or "").strip() or None
+            requested_course = selected_course_name or str(active_learning.get("subject") or "").strip() or None
+            requested_course_id = selected_course_id
             requested_lesson = str(active_learning.get("lesson") or "").strip() or None
             requested_topic = str(active_learning.get("topic") or "").strip() or None
 
@@ -5876,7 +5943,7 @@ Tin nhắn hiện tại:
     runtime_cache_initial = bool(lesson_confirmed_scope or forced_plan_scope)
     if study_retrieval_allowed and requested_lesson:
         runtime_lesson_cache = _load_runtime_lesson_cache(
-            requested_content_type or "Giáo trình", requested_lesson, requested_topic, request_id=request_id
+            requested_content_type or "Giáo trình", requested_lesson, requested_topic, course_id=selected_course_id, request_id=request_id
         )
         runtime_cache_hit = bool(runtime_lesson_cache)
         if not runtime_cache_hit:
@@ -6253,18 +6320,18 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
         # Lesson is a hard retrieval boundary once explicitly identified.
         # Never relax to content_type-only because that could surface the next
         # lesson (e.g. Bài 4) when the user asked for Bài 3.
-        add_priority_filter(requested_content_type, None, requested_lesson, None)
-        add_priority_filter(None, None, requested_lesson, None)
+        add_priority_filter(requested_content_type, requested_course, requested_lesson, None)
+        add_priority_filter(None, requested_course, requested_lesson, None)
         if requested_topic:
-            add_priority_filter(requested_content_type, None, requested_lesson, requested_topic)
-            add_priority_filter(None, None, requested_lesson, requested_topic)
+            add_priority_filter(requested_content_type, requested_course, requested_lesson, requested_topic)
+            add_priority_filter(None, requested_course, requested_lesson, requested_topic)
     elif requested_topic:
-        add_priority_filter(requested_content_type, None, None, requested_topic)
-        add_priority_filter(None, None, None, requested_topic)
+        add_priority_filter(requested_content_type, requested_course, None, requested_topic)
+        add_priority_filter(None, requested_course, None, requested_topic)
         if requested_content_type:
-            add_priority_filter(requested_content_type, None, None, None)
+            add_priority_filter(requested_content_type, requested_course, None, None)
     elif requested_content_type:
-        add_priority_filter(requested_content_type, None, None, None)
+        add_priority_filter(requested_content_type, requested_course, None, None)
 
     # Remove duplicate filters while preserving priority.
     unique_filters = []
@@ -6389,7 +6456,7 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
         scoped_semantic_filter = build_scope_filter(
             "text",
             requested_content_type,
-            None,  # course is deliberately relaxed first
+            requested_course,
             requested_lesson,
             requested_topic,
         ) if (requested_content_type or requested_lesson or requested_topic) else None
@@ -6420,7 +6487,7 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
     # whole content type: that is how Bài 4 can leak into a Bài 3 lesson.
     if result is None and not requested_lesson and not requested_topic:
         result = query_text_matches(
-            build_scope_filter("text", requested_content_type, None, None, None)
+            build_scope_filter("text", requested_content_type, requested_course, None, None)
             if requested_content_type else None
         )
         print(
@@ -7582,6 +7649,11 @@ def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
     _set_learning_profile(user["id"],"planned",True)
     return {"success":True,"plan":_active_plan(user["id"]),"plans":_active_plans(user["id"])}
 
+@app.get("/learning/courses")
+def learning_courses(authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    return {"success":True,"courses":_authorized_courses(user["id"])}
+
 @app.get("/learning/summary")
 def learning_summary(authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
@@ -7604,20 +7676,32 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/learning/catalog")
 def learning_catalog(authorization: Optional[str] = Header(default=None)):
-    require_active_user(authorization); conn=db()
+    user=require_active_user(authorization)
+    course_ids=[int(c["course_id"]) for c in _authorized_courses(user["id"]) if c.get("course_id") is not None]
+    if not course_ids:
+        return {"success":True,"documents":[]}
+    conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,source_file,namespace
-                FROM knowledge_documents
+                SELECT kd.subject,kd.course_id,COALESCE(c.name,kd.subject) AS course_name,
+                       kd.content_type,kd.lesson,kd.lesson_pages,kd.topic,kd.topic_pages,
+                       kd.question_pages,kd.answer_pages,kd.source_file,kd.namespace
+                FROM knowledge_documents kd
+                LEFT JOIN courses c ON c.id=kd.course_id
+                WHERE kd.course_id = ANY(%s)
                 UNION ALL
-                SELECT subject,content_type,lesson,NULL::VARCHAR AS lesson_pages,NULL::VARCHAR AS topic,
+                SELECT cl.subject,cl.course_id,COALESCE(c.name,cl.subject) AS course_name,
+                       cl.content_type,cl.lesson,NULL::VARCHAR AS lesson_pages,NULL::VARCHAR AS topic,
                        NULL::VARCHAR AS topic_pages,NULL::VARCHAR AS question_pages,NULL::VARCHAR AS answer_pages,
-                       source_file,'__default__'::VARCHAR AS namespace
-                FROM curriculum_lessons WHERE status='PUBLISHED'
-                ORDER BY subject,lesson,topic,source_file
-            """)
-            return {"success":True,"documents":[dict(x) for x in cur.fetchall()]}
+                       cl.source_file,'__default__'::VARCHAR AS namespace
+                FROM curriculum_lessons cl
+                LEFT JOIN courses c ON c.id=cl.course_id
+                WHERE cl.status='PUBLISHED' AND cl.course_id = ANY(%s)
+                ORDER BY course_name,lesson,topic,source_file
+            """,(course_ids,course_ids))
+            rows=[dict(x) for x in cur.fetchall()]
+        return {"success":True,"documents":rows}
     finally: conn.close()
 
 def check_admin(password: str):
@@ -9050,7 +9134,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 </main>
 
 <script>
-let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0;
+let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0, adminCourses=[];
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
@@ -9067,9 +9151,9 @@ async function login(){
     document.getElementById("login").style.display="none";
     document.getElementById("panel").style.display="block";
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
+    await loadCourses();
     await loadUsers();
     await loadPaymentPackages();
-    await loadCourses();
     await loadKnowledgeCatalog();
     await loadCurriculumDrafts();
     startChatPolling();
@@ -9079,6 +9163,7 @@ async function loadCourses(){
   try{
     const d=await api('/admin/api/courses?password='+encodeURIComponent(pw));
     const courses=d.courses||[];
+    adminCourses=courses;
     const selects=[document.getElementById('courseId'),document.getElementById('curCourse')].filter(Boolean);
     selects.forEach(sel=>{
       const prev=sel.value;
@@ -9458,9 +9543,13 @@ async function loadUsers(){
     const ex=s.expires_at?new Intl.DateTimeFormat("vi-VN",{dateStyle:"short",timeStyle:"short",timeZone:"Asia/Ho_Chi_Minh"}).format(new Date(s.expires_at)):"-";
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
       <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
-      <div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>${esc(s.plan||"Free")}</b> · ${s.plan==='Free' ? `đã hỏi hôm nay: ${Number(s.used_today||0)}/5` : `hết hạn: ${ex}`}</div>
+      <div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>${esc(s.plan||"Free")}</b> · Khóa: <b>${esc(s.course_name||"Chưa cấp")}</b> · ${s.plan==='Free' ? `đã hỏi hôm nay: ${Number(s.used_today||0)}/5` : `hết hạn: ${ex}`}</div>
       <div class="small">Bấm để xem lịch sử và chat</div>
-      <div style="margin-top:7px">
+      <div style="margin-top:7px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <select id="user-course-${u.id}" onclick="event.stopPropagation()" style="min-width:210px;padding:5px">
+          <option value="">-- Chọn khóa học để cấp quyền --</option>
+          ${adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}" ${String(s.course_id||'')===String(c.id)?'selected':''}>${esc(c.code)} · ${esc(c.name)}</option>`).join('')}
+        </select>
         <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
         <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
         <button onclick="event.stopPropagation();act(${u.id},6)">6 tháng</button>
@@ -9549,8 +9638,12 @@ async function sendAdminMessage(){
   }
 }
 async function act(id,m){
-  if(!confirm("Kích hoạt/gia hạn "+m+" tháng?"))return;
-  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,plan:"N5"})});
+  const sel=document.getElementById("user-course-"+id);
+  const courseId=sel?sel.value:"";
+  if(!courseId){alert("Hãy chọn khóa học trước khi kích hoạt/gia hạn gói.");return;}
+  const courseName=(adminCourses.find(c=>String(c.id)===String(courseId))||{}).name||"khóa học";
+  if(!confirm("Kích hoạt/gia hạn "+m+" tháng cho "+courseName+"?"))return;
+  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,course_id:Number(courseId)})});
   loadUsers();
 }
 async function resetFree(id){
@@ -10999,67 +11092,61 @@ async def admin_payment_package(months: int, password: str = Form(...), price_vn
 @app.get("/admin/api/users")
 def admin_users(password: str):
     check_admin(password)
-    conn = db()
+    conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
-                    s.id subscription_id,s.plan,s.started_at,s.expires_at,s.status subscription_status,
+                    s.id subscription_id,s.plan,s.course_id,s.started_at,s.expires_at,s.status subscription_status,
                     COALESCE(dq.question_count,0) AS used_today
                     FROM users u LEFT JOIN LATERAL
                     (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
                     LEFT JOIN daily_question_usage dq ON dq.user_id=u.id AND dq.usage_date=%s
-                    ORDER BY u.id DESC""", (_now_local().date(),))
+                    ORDER BY u.id DESC""",(_now_local().date(),))
             rows=cur.fetchall()
     finally: conn.close()
-    now = datetime.now(timezone.utc)
-    users_out = []
+    out=[]
     for r in rows:
-        raw_plan = str(r["plan"] or "Free")
-        raw_exp = r["expires_at"]
-        paid_active = raw_plan != "Free" and str(r["subscription_status"] or "").upper() == "ACTIVE" and raw_exp and raw_exp > now
-        plan = raw_plan if paid_active else "Free"
-        users_out.append({
-            "id": r["id"], "phone": r["phone"], "nickname": r["nickname"], "status": r["status"],
-            "created_at": r["created_at"],
-            "subscription": {
-                "id": r["subscription_id"],
-                "plan": plan,
-                "started_at": r["started_at"] if paid_active else None,
-                "expires_at": raw_exp if paid_active else None,
-                "expires_at_vn": _vn_display(raw_exp) if paid_active else None,
-                "status": "ACTIVE",
-                "used_today": int(r["used_today"] or 0),
-                "daily_limit": None if paid_active else 5
-            }
-        })
-    return {"users": users_out}
+        courses=_authorized_courses(r['id'])
+        paid=bool(courses); primary=courses[0] if courses else None
+        out.append({"id":r['id'],"phone":r['phone'],"nickname":r['nickname'],"status":r['status'],"created_at":r['created_at'],
+                    "subscription":{"id":r['subscription_id'],"plan":str(r['plan'] or 'Free') if paid else 'Free',
+                                    "course_id":primary.get('course_id') if primary else None,
+                                    "course_name":", ".join(str(c.get('name') or '') for c in courses) if courses else None,
+                                    "courses":courses,
+                                    "started_at":r['started_at'] if paid else None,
+                                    "expires_at":r['expires_at'] if paid else None,
+                                    "expires_at_vn":_vn_display(r['expires_at']) if paid else None,
+                                    "status":"ACTIVE","used_today":int(r['used_today'] or 0),"daily_limit":None if paid else 5}})
+    return {"users":out}
 
 @app.post("/admin/api/users/{user_id}/activate")
 def admin_activate(user_id:int,data:dict):
-    check_admin(str(data.get("password",""))); months=int(data.get("months",1))
+    check_admin(str(data.get("password","")))
+    months=int(data.get("months",1))
     if months not in (1,3,6): raise HTTPException(400,"Thời hạn phải 1, 3 hoặc 6 tháng.")
+    try: course_id=int(data.get("course_id"))
+    except Exception: raise HTTPException(400,"Phải chọn khóa học trước khi kích hoạt/gia hạn gói.")
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
             if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
-            cur.execute("SELECT id,plan,expires_at FROM subscriptions WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user_id,))
+            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(course_id,))
+            course=cur.fetchone()
+            if not course: raise HTTPException(404,"Không tìm thấy khóa học.")
+            if str(course['status'] or 'ACTIVE').upper()!='ACTIVE': raise HTTPException(400,"Khóa học đang tắt, không thể cấp quyền.")
+            cur.execute("""SELECT id,expires_at FROM subscriptions WHERE user_id=%s AND course_id=%s AND status='ACTIVE' ORDER BY id DESC LIMIT 1""",(user_id,course_id))
             old=cur.fetchone(); now=_now_local()
-            old_plan = str(old.get("plan") or "Free") if old else "Free"
-            start = old["expires_at"] if old and old_plan != "Free" and old["expires_at"] and old["expires_at"]>now else now
-            exp=_add_calendar_months(start, months)
-            plan_name=f"{months} tháng"
+            start_dt=old['expires_at'] if old and old['expires_at'] and old['expires_at']>now else now
+            exp=_add_calendar_months(start_dt,months); plan_name=f"{months} tháng"
             if old:
-                cur.execute("UPDATE subscriptions SET plan=%s,started_at=%s,expires_at=%s,status='ACTIVE' WHERE id=%s",
-                            (plan_name,start,exp,old["id"]))
+                cur.execute("UPDATE subscriptions SET plan=%s,started_at=%s,expires_at=%s,status='ACTIVE' WHERE id=%s",(plan_name,start_dt,exp,old['id']))
             else:
-                cur.execute("INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status) VALUES(%s,%s,%s,%s,'ACTIVE')",
-                            (user_id,plan_name,start,exp))
+                cur.execute("INSERT INTO subscriptions(user_id,course_id,plan,started_at,expires_at,status) VALUES(%s,%s,%s,%s,%s,'ACTIVE')",(user_id,course_id,plan_name,start_dt,exp))
             cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
         conn.commit()
     finally: conn.close()
-    return {"success":True,"expires_at":exp,"expires_at_vn":_vn_display(exp),"timezone":"Asia/Ho_Chi_Minh"}
-
+    return {"success":True,"course_id":course_id,"course_name":course['name'],"expires_at":exp,"expires_at_vn":_vn_display(exp),"timezone":"Asia/Ho_Chi_Minh"}
 
 
 @app.post("/admin/api/chat/send")
@@ -11144,14 +11231,14 @@ def admin_reset_free(user_id:int,data:dict):
             # Close every older subscription so there is no ambiguity about
             # which package is active. Keep rows for audit/history.
             cur.execute(
-                "UPDATE subscriptions SET status='EXPIRED', expires_at=COALESCE(expires_at,%s) WHERE user_id=%s AND status <> 'EXPIRED'",
+                "UPDATE subscriptions SET status='EXPIRED', expires_at=COALESCE(expires_at,%s) WHERE user_id=%s AND status='ACTIVE' AND course_id IS NOT NULL",
                 (now, user_id)
             )
 
             # Insert a new authoritative Free subscription as the latest row.
             cur.execute(
-                """INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status)
-                   VALUES(%s,'Free',%s,NULL,'ACTIVE')
+                """INSERT INTO subscriptions(user_id,course_id,plan,started_at,expires_at,status)
+                   VALUES(%s,NULL,'Free',%s,NULL,'ACTIVE')
                    RETURNING id,plan,started_at,expires_at,status""",
                 (user_id, now)
             )
