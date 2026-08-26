@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-26-v19_80_course_catalog_admin"
+SERVER_VERSION = "2026-08-26-v19_82_course_metadata_admin"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -160,6 +160,7 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_documents (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL,
+                course_id BIGINT,
                 subject VARCHAR(255) NOT NULL,
                 content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
                 lesson VARCHAR(255), lesson_pages VARCHAR(255), topic VARCHAR(255), topic_pages VARCHAR(255),
@@ -213,6 +214,14 @@ def init_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_status_order ON courses(status,sort_order,id);")
+            cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_documents_course ON knowledge_documents(course_id,content_type,lesson,topic);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
+            cur.execute("""UPDATE knowledge_documents kd SET course_id=c.id
+                           FROM courses c
+                           WHERE kd.course_id IS NULL
+                             AND lower(trim(kd.subject))=lower(trim(c.name))""")
             # Backfill the course catalog from legacy Knowledge Base subjects once.
             # Existing documents keep their current subject text; future uploads
             # must select a course from this canonical catalog. Non-ASCII legacy
@@ -7624,17 +7633,20 @@ def _knowledge_catalog_rows():
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT source_file, subject, content_type, lesson, lesson_pages,
-                       topic, topic_pages, question_pages, answer_pages, namespace
-                FROM knowledge_documents
+                SELECT kd.source_file, kd.subject, kd.course_id, COALESCE(c.name,kd.subject) AS course_name,
+                       kd.content_type, kd.lesson, kd.lesson_pages, kd.topic, kd.topic_pages,
+                       kd.question_pages, kd.answer_pages, kd.namespace
+                FROM knowledge_documents kd
+                LEFT JOIN courses c ON c.id=kd.course_id
                 UNION ALL
-                SELECT source_file, subject, content_type, lesson, NULL::VARCHAR AS lesson_pages,
-                       NULL::VARCHAR AS topic, NULL::VARCHAR AS topic_pages,
-                       NULL::VARCHAR AS question_pages, NULL::VARCHAR AS answer_pages,
+                SELECT cl.source_file, cl.subject, cl.course_id, COALESCE(c.name,cl.subject) AS course_name,
+                       cl.content_type, cl.lesson, NULL::VARCHAR AS lesson_pages, NULL::VARCHAR AS topic,
+                       NULL::VARCHAR AS topic_pages, NULL::VARCHAR AS question_pages, NULL::VARCHAR AS answer_pages,
                        '__default__'::VARCHAR AS namespace
-                FROM curriculum_lessons
-                WHERE status='PUBLISHED'
-                ORDER BY source_file, subject, content_type, lesson, topic
+                FROM curriculum_lessons cl
+                LEFT JOIN courses c ON c.id=cl.course_id
+                WHERE cl.status='PUBLISHED'
+                ORDER BY source_file, course_name, content_type, lesson, topic
             """)
             return [dict(r) for r in cur.fetchall()]
     finally:
@@ -7648,7 +7660,7 @@ def _knowledge_catalog_tree(rows):
         if not sf: continue
         doc = by_source.get(sf)
         if doc is None:
-            doc = {"source_file":sf,"subject":row.get("subject") or "","namespace":row.get("namespace") or "__default__","content_types":{}}
+            doc = {"source_file":sf,"subject":row.get("subject") or "","course_id":row.get("course_id"),"course_name":row.get("course_name") or row.get("subject") or "","namespace":row.get("namespace") or "__default__","content_types":{}}
             by_source[sf]=doc; tree.append(doc)
         ct=str(row.get("content_type") or "Từ vựng").strip() or "Từ vựng"
         ctn=doc["content_types"].setdefault(ct,{})
@@ -8099,7 +8111,7 @@ def init_curriculum_db():
                 UNIQUE(source_file, content_type, lesson, version)
             );""")
             cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_lessons (
-                id BIGSERIAL PRIMARY KEY, draft_id BIGINT, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
+                id BIGSERIAL PRIMARY KEY, draft_id BIGINT, source_file VARCHAR(500) NOT NULL, course_id BIGINT, subject VARCHAR(255) NOT NULL,
                 content_type VARCHAR(30) NOT NULL, lesson VARCHAR(255) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'PUBLISHED',
                 version INTEGER NOT NULL DEFAULT 1, raw_source_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -8113,6 +8125,12 @@ def init_curriculum_db():
                 UNIQUE(lesson_id, step_code)
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_scope ON curriculum_lessons(content_type, lesson, status);")
+            cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
+            cur.execute("""UPDATE curriculum_lessons cl SET course_id=c.id
+                           FROM courses c
+                           WHERE cl.course_id IS NULL
+                             AND lower(trim(cl.subject))=lower(trim(c.name))""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_steps_lesson ON curriculum_steps(lesson_id, step_order);")
         conn.commit()
     finally:
@@ -8546,6 +8564,7 @@ async def admin_curriculum_draft_upload(
 
             payload={
                 'source_file':source_file,
+                'course_id':course_id,
                 'subject':subject,
                 'content_type':ct,
                 'lesson':ls,
@@ -8771,7 +8790,12 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             source_file=str(draft.get('source_file') or dr['source_file']).strip()
             lesson=str(draft.get('lesson') or dr['lesson']).strip()
             subject=str(draft.get('subject') or dr['subject']).strip()
-            draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=subject; draft['content_type']=ct
+            course_id_val=draft.get('course_id')
+            if course_id_val is None:
+                course_id_val=dr.get('course_id') if isinstance(dr,dict) else None
+            try: course_id_val=int(course_id_val) if course_id_val is not None else None
+            except Exception: course_id_val=None
+            draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=subject; draft['content_type']=ct; draft['course_id']=course_id_val
 
             # Persist the exact edited draft first. Publish and DB step insertion happen
             # in the same transaction, so the published content is byte-for-byte sourced
@@ -8779,7 +8803,7 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
             cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND status='PUBLISHED'",(source_file,ct,lesson))
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,lesson)); version=int(cur.fetchone()['next_version'])
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,subject,ct,lesson,version,json.dumps({'pages':draft.get('pages') or []},ensure_ascii=False)))
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,subject,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id')},ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
@@ -9300,7 +9324,7 @@ function renderKnowledgeCatalog(nodes){
               <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
                 <div style="display:flex;align-items:center;gap:7px">
                   <button class="gray" style="padding:4px 8px" onclick="toggleKbSection('${lsId}',this)">▾</button>
-                  <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""}</div>
+                  <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
                 <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
               </div>
@@ -10614,7 +10638,7 @@ async def admin_knowledge_upload(
                     } for r in page_meta]
                     md={
                         "record_type":"text",
-                        "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
+                        "text":chunk,"course":subject,"course_id":course_id,"course_name":subject,"subject":subject,"content_type":content_type,
                         "source_file":source_file,"page":page_no,"chunk_index":rec["chunk_index"],
                         "metadata_records":json.dumps(md_list,ensure_ascii=False),
                         "image_keys":json.dumps(rec["image_keys"],ensure_ascii=False),
@@ -10656,7 +10680,7 @@ async def admin_knowledge_upload(
                     image_md={
                         "record_type":"image",
                         "text":search_text,
-                        "course":subject,"subject":subject,"content_type":content_type,
+                        "course":subject,"course_id":course_id,"course_name":subject,"subject":subject,"content_type":content_type,
                         "source_file":source_file,"page":page_no,
                         "image_key":key,"image_url":b2_url(key),
                         "term":term,"reading":reading,"meaning":meaning,
@@ -10727,7 +10751,7 @@ async def admin_knowledge_upload(
                 ))
                 md={
                     "record_type":"text",
-                    "text":chunk,"course":subject,"subject":subject,"content_type":content_type,
+                    "text":chunk,"course":subject,"course_id":course_id,"course_name":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,"chunk_index":chunk_no,"page_chunk_index":page_chunk_no,
                     "metadata_records":json.dumps(md_list,ensure_ascii=False),
                     "image_keys":json.dumps(lesson_image_keys,ensure_ascii=False)
@@ -10757,7 +10781,7 @@ async def admin_knowledge_upload(
                     search_text=f"Hình minh họa trang {page_no}"
                 image_md={
                     "record_type":"image","text":search_text,
-                    "course":subject,"subject":subject,"content_type":content_type,
+                    "course":subject,"course_id":course_id,"course_name":subject,"subject":subject,"content_type":content_type,
                     "source_file":source_file,"page":page_no,
                     "image_key":key,"image_url":b2_url(key),
                     "term":term,"reading":reading,"meaning":meaning,
@@ -10799,9 +10823,9 @@ async def admin_knowledge_upload(
             cur.execute("DELETE FROM knowledge_documents WHERE source_file=%s", (source_file,))
             for r in records_meta:
                 cur.execute("""INSERT INTO knowledge_documents
-                    (source_file,subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (source_file,subject,r["content_type"],r["lesson"],r["lesson_pages"],r["topic"],
+                    (source_file,course_id,subject,content_type,lesson,lesson_pages,topic,topic_pages,question_pages,answer_pages,namespace)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (source_file,course_id,subject,r["content_type"],r["lesson"],r["lesson_pages"],r["topic"],
                      r["topic_pages"],r["question_pages"],r["answer_pages"],namespace))
         conn.commit()
     finally:
