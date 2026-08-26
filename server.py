@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-26-v19_84_course_access_and_client_course"
+SERVER_VERSION = "2026-08-26-v19_85_curriculum_pinecone_safe_reindex"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -8908,6 +8908,7 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
     check_admin(str(payload.get('password') or ''))
     client_draft = payload.get('draft')
     conn=db()
+    old_curriculum_versions=[]
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s FOR UPDATE',(draft_id,)); dr=cur.fetchone()
@@ -8932,15 +8933,47 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
                 course_id_val=dr.get('course_id') if isinstance(dr,dict) else None
             try: course_id_val=int(course_id_val) if course_id_val is not None else None
             except Exception: course_id_val=None
-            draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=subject; draft['content_type']=ct; draft['course_id']=course_id_val
+            # Resolve the canonical course before publishing. New curriculum content is
+            # required to carry a real course_id so Pinecone and runtime share one scope.
+            course_name = subject
+            if course_id_val is not None:
+                cur.execute("SELECT id,name,status FROM courses WHERE id=%s", (course_id_val,))
+                course_row = cur.fetchone()
+                if not course_row:
+                    raise HTTPException(400, 'Khóa học không tồn tại.')
+                if str(course_row.get('status') or 'ACTIVE').upper() != 'ACTIVE':
+                    raise HTTPException(400, 'Khóa học đang tắt, không thể publish nội dung mới.')
+                course_name = str(course_row.get('name') or subject).strip()
+            else:
+                cur.execute("SELECT id,name,status FROM courses WHERE lower(trim(name))=lower(trim(%s)) LIMIT 1", (subject,))
+                course_row = cur.fetchone()
+                if course_row:
+                    course_id_val = int(course_row['id'])
+                    course_name = str(course_row.get('name') or subject).strip()
+                else:
+                    raise HTTPException(400, 'Bài học phải thuộc một khóa học trong Danh mục khóa học.')
+            draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=course_name; draft['content_type']=ct; draft['course_id']=course_id_val
+
+            # Capture the currently published versions before archiving them. Their
+            # deterministic Pinecone IDs will be removed only AFTER the new vectors
+            # are successfully upserted and verified.
+            cur.execute("""
+                SELECT id
+                FROM curriculum_lessons
+                WHERE source_file=%s AND content_type=%s AND lesson=%s
+                  AND status='PUBLISHED'
+                  AND course_id=%s
+                ORDER BY id DESC
+            """, (source_file, ct, lesson, course_id_val))
+            old_curriculum_versions = [int(r['id']) for r in cur.fetchall()]
 
             # Persist the exact edited draft first. Publish and DB step insertion happen
             # in the same transaction, so the published content is byte-for-byte sourced
             # from this normalized draft snapshot.
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
-            cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND status='PUBLISHED'",(source_file,ct,lesson))
-            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,lesson)); version=int(cur.fetchone()['next_version'])
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,subject,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id')},ensure_ascii=False)))
+            cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id'),'course_name':course_name},ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
@@ -8959,26 +8992,112 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
     _invalidate_catalog_cache()
 
     # Index exactly the just-published edited content, never the original AI draft/source.
+    # SAFETY: never delete old Pinecone vectors before the replacement is fully indexed
+    # and verified. A failed embed/upsert must leave the old vectors intact.
+    pinecone_indexed = False
+    pinecone_cleanup = False
     if index:
+        new_vector_ids=[]
         try:
-            _delete_pinecone_scope_exact(
-                '__default__',
-                _pinecone_scope_filter(source_file, content_type=ct, lesson=lesson),
-                source_file=source_file, content_type=ct, lesson=lesson, topic=None,
-            )
             vectors=[]
             for step in draft.get('steps') or []:
                 content=step.get('content') or {}
                 text='\n'.join(str(content.get(k) or '') for k in ('title','content'))
-                if not text.strip(): continue
+                if not text.strip():
+                    continue
+                code=str(step.get('code') or '')
+                vector_id=f'curriculum:{lesson_id}:{code}'
                 vec=embed_text(text[:8000])
-                vectors.append({'id':f'curriculum:{lesson_id}:{step.get("code")}', 'values':vec, 'metadata':{'record_type':'curriculum_step','content_id':str(lesson_id),'lesson_id':str(lesson_id),'step_code':str(step.get('code') or ''),'source_file':source_file,'content_type':ct,'lesson':lesson,'text':text[:6000]}})
+                metadata={
+                    'record_type':'curriculum_step',
+                    'course_id':int(course_id_val),
+                    'course':str(course_name),
+                    'course_name':str(course_name),
+                    'subject':str(course_name),
+                    'content_id':str(lesson_id),
+                    'lesson_id':str(lesson_id),
+                    'step_code':code,
+                    'source_file':source_file,
+                    'content_type':ct,
+                    'lesson':lesson,
+                    'text':text[:6000],
+                }
+                vectors.append({'id':vector_id,'values':vec,'metadata':metadata})
+                new_vector_ids.append(vector_id)
                 if len(vectors)>=50:
-                    index.upsert(vectors=vectors,namespace='__default__'); vectors=[]
-            if vectors: index.upsert(vectors=vectors,namespace='__default__')
+                    index.upsert(vectors=vectors,namespace='__default__')
+                    vectors=[]
+            if vectors:
+                index.upsert(vectors=vectors,namespace='__default__')
+
+            if not new_vector_ids:
+                raise RuntimeError('Curriculum không có step nào có text để index Pinecone.')
+
+            # Verify the new IDs before touching old vectors. Pinecone is eventually
+            # consistent, so retry a few times before declaring the replacement ready.
+            remaining=set(new_vector_ids)
+            for attempt in range(1,6):
+                try:
+                    fetched=index.fetch(ids=list(remaining),namespace='__default__')
+                    present=set((getattr(fetched,'vectors',{}) or {}).keys())
+                    remaining -= present
+                    if not remaining:
+                        break
+                except Exception as verify_exc:
+                    print('[CURRICULUM PINECONE VERIFY] attempt=%s failed: %s: %s' % (attempt, type(verify_exc).__name__, verify_exc))
+                time.sleep(min(5.0, 0.5 * attempt))
+            if remaining:
+                raise RuntimeError(f'Pinecone verification failed; missing {len(remaining)} new vector(s). Old vectors were NOT deleted.')
+
+            pinecone_indexed = True
+
+            # Replacement is now known-good. Remove only prior published versions of
+            # THIS course/lesson using their deterministic vector IDs. This is safer
+            # than deleting by a broad source_file filter and cannot remove the new IDs.
+            old_vector_ids=[]
+            if old_curriculum_versions:
+                conn2=db()
+                try:
+                    with conn2.cursor() as cur2:
+                        for old_id in old_curriculum_versions:
+                            cur2.execute("SELECT step_code FROM curriculum_steps WHERE lesson_id=%s", (old_id,))
+                            old_vector_ids.extend([f'curriculum:{old_id}:{str(r[0] or "")}' for r in cur2.fetchall() if str(r[0] or '')])
+                finally:
+                    conn2.close()
+            old_vector_ids=[vid for vid in old_vector_ids if vid not in set(new_vector_ids)]
+            if old_vector_ids:
+                try:
+                    for i in range(0,len(old_vector_ids),1000):
+                        index.delete(ids=old_vector_ids[i:i+1000],namespace='__default__')
+                    pinecone_cleanup = True
+                except Exception as cleanup_exc:
+                    # Never remove the verified replacement vectors just because legacy
+                    # cleanup failed. Keeping both versions is safer than data loss.
+                    print('[CURRICULUM PINECONE OLD-VECTOR CLEANUP] failed; NEW VECTORS KEPT:', type(cleanup_exc).__name__, str(cleanup_exc))
+            else:
+                pinecone_cleanup = True
         except Exception as exc:
-            print('[CURRICULUM PINECONE INDEX] failed:',type(exc).__name__,str(exc))
-    return {'success':True,'lesson_id':lesson_id,'version':version,'status':'PUBLISHED'}
+            # Critical invariant: old vectors are preserved on any replacement failure.
+            # New partial vectors are safe to remove because their IDs are unique to the
+            # newly-created lesson row. The DB lesson remains published and runtime uses DB/cache.
+            if new_vector_ids:
+                try:
+                    for i in range(0,len(new_vector_ids),1000):
+                        index.delete(ids=new_vector_ids[i:i+1000],namespace='__default__')
+                except Exception as cleanup_exc:
+                    print('[CURRICULUM PINECONE NEW-VECTOR CLEANUP] failed:', type(cleanup_exc).__name__, str(cleanup_exc))
+            print('[CURRICULUM PINECONE INDEX] failed; OLD VECTORS PRESERVED:', type(exc).__name__, str(exc))
+
+    return {
+        'success':True,
+        'lesson_id':lesson_id,
+        'version':version,
+        'status':'PUBLISHED',
+        'course_id':int(course_id_val),
+        'course_name':course_name,
+        'pinecone_indexed':pinecone_indexed,
+        'pinecone_old_vectors_cleaned':pinecone_cleanup,
+    }
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
