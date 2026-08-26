@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-26-v19_82_course_metadata_admin"
+SERVER_VERSION = "2026-08-26-v19_83_course_catalog_display_fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7654,24 +7654,77 @@ def _knowledge_catalog_rows():
 
 
 def _knowledge_catalog_tree(rows):
+    """Build the admin catalog without leaking the document-level course onto every lesson.
+
+    A single source_file can contain lessons assigned to different courses (legacy uploads and
+    migration data can legitimately have this shape). Therefore the course identity belongs to
+    each lesson node, not only to the outer document node.
+    """
     by_source = {}; tree = []
     for row in rows:
         sf = str(row.get("source_file") or "").strip()
-        if not sf: continue
+        if not sf:
+            continue
         doc = by_source.get(sf)
+        row_course_id = row.get("course_id")
+        row_course_name = str(row.get("course_name") or row.get("subject") or "").strip()
         if doc is None:
-            doc = {"source_file":sf,"subject":row.get("subject") or "","course_id":row.get("course_id"),"course_name":row.get("course_name") or row.get("subject") or "","namespace":row.get("namespace") or "__default__","content_types":{}}
-            by_source[sf]=doc; tree.append(doc)
-        ct=str(row.get("content_type") or "Từ vựng").strip() or "Từ vựng"
-        ctn=doc["content_types"].setdefault(ct,{})
-        lesson=str(row.get("lesson") or "").strip()
-        if not lesson: continue
-        ln=ctn.setdefault(lesson,{"lesson":lesson,"lesson_pages":row.get("lesson_pages"),"topics":{}})
-        topic=str(row.get("topic") or "").strip()
+            doc = {
+                "source_file": sf,
+                "subject": row.get("subject") or "",
+                "course_id": row_course_id,
+                "course_name": row_course_name,
+                "namespace": row.get("namespace") or "__default__",
+                "course_names": [],
+                "content_types": {},
+            }
+            by_source[sf] = doc
+            tree.append(doc)
+        if row_course_name and row_course_name not in doc["course_names"]:
+            doc["course_names"].append(row_course_name)
+
+        ct = str(row.get("content_type") or "Từ vựng").strip() or "Từ vựng"
+        ctn = doc["content_types"].setdefault(ct, {})
+        lesson = str(row.get("lesson") or "").strip()
+        if not lesson:
+            continue
+
+        # Keep lessons from different courses separate even when they have the same lesson name.
+        course_key = str(row_course_id) if row_course_id not in (None, "") else f"name:{row_course_name.casefold()}"
+        lesson_key = f"{course_key}::{lesson.casefold()}"
+        ln = ctn.setdefault(lesson_key, {
+            "lesson": lesson,
+            "lesson_pages": row.get("lesson_pages"),
+            "course_id": row_course_id,
+            "course_name": row_course_name,
+            "topics": {},
+        })
+        topic = str(row.get("topic") or "").strip()
         if topic:
-            ln["topics"][topic]={"topic":topic,"topic_pages":row.get("topic_pages"),"question_pages":row.get("question_pages"),"answer_pages":row.get("answer_pages")}
+            ln["topics"][topic] = {
+                "topic": topic,
+                "topic_pages": row.get("topic_pages"),
+                "question_pages": row.get("question_pages"),
+                "answer_pages": row.get("answer_pages"),
+            }
+
     for doc in tree:
-        doc["content_types"]=[{"content_type":ct,"lessons":[{**ln,"topics":list(ln["topics"].values())} for ln in lessons.values()]} for ct,lessons in doc["content_types"].items()]
+        # Preserve deterministic order while showing the actual course(s) represented in this PDF.
+        doc["course_names"] = sorted(doc["course_names"], key=lambda x: x.casefold())
+        if len(doc["course_names"]) == 1:
+            doc["course_name"] = doc["course_names"][0]
+        elif doc["course_names"]:
+            doc["course_name"] = "Nhiều khóa học"
+        doc["content_types"] = [
+            {
+                "content_type": ct,
+                "lessons": [
+                    {**ln, "topics": list(ln["topics"].values())}
+                    for ln in lessons.values()
+                ],
+            }
+            for ct, lessons in doc["content_types"].items()
+        ]
     return tree
 
 
@@ -9307,7 +9360,7 @@ function renderKnowledgeCatalog(nodes){
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
         <div style="display:flex;align-items:center;gap:8px">
           <button class="gray kb-toggle kb-doc-toggle" style="padding:5px 10px;min-width:110px;font-weight:700" onclick="toggleKbSection('${docId}',this)">▾ Thu gọn</button>
-          <div><b>📄 ${esc(doc.source_file)}</b><div class="small">${esc(doc.subject||"")} · ${esc(doc.namespace||"__default__")}</div></div>
+          <div><b>📄 ${esc(doc.source_file)}</b><div class="small">${esc(doc.course_names?.length ? "Khóa: " + doc.course_names.join(", ") : (doc.subject||"Chưa xác định"))} · ${esc(doc.namespace||"__default__")}</div></div>
         </div>
         <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file})})'>🗑️ Xóa tài liệu</button>
       </div>
@@ -9324,7 +9377,7 @@ function renderKnowledgeCatalog(nodes){
               <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
                 <div style="display:flex;align-items:center;gap:7px">
                   <button class="gray" style="padding:4px 8px" onclick="toggleKbSection('${lsId}',this)">▾</button>
-                  <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(doc.course_name||doc.subject||"Chưa xác định")}</span></div>
+                  <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(ls.course_name||doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
                 <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
               </div>
