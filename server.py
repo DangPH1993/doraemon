@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-26-v19_85_curriculum_pinecone_safe_reindex"
+SERVER_VERSION = "2026-08-27-v19_87_vietnam_time"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -556,6 +556,9 @@ def _authorized_courses(user_id):
     finally:
         conn.close()
     rows.sort(key=lambda r:(str(r.get('name') or '').casefold(), int(r.get('course_id') or 0)))
+    for row in rows:
+        row['expires_at_vn'] = _vn_display(row.get('expires_at'))
+        row['started_at_vn'] = _vn_display(row.get('started_at'))
     return rows
 
 
