@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.88-curriculum-one-call")
-SERVER_VERSION = "2026-08-27-v19_89_curriculum_overview"
+SERVER_VERSION = "2026-08-27-v19_90_curriculum_knowledge_master"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -433,6 +433,10 @@ def startup():
     if DATABASE_URL:
         init_db()
         init_curriculum_db()
+        try:
+            _backfill_all_curriculum_knowledge_masters()
+        except Exception as exc:
+            print("[CURRICULUM KNOWLEDGE MASTER] startup backfill skipped:", type(exc).__name__, str(exc))
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
@@ -2936,7 +2940,14 @@ def _published_curriculum_runtime_payload(lesson_row, step_rows):
         refs=content.get("source_refs") if isinstance(content,dict) else []
         page=None
         if isinstance(refs,list) and refs and isinstance(refs[0],dict): page=refs[0].get("page")
-        text=_published_curriculum_step_text(content) or str(row.get("title") or "").strip()
+        code=str(row.get("step_code") or "").upper()
+        stype=str(row.get("step_type") or "").strip().casefold()
+        if code == "B1" or stype == "vocabulary":
+            text=_published_curriculum_vocabulary_text({"content":content}) or str(row.get("title") or "").strip()
+        elif code == "B2" or stype == "grammar":
+            text=_published_curriculum_grammar_text({"content":content}) or str(row.get("title") or "").strip()
+        else:
+            text=_published_curriculum_step_text(content) or str(row.get("title") or "").strip()
         sections.append({"chunk_index":order,"page":page or order+1,"content_unit_id":f"curriculum:{row.get('step_code')}","step_code":str(row.get("step_code") or ""),"step_title":str(row.get("title") or ""),"step_type":str(row.get("step_type") or "lesson"),"text":text,"content":content,"image_keys":keys})
     return {"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
 
@@ -2959,6 +2970,30 @@ def _published_curriculum_step(cache,index):
         "images":imgs,
         "is_final":str(sec.get("step_code") or "").upper()=="FINAL" or index==len(sections)-1
     }
+
+
+def _published_curriculum_grammar_text(step):
+    """Render all grammar schema fields instead of collapsing them to one field."""
+    content=step.get("content") if isinstance(step,dict) else {}
+    content=content if isinstance(content,dict) else {}
+    items=content.get("items") if isinstance(content.get("items"),list) else []
+    if not items:
+        return str(step.get("text") or "").strip()
+    lines=[]
+    for i,item in enumerate(items,1):
+        if not isinstance(item,dict):
+            if str(item).strip(): lines.append(f"{i}. {str(item).strip()}")
+            continue
+        pattern=str(item.get("pattern") or item.get("structure") or item.get("grammar") or item.get("title") or "").strip()
+        meaning=str(item.get("meaning") or item.get("definition") or item.get("translation") or "").strip()
+        explanation=str(item.get("explanation") or item.get("content") or "").strip()
+        example=str(item.get("example") or "").strip()
+        row=[f"{i}. {pattern}" if pattern else f"{i}."]
+        if meaning: row.append(f"   🇻🇳 Ý nghĩa: {meaning}")
+        if explanation: row.append(f"   📘 Giải thích: {explanation}")
+        if example: row.append(f"   💬 Ví dụ: {example}")
+        lines.append("\n".join(row))
+    return "\n\n".join(lines).strip()
 
 
 def _published_curriculum_vocabulary_text(step):
@@ -3003,10 +3038,9 @@ def _published_curriculum_vocabulary_text(step):
         else:
             fallback=pick(item,"question","pattern","answer")
             if fallback: lines.append(f"{i}. {fallback}")
-    intro=str(content.get("content") or "").strip()
-    # If the content is only a generic intro, keep it; the structured rows are the
-    # authoritative spelling/reading/meaning payload.
-    return "\n\n".join([x for x in (intro,"\n".join(lines)) if x]).strip() or str(step.get("text") or "").strip()
+    # Structured vocabulary items are authoritative; do not let a generic prose list
+    # replace/hide the writing, reading, pronunciation and meaning fields.
+    return "\n".join(lines).strip() or str(content.get("content") or step.get("text") or "").strip()
 
 
 
@@ -8058,6 +8092,7 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
     image_keys = []
     namespaces = []
     matching_lessons = []
+    affected_course_ids=set()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -8073,12 +8108,13 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
                 namespaces = ["__default__"]
 
             cur.execute(
-                f"""SELECT DISTINCT lesson,content_type FROM knowledge_documents WHERE {ws}
+                f"""SELECT DISTINCT lesson,content_type,NULL::BIGINT AS course_id FROM knowledge_documents WHERE {ws}
                     UNION
-                    SELECT DISTINCT lesson,content_type FROM curriculum_lessons WHERE {ws} AND status='PUBLISHED'""",
+                    SELECT DISTINCT lesson,content_type,course_id FROM curriculum_lessons WHERE {ws} AND status='PUBLISHED'""",
                 tuple(params) * 2,
             )
             matching_lessons = [dict(r) for r in (cur.fetchall() or [])]
+            affected_course_ids={int(r['course_id']) for r in matching_lessons if r.get('course_id') is not None}
 
             cur.execute(
                 f"SELECT DISTINCT image_key FROM knowledge_images WHERE {ws} "
@@ -8182,6 +8218,11 @@ def _delete_knowledge_scope(*, source_file: str, content_type: str | None = None
         conn.close()
 
     _invalidate_catalog_cache()
+    for _cid in sorted(affected_course_ids):
+        try:
+            _rebuild_course_curriculum_knowledge_master(_cid)
+        except Exception as exc:
+            print(f"[CURRICULUM KNOWLEDGE MASTER] delete rebuild failed course_id={_cid}: {type(exc).__name__}: {exc}")
 
     # B2 deletion is conservative. A topic/lesson may reference an image key that
     # is shared elsewhere, so only delete physical objects automatically when the
@@ -8273,6 +8314,22 @@ def init_curriculum_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(lesson_id, step_code)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_vocab_master (
+                id BIGSERIAL PRIMARY KEY, course_id BIGINT NOT NULL, normalized_key TEXT NOT NULL,
+                writing TEXT NOT NULL DEFAULT '', reading TEXT NOT NULL DEFAULT '', pronunciation_vi TEXT NOT NULL DEFAULT '',
+                meaning TEXT NOT NULL DEFAULT '', example TEXT NOT NULL DEFAULT '', source_lesson VARCHAR(255) NOT NULL DEFAULT '',
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(course_id, normalized_key)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_grammar_master (
+                id BIGSERIAL PRIMARY KEY, course_id BIGINT NOT NULL, normalized_key TEXT NOT NULL,
+                pattern TEXT NOT NULL DEFAULT '', meaning TEXT NOT NULL DEFAULT '', explanation TEXT NOT NULL DEFAULT '',
+                example TEXT NOT NULL DEFAULT '', source_lesson VARCHAR(255) NOT NULL DEFAULT '',
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(course_id, normalized_key)
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_vocab_master_course ON curriculum_vocab_master(course_id, normalized_key);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_grammar_master_course ON curriculum_grammar_master(course_id, normalized_key);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_scope ON curriculum_lessons(content_type, lesson, status);")
             cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
@@ -8511,76 +8568,164 @@ def _lesson_sort_key(name):
     return (2, 10**9, text.casefold())
 
 
-def _load_previous_course_curriculum_digest(course_id, current_lesson, content_type, *, max_chars=24000):
-    """Load concise published curriculum context from earlier lessons in the same course.
+def _normalize_master_text(value):
+    import unicodedata
+    text=unicodedata.normalize('NFKC', str(value or '')).casefold().strip()
+    text=re.sub(r"\s+", "", text)
+    return text
 
-    DB-only. No GenAI, embedding, or Pinecone call. Structured vocabulary/grammar items
-    are preferred so the single generation call can distinguish genuinely new material.
-    """
-    if not course_id:
+
+def _vocab_master_key(item):
+    if not isinstance(item,dict):
         return ''
-    conn=db()
+    writing=next((str(item.get(k) or '').strip() for k in ('writing','word','term','kanji') if str(item.get(k) or '').strip()), '')
+    reading=next((str(item.get(k) or '').strip() for k in ('reading','hiragana','kana','yomikata') if str(item.get(k) or '').strip()), '')
+    return _normalize_master_text(writing or reading)
+
+
+def _grammar_master_key(item):
+    if not isinstance(item,dict):
+        return ''
+    pattern=next((str(item.get(k) or '').strip() for k in ('pattern','structure','grammar') if str(item.get(k) or '').strip()), '')
+    return _normalize_master_text(pattern)
+
+
+def _rebuild_course_curriculum_knowledge_master(course_id):
+    """Rebuild published-course vocabulary/grammar master tables from DB only."""
+    if course_id in (None, ''):
+        return {'vocab':0,'grammar':0}
+    cid=int(course_id)
+    conn=db(); vocab={}; grammar={}
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT cl.id, cl.lesson, cl.version, cs.step_code, cs.step_order, cs.title,
-                       cs.step_type, cs.content_json
-                FROM curriculum_lessons cl
-                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
-                WHERE cl.status='PUBLISHED'
-                  AND cl.course_id=%s
-                  AND lower(trim(cl.content_type))=lower(trim(%s))
-                ORDER BY cl.id, cs.step_order, cs.id
-            """, (int(course_id), str(content_type or '').strip()))
+            cur.execute("""SELECT cl.lesson, cs.step_code, cs.content_json
+                          FROM curriculum_lessons cl
+                          JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                          WHERE cl.status='PUBLISHED' AND cl.course_id=%s
+                            AND lower(trim(cl.content_type))='giáo trình'
+                            AND upper(trim(cs.step_code)) IN ('B1','B2')
+                          ORDER BY cl.id, cs.step_order, cs.id""", (cid,))
             rows=cur.fetchall() or []
+            for row in rows:
+                content=row.get('content_json') if isinstance(row.get('content_json'),dict) else {}
+                items=content.get('items') if isinstance(content.get('items'),list) else []
+                code=str(row.get('step_code') or '').upper(); lesson=str(row.get('lesson') or '').strip()
+                for item in items:
+                    if not isinstance(item,dict): continue
+                    key=_vocab_master_key(item) if code=='B1' else _grammar_master_key(item)
+                    if not key: continue
+                    target=vocab if code=='B1' else grammar
+                    target.setdefault(key,(lesson,item))
+            cur.execute('DELETE FROM curriculum_vocab_master WHERE course_id=%s',(cid,))
+            for key,(lesson,item) in vocab.items():
+                writing=str(item.get('writing') or item.get('word') or item.get('term') or item.get('kanji') or '').strip()
+                reading=str(item.get('reading') or item.get('hiragana') or item.get('kana') or item.get('yomikata') or '').strip()
+                pron=str(item.get('pronunciation_vi') or item.get('vietnamese_pronunciation') or item.get('vn_pronunciation') or '').strip()
+                meaning=str(item.get('meaning') or item.get('definition') or item.get('translation') or item.get('vietnamese_meaning') or '').strip()
+                example=str(item.get('example') or item.get('content') or '').strip()
+                cur.execute("""INSERT INTO curriculum_vocab_master
+                    (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                      writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
+                      meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()""",
+                    (cid,key,writing,reading,pron,meaning,example,lesson))
+            cur.execute('DELETE FROM curriculum_grammar_master WHERE course_id=%s',(cid,))
+            for key,(lesson,item) in grammar.items():
+                pattern=str(item.get('pattern') or item.get('structure') or item.get('grammar') or '').strip()
+                meaning=str(item.get('meaning') or item.get('definition') or item.get('translation') or '').strip()
+                explanation=str(item.get('explanation') or item.get('content') or '').strip()
+                example=str(item.get('example') or '').strip()
+                cur.execute("""INSERT INTO curriculum_grammar_master
+                    (course_id,normalized_key,pattern,meaning,explanation,example,source_lesson)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                      pattern=EXCLUDED.pattern,meaning=EXCLUDED.meaning,explanation=EXCLUDED.explanation,
+                      example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()""",
+                    (cid,key,pattern,meaning,explanation,example,lesson))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"[CURRICULUM KNOWLEDGE MASTER] course_id={cid} vocab={len(vocab)} grammar={len(grammar)} rebuilt=1")
+    return {'vocab':len(vocab),'grammar':len(grammar)}
+
+
+def _get_course_curriculum_knowledge(course_id, source_digest=''):
+    """Return exact vocab keys and a compact set of grammar candidates from the course master."""
+    if course_id in (None,''):
+        return set(), ''
+    cid=int(course_id); conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT normalized_key FROM curriculum_vocab_master WHERE course_id=%s',(cid,))
+            vocab_keys={str(r.get('normalized_key') or '') for r in (cur.fetchall() or []) if str(r.get('normalized_key') or '')}
+            cur.execute('SELECT normalized_key,pattern,meaning,explanation,example,source_lesson FROM curriculum_grammar_master WHERE course_id=%s',(cid,))
+            grammar_rows=[dict(r) for r in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+    src=_normalize_master_text(source_digest)
+    src_tokens=set(re.findall(r"[\wぁ-んァ-ン一-龯ー]+", src, flags=re.UNICODE))
+    ranked=[]
+    for row in grammar_rows:
+        pat=str(row.get('pattern') or '').strip(); norm=_normalize_master_text(pat)
+        if not norm: continue
+        toks=set(re.findall(r"[\wぁ-んァ-ン一-龯ー]+", norm, flags=re.UNICODE))
+        score=len(toks & src_tokens)
+        if norm and norm in src: score += 10
+        ranked.append((score,pat,row))
+    ranked.sort(key=lambda x:(-x[0],_normalize_master_text(x[1])))
+    context='\n'.join(f"- {r.get('pattern')} | {r.get('meaning') or ''} | {r.get('explanation') or ''}" for _,_,r in ranked[:20])
+    return vocab_keys, context
+
+
+def _filter_generated_course_knowledge(steps, course_id):
+    """Exact code gate for vocabulary/grammar master. No GenAI call."""
+    vocab_keys,_=_get_course_curriculum_knowledge(course_id,'')
+    seen_vocab=set(); seen_grammar=set(); conn=db()
+    try:
+        with conn.cursor() as cur:
+            out=[]
+            for st in (steps or []):
+                if not isinstance(st,dict): continue
+                code=str(st.get('code') or '').upper()
+                content=dict(st.get('content') if isinstance(st.get('content'),dict) else st)
+                items=content.get('items') if isinstance(content.get('items'),list) else []
+                if code=='B1':
+                    kept=[]
+                    for item in items:
+                        key=_vocab_master_key(item)
+                        if not key or key in vocab_keys or key in seen_vocab: continue
+                        seen_vocab.add(key); kept.append(item)
+                    content['items']=kept; content['content']=''
+                elif code=='B2':
+                    kept=[]
+                    for item in items:
+                        key=_grammar_master_key(item)
+                        if not key or key in seen_grammar: continue
+                        cur.execute('SELECT 1 FROM curriculum_grammar_master WHERE course_id=%s AND normalized_key=%s LIMIT 1',(int(course_id),key))
+                        if cur.fetchone(): continue
+                        seen_grammar.add(key); kept.append(item)
+                    content['items']=kept; content['content']=''
+                st2=dict(st); st2['content']=content; out.append(st2)
+            return out
     finally:
         conn.close()
 
-    current_key=_lesson_sort_key(current_lesson)
-    grouped={}
-    for r in rows:
-        lesson=str(r.get('lesson') or '').strip()
-        if not lesson or lesson.casefold()==str(current_lesson or '').strip().casefold():
-            continue
-        if _lesson_sort_key(lesson) >= current_key:
-            continue
-        grouped.setdefault(lesson, []).append(r)
 
-    if not grouped:
-        return '(Chưa có bài trước cùng khóa để so sánh.)'
-
-    blocks=[]
-    for lesson in sorted(grouped, key=_lesson_sort_key):
-        parts=[f"### {lesson}"]
-        for r in grouped[lesson]:
-            code=str(r.get('step_code') or '').strip()
-            title=str(r.get('title') or '').strip()
-            stype=str(r.get('step_type') or '').strip()
-            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
-            items=content.get('items') if isinstance(content.get('items'),list) else []
-            structured=[]
-            for item in items:
-                if not isinstance(item,dict):
-                    continue
-                row={}
-                for k in (
-                    'writing','word','term','kanji','reading','hiragana','kana','pronunciation',
-                    'pronunciation_vi','vietnamese_pronunciation','meaning','definition',
-                    'pattern','structure','grammar','explanation','example'
-                ):
-                    v=item.get(k)
-                    if v not in (None,'',[],{}): row[k]=v
-                if row: structured.append(row)
-            text=str(content.get('content') or '').strip()
-            if structured:
-                parts.append(f"- {code} {title} [{stype}] items="+json.dumps(structured,ensure_ascii=False)[:7000])
-            elif text:
-                parts.append(f"- {code} {title} [{stype}]\n{text[:3500]}")
-        blocks.append('\n'.join(parts))
-    return '\n\n'.join(blocks)[:max_chars] or '(Chưa có bài trước cùng khóa để so sánh.)'
+def _backfill_all_curriculum_knowledge_masters():
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM courses WHERE status='ACTIVE' ORDER BY id")
+            ids=[r[0] for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+    for cid in ids:
+        try: _rebuild_course_curriculum_knowledge_master(cid)
+        except Exception as exc: print(f"[CURRICULUM KNOWLEDGE MASTER] backfill failed course_id={cid}: {type(exc).__name__}: {exc}")
 
 
-def _curriculum_generate_all_steps(content_type, lesson, source_digest, previous_digest=''):
+def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference=''):
     """Generate all curriculum steps in exactly ONE GenAI call per lesson.
 
     OCR/Vision has already completed before this function runs.
@@ -8609,10 +8754,10 @@ NGUỒN HIỆN TẠI:
 
 YÊU CẦU RIÊNG CHO GIÁO TRÌNH:
 0) B0 = 'Tổng quan bài học'. Đây là phần mở đầu trước từ vựng và ngữ pháp. Phải giới thiệu ngắn gọn nhưng rõ ràng: chủ đề/tình huống chính của bài, mục tiêu giao tiếp hoặc mục tiêu học tập chính, và người học sẽ sử dụng được gì sau bài. CHỈ dùng thông tin có trong NGUỒN HIỆN TẠI. B0 KHÔNG phải danh sách từ vựng và KHÔNG phải phần phân tích ngữ pháp chi tiết.
-1) B1 = 'Từ vựng mới của bài'. Chỉ liệt kê từ vựng THỰC SỰ MỚI so với các bài trước cùng khóa trong PHẦN SO SÁNH bên dưới. Không lặp lại từ đã học trước.
+1) B1 = 'Từ vựng mới của bài'. Liệt kê các từ vựng xuất hiện/được dạy trong bài hiện tại. Server sẽ dùng DB master + code để loại các từ đã được dạy trước cùng khóa; không cần đưa lịch sử từ vựng vào prompt.
    Mỗi item bắt buộc có writing/word, reading, pronunciation_vi và meaning khi nguồn có. pronunciation_vi BẮT BUỘC KHÔNG RỖNG: cách phát âm dành cho người Việt, viết dễ đọc bằng tiếng Việt và dựa trên reading; không dùng IPA thay cho trường này.
    Nếu cùng từ xuất hiện nhiều lần trong bài hiện tại, chỉ liệt kê một lần.
-2) B2 = 'Ngữ pháp mới của bài'. Chỉ liệt kê CẤU TRÚC NGỮ PHÁP THỰC SỰ MỚI so với các bài trước cùng khóa. Không đưa lại mẫu đã xuất hiện ở bài trước. Mỗi item nên có pattern/structure, meaning, explanation, example khi nguồn có.
+2) B2 = 'Ngữ pháp mới của bài'. Xác định các cấu trúc ngữ pháp xuất hiện/được dạy trong bài hiện tại. Đối chiếu các ứng viên ngữ pháp cũ do code chọn từ DB để tránh lặp về mặt ý nghĩa/cấu trúc; server sẽ loại pattern trùng tuyệt đối bằng code. Mỗi item nên có pattern/structure, meaning, explanation, example khi nguồn có.
 3) Sau B0, B1, B2, tạo các CẶP STEP cho từng PHẦN/SECTION trong bài theo đúng thứ tự nguồn:
    - Step A: type='original_text': chép Y NGUYÊN nội dung tiếng Nhật của phần đó từ nguồn hiện tại; không dịch, không tóm tắt, không diễn giải. Đây là nội dung Doraemon đưa cho user đọc trước.
    - Step B: type='translation_explanation': dịch sang tiếng Việt và giải thích ngữ pháp/cách dùng của CHÍNH Step A; không thêm kiến thức ngoài nguồn.
@@ -8622,8 +8767,8 @@ YÊU CẦU RIÊNG CHO GIÁO TRÌNH:
 6) source_refs phải chỉ ra trang nguồn cho từng step.
 7) Với original_text, trường content phải giữ nguyên văn; tuyệt đối không biến thành lời tóm tắt.
 
-PHẦN SO SÁNH CÁC BÀI TRƯỚC CÙNG KHÓA:
-{previous_digest or '(Chưa có bài trước cùng khóa để so sánh.)'}
+CÁC CẤU TRÚC NGỮ PHÁP TRƯỚC ĐÂY CẦN KIỂM TRA:
+{grammar_reference or '(Không có ứng viên ngữ pháp cũ đáng chú ý từ DB.)'}
 
 TRẢ JSON DUY NHẤT:
 {{"steps":[
@@ -8705,7 +8850,7 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest, previou
 """
     compare_note = ""
     if str(content_type or '').strip() == 'Giáo trình' and str(step.get('code') or '').upper() in {'B0','B1'}:
-        compare_note = f"""\n\nPHẦN SO SÁNH CÁC BÀI TRƯỚC CÙNG KHÓA:\n{previous_digest or '(Chưa có bài trước cùng khóa để so sánh.)'}\n\nĐối với B0/B1 của Giáo trình, chỉ giữ lại từ vựng/ngữ pháp THỰC SỰ MỚI so với phần trên. B0 phải có pronunciation_vi cho mọi từ."""
+        compare_note = f"""\n\nCÁC CẤU TRÚC NGỮ PHÁP TRƯỚC ĐÂY CẦN KIỂM TRA (rút gọn từ DB master):\n{previous_digest or '(Không có ứng viên ngữ pháp cũ đáng chú ý từ DB.)'}"""
     prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}{compare_note}\n\nQUY TẮC ƯU TIÊN: nếu loại nội dung là Truyện đọc và bước là B0, tuyệt đối ưu tiên văn bản tiếng Nhật nguyên gốc trong NGUỒN; không được chuyển ngữ sang tiếng Việt ở B0.\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
     data=_curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
     if isinstance(data, list):
@@ -8845,7 +8990,7 @@ async def admin_curriculum_draft_upload(
 
             digest=_curriculum_source_digest(pages)
             normalized_steps=[]
-            previous_digest=_load_previous_course_curriculum_digest(course_id,ls,ct)
+            _, grammar_reference = _get_course_curriculum_knowledge(course_id, digest)
             if ct == 'Truyện đọc':
                 # B0 stays deterministic from source; B1-B3 are generated together in ONE call.
                 story_text = "\n\n".join(
@@ -8865,7 +9010,10 @@ async def admin_curriculum_draft_upload(
                 }
                 story_b0 = _resolve_curriculum_step_images(story_b0, pages)
                 normalized_steps.append({'code':'B0','title':'Nội dung truyện','type':'story','content':story_b0})
-                generated=_curriculum_generate_all_steps(ct,ls,digest,previous_digest)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                if ct == 'Truyện đọc':
+                    # Apply the course master gate only to vocabulary/grammar items in the generated story steps.
+                    generated = _filter_generated_course_knowledge(generated, course_id)
                 story_map={'B1':('Bản dịch tiếng Việt','translation'),'B2':('Từ vựng','vocabulary'),'B3':('Ngữ pháp','grammar')}
                 for st in generated:
                     code=str(st.get('code') or '').strip().upper()
@@ -8876,7 +9024,9 @@ async def admin_curriculum_draft_upload(
                     normalized_steps.append({'code':code,'title':str(st.get('title') or title),'type':str(st.get('type') or step_type),'content':content})
                 print('[CURRICULUM ONE-CALL] type=Truyện đọc vision_first=1 genai_calls=1 total_steps=%s' % len(normalized_steps))
             else:
-                generated=_curriculum_generate_all_steps(ct,ls,digest,previous_digest)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                if ct == 'Giáo trình':
+                    generated = _filter_generated_course_knowledge(generated, course_id)
                 plan=_normalize_curriculum_steps(ct,generated,digest)
                 for st in plan:
                     code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
@@ -8884,7 +9034,7 @@ async def admin_curriculum_draft_upload(
                     content=st.get('content') if isinstance(st.get('content'),dict) else st
                     content=_resolve_curriculum_step_images(content,pages)
                     normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
-                print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s previous_course_context=%s' % (ct,len(normalized_steps),bool(previous_digest and previous_digest.startswith('###'))))
+                print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s course_master=1 grammar_reference=%s' % (ct,len(normalized_steps),bool(grammar_reference)))
 
             payload={
                 'source_file':source_file,
@@ -9083,8 +9233,11 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
         draft=dict(row['draft_json'] or {}); step=next((s for s in draft.get('steps',[]) if str(s.get('code'))==step_code),None)
         if not step: raise HTTPException(404,'Step không tồn tại.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
-        previous_digest=_load_previous_course_curriculum_digest(draft.get('course_id'),str(draft.get('lesson') or ''),str(draft.get('content_type') or ''))
-        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=previous_digest)
+        _, grammar_reference = _get_course_curriculum_knowledge(draft.get('course_id'), digest)
+        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=grammar_reference)
+        if str(draft.get('content_type') or '').strip() == 'Giáo trình':
+            one = _filter_generated_course_knowledge([{'code':str(step.get('code') or ''),'content':new_content}], draft.get('course_id'))
+            new_content = (one[0].get('content') if one else new_content)
         new_content=_resolve_curriculum_step_images(new_content, draft.get('pages') or [])
         step['content']=new_content; draft['steps']=[s if s is not step else step for s in draft['steps']]
         with conn.cursor() as cur: cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
@@ -9178,6 +9331,11 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
         conn.close()
 
     _invalidate_catalog_cache()
+    if course_id_val:
+        try:
+            _rebuild_course_curriculum_knowledge_master(int(course_id_val))
+        except Exception as exc:
+            print("[CURRICULUM KNOWLEDGE MASTER] publish rebuild failed:", type(exc).__name__, str(exc))
 
     # Index exactly the just-published edited content, never the original AI draft/source.
     # SAFETY: never delete old Pinecone vectors before the replacement is fully indexed
