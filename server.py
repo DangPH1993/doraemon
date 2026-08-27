@@ -85,8 +85,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.66-one-exchange-genai-context")
-SERVER_VERSION = "2026-08-27-v19_87_vietnam_time"
+print("[DORAEMON SERVER FINGERPRINT] 19.88-curriculum-one-call")
+SERVER_VERSION = "2026-08-27-v19_88_curriculum_one_call"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -2886,8 +2886,8 @@ def _published_curriculum_step_text(content):
         lines=[]
         for i,item in enumerate(items,1):
             if isinstance(item,dict):
-                title=str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or "").strip()
-                body=str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("example") or "").strip()
+                title=str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or item.get("structure") or item.get("grammar") or "").strip()
+                body=str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("explanation") or item.get("example") or "").strip()
                 if title and body: lines.append(f"{i}. {title}\n{body}")
                 elif title: lines.append(f"{i}. {title}")
                 elif body: lines.append(f"{i}. {body}")
@@ -2984,14 +2984,19 @@ def _published_curriculum_vocabulary_text(step):
             if str(item).strip(): lines.append(f"{i}. {str(item).strip()}")
             continue
         writing=pick(item,"writing","word","term","kanji","title","text")
-        reading=pick(item,"reading","hiragana","kana","pronunciation","yomikata")
+        reading=pick(item,"reading","hiragana","kana","yomikata")
+        pronunciation_vi=pick(item,"pronunciation_vi","vietnamese_pronunciation","vn_pronunciation","pronunciation_vi_text")
+        pronunciation=pick(item,"pronunciation")
         meaning=pick(item,"meaning","definition","translation","vietnamese_meaning")
         example=pick(item,"example","content")
-        if writing or reading or meaning:
+        if writing or reading or pronunciation_vi or pronunciation or meaning:
             row=[f"{i}. {writing}" if writing else f"{i}."]
             if reading:
                 row.append(f"   📖 Cách đọc: {reading}")
-                row.append(f"   🔊 Phát âm: {reading}")
+            if pronunciation_vi:
+                row.append(f"   🔊 Phát âm tiếng Việt: {pronunciation_vi}")
+            elif pronunciation:
+                row.append(f"   🔊 Phát âm: {pronunciation}")
             if meaning: row.append(f"   🇻🇳 Nghĩa: {meaning}")
             if example: row.append(f"   Ví dụ: {example}")
             lines.append("\n".join(row))
@@ -3179,7 +3184,11 @@ def _published_curriculum_blocks(step, cache):
     if step.get("is_final"):
         blocks.extend(_curriculum_final_blocks())
     else:
-        blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+        step_type=str(step.get("step_type") or (step.get("content") or {}).get("type") or "").strip().casefold()
+        if step_type in {"original_text","original","source_original","section_original"}:
+            blocks.append({"type":"text","text":"📖 Cậu đọc nguyên văn phần giáo trình này xong chưa? Doraemon sẽ dịch và giải thích ngữ pháp cho cậu ở phần tiếp theo nhé. 😊"})
+        else:
+            blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
         blocks.extend(_curriculum_continue_blocks(step["index"]))
     return blocks
 
@@ -8279,9 +8288,9 @@ def init_curriculum_db():
 
 CURRICULUM_STEP_RULES = {
     'Giáo trình': [
-        {'code':'B0','title':'Giới thiệu mục đích bài học','type':'intro'},
-        {'code':'B1','title':'Giới thiệu từ vựng và ngữ pháp, câu hỏi toàn bài nếu có','type':'overview'},
-        {'code':'SECTION','title':'Các section và câu hỏi từng section nếu có','type':'section'},
+        {'code':'B0','title':'Từ vựng mới của bài','type':'vocabulary'},
+        {'code':'B1','title':'Ngữ pháp mới của bài','type':'grammar'},
+        {'code':'SECTION','title':'Các phần của bài: nguyên văn rồi dịch và giải thích','type':'section'},
         {'code':'FINAL','title':'Tổng kết','type':'summary'},
     ],
     'Từ vựng': [
@@ -8311,8 +8320,8 @@ CURRICULUM_STEP_RULES = {
 def _normalize_curriculum_steps(content_type, steps, source_digest):
     raw=[s for s in (steps or []) if isinstance(s,dict)]
     if content_type == 'Giáo trình':
-        b0=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B0'), {'code':'B0','title':'Giới thiệu mục đích bài học','type':'intro'})
-        b1=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B1'), {'code':'B1','title':'Giới thiệu từ vựng và ngữ pháp, câu hỏi toàn bài nếu có','type':'overview'})
+        b0=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B0'), {'code':'B0','title':'Từ vựng mới của bài','type':'vocabulary'})
+        b1=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B1'), {'code':'B1','title':'Ngữ pháp mới của bài','type':'grammar'})
         final=next((dict(s) for s in raw if str(s.get('code') or '').upper() in {'FINAL','SUMMARY'}), {'code':'FINAL','title':'Tổng kết','type':'summary'})
         sections=[dict(s) for s in raw if str(s.get('code') or '').upper() not in {'B0','B1','FINAL','SUMMARY'}]
         for i,s in enumerate(sections,1):
@@ -8485,6 +8494,165 @@ def _curriculum_ai_json(prompt, operation):
     _log_gemini_usage(response, operation=operation)
     return _parse_gemini_json(response.text or '{}')
 
+def _lesson_sort_key(name):
+    """Sort lesson names naturally: Bài 2 before Bài 10; non-numbered lessons last."""
+    text=str(name or '').strip()
+    m=re.search(r'\b(?:bài|lesson|unit|chapter|phần)\s*([0-9]+)', text, flags=re.I)
+    if m:
+        return (0, int(m.group(1)), text.casefold())
+    m=re.search(r'\b([0-9]+)\b', text)
+    if m:
+        return (1, int(m.group(1)), text.casefold())
+    return (2, 10**9, text.casefold())
+
+
+def _load_previous_course_curriculum_digest(course_id, current_lesson, content_type, *, max_chars=24000):
+    """Load concise published curriculum context from earlier lessons in the same course.
+
+    DB-only. No GenAI, embedding, or Pinecone call. Structured vocabulary/grammar items
+    are preferred so the single generation call can distinguish genuinely new material.
+    """
+    if not course_id:
+        return ''
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cl.id, cl.lesson, cl.version, cs.step_code, cs.step_order, cs.title,
+                       cs.step_type, cs.content_json
+                FROM curriculum_lessons cl
+                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                WHERE cl.status='PUBLISHED'
+                  AND cl.course_id=%s
+                  AND lower(trim(cl.content_type))=lower(trim(%s))
+                ORDER BY cl.id, cs.step_order, cs.id
+            """, (int(course_id), str(content_type or '').strip()))
+            rows=cur.fetchall() or []
+    finally:
+        conn.close()
+
+    current_key=_lesson_sort_key(current_lesson)
+    grouped={}
+    for r in rows:
+        lesson=str(r.get('lesson') or '').strip()
+        if not lesson or lesson.casefold()==str(current_lesson or '').strip().casefold():
+            continue
+        if _lesson_sort_key(lesson) >= current_key:
+            continue
+        grouped.setdefault(lesson, []).append(r)
+
+    if not grouped:
+        return '(Chưa có bài trước cùng khóa để so sánh.)'
+
+    blocks=[]
+    for lesson in sorted(grouped, key=_lesson_sort_key):
+        parts=[f"### {lesson}"]
+        for r in grouped[lesson]:
+            code=str(r.get('step_code') or '').strip()
+            title=str(r.get('title') or '').strip()
+            stype=str(r.get('step_type') or '').strip()
+            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+            items=content.get('items') if isinstance(content.get('items'),list) else []
+            structured=[]
+            for item in items:
+                if not isinstance(item,dict):
+                    continue
+                row={}
+                for k in (
+                    'writing','word','term','kanji','reading','hiragana','kana','pronunciation',
+                    'pronunciation_vi','vietnamese_pronunciation','meaning','definition',
+                    'pattern','structure','grammar','explanation','example'
+                ):
+                    v=item.get(k)
+                    if v not in (None,'',[],{}): row[k]=v
+                if row: structured.append(row)
+            text=str(content.get('content') or '').strip()
+            if structured:
+                parts.append(f"- {code} {title} [{stype}] items="+json.dumps(structured,ensure_ascii=False)[:7000])
+            elif text:
+                parts.append(f"- {code} {title} [{stype}]\n{text[:3500]}")
+        blocks.append('\n'.join(parts))
+    return '\n\n'.join(blocks)[:max_chars] or '(Chưa có bài trước cùng khóa để so sánh.)'
+
+
+def _curriculum_generate_all_steps(content_type, lesson, source_digest, previous_digest=''):
+    """Generate all curriculum steps in exactly ONE GenAI call per lesson.
+
+    OCR/Vision has already completed before this function runs.
+    """
+    ct=str(content_type or '').strip()
+    rules=json.dumps(CURRICULUM_STEP_RULES.get(ct) or [], ensure_ascii=False)
+    common=f"""Bạn là AI biên soạn giáo trình cho Doraemon.
+LOẠI NỘI DUNG: {ct}
+BÀI HỌC: {lesson}
+
+QUY TẮC CHUNG:
+- Chỉ dùng thông tin có trong NGUỒN HIỆN TẠI; không bịa dữ kiện.
+- OCR/Vision đã được xử lý trước. Không cần gọi công cụ nào.
+- Trả về TOÀN BỘ CÁC BƯỚC trong MỘT JSON DUY NHẤT, trong MỘT LẦN gọi.
+- Mỗi step có schema: {{"code":"B0","title":"...","type":"...","content":"...","items":[],"source_refs":[],"images":[]}}.
+- Chỉ trả image_key thực sự có trong NGUỒN. Ưu tiên ảnh minh họa/chunk cần thiết; không chọn ảnh nguyên trang nếu không cần.
+
+QUY TẮC BƯỚC KHUNG:
+{rules}
+
+NGUỒN HIỆN TẠI:
+{source_digest}
+"""
+    if ct == 'Giáo trình':
+        prompt=common+f"""
+
+YÊU CẦU RIÊNG CHO GIÁO TRÌNH:
+1) B0 = 'Từ vựng mới của bài'. Chỉ liệt kê từ vựng THỰC SỰ MỚI so với các bài trước cùng khóa trong PHẦN SO SÁNH bên dưới. Không lặp lại từ đã học trước.
+   Mỗi item bắt buộc có:
+   - writing/word: chữ Nhật
+   - reading: hiragana/kana chính xác theo nguồn
+   - pronunciation_vi: cách phát âm dành cho người Việt, BẮT BUỘC KHÔNG RỖNG; viết dễ đọc bằng tiếng Việt và dựa trên reading; không dùng IPA thay cho trường này
+   - meaning: nghĩa tiếng Việt theo nguồn
+   Nếu cùng từ xuất hiện nhiều lần trong bài hiện tại, chỉ liệt kê một lần.
+2) B1 = 'Ngữ pháp mới của bài'. Chỉ liệt kê CẤU TRÚC NGỮ PHÁP THỰC SỰ MỚI so với các bài trước cùng khóa. Mỗi item nên có pattern/structure, meaning, explanation, example khi nguồn có. Không đưa lại mẫu đã xuất hiện ở bài trước.
+3) Sau B0 và B1, tạo các CẶP STEP cho từng PHẦN/SECTION trong bài theo đúng thứ tự nguồn:
+   - Step A: type='original_text': chép Y NGUYÊN nội dung tiếng Nhật của phần đó từ nguồn hiện tại; không dịch, không tóm tắt, không diễn giải. Đây là nội dung Doraemon đưa cho user đọc trước.
+   - Step B: type='translation_explanation': dịch sang tiếng Việt và giải thích ngữ pháp/cách dùng của CHÍNH Step A; không thêm kiến thức ngoài nguồn.
+   Hai step của cùng một section phải đứng liền nhau.
+4) Không gộp nhiều section thành một step. Nếu khó xác định ranh giới, dùng tiêu đề/marker/đoạn rõ nhất trong nguồn.
+5) FINAL = tổng kết ngắn những gì đã học trong bài.
+6) source_refs phải chỉ ra trang nguồn cho từng step.
+7) Với original_text, trường content phải giữ nguyên văn; tuyệt đối không biến thành lời tóm tắt.
+
+PHẦN SO SÁNH CÁC BÀI TRƯỚC CÙNG KHÓA:
+{previous_digest or '(Chưa có bài trước cùng khóa để so sánh.)'}
+
+TRẢ JSON DUY NHẤT:
+{{"steps":[
+  {{"code":"B0","title":"Từ vựng mới của bài","type":"vocabulary","content":"","items":[{{"writing":"...","reading":"...","pronunciation_vi":"...","meaning":"...","example":"..."}}],"source_refs":[{{"page":1,"reason":"..."}}],"images":[]}},
+  {{"code":"B1","title":"Ngữ pháp mới của bài","type":"grammar","content":"","items":[{{"pattern":"...","meaning":"...","explanation":"...","example":"..."}}],"source_refs":[],"images":[]}},
+  {{"code":"B2","title":"Phần 1 · Nguyên văn","type":"original_text","content":"...","source_refs":[],"images":[]}},
+  {{"code":"B3","title":"Phần 1 · Dịch và giải thích ngữ pháp","type":"translation_explanation","content":"...","source_refs":[],"images":[]}},
+  {{"code":"FINAL","title":"Tổng kết","type":"summary","content":"...","source_refs":[],"images":[]}}
+]}}
+"""
+    elif ct == 'Truyện đọc':
+        prompt=common+"""
+
+YÊU CẦU RIÊNG CHO TRUYỆN ĐỌC:
+- B0 được server lấy nguyên văn trực tiếp từ OCR/text nguồn, bạn KHÔNG cần tạo B0.
+- Trả đúng B1, B2, B3 trong một lần gọi: B1 bản dịch, B2 từ vựng của chính truyện (writing/reading/pronunciation_vi/meaning), B3 ngữ pháp của chính truyện.
+- pronunciation_vi luôn là cách đọc dành cho người Việt dựa trên reading.
+"""
+    else:
+        prompt=common+"""
+
+YÊU CẦU: tạo ĐỦ các step bắt buộc của loại nội dung này trong cùng một lần gọi. Tôn trọng mã bước và vai trò của từng step. Với Từ vựng, item phải có writing + reading + pronunciation_vi + meaning khi nguồn có. Với Ngữ pháp, chỉ dùng cấu trúc có trong nguồn.
+"""
+    data=_curriculum_ai_json(prompt, f'curriculum_all_steps_{ct or "unknown"}')
+    if isinstance(data,list): data={'steps':data}
+    if not isinstance(data,dict): data={}
+    steps=data.get('steps') if isinstance(data.get('steps'),list) else []
+    if not steps: raise HTTPException(500,'AI không tạo được nội dung các bước curriculum.')
+    return steps
+
+
 def _curriculum_step_plan(content_type, source_digest):
     rule=json.dumps(CURRICULUM_STEP_RULES.get(content_type) or [], ensure_ascii=False)
     prompt=f"""Bạn là AI biên soạn giáo trình cho Doraemon.\nLoại nội dung: {content_type}\n\nQUY TẮC BƯỚC BẮT BUỘC:\n{rule}\n\nNguồn tài liệu dưới đây là nguồn sự thật. Không được tạo ra kiến thức không có trong nguồn. Với Giáo trình, phải biến marker SECTION thành số section thực tế được tìm thấy; luôn giữ B0, B1 và bước cuối FINAL. Các loại khác phải giữ đúng số bước và mã bước đã quy định.\n\nNGUỒN:\n{source_digest}\n\nTrả JSON: {{\"steps\":[{{\"code\":\"B0\",\"title\":\"...\",\"instruction\":\"...\"}}]}}"""
@@ -8501,7 +8669,7 @@ def _curriculum_step_plan(content_type, source_digest):
     if not steps: raise HTTPException(500,'AI không tạo được số bước.')
     return steps
 
-def _curriculum_generate_step(content_type, lesson, step, source_digest):
+def _curriculum_generate_step(content_type, lesson, step, source_digest, previous_digest=''):
     extra_rules=""
     if str(content_type or "").strip() == "Từ vựng":
         extra_rules="""\n\nQUY TẮC BẮT BUỘC CHO TỪ VỰNG:
@@ -8526,7 +8694,10 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest):
 - B3 = NGỮ PHÁP dựa trên chính B0, không thay nội dung truyện gốc.
 - Nếu nguồn không có bản tiếng Nhật rõ ràng cho một đoạn, không tự sáng tác lại; giữ nguyên dữ liệu nguồn và để phần thiếu rỗng hoặc ghi rõ không xác định.
 """
-    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}\n\nQUY TẮC ƯU TIÊN: nếu loại nội dung là Truyện đọc và bước là B0, tuyệt đối ưu tiên văn bản tiếng Nhật nguyên gốc trong NGUỒN; không được chuyển ngữ sang tiếng Việt ở B0.\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
+    compare_note = ""
+    if str(content_type or '').strip() == 'Giáo trình' and str(step.get('code') or '').upper() in {'B0','B1'}:
+        compare_note = f"""\n\nPHẦN SO SÁNH CÁC BÀI TRƯỚC CÙNG KHÓA:\n{previous_digest or '(Chưa có bài trước cùng khóa để so sánh.)'}\n\nĐối với B0/B1 của Giáo trình, chỉ giữ lại từ vựng/ngữ pháp THỰC SỰ MỚI so với phần trên. B0 phải có pronunciation_vi cho mọi từ."""
+    prompt=f"""Bạn đang soạn nội dung cho Doraemon.\nLoại nội dung: {content_type}\nBài học: {lesson}\nBước: {step.get('code')} - {step.get('title')}\n\nCHỈ DÙNG THÔNG TIN CÓ TRONG NGUỒN. Có thể sắp xếp, diễn giải và rút gọn, nhưng không được bịa dữ kiện mới. Phải đưa cả text từ bài học và tri thức OCR/Vision phù hợp vào content. Nếu nguồn không có dữ kiện cho một trường, để chuỗi rỗng hoặc mảng rỗng.{extra_rules}{compare_note}\n\nQUY TẮC ƯU TIÊN: nếu loại nội dung là Truyện đọc và bước là B0, tuyệt đối ưu tiên văn bản tiếng Nhật nguyên gốc trong NGUỒN; không được chuyển ngữ sang tiếng Việt ở B0.\n\nTrả JSON với schema: {{"title":"...","content":"...","source_refs":[{{"page":1,"reason":"..."}}],"images":[{{"image_url":"...","image_key":"...","caption":"..."}}],"items":[]}}\n\nNGUỒN:\n{source_digest}"""
     data=_curriculum_ai_json(prompt, f"curriculum_step_{step.get('code','X')}")
     if isinstance(data, list):
         data=next((x for x in data if isinstance(x,dict)), {})
@@ -8665,8 +8836,9 @@ async def admin_curriculum_draft_upload(
 
             digest=_curriculum_source_digest(pages)
             normalized_steps=[]
+            previous_digest=_load_previous_course_curriculum_digest(course_id,ls,ct)
             if ct == 'Truyện đọc':
-                # Story has fixed steps. Skip the planning call and copy B0 from source directly.
+                # B0 stays deterministic from source; B1-B3 are generated together in ONE call.
                 story_text = "\n\n".join(
                     str(pg.get('text') or '').strip()
                     for pg in pages
@@ -8684,23 +8856,26 @@ async def admin_curriculum_draft_upload(
                 }
                 story_b0 = _resolve_curriculum_step_images(story_b0, pages)
                 normalized_steps.append({'code':'B0','title':'Nội dung truyện','type':'story','content':story_b0})
-                for code,title,step_type in [
-                    ('B1','Bản dịch tiếng Việt','translation'),
-                    ('B2','Từ vựng','vocabulary'),
-                    ('B3','Ngữ pháp','grammar'),
-                ]:
-                    content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,previous_digest)
+                story_map={'B1':('Bản dịch tiếng Việt','translation'),'B2':('Từ vựng','vocabulary'),'B3':('Ngữ pháp','grammar')}
+                for st in generated:
+                    code=str(st.get('code') or '').strip().upper()
+                    if code not in story_map: continue
+                    title,step_type=story_map[code]
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
                     content=_resolve_curriculum_step_images(content,pages)
-                    normalized_steps.append({'code':code,'title':title,'type':step_type,'content':content})
-                print('[CURRICULUM STORY LOWTOKEN] step_plan_genai=0 B0_genai=0 B1_B2_B3_genai=1_each total_calls=3')
+                    normalized_steps.append({'code':code,'title':str(st.get('title') or title),'type':str(st.get('type') or step_type),'content':content})
+                print('[CURRICULUM ONE-CALL] type=Truyện đọc vision_first=1 genai_calls=1 total_steps=%s' % len(normalized_steps))
             else:
-                plan=_normalize_curriculum_steps(ct,_curriculum_step_plan(ct,digest),digest)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,previous_digest)
+                plan=_normalize_curriculum_steps(ct,generated,digest)
                 for st in plan:
                     code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
                     if not code or not title: continue
-                    content=_curriculum_generate_step(ct,ls,{'code':code,'title':title},digest)
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
                     content=_resolve_curriculum_step_images(content,pages)
                     normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s previous_course_context=%s' % (ct,len(normalized_steps),bool(previous_digest and previous_digest.startswith('###'))))
 
             payload={
                 'source_file':source_file,
@@ -8899,7 +9074,8 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
         draft=dict(row['draft_json'] or {}); step=next((s for s in draft.get('steps',[]) if str(s.get('code'))==step_code),None)
         if not step: raise HTTPException(404,'Step không tồn tại.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
-        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest)
+        previous_digest=_load_previous_course_curriculum_digest(draft.get('course_id'),str(draft.get('lesson') or ''),str(draft.get('content_type') or ''))
+        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=previous_digest)
         new_content=_resolve_curriculum_step_images(new_content, draft.get('pages') or [])
         step['content']=new_content; draft['steps']=[s if s is not step else step for s in draft['steps']]
         with conn.cursor() as cur: cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
