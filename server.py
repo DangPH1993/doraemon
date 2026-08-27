@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.88-curriculum-one-call")
-SERVER_VERSION = "2026-08-27-v19_88_curriculum_one_call"
+SERVER_VERSION = "2026-08-27-v19_89_curriculum_overview"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -8288,8 +8288,9 @@ def init_curriculum_db():
 
 CURRICULUM_STEP_RULES = {
     'Giáo trình': [
-        {'code':'B0','title':'Từ vựng mới của bài','type':'vocabulary'},
-        {'code':'B1','title':'Ngữ pháp mới của bài','type':'grammar'},
+        {'code':'B0','title':'Tổng quan bài học','type':'overview'},
+        {'code':'B1','title':'Từ vựng mới của bài','type':'vocabulary'},
+        {'code':'B2','title':'Ngữ pháp mới của bài','type':'grammar'},
         {'code':'SECTION','title':'Các phần của bài: nguyên văn rồi dịch và giải thích','type':'section'},
         {'code':'FINAL','title':'Tổng kết','type':'summary'},
     ],
@@ -8320,15 +8321,16 @@ CURRICULUM_STEP_RULES = {
 def _normalize_curriculum_steps(content_type, steps, source_digest):
     raw=[s for s in (steps or []) if isinstance(s,dict)]
     if content_type == 'Giáo trình':
-        b0=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B0'), {'code':'B0','title':'Từ vựng mới của bài','type':'vocabulary'})
-        b1=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B1'), {'code':'B1','title':'Ngữ pháp mới của bài','type':'grammar'})
+        b0=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B0'), {'code':'B0','title':'Tổng quan bài học','type':'overview'})
+        b1=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B1'), {'code':'B1','title':'Từ vựng mới của bài','type':'vocabulary'})
+        b2=next((dict(s) for s in raw if str(s.get('code') or '').upper()=='B2'), {'code':'B2','title':'Ngữ pháp mới của bài','type':'grammar'})
         final=next((dict(s) for s in raw if str(s.get('code') or '').upper() in {'FINAL','SUMMARY'}), {'code':'FINAL','title':'Tổng kết','type':'summary'})
-        sections=[dict(s) for s in raw if str(s.get('code') or '').upper() not in {'B0','B1','FINAL','SUMMARY'}]
+        sections=[dict(s) for s in raw if str(s.get('code') or '').upper() not in {'B0','B1','B2','FINAL','SUMMARY'}]
         for i,s in enumerate(sections,1):
-            s['code']=f'B{i+1}'
+            s['code']=f'B{i+2}'
             s.setdefault('type','section')
             s.setdefault('title',f'Section {i}')
-        return [b0,b1,*sections,final]
+        return [b0,b1,b2,*sections,final]
     rules=CURRICULUM_STEP_RULES.get(content_type) or []
     out=[]
     for rule in rules:
@@ -8339,8 +8341,8 @@ def _normalize_curriculum_steps(content_type, steps, source_digest):
 def reindex_curriculum_draft_steps_safe(content_type, steps):
     """Reindex draft step codes without touching any published lesson.
 
-    Giáo trình keeps B0, B1 and FINAL as structural anchors; only section
-    steps are renumbered B2, B3, ... . Other content types are re-numbered
+    Giáo trình keeps B0, B1, B2 and FINAL as structural anchors; only section
+    steps are renumbered B3, B4, ... . Other content types are re-numbered
     by current draft order so deleting a step shifts following steps up.
     This function operates on draft_json only.
     """
@@ -8349,14 +8351,17 @@ def reindex_curriculum_draft_steps_safe(content_type, steps):
     if ct == 'Giáo trình':
         b0=next((x for x in raw if str(x.get('code') or '').upper()=='B0'), None)
         b1=next((x for x in raw if str(x.get('code') or '').upper()=='B1'), None)
+        b2=next((x for x in raw if str(x.get('code') or '').upper()=='B2'), None)
         final=next((x for x in raw if str(x.get('code') or '').upper() in {'FINAL','SUMMARY'}), None)
-        sections=[x for x in raw if str(x.get('code') or '').upper() not in {'B0','B1','FINAL','SUMMARY'}]
+        sections=[x for x in raw if str(x.get('code') or '').upper() not in {'B0','B1','B2','FINAL','SUMMARY'}]
         out=[]
         if b0 is not None:
             b0['code']='B0'; out.append(b0)
         if b1 is not None:
             b1['code']='B1'; out.append(b1)
-        for i,x in enumerate(sections,start=2):
+        if b2 is not None:
+            b2['code']='B2'; out.append(b2)
+        for i,x in enumerate(sections,start=3):
             x['code']=f'B{i}'; out.append(x)
         if final is not None:
             final['code']='FINAL'; out.append(final)
@@ -8603,15 +8608,12 @@ NGUỒN HIỆN TẠI:
         prompt=common+f"""
 
 YÊU CẦU RIÊNG CHO GIÁO TRÌNH:
-1) B0 = 'Từ vựng mới của bài'. Chỉ liệt kê từ vựng THỰC SỰ MỚI so với các bài trước cùng khóa trong PHẦN SO SÁNH bên dưới. Không lặp lại từ đã học trước.
-   Mỗi item bắt buộc có:
-   - writing/word: chữ Nhật
-   - reading: hiragana/kana chính xác theo nguồn
-   - pronunciation_vi: cách phát âm dành cho người Việt, BẮT BUỘC KHÔNG RỖNG; viết dễ đọc bằng tiếng Việt và dựa trên reading; không dùng IPA thay cho trường này
-   - meaning: nghĩa tiếng Việt theo nguồn
+0) B0 = 'Tổng quan bài học'. Đây là phần mở đầu trước từ vựng và ngữ pháp. Phải giới thiệu ngắn gọn nhưng rõ ràng: chủ đề/tình huống chính của bài, mục tiêu giao tiếp hoặc mục tiêu học tập chính, và người học sẽ sử dụng được gì sau bài. CHỈ dùng thông tin có trong NGUỒN HIỆN TẠI. B0 KHÔNG phải danh sách từ vựng và KHÔNG phải phần phân tích ngữ pháp chi tiết.
+1) B1 = 'Từ vựng mới của bài'. Chỉ liệt kê từ vựng THỰC SỰ MỚI so với các bài trước cùng khóa trong PHẦN SO SÁNH bên dưới. Không lặp lại từ đã học trước.
+   Mỗi item bắt buộc có writing/word, reading, pronunciation_vi và meaning khi nguồn có. pronunciation_vi BẮT BUỘC KHÔNG RỖNG: cách phát âm dành cho người Việt, viết dễ đọc bằng tiếng Việt và dựa trên reading; không dùng IPA thay cho trường này.
    Nếu cùng từ xuất hiện nhiều lần trong bài hiện tại, chỉ liệt kê một lần.
-2) B1 = 'Ngữ pháp mới của bài'. Chỉ liệt kê CẤU TRÚC NGỮ PHÁP THỰC SỰ MỚI so với các bài trước cùng khóa. Mỗi item nên có pattern/structure, meaning, explanation, example khi nguồn có. Không đưa lại mẫu đã xuất hiện ở bài trước.
-3) Sau B0 và B1, tạo các CẶP STEP cho từng PHẦN/SECTION trong bài theo đúng thứ tự nguồn:
+2) B2 = 'Ngữ pháp mới của bài'. Chỉ liệt kê CẤU TRÚC NGỮ PHÁP THỰC SỰ MỚI so với các bài trước cùng khóa. Không đưa lại mẫu đã xuất hiện ở bài trước. Mỗi item nên có pattern/structure, meaning, explanation, example khi nguồn có.
+3) Sau B0, B1, B2, tạo các CẶP STEP cho từng PHẦN/SECTION trong bài theo đúng thứ tự nguồn:
    - Step A: type='original_text': chép Y NGUYÊN nội dung tiếng Nhật của phần đó từ nguồn hiện tại; không dịch, không tóm tắt, không diễn giải. Đây là nội dung Doraemon đưa cho user đọc trước.
    - Step B: type='translation_explanation': dịch sang tiếng Việt và giải thích ngữ pháp/cách dùng của CHÍNH Step A; không thêm kiến thức ngoài nguồn.
    Hai step của cùng một section phải đứng liền nhau.
@@ -8625,10 +8627,11 @@ PHẦN SO SÁNH CÁC BÀI TRƯỚC CÙNG KHÓA:
 
 TRẢ JSON DUY NHẤT:
 {{"steps":[
-  {{"code":"B0","title":"Từ vựng mới của bài","type":"vocabulary","content":"","items":[{{"writing":"...","reading":"...","pronunciation_vi":"...","meaning":"...","example":"..."}}],"source_refs":[{{"page":1,"reason":"..."}}],"images":[]}},
-  {{"code":"B1","title":"Ngữ pháp mới của bài","type":"grammar","content":"","items":[{{"pattern":"...","meaning":"...","explanation":"...","example":"..."}}],"source_refs":[],"images":[]}},
-  {{"code":"B2","title":"Phần 1 · Nguyên văn","type":"original_text","content":"...","source_refs":[],"images":[]}},
-  {{"code":"B3","title":"Phần 1 · Dịch và giải thích ngữ pháp","type":"translation_explanation","content":"...","source_refs":[],"images":[]}},
+  {{"code":"B0","title":"Tổng quan bài học","type":"overview","content":"...","items":[],"source_refs":[],"images":[]}},
+  {{"code":"B1","title":"Từ vựng mới của bài","type":"vocabulary","content":"","items":[{{"writing":"...","reading":"...","pronunciation_vi":"...","meaning":"...","example":"..."}}],"source_refs":[],"images":[]}},
+  {{"code":"B2","title":"Ngữ pháp mới của bài","type":"grammar","content":"","items":[{{"pattern":"...","meaning":"...","explanation":"...","example":"..."}}],"source_refs":[],"images":[]}},
+  {{"code":"B3","title":"Phần 1 · Nguyên văn","type":"original_text","content":"...","source_refs":[],"images":[]}},
+  {{"code":"B4","title":"Phần 1 · Dịch và giải thích ngữ pháp","type":"translation_explanation","content":"...","source_refs":[],"images":[]}},
   {{"code":"FINAL","title":"Tổng kết","type":"summary","content":"...","source_refs":[],"images":[]}}
 ]}}
 """
@@ -8650,6 +8653,12 @@ YÊU CẦU: tạo ĐỦ các step bắt buộc của loại nội dung này tron
     if not isinstance(data,dict): data={}
     steps=data.get('steps') if isinstance(data.get('steps'),list) else []
     if not steps: raise HTTPException(500,'AI không tạo được nội dung các bước curriculum.')
+    if ct == 'Giáo trình':
+        for st in steps:
+            code=str(st.get('code') or '').upper()
+            if code=='B0': st['title']='Tổng quan bài học'; st['type']='overview'
+            elif code=='B1': st['title']='Từ vựng mới của bài'; st['type']='vocabulary'
+            elif code=='B2': st['title']='Ngữ pháp mới của bài'; st['type']='grammar'
     return steps
 
 
@@ -9714,9 +9723,9 @@ function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
-  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label><textarea class="cur-text" data-code="${esc(code)}" style="width:100%;min-height:150px;margin-top:5px">${esc((s.content&&typeof s.content==='object')?String(s.content.content||''):'')}</textarea><details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
+  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label><textarea class="cur-text" data-code="${esc(code)}" style="width:100%;min-height:150px;margin-top:5px">${esc((s.content&&typeof s.content==='object')?String(s.content.content||''):'')}</textarea><details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
-function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}sections.forEach((x,i)=>{x.code='B'+(i+2);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
+function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
 async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:String(textTa.value||'')};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.value=String((d.step.content||{}).content||'');_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
