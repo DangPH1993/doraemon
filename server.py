@@ -9657,24 +9657,39 @@ async function savePaymentPackage(months){
 async function loadUsers(){
   const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
   document.getElementById("count").textContent="  Tổng: "+d.users.length;
+  const activeAdminCourses=adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE');
   document.getElementById("users").innerHTML=d.users.map(u=>{
-    const s=u.subscription||{}, st=u.status||"PENDING";
-    const ex=s.expires_at?new Intl.DateTimeFormat("vi-VN",{dateStyle:"short",timeStyle:"short",timeZone:"Asia/Ho_Chi_Minh"}).format(new Date(s.expires_at)):"-";
+    const s=u.subscription||{}, st=u.status||"PENDING", courses=Array.isArray(s.courses)?s.courses:[];
+    const paidCourses=courses.filter(c=>c && c.course_id!=null);
+    const courseRows=paidCourses.length ? paidCourses.map(c=>{
+      const ex=c.expires_at?new Intl.DateTimeFormat("vi-VN",{dateStyle:"short",timeStyle:"short",timeZone:"Asia/Ho_Chi_Minh"}).format(new Date(c.expires_at)):"-";
+      return `<div style="margin-top:7px;padding:8px 10px;background:#f7f9fc;border:1px solid #dfe5ee;border-radius:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+        <div style="min-width:250px;flex:1"><b>🎓 ${esc(c.code||'')} · ${esc(c.name||'')}</b><br><span class="small">Gói: <b>${esc(c.plan||'')}</b> · hết hạn: <b>${esc(ex)}</b></span></div>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},1)">1 tháng</button>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},3)">3 tháng</button>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},6)">6 tháng</button>
+        <button class="red" onclick="event.stopPropagation();lockCourse(${u.id},${Number(c.course_id)},'${esc(c.name||'')}')">Khóa khóa</button>
+      </div>`;
+    }).join('') : `<div class="small" style="margin-top:7px;color:#667085">Chưa được cấp khóa học trả phí.</div>`;
+    const grantRow=`<div style="margin-top:9px;padding-top:8px;border-top:1px dashed #cfd7e3;display:flex;gap:6px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+      <select id="user-course-${u.id}" onclick="event.stopPropagation()" style="min-width:240px;padding:6px">
+        <option value="">-- Chọn khóa học để cấp quyền --</option>
+        ${activeAdminCourses.map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('')}
+      </select>
+      <button onclick="event.stopPropagation();act(${u.id},1)">+ 1 tháng</button>
+      <button onclick="event.stopPropagation();act(${u.id},3)">+ 3 tháng</button>
+      <button onclick="event.stopPropagation();act(${u.id},6)">+ 6 tháng</button>
+      ${paidCourses.length ? `<button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Về Free</button>` : ''}
+    </div>`;
+    const headerInfo=paidCourses.length
+      ? `<div><span class="status-${st}"><b>${st}</b></span> · ${paidCourses.length} khóa đang kích hoạt</div>`
+      : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · đã hỏi hôm nay: ${Number(s.used_today||0)}/5</div>`;
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
       <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
-      <div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>${esc(s.plan||"Free")}</b> · Khóa: <b>${esc(s.course_name||"Chưa cấp")}</b> · ${s.plan==='Free' ? `đã hỏi hôm nay: ${Number(s.used_today||0)}/5` : `hết hạn: ${ex}`}</div>
-      <div class="small">Bấm để xem lịch sử và chat</div>
-      <div style="margin-top:7px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <select id="user-course-${u.id}" onclick="event.stopPropagation()" style="min-width:210px;padding:5px">
-          <option value="">-- Chọn khóa học để cấp quyền --</option>
-          ${adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}" ${String(s.course_id||'')===String(c.id)?'selected':''}>${esc(c.code)} · ${esc(c.name)}</option>`).join('')}
-        </select>
-        <button onclick="event.stopPropagation();act(${u.id},1)">1 tháng</button>
-        <button onclick="event.stopPropagation();act(${u.id},3)">3 tháng</button>
-        <button onclick="event.stopPropagation();act(${u.id},6)">6 tháng</button>
-        <button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Gói Free</button>
-        <button class="red" onclick="event.stopPropagation();lock(${u.id})">Khóa</button>
-      </div>
+      ${headerInfo}
+      ${courseRows}
+      ${grantRow}
+      <div style="margin-top:7px" class="small">Bấm để xem lịch sử và chat</div>
     </div>`;
   }).join("");
 }
@@ -9759,20 +9774,26 @@ async function sendAdminMessage(){
 async function act(id,m){
   const sel=document.getElementById("user-course-"+id);
   const courseId=sel?sel.value:"";
-  if(!courseId){alert("Hãy chọn khóa học trước khi kích hoạt/gia hạn gói.");return;}
+  if(!courseId){alert("Hãy chọn khóa học trước khi cấp/gia hạn.");return;}
   const courseName=(adminCourses.find(c=>String(c.id)===String(courseId))||{}).name||"khóa học";
-  if(!confirm("Kích hoạt/gia hạn "+m+" tháng cho "+courseName+"?"))return;
+  if(!confirm("Cấp/gia hạn "+m+" tháng cho "+courseName+"?"))return;
   await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,course_id:Number(courseId)})});
   loadUsers();
 }
-async function resetFree(id){
-  if(!confirm("Đưa user này về gói Free (5 lượt hỏi/ngày)?"))return;
-  await api("/admin/api/users/"+id+"/reset-free",{method:"POST",body:JSON.stringify({password:pw})});
+async function renewCourse(userId,courseId,months){
+  const courseName=(adminCourses.find(c=>String(c.id)===String(courseId))||{}).name||"khóa học";
+  if(!confirm("Gia hạn "+months+" tháng cho "+courseName+"?"))return;
+  await api("/admin/api/users/"+userId+"/activate",{method:"POST",body:JSON.stringify({password:pw,months,course_id:Number(courseId)})});
   loadUsers();
 }
-async function lock(id){
-  if(!confirm("Khóa tài khoản?"))return;
-  await api("/admin/api/users/"+id+"/status",{method:"POST",body:JSON.stringify({password:pw,status:"LOCKED"})});
+async function lockCourse(userId,courseId,courseName){
+  if(!confirm("Khóa riêng khóa "+courseName+" của user này? Các khóa khác vẫn giữ nguyên."))return;
+  await api("/admin/api/users/"+userId+"/courses/"+courseId+"/lock",{method:"POST",body:JSON.stringify({password:pw})});
+  loadUsers();
+}
+async function resetFree(id){
+  if(!confirm("Đưa user này về gói Free và khóa toàn bộ các khóa trả phí đang hoạt động?"))return;
+  await api("/admin/api/users/"+id+"/reset-free",{method:"POST",body:JSON.stringify({password:pw})});
   loadUsers();
 }
 </script>
@@ -11327,6 +11348,37 @@ def admin_ws_token(password: str):
     if not ADMIN_WS_TOKEN:
         raise HTTPException(500, "ADMIN_WS_TOKEN chưa được cấu hình trên Render.")
     return {"token": ADMIN_WS_TOKEN}
+
+@app.post("/admin/api/users/{user_id}/courses/{course_id}/lock")
+def admin_lock_user_course(user_id:int, course_id:int, data:dict):
+    """Expire one paid course for a user without affecting other courses or the account."""
+    check_admin(str(data.get("password", "")))
+    now=_now_local()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
+            if not cur.fetchone():
+                raise HTTPException(404,"Không tìm thấy user.")
+            cur.execute("SELECT id,name FROM courses WHERE id=%s",(course_id,))
+            course=cur.fetchone()
+            if not course:
+                raise HTTPException(404,"Không tìm thấy khóa học.")
+            cur.execute("""UPDATE subscriptions SET status='EXPIRED', expires_at=LEAST(COALESCE(expires_at,%s),%s)
+                           WHERE id=(SELECT id FROM subscriptions WHERE user_id=%s AND course_id=%s AND status='ACTIVE'
+                                     ORDER BY expires_at DESC NULLS LAST,id DESC LIMIT 1)
+                           RETURNING id""",(now,now,user_id,course_id))
+            row=cur.fetchone()
+            if not row:
+                raise HTTPException(404,"User không có khóa học đang hoạt động này.")
+        conn.commit()
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return {"success":True,"user_id":user_id,"course_id":course_id,"course_name":course['name'],"status":"EXPIRED"}
 
 @app.post("/admin/api/users/{user_id}/reset-free")
 def admin_reset_free(user_id:int,data:dict):
