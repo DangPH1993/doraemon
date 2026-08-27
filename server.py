@@ -86,7 +86,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.88-curriculum-one-call")
-SERVER_VERSION = "2026-08-27-v19_90_curriculum_knowledge_master"
+SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7765,14 +7765,15 @@ def _knowledge_catalog_rows():
             cur.execute("""
                 SELECT kd.source_file, kd.subject, kd.course_id, COALESCE(c.name,kd.subject) AS course_name,
                        kd.content_type, kd.lesson, kd.lesson_pages, kd.topic, kd.topic_pages,
-                       kd.question_pages, kd.answer_pages, kd.namespace
+                       kd.question_pages, kd.answer_pages, kd.namespace,
+                       NULL::BIGINT AS curriculum_lesson_id, FALSE AS is_curriculum, NULL::INTEGER AS curriculum_version
                 FROM knowledge_documents kd
                 LEFT JOIN courses c ON c.id=kd.course_id
                 UNION ALL
                 SELECT cl.source_file, cl.subject, cl.course_id, COALESCE(c.name,cl.subject) AS course_name,
                        cl.content_type, cl.lesson, NULL::VARCHAR AS lesson_pages, NULL::VARCHAR AS topic,
                        NULL::VARCHAR AS topic_pages, NULL::VARCHAR AS question_pages, NULL::VARCHAR AS answer_pages,
-                       '__default__'::VARCHAR AS namespace
+                       '__default__'::VARCHAR AS namespace, cl.id AS curriculum_lesson_id, TRUE AS is_curriculum, cl.version AS curriculum_version
                 FROM curriculum_lessons cl
                 LEFT JOIN courses c ON c.id=cl.course_id
                 WHERE cl.status='PUBLISHED'
@@ -7828,7 +7829,16 @@ def _knowledge_catalog_tree(rows):
             "course_id": row_course_id,
             "course_name": row_course_name,
             "topics": {},
+            "is_curriculum": bool(row.get("is_curriculum")),
+            "curriculum_lesson_id": row.get("curriculum_lesson_id"),
+            "curriculum_version": row.get("curriculum_version"),
         })
+        # A lesson node can be backed by both legacy Knowledge Base rows and a published
+        # Curriculum row. Preserve the Curriculum identity whenever it is present.
+        if row.get("is_curriculum"):
+            ln["is_curriculum"] = True
+            ln["curriculum_lesson_id"] = row.get("curriculum_lesson_id")
+            ln["curriculum_version"] = row.get("curriculum_version")
         topic = str(row.get("topic") or "").strip()
         if topic:
             ln["topics"][topic] = {
@@ -9143,6 +9153,116 @@ async def admin_curriculum_draft_remove(draft_id:int, password:str = '', request
             payload = None
     return await admin_curriculum_draft_delete_post(draft_id=draft_id, password=password, payload=payload)
 
+@app.post('/admin/api/curriculum/published/{lesson_id}/edit-draft')
+def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
+    """Clone a published Curriculum lesson into an editable Admin Draft.
+
+    The published lesson remains untouched until the resulting draft is explicitly
+    published again. Reuses an existing active edit draft for the same lesson so
+    repeated clicks do not create duplicate drafts.
+    """
+    check_admin(str(payload.get('password') or ''))
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cl.*, COALESCE(c.name, cl.subject) AS course_name
+                FROM curriculum_lessons cl
+                LEFT JOIN courses c ON c.id=cl.course_id
+                WHERE cl.id=%s AND cl.status='PUBLISHED'
+            """, (int(lesson_id),))
+            lesson=cur.fetchone()
+            if not lesson:
+                raise HTTPException(404,'Không tìm thấy bài học Curriculum đã publish.')
+
+            # Reuse an existing non-published edit draft for this exact lesson.
+            cur.execute("""
+                SELECT id, status, version, draft_json
+                FROM curriculum_drafts
+                WHERE status <> 'PUBLISHED'
+                  AND draft_json->>'edit_of_lesson_id'=%s
+                ORDER BY id DESC
+                LIMIT 1
+            """, (str(lesson_id),))
+            existing=cur.fetchone()
+            if existing:
+                return {
+                    'success':True,
+                    'draft_id':int(existing['id']),
+                    'status':str(existing.get('status') or ''),
+                    'reused':True,
+                    'message':'Đang dùng Draft chỉnh sửa hiện có.'
+                }
+
+            raw_source=lesson.get('raw_source_json') if isinstance(lesson.get('raw_source_json'),dict) else {}
+            pages=raw_source.get('pages') if isinstance(raw_source,dict) else []
+            pages=pages if isinstance(pages,list) else []
+            steps=[]
+            cur.execute("""
+                SELECT step_code, step_order, title, step_type, content_json
+                FROM curriculum_steps
+                WHERE lesson_id=%s
+                ORDER BY step_order,id
+            """, (int(lesson_id),))
+            for r in cur.fetchall() or []:
+                content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+                steps.append({
+                    'code':str(r.get('step_code') or ''),
+                    'title':str(r.get('title') or ''),
+                    'type':str(r.get('step_type') or 'lesson'),
+                    'content':content,
+                })
+            if not steps:
+                raise HTTPException(409,'Bài học đã publish nhưng chưa có các bước để chỉnh sửa.')
+
+            selected_pages=[]
+            if isinstance(raw_source,dict):
+                selected_pages=raw_source.get('selected_pages') or []
+            if not selected_pages:
+                selected_pages=sorted({int(pg.get('page')) for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()})
+            page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
+
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",
+                        (lesson['source_file'], lesson['content_type'], lesson['lesson']))
+            version=int(cur.fetchone()['next_version'])
+            draft_json={
+                'source_file':str(lesson['source_file'] or ''),
+                'course_id':int(lesson['course_id']) if lesson.get('course_id') is not None else None,
+                'subject':str(lesson.get('course_name') or lesson.get('subject') or ''),
+                'content_type':str(lesson['content_type'] or ''),
+                'lesson':str(lesson['lesson'] or ''),
+                'page_ranges':page_ranges,
+                'selected_pages':selected_pages,
+                'page_count':len(pages),
+                'pages':pages,
+                'steps':steps,
+                'edit_of_lesson_id':int(lesson_id),
+                'edit_of_version':int(lesson.get('version') or 1),
+            }
+            cur.execute("""
+                INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json)
+                VALUES(%s,%s,%s,%s,'ADMIN_REVIEW',%s,%s::jsonb)
+                RETURNING id
+            """, (lesson['source_file'], draft_json['subject'], lesson['content_type'], lesson['lesson'], version, json.dumps(draft_json,ensure_ascii=False)))
+            draft_id=int(cur.fetchone()['id'])
+        conn.commit()
+        print(f"[CURRICULUM EDIT DRAFT] lesson_id={lesson_id} draft_id={draft_id} source_version={lesson.get('version')} course_id={lesson.get('course_id')}")
+        return {
+            'success':True,
+            'draft_id':draft_id,
+            'status':'ADMIN_REVIEW',
+            'reused':False,
+            'lesson_id':int(lesson_id),
+            'source_version':int(lesson.get('version') or 1),
+        }
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500,f'Không tạo được Draft chỉnh sửa: {type(exc).__name__}: {exc}')
+    finally:
+        conn.close()
+
 @app.get('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_get(draft_id:int,password:str):
     check_admin(password); conn=db()
@@ -9549,7 +9669,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 
 <div class="card">
 <h3>🗂️ Quản lý tài liệu / bài học / chủ đề</h3>
-<div class="small" style="margin-bottom:10px">Xóa tại đây sẽ xóa cả Pinecone vector và Knowledge Cache PostgreSQL tương ứng.</div>
+<div class="small" style="margin-bottom:10px">Bài Curriculum đã publish có nút <b>✏️ Edit Curriculum</b> để mở một Draft chỉnh sửa riêng; bản đang chạy chỉ thay đổi sau khi bạn Publish lại.</div>
 <div id="knowledgeCatalogAdmin">Đang tải...</div>
 </div>
 
@@ -9877,6 +9997,20 @@ function changeCurriculumImage(code,key,add){
   _curriculumSetStepState(wanted,c); if(ta){ta.value=JSON.stringify(c,null,2);ta.dispatchEvent(new Event('input',{bubbles:true}));}
   const host=document.getElementById('cur-gallery-'+encodeURIComponent(wanted)); if(host)host.outerHTML=curriculumImageGallery({code:wanted,content:c},pages); return false;
 }
+async function editPublishedCurriculum(lessonId){
+  try{
+    if(!lessonId)return;
+    const d=await api('/admin/api/curriculum/published/'+encodeURIComponent(String(lessonId))+'/edit-draft',{method:'POST',body:JSON.stringify({password:pw})});
+    if(!d.draft_id)throw new Error('Không nhận được Draft chỉnh sửa.');
+    const base=await api('/admin/api/curriculum/drafts/'+d.draft_id+'?password='+encodeURIComponent(pw));
+    const dj=base.draft_json||{};
+    renderCurriculumDraft(d.draft_id,{...dj,draft_id:d.draft_id,status:base.status,version:base.version});
+    const ed=document.getElementById('curDraftEditor');
+    if(ed)ed.scrollIntoView({behavior:'smooth',block:'start'});
+    const st=document.getElementById('curStatus');
+    if(st)st.textContent=d.reused?'✏️ Đã mở Draft chỉnh sửa đang có của bài đã publish.':'✏️ Đã tạo Draft chỉnh sửa từ bài đã publish. Bản đang chạy vẫn giữ nguyên cho tới khi Publish lại.';
+  }catch(e){alert('❌ Không mở được bài để chỉnh sửa: '+e.message);}
+}
 function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(`Xóa bước ${label} khỏi DRAFT? Giáo trình PUBLISHED của Doraemon KHÔNG bị ảnh hưởng cho tới khi bạn Publish lại.`))return;api('/admin/api/curriculum/drafts/'+id+'/delete-step',{method:'POST',body:JSON.stringify({password:pw,step_code:label})}).then(d=>{renderCurriculumDraft(id,d);const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Đã xóa ${label} khỏi Draft. Các bước sau đã được đánh lại.`;}).catch(e=>alert('❌ '+e.message));}
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
@@ -9929,7 +10063,10 @@ function renderKnowledgeCatalog(nodes){
                   <button class="gray" style="padding:4px 8px" onclick="toggleKbSection('${lsId}',this)">▾</button>
                   <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(ls.course_name||doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
-                <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button>` : ''}
+                  <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
+                </div>
               </div>
               <div id="${lsId}" style="margin-top:6px">${(ls.topics||[]).length?`<div class="small" style="margin-left:26px"><b>Chủ đề:</b> ${(ls.topics||[]).map(t=>`<span style='display:inline-flex;align-items:center;gap:4px;border:1px solid #ddd;border-radius:999px;padding:3px 7px;margin:3px 4px 0 0;background:#fff'>${esc(t.topic)} <button class='red' style='padding:2px 6px' onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson,topic:t.topic})})'>×</button></span>`).join("")}</div>`:`<div class="small" style="margin-left:26px;color:#999">Không có chủ đề.</div>`}</div>
             </div>`;
