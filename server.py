@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.96-curriculum-progress-bootstrap-course-id-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.98-selected-course-plan-catalog-scope")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -283,10 +283,28 @@ def init_db():
                 version INTEGER NOT NULL DEFAULT 1, status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
                 goal_name TEXT NOT NULL, content_type VARCHAR(30) NOT NULL DEFAULT 'Giáo trình',
                 scope TEXT NOT NULL DEFAULT '', start_date DATE NOT NULL, target_date DATE,
+                course_id BIGINT,
                 units_per_day NUMERIC(8,3), days_per_unit INTEGER,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), confirmed_at TIMESTAMPTZ, superseded_at TIMESTAMPTZ
             );""")
             cur.execute("""ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS parent_plan_id BIGINT REFERENCES study_plans(id) ON DELETE SET NULL;""")
+            cur.execute("ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_study_plans_user_course_status ON study_plans(user_id,course_id,status,start_date,id);")
+            cur.execute("""UPDATE study_plans p SET course_id=x.course_id
+                FROM (
+                    SELECT p2.id, MIN(src.course_id) AS course_id
+                    FROM study_plans p2
+                    JOIN study_plan_items i ON i.study_plan_id=p2.id
+                    JOIN (
+                        SELECT DISTINCT course_id,content_type,lesson FROM knowledge_documents WHERE course_id IS NOT NULL
+                        UNION
+                        SELECT DISTINCT course_id,content_type,lesson FROM curriculum_lessons WHERE course_id IS NOT NULL AND status='PUBLISHED'
+                    ) src ON lower(trim(coalesce(src.content_type,'')))=lower(trim(coalesce(p2.content_type,'')))
+                         AND lower(trim(src.lesson))=lower(trim(i.lesson))
+                    WHERE p2.course_id IS NULL
+                    GROUP BY p2.id
+                    HAVING COUNT(DISTINCT src.course_id)=1
+                ) x WHERE p.id=x.id AND p.course_id IS NULL;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plan_items (
                 id BIGSERIAL PRIMARY KEY, study_plan_id BIGINT NOT NULL REFERENCES study_plans(id) ON DELETE CASCADE,
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
@@ -4033,7 +4051,7 @@ def _plan_content_type_from_text(text):
     return None
 
 
-def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
+def _unique_lessons_for_scope(content_type='Giáo trình', scope_query='', course_id=None):
     """Return lessons strictly from the requested plan content type.
 
     Plan generation must never fall back from a requested type (e.g. Ngữ pháp)
@@ -4043,8 +4061,20 @@ def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
     wanted = str(content_type or 'Giáo trình').strip()
     catalog = _load_catalog_cached()
     rows=[]; seen=set(); q=_clean_scope_value(scope_query)
+    wanted_course_id = None
+    try:
+        wanted_course_id = int(course_id) if course_id not in (None, '') else None
+    except Exception:
+        wanted_course_id = None
     for item in catalog:
         raw_type = str(item.get('content_type') or '').strip()
+        item_course_id = item.get('course_id')
+        if wanted_course_id is not None:
+            try:
+                if int(item_course_id) != wanted_course_id:
+                    continue
+            except Exception:
+                continue
         normalized = _normalize_content_type(raw_type)
         if normalized.casefold() != wanted.casefold():
             continue
@@ -4057,7 +4087,7 @@ def _unique_lessons_for_scope(content_type='Giáo trình', scope_query=''):
         if key in seen:
             continue
         seen.add(key); rows.append(lesson)
-    print(f"[STUDY PLAN LESSONS] content_type={wanted!r} scope={scope_query!r} lessons={len(rows)}")
+    print(f"[STUDY PLAN LESSONS] course_id={wanted_course_id!r} content_type={wanted!r} scope={scope_query!r} lessons={len(rows)}")
     return rows
 
 
@@ -4198,11 +4228,11 @@ def _infer_plan_content_type_from_history(recent_history):
     return None
 
 
-def _set_pending_plan_request(user_id, content_type=None, scope=None):
+def _set_pending_plan_request(user_id, content_type=None, scope=None, course_id=None):
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=%s,pending_plan_scope=%s,pending_plan_created_at=NOW(),updated_at=NOW() WHERE user_id=%s""",(content_type,scope,user_id))
+            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=%s,pending_plan_scope=%s,pending_plan_course_id=%s,pending_plan_created_at=NOW(),updated_at=NOW() WHERE user_id=%s""",(content_type,scope,course_id,user_id))
         conn.commit()
     finally:
         conn.close()
@@ -4211,7 +4241,7 @@ def _get_pending_plan_request(user_id):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT pending_plan_content_type,pending_plan_scope,pending_plan_created_at FROM user_learning_state WHERE user_id=%s",(user_id,))
+            cur.execute("SELECT pending_plan_content_type,pending_plan_scope,pending_plan_course_id,pending_plan_created_at FROM user_learning_state WHERE user_id=%s",(user_id,))
             r=cur.fetchone()
             return dict(r) if r else None
     finally:
@@ -4221,20 +4251,25 @@ def _clear_pending_plan_request(user_id):
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=NULL,pending_plan_scope=NULL,pending_plan_created_at=NULL,updated_at=NOW() WHERE user_id=%s""",(user_id,))
+            cur.execute("""UPDATE user_learning_state SET pending_plan_content_type=NULL,pending_plan_scope=NULL,pending_plan_course_id=NULL,pending_plan_created_at=NULL,updated_at=NOW() WHERE user_id=%s""",(user_id,))
         conn.commit()
     finally:
         conn.close()
 
 def _build_plan_preview(user_id, req, existing_plan_id=None):
     requested_type = req.get('content_type') or 'Giáo trình'
+    course_id = req.get('course_id')
+    try: course_id = int(course_id) if course_id not in (None,'') else None
+    except Exception: course_id = None
+    if course_id is None:
+        return None, "Doraemon cần biết **khóa học đang chọn trong Cấu hình** để lập lộ trình, để tránh trộn bài giữa các khóa. Cậu hãy chọn khóa học rồi thử lại nhé."
     requested_type = _normalize_content_type(requested_type) if requested_type in CONTENT_TYPES else requested_type
     req['content_type'] = requested_type
     print(f"[STUDY PLAN LESSONS] content_type={requested_type!r} scope={req.get('scope') or ''!r} source={req.get('goal') or ''!r}")
-    lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(requested_type, req.get('scope') or '')
+    lessons=list(req.get('_lessons_override') or []) or _unique_lessons_for_scope(requested_type, req.get('scope') or '', course_id)
     if not lessons:
         # fall back to all curriculum lessons from the selected type
-        lessons=_unique_lessons_for_scope(requested_type, '')
+        lessons=_unique_lessons_for_scope(requested_type, '', course_id)
     if not lessons:
         return None, f"Doraemon chưa tìm thấy danh sách bài phù hợp cho loại nội dung **{requested_type}** để lập lộ trình."
     start=_now_local().date()
@@ -4289,8 +4324,8 @@ def _build_plan_preview(user_id, req, existing_plan_id=None):
         with conn.cursor() as cur:
             cur.execute("SELECT COALESCE(MAX(version),0)+1 FROM study_plans WHERE user_id=%s",(user_id,))
             version=int(cur.fetchone()[0])
-            cur.execute("""INSERT INTO study_plans(user_id,version,status,goal_name,content_type,scope,start_date,target_date,units_per_day,days_per_unit)\n                VALUES(%s,%s,'DRAFT',%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (user_id,version,req.get('goal') or 'Lộ trình học',req.get('content_type') or 'Giáo trình',req.get('scope') or '',start,target,units_per_day,days_per_unit))
+            cur.execute("""INSERT INTO study_plans(user_id,version,status,goal_name,content_type,scope,start_date,target_date,course_id,units_per_day,days_per_unit)\n                VALUES(%s,%s,'DRAFT',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (user_id,version,req.get('goal') or 'Lộ trình học',req.get('content_type') or 'Giáo trình',req.get('scope') or '',start,target,course_id,units_per_day,days_per_unit))
             plan_id=int(cur.fetchone()[0])
             for d,i,lesson,target_text in items:
                 cur.execute("INSERT INTO study_plan_items(study_plan_id,plan_date,unit_index,lesson,target,status) VALUES(%s,%s,%s,%s,%s,'pending')",
@@ -4315,13 +4350,16 @@ def _finalize_completed_active_plans(user_id):
         conn.commit()
     finally: conn.close()
 
-def _active_plans(user_id, include_completed=False):
+def _active_plans(user_id, include_completed=False, course_id=None):
     _finalize_completed_active_plans(user_id)
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             status_clause="status='ACTIVE'" if not include_completed else "status IN ('ACTIVE','COMPLETED')"
-            cur.execute(f"SELECT * FROM study_plans WHERE user_id=%s AND {status_clause} ORDER BY start_date, id",(user_id,))
+            if course_id is None:
+                cur.execute(f"SELECT * FROM study_plans WHERE user_id=%s AND {status_clause} ORDER BY start_date, id",(user_id,))
+            else:
+                cur.execute(f"SELECT * FROM study_plans WHERE user_id=%s AND {status_clause} AND course_id=%s ORDER BY start_date, id",(user_id,int(course_id)))
             plans=[]
             for row in cur.fetchall():
                 p=dict(row)
@@ -4332,8 +4370,8 @@ def _active_plans(user_id, include_completed=False):
             return plans
     finally: conn.close()
 
-def _active_plan(user_id, plan_id=None):
-    plans=_active_plans(user_id)
+def _active_plan(user_id, plan_id=None, course_id=None):
+    plans=_active_plans(user_id, course_id=course_id)
     if plan_id is not None:
         try:
             pid=int(plan_id)
@@ -4345,19 +4383,25 @@ def _active_plan(user_id, plan_id=None):
                     return p
     return plans[0] if plans else None
 
-def _latest_draft(user_id):
+def _latest_draft(user_id, course_id=None):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            if course_id is None:
+                cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            else:
+                cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' AND course_id=%s ORDER BY id DESC LIMIT 1",(user_id,int(course_id)))
             row=cur.fetchone(); return dict(row) if row else None
     finally: conn.close()
 
-def _confirm_latest_draft(user_id):
+def _confirm_latest_draft(user_id, course_id=None):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            if course_id is None:
+                cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' ORDER BY id DESC LIMIT 1",(user_id,))
+            else:
+                cur.execute("SELECT * FROM study_plans WHERE user_id=%s AND status='DRAFT' AND course_id=%s ORDER BY id DESC LIMIT 1",(user_id,int(course_id)))
             row=cur.fetchone()
             if not row:
                 return None
@@ -4373,9 +4417,8 @@ def _confirm_latest_draft(user_id):
         conn.rollback(); raise
     finally: conn.close()
 
-
-def _study_plan_brief_for_auto_chat(user_id):
-    plans=_active_plans(user_id)
+def _study_plan_brief_for_auto_chat(user_id, course_id=None):
+    plans=_active_plans(user_id, course_id=course_id) if course_id is not None else _active_plans(user_id)
     if not plans: return ""
     today=_now_local().date()
     summaries=[]
@@ -4413,9 +4456,9 @@ def _is_pure_greeting(text: str) -> bool:
     return any(re.fullmatch(pattern, normalized, flags=re.UNICODE) for pattern in patterns)
 
 
-def _build_plan_choice_blocks(user_id: int, include_header: bool = True):
+def _build_plan_choice_blocks(user_id: int, include_header: bool = True, course_id=None):
     """Build all active Study Plans with one inline Yes/No choice per plan."""
-    plans = _active_plans(user_id)
+    plans = _active_plans(user_id, course_id=course_id) if course_id is not None else _active_plans(user_id)
     today = _now_local().date()
     blocks = []
     if include_header:
@@ -4589,7 +4632,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
 
     nickname = user.get("nickname") or "bạn"
     profile = _get_learning_profile(user["id"])
-    active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
+    active_plan = _active_plan(user["id"], course_id=selected_course_id) if profile.get("learning_mode") == "planned" else None
     if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
         courses=_course_guides_for_welcome(user["id"], selected_course_id)
         guide_seen=bool(profile.get("course_guide_seen"))
@@ -4653,7 +4696,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
     # Planned users with one or more unfinished plans are asked per plan whether
     # they want to follow that plan today. Fully completed plans are hidden.
     if profile.get("learning_mode") == "planned":
-        active_plans, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False)
+        active_plans, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False, course_id=selected_course_id)
         if active_plans:
             header=(f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n{curriculum}\n\n")
             blocks=[{"type":"text","text":header.rstrip()}] + plan_blocks
@@ -4993,6 +5036,7 @@ def proxy_chat(
             _finish_study_session(user["id"])
     study_session = _get_study_session(user["id"], data.chatbox_id)
     selected_course_id, selected_course_name, authorized_courses = _resolve_request_course(user["id"], data.course_id)
+    print(f"[COURSE SCOPE SELECTED] user={user['id']} course_id={selected_course_id!r} course={selected_course_name!r}")
     if selected_course_id is None and study_session and study_session.get("course"):
         session_name=str(study_session.get("course") or "").strip().casefold()
         hit=next((c for c in authorized_courses if str(c.get("name") or "").strip().casefold()==session_name),None)
@@ -5208,7 +5252,7 @@ def proxy_chat(
             # The selected plan is identified by action suffix: plan_today_yes:<plan_id>.
             # This avoids ambiguity when several plans show identical Có/Không buttons.
             profile = _get_learning_profile(user["id"])
-            active_plan = _active_plan(user["id"], action_plan_id) if profile.get("learning_mode") == "planned" else None
+            active_plan = _active_plan(user["id"], action_plan_id, course_id=selected_course_id) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items", [])
                                        if str(x.get("status") or "").lower() != "completed"), None)
             if not planned_start_item:
@@ -5218,7 +5262,7 @@ def proxy_chat(
             forced_lesson = str(planned_start_item.get("lesson") or "").strip()
             print(f"[STUDY PLAN] today_yes user={user['id']} plan={active_plan.get('id') if active_plan else None} lesson={forced_lesson!r} content_type={forced_content_type!r}")
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None,"course_id":selected_course_id}, data.chatbox_id)
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
             try:
                 _ensure_learning_progress_started(user["id"], study_session)
@@ -5232,12 +5276,12 @@ def proxy_chat(
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
         elif ui_action == "plan_apply_draft":
-            draft = _latest_draft(user["id"])
+            draft = _latest_draft(user["id"], selected_course_id)
             if not draft:
                 msg = "🤖 Doraemon không còn thấy lộ trình chờ xác nhận. Cậu hãy yêu cầu Doraemon lập lại lộ trình nhé."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             try:
-                plan = _confirm_latest_draft(user["id"])
+                plan = _confirm_latest_draft(user["id"], selected_course_id)
             except Exception as exc:
                 print(f"[STUDY PLAN] UI confirm draft error user={user['id']}: {exc}")
                 msg = "🤖 Doraemon chưa áp dụng được lộ trình lúc này. Cậu thử lại nhé."
@@ -5254,7 +5298,7 @@ def proxy_chat(
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan":plan}
 
         if ui_action == "plan_cancel_draft":
-            draft = _latest_draft(user["id"])
+            draft = _latest_draft(user["id"], selected_course_id)
             if draft:
                 conn=db()
                 try:
@@ -5269,7 +5313,7 @@ def proxy_chat(
 
         if ui_action == "plan_start":
             profile = _get_learning_profile(user["id"])
-            active_plan = _active_plan(user["id"], action_plan_id) if profile.get("learning_mode") == "planned" else None
+            active_plan = _active_plan(user["id"], action_plan_id, course_id=selected_course_id) if profile.get("learning_mode") == "planned" else None
             planned_start_item = next((x for x in (active_plan or {}).get("items",[]) if str(x.get("status")).lower() != "completed"), None)
             if not planned_start_item:
                 msg="🎉 Cậu đã hoàn thành toàn bộ các bài hiện có trong lộ trình rồi nhé!"
@@ -5280,7 +5324,7 @@ def proxy_chat(
             msg = f"🤖 Được nhé! Mình cùng học **{forced_lesson}** theo lộ trình nào.\n"
             # Do not return here: continue into the existing RAG path, but force the exact plan scope.
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
-            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None,"course_id":selected_course_id}, data.chatbox_id)
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
             try:
                 _ensure_learning_progress_started(user["id"], study_session)
@@ -5351,7 +5395,9 @@ def proxy_chat(
         current_type = _plan_content_type_from_text(data.text)
         pending_type = current_type or history_type or pending_db_type or 'Giáo trình'
         pending_scope = pending.get('pending_plan_scope') or ''
+        pending_course_id = pending.get('pending_plan_course_id') or selected_course_id
         probe = _parse_plan_request(data.text)
+        probe['course_id'] = pending_course_id
         print(
             f"[STUDY PLAN CONTEXT] current_type={current_type!r} "
             f"history_type={history_type!r} db_pending_type={pending_db_type!r} "
@@ -5370,6 +5416,7 @@ def proxy_chat(
                      "Để tính lộ trình cụ thể, cậu cho Doraemon biết muốn duy trì mục tiêu này trong bao nhiêu ngày nhé.")
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             _clear_pending_plan_request(user["id"])
+            probe['course_id']=selected_course_id
             pid,preview=_build_plan_preview(user["id"],probe)
             blocks=[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}]
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"study_plan_draft_id":pid}
@@ -5378,8 +5425,8 @@ def proxy_chat(
     # structured command to start the FIRST ACTIVE plan item; it must never fall
     # through to generic RAG (which can select an unrelated lesson such as Ngữ pháp Bài 1).
     if profile.get("learning_mode")=="planned" and not plan_start_action:
-        active_plan=_active_plan(user["id"])
-        draft=_latest_draft(user["id"])
+        active_plan=_active_plan(user["id"], course_id=selected_course_id)
+        draft=_latest_draft(user["id"], selected_course_id)
         # IMPORTANT: once a user already has an ACTIVE Study Plan, any explicit
         # plan-intent phrase such as "mình muốn học theo lộ trình" or
         # "mình muốn học lộ trình" means "start/continue my plan" rather than
@@ -5397,7 +5444,7 @@ def proxy_chat(
                 if has_concrete_target:
                     pass
                 else:
-                    plans_all, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False)
+                    plans_all, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False, course_id=selected_course_id)
                     if plans_all:
                         msg="🎯 Cậu đang có các lộ trình học đang theo dõi. Hôm nay cậu muốn tiếp tục lộ trình nào?"
                         blocks=[{"type":"text","text":msg}] + plan_blocks
@@ -5411,12 +5458,12 @@ def proxy_chat(
             try:
                 conn0=db()
                 with conn0.cursor(cursor_factory=RealDictCursor) as cur0:
-                    cur0.execute("SELECT content_type,lesson FROM learning_progress WHERE user_id=%s AND LOWER(COALESCE(status,'')) IN ('in_progress','active','review') ORDER BY last_studied_at DESC LIMIT 1",(user['id'],))
+                    cur0.execute("SELECT content_type,lesson,course_id FROM learning_progress WHERE user_id=%s AND course_id IS NOT DISTINCT FROM %s AND LOWER(COALESCE(status,'')) IN ('in_progress','active','review') ORDER BY last_studied_at DESC LIMIT 1",(user['id'],selected_course_id))
                     latest_lp=cur0.fetchone()
             finally:
                 try: conn0.close()
                 except Exception: pass
-            candidates=_active_plans(user["id"])
+            candidates=_active_plans(user["id"], course_id=selected_course_id)
             chosen=active_plan
             if latest_lp:
                 for cand in candidates:
@@ -5468,21 +5515,22 @@ def proxy_chat(
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             oldplan=None
             requested_type=_parse_plan_request(data.text).get('content_type')
-            for candidate in _active_plans(user["id"]):
+            for candidate in _active_plans(user["id"], course_id=selected_course_id):
                 if _normalize_content_type(candidate.get('content_type') or '') == _normalize_content_type(requested_type or candidate.get('content_type') or ''):
                     oldplan=candidate
                     break
             if oldplan is None:
-                oldplan=_active_plan(user["id"])
+                oldplan=_active_plan(user["id"], course_id=selected_course_id)
             if oldplan:
                 # Rebuild from the remaining lessons, preserving completed history.
                 done={x['lesson'] for x in oldplan['items'] if str(x.get('status')).lower()=='completed'}
-                lessons=[x for x in _unique_lessons_for_scope(oldplan.get('content_type') or 'Giáo trình', oldplan.get('scope') or '') if x not in done]
+                lessons=[x for x in _unique_lessons_for_scope(oldplan.get('content_type') or 'Giáo trình', oldplan.get('scope') or '', selected_course_id) if x not in done]
                 req['content_type']=oldplan.get('content_type') or 'Giáo trình'; req['scope']=oldplan.get('scope') or ''; req['goal']=data.text
                 req['_lessons_override']=lessons; req['target_date']=req.get('target_date') or oldplan.get('target_date')
                 # Simplified rebuild: create a draft using remaining lessons by temporarily using helper's catalog selection.
                 # For consistency, if override exists we build the same plan shape manually below.
                 req['override_done']=done; req['parent_plan_id']=oldplan.get('id')
+            req['course_id']=selected_course_id
             pid,preview=_build_plan_preview(user["id"],req)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
         # Plan creation. Existing active plans do not block a new independent plan.
@@ -5494,7 +5542,7 @@ def proxy_chat(
             if not has_target:
                 requested_type = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req_probe.get('content_type') or 'Giáo trình'
                 scope_hint = req_probe.get('scope') or ''
-                _set_pending_plan_request(user["id"], requested_type, scope_hint)
+                _set_pending_plan_request(user["id"], requested_type, scope_hint, selected_course_id)
                 msg=("Được nhé! 🤖 Doraemon sẽ tạo một lộ trình mới riêng cho cậu.\n\n"
                      f"Cậu muốn đặt mục tiêu cho **{requested_type}** như thế nào? Ví dụ: \"Mỗi ngày 1 bài\", \"2 ngày học 1 bài\", \"mỗi ngày 10 từ bộ thủ trong 7 ngày\" hoặc \"hoàn thành trong 10 ngày\".\n\n"
                      "Lộ trình hiện tại vẫn được giữ nguyên. Sau khi Doraemon tính xong, cậu sẽ xem và xác nhận trước khi áp dụng.")
@@ -5502,7 +5550,9 @@ def proxy_chat(
             if profile.get("learning_mode") != "planned":
                 _set_learning_profile(user["id"], "planned", True)
             req_probe['content_type'] = _plan_content_type_from_text(data.text) or req_probe.get('content_type') or _infer_plan_content_type_from_history(recent_history) or 'Giáo trình'
-            print(f"[STUDY PLAN] new-plan target content_type={req_probe['content_type']!r} source=current/history")
+            req_probe['course_id']=selected_course_id
+            print(f"[STUDY PLAN] new-plan target course_id={selected_course_id!r} content_type={req_probe['content_type']!r} source=current/history")
+            req_probe['course_id']=selected_course_id
             pid,preview=_build_plan_preview(user["id"],req_probe)
             return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
@@ -5518,7 +5568,7 @@ def proxy_chat(
                         _set_learning_profile(user["id"], "planned", True)
                     req_type = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req_probe.get('content_type') or 'Giáo trình'
                     print(f"[STUDY PLAN] create request lock content_type={req_type!r} source=current/history")
-                    _set_pending_plan_request(user["id"], req_type, req_probe.get('scope') or '')
+                    _set_pending_plan_request(user["id"], req_type, req_probe.get('scope') or '', selected_course_id)
                     msg=("Tuyệt! 🤖 Doraemon sẽ lập lộ trình cho cậu.\n\n"
                          "Cậu cho Doraemon biết mục tiêu cụ thể nhé. Ví dụ: "
                          "'Mình muốn học hết giáo trình N5 trong 1 tháng', "
@@ -5530,7 +5580,9 @@ def proxy_chat(
                 if profile.get("learning_mode") != "planned":
                     _set_learning_profile(user["id"], "planned", True)
                 req['content_type'] = _plan_content_type_from_text(data.text) or _infer_plan_content_type_from_history(plan_recent_history) or req.get('content_type') or 'Giáo trình'
-                print(f"[STUDY PLAN] concrete target content_type={req['content_type']!r} source=current/history")
+                req['course_id'] = selected_course_id
+                print(f"[STUDY PLAN] concrete target course_id={selected_course_id!r} content_type={req['content_type']!r} source=current/history")
+                req['course_id']=selected_course_id
                 pid,preview=_build_plan_preview(user["id"],req)
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
@@ -5552,7 +5604,7 @@ def proxy_chat(
     namespace = data.knowledge_namespace or "__default__"
     query_text = data.text
     if data.proactive:
-        plan_hint = _study_plan_brief_for_auto_chat(user["id"])
+        plan_hint = _study_plan_brief_for_auto_chat(user["id"], selected_course_id)
         if plan_hint:
             query_text = plan_hint
 
@@ -7911,13 +7963,23 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
 
 
 @app.get("/learning/plan")
-def get_learning_plan(authorization: Optional[str] = Header(default=None)):
+def get_learning_plan(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
     profile=_get_learning_profile(user["id"])
-    plans=_active_plans(user["id"])
+    authorized=_authorized_courses(user["id"])
+    authorized_ids=[int(c["course_id"]) for c in authorized if c.get("course_id") is not None]
+    if course_id is not None:
+        _resolve_request_course(user["id"], course_id)
+    elif len(authorized_ids)==1:
+        course_id=authorized_ids[0]
+    else:
+        # Multiple courses require the client to explicitly select one. Never mix plans.
+        plans=[]; plan=None; draft=None
+        return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":None,"plans":[],"draft":None,"course_id":None,"requires_course_selection":bool(authorized_ids),"courses":authorized}
+    plans=_active_plans(user["id"], course_id=course_id)
     plan=plans[0] if plans else None
-    draft=_latest_draft(user["id"])
-    return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"plans":plans,"draft":draft}
+    draft=_latest_draft(user["id"], course_id)
+    return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":plan,"plans":plans,"draft":draft,"course_id":course_id,"requires_course_selection":False}
 
 @app.delete("/learning/plan/{plan_id}")
 def delete_learning_plan(plan_id: int, authorization: Optional[str] = Header(default=None)):
@@ -7962,13 +8024,15 @@ def delete_learning_plan(plan_id: int, authorization: Optional[str] = Header(def
 
 
 @app.post("/learning/plan/confirm")
-def confirm_learning_plan(authorization: Optional[str] = Header(default=None)):
+def confirm_learning_plan(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    plan=_confirm_latest_draft(user["id"])
+    if course_id is not None:
+        _resolve_request_course(user["id"], course_id)
+    plan=_confirm_latest_draft(user["id"], course_id)
     if not plan:
         raise HTTPException(404,"Không có lộ trình nháp để xác nhận.")
     _set_learning_profile(user["id"],"planned",True)
-    return {"success":True,"plan":_active_plan(user["id"]),"plans":_active_plans(user["id"])}
+    return {"success":True,"plan":_active_plan(user["id"], course_id=course_id),"plans":_active_plans(user["id"], course_id=course_id) if course_id is not None else _active_plans(user["id"])}
 
 @app.get("/learning/courses")
 def learning_courses(authorization: Optional[str] = Header(default=None)):
@@ -7996,11 +8060,18 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
 
 
 @app.get("/learning/catalog")
-def learning_catalog(authorization: Optional[str] = Header(default=None)):
+def learning_catalog(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    course_ids=[int(c["course_id"]) for c in _authorized_courses(user["id"]) if c.get("course_id") is not None]
+    authorized=_authorized_courses(user["id"])
+    course_ids=[int(c["course_id"]) for c in authorized if c.get("course_id") is not None]
+    if course_id is not None:
+        if int(course_id) not in course_ids:
+            raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
+        course_ids=[int(course_id)]
+    elif len(course_ids)>1:
+        return {"success":True,"documents":[],"requires_course_selection":True,"courses":authorized}
     if not course_ids:
-        return {"success":True,"documents":[]}
+        return {"success":True,"documents":[],"requires_course_selection":False,"courses":[]}
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
