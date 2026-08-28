@@ -1,4 +1,4 @@
-# VERSION: v19_72 — v19_71 + OpenAI/GPT token usage logging
+# VERSION: v19_93 — staged Course Guide onboarding + curriculum finish flow
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
 BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
@@ -211,10 +211,12 @@ def init_db():
                 level VARCHAR(50),
                 status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
                 sort_order INTEGER NOT NULL DEFAULT 0,
+                course_guide JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_status_order ON courses(status,sort_order,id);")
+            cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS course_guide JSONB NOT NULL DEFAULT '{}'::jsonb;")
             cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_course ON subscriptions(user_id,course_id,status,expires_at DESC);")
@@ -288,6 +290,7 @@ def init_db():
             );""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS course_guide_seen BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_active BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_content_type VARCHAR(30);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course VARCHAR(255);""")
@@ -3886,23 +3889,23 @@ def _get_learning_profile(user_id):
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT learning_mode,onboarding_completed FROM user_learning_state WHERE user_id=%s""", (user_id,))
+            cur.execute("""SELECT learning_mode,onboarding_completed,course_guide_seen FROM user_learning_state WHERE user_id=%s""", (user_id,))
             row = cur.fetchone()
-            return dict(row) if row else {"learning_mode": None, "onboarding_completed": False}
+            return dict(row) if row else {"learning_mode": None, "onboarding_completed": False, "course_guide_seen": False}
     finally:
         conn.close()
-
 
 def _set_learning_profile(user_id, mode, completed=True):
     conn = db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,updated_at)\n                VALUES(%s,TRUE,0,%s,%s,NOW())\n                ON CONFLICT(user_id) DO UPDATE SET learning_mode=%s,onboarding_completed=%s,updated_at=NOW()""",
+            cur.execute("""INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,course_guide_seen,updated_at)
+                VALUES(%s,TRUE,0,%s,%s,TRUE,NOW())
+                ON CONFLICT(user_id) DO UPDATE SET learning_mode=%s,onboarding_completed=%s,course_guide_seen=TRUE,updated_at=NOW()""",
                 (user_id, mode, completed, mode, completed))
         conn.commit()
     finally:
         conn.close()
-
 
 def _plan_content_type_from_text(text):
     q = str(text or '').casefold()
@@ -4345,13 +4348,51 @@ def _build_plan_choice_blocks(user_id: int, include_header: bool = True):
     return plans, blocks
 
 
+def _course_guides_for_welcome(user_id):
+    """Return course guides for onboarding: authorized courses first; otherwise active catalog.
+    Free users can read course introductions but are not granted course-learning entitlement."""
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (s.course_id) c.id,c.code,c.name,c.language,c.level,c.course_guide
+                FROM subscriptions s JOIN courses c ON c.id=s.course_id
+                WHERE s.user_id=%s AND s.course_id IS NOT NULL
+                  AND upper(coalesce(s.status,''))='ACTIVE' AND s.expires_at IS NOT NULL AND s.expires_at>%s
+                  AND upper(coalesce(c.status,'ACTIVE'))='ACTIVE'
+                ORDER BY s.course_id,s.expires_at DESC,s.id DESC
+            """,(user_id,_now_local()))
+            rows=[dict(r) for r in cur.fetchall()]
+            if not rows:
+                cur.execute("""SELECT id,code,name,language,level,course_guide FROM courses
+                               WHERE upper(coalesce(status,'ACTIVE'))='ACTIVE'
+                               ORDER BY sort_order,id LIMIT 12""")
+                rows=[dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    return rows
+
+def _format_course_guide_message(course):
+    g=course.get('course_guide') if isinstance(course.get('course_guide'),dict) else {}
+    name=str(course.get('name') or '').strip() or 'Khóa học'
+    lines=[f"🎓 **{name}**"]
+    if g.get('summary'): lines.append(str(g['summary']).strip())
+    if g.get('recommended_for'): lines.append(f"👥 **Phù hợp với:** {g['recommended_for'].strip()}")
+    if g.get('goals'): lines.append(f"🎯 **Mục tiêu:** {g['goals'].strip()}")
+    if g.get('main_content'): lines.append(f"📚 **Nội dung chính:** {g['main_content'].strip()}")
+    if g.get('study_method'): lines.append(f"🧭 **Cách học:** {g['study_method'].strip()}")
+    if g.get('recommended_duration'): lines.append(f"⏱ **Thời lượng khuyến nghị:** {g['recommended_duration'].strip()}")
+    if g.get('prerequisites'): lines.append(f"📌 **Điều kiện đầu vào:** {g['prerequisites'].strip()}")
+    if g.get('cta'): lines.append(str(g['cta']).strip())
+    return "\n".join(lines)
+
 def _build_welcome_for_user(user, mark_seen: bool = False):
     """
     Build the same concise onboarding/returning-user message for both
     /session/welcome and a standalone 'Chào' sent through /api/proxy-chat.
 
     Important:
-    - The curriculum is always shown.
+    - New users first receive Course Guide information, then choose learning mode.
     - Only unfinished / reviewable learning is shown.
     - Completed learning is NOT presented as 'đang học dở'.
     - No Gemini/Pinecone call is needed for a greeting.
@@ -4424,17 +4465,39 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     profile = _get_learning_profile(user["id"])
     active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
     if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
-        message = (f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ "
-                   "lập lộ trình học theo mục tiêu cho cậu, hay cậu muốn học tự do?\n\n"
-                   "Hãy chọn một trong hai lựa chọn bên dưới nhé.")
-        blocks = [
-            {"type":"text","text":message},
-            {"type":"choice","id":"plan_choice","options":[
+        courses=_course_guides_for_welcome(user["id"])
+        guide_seen=bool(profile.get("course_guide_seen"))
+        if courses and not guide_seen:
+            names=[str(c.get("name") or "Khóa học").strip() for c in courses[:6] if str(c.get("name") or "").strip()]
+            target=names[0] if len(names)==1 else "các khóa học của cậu"
+            msg=(f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ giới thiệu "
+                 f"tổng quan về {target} để biết nội dung, mục tiêu và cách học không? 😊")
+            blocks=[{"type":"text","text":msg},{"type":"choice","id":"course_guide_intro","options":[
+                {"label":"Giới thiệu khóa học","action":"onboarding_show_course_guide"},
+                {"label":"Bỏ qua","action":"onboarding_skip_course_guide"}
+            ]}]
+            return {"success":True,"mode":"course_guide_prompt","message":msg,"content_blocks":blocks,"learning_history":unfinished_rows,"course_guides":courses}
+        if courses:
+            guide_blocks=[{"type":"text","text":"📖 Đây là thông tin tổng quan về khóa học của cậu:"}]
+            for c in courses[:6]:
+                guide_blocks.append({"type":"text","text":_format_course_guide_message(c)})
+            outro=("🎯 Sau phần giới thiệu này, cậu có muốn Doraemon lập lộ trình học theo mục tiêu cho cậu không?"
+                   if len(courses)==1 else
+                   "🎯 Sau phần giới thiệu này, cậu có muốn chọn một mục tiêu và để Doraemon lập lộ trình học cho cậu không?")
+            guide_blocks.append({"type":"text","text":outro})
+            guide_blocks.append({"type":"choice","id":"plan_choice","options":[
                 {"label":"Học theo lộ trình","action":"onboarding_planned"},
                 {"label":"Học tự do","action":"onboarding_free"}
-            ]}
-        ]
-        return {"success":True,"mode":"plan_choice","message":message,"content_blocks":blocks,"learning_history":unfinished_rows}
+            ]})
+            message="\n\n".join(str(b.get('text') or '') for b in guide_blocks if b.get('type')=='text')
+            return {"success":True,"mode":"plan_choice","message":message,"content_blocks":guide_blocks,"learning_history":unfinished_rows,"course_guides":courses}
+        msg=(f"Chào {nickname}! 👋 Tớ là Doraemon. Hiện chưa có khóa học nào được mở trong hệ thống. "
+             "Cậu vẫn có thể dùng Doraemon để trò chuyện và sau đó chọn cách học phù hợp.")
+        blocks=[{"type":"text","text":msg},{"type":"choice","id":"plan_choice","options":[
+            {"label":"Học theo lộ trình","action":"onboarding_planned"},
+            {"label":"Học tự do","action":"onboarding_free"}
+        ]}]
+        return {"success":True,"mode":"plan_choice","message":msg,"content_blocks":blocks,"learning_history":unfinished_rows,"course_guides":[]}
 
     curriculum = (
         "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
@@ -4877,38 +4940,27 @@ def proxy_chat(
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
 
-    # Curriculum finish actions apply to ALL structured curriculum content types
-    # (Giáo trình, Ngữ pháp, Từ vựng, Bài tập, Truyện đọc). Previously this gate
-    # only handled Giáo trình, so Grammar/Vocabulary finish buttons fell through to
-    # the normal DB-first renderer and simply showed the same final step again.
+    # Curriculum finish actions apply to ALL structured curriculum content types.
     if ui_action in {"curriculum_finish_yes", "curriculum_finish_no"} and study_session:
         lesson_label=(study_session or {}).get("lesson") or "bài học này"
         content_type=_normalize_content_type((study_session or {}).get("content_type"))
         if ui_action == "curriculum_finish_yes":
-            # Mark the CURRENT lesson as completed before closing the session.
-            # Prefer the most recent learning_progress row for the exact user +
-            # content_type + lesson; this avoids completing a different lesson when
-            # the learner has multiple plans/courses.
             try:
                 conn_done=db()
                 with conn_done.cursor(cursor_factory=RealDictCursor) as cur_done:
-                    cur_done.execute(
-                        """SELECT id FROM learning_progress
+                    cur_done.execute("""SELECT id FROM learning_progress
                            WHERE user_id=%s AND LOWER(COALESCE(content_type,''))=LOWER(%s)
                              AND LOWER(COALESCE(lesson,''))=LOWER(%s)
                            ORDER BY last_studied_at DESC NULLS LAST, id DESC LIMIT 1""",
-                        (user["id"], content_type, lesson_label)
-                    )
+                        (user["id"], content_type, lesson_label))
                     lp=cur_done.fetchone()
                     if lp:
-                        cur_done.execute(
-                            """UPDATE learning_progress
+                        cur_done.execute("""UPDATE learning_progress
                                SET status='completed', completed_at=NOW(), last_studied_at=NOW(),
                                    next_review_at=%s, current_position=GREATEST(COALESCE(current_position,0), %s)
                              WHERE id=%s""",
                             (datetime.now(timezone.utc) + timedelta(days=7) if content_type in {"Từ vựng","Ngữ pháp"} else None,
-                             int((study_session or {}).get("curriculum_step") or 0), lp["id"])
-                        )
+                             int((study_session or {}).get("curriculum_step") or 0), lp["id"]))
                 conn_done.commit()
             except Exception as exc:
                 try: conn_done.rollback()
@@ -4917,21 +4969,16 @@ def proxy_chat(
             finally:
                 try: conn_done.close()
                 except Exception: pass
-
-            # Also synchronize any active Study Plan item for this exact lesson/type.
             try:
                 _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":content_type})
             except Exception as exc:
                 print(f"[CURRICULUM FINISH] plan completion sync skipped: {type(exc).__name__}: {exc}")
-
             _finish_study_session(user["id"])
             msg=f"✅ Tuyệt vời! Doraemon đã ghi nhận cậu đã hoàn thành **{lesson_label}**. Hẹn gặp cậu ở bài tiếp theo nhé! 🤖"
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"completed","lesson":lesson_label,"content_type":content_type}}
-
-        if ui_action == "curriculum_finish_no":
-            _set_curriculum_flow(user["id"], waiting="review")
-            msg="Được nhé! 🤖 Cậu muốn Doraemon ôn lại phần nào của bài? Cậu có thể nói tên phần, từ, ngữ pháp hoặc câu hỏi cậu chưa chắc."
-            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        _set_curriculum_flow(user["id"], waiting="review")
+        msg=f"Được nhé! 🤖 Cậu muốn ôn lại phần nào của **{lesson_label}**?"
+        return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":"review","lesson":lesson_label,"content_type":content_type}}
 
     if ui_action == "curriculum_next" and study_session and study_session.get("content_type") == "Giáo trình":
         try:
@@ -4968,6 +5015,43 @@ def proxy_chat(
 
     plan_start_action = None
     if ui_action:
+        if ui_action == "onboarding_show_course_guide":
+            courses=_course_guides_for_welcome(user["id"])
+            conn_guide=db()
+            try:
+                with conn_guide.cursor() as cur_guide:
+                    cur_guide.execute("UPDATE user_learning_state SET course_guide_seen=TRUE, updated_at=NOW() WHERE user_id=%s", (user["id"],))
+                conn_guide.commit()
+            finally:
+                conn_guide.close()
+            blocks=[{"type":"text","text":"📖 Đây là thông tin tổng quan về khóa học của cậu:"}]
+            for c in courses[:6]:
+                blocks.append({"type":"text","text":_format_course_guide_message(c)})
+            outro=("🎯 Sau phần giới thiệu này, cậu có muốn Doraemon lập lộ trình học theo mục tiêu cho cậu không?"
+                   if len(courses)==1 else
+                   "🎯 Sau phần giới thiệu này, cậu có muốn chọn một mục tiêu và để Doraemon lập lộ trình học cho cậu không?")
+            blocks.append({"type":"text","text":outro})
+            blocks.append({"type":"choice","id":"plan_choice","options":[
+                {"label":"Học theo lộ trình","action":"onboarding_planned"},
+                {"label":"Học tự do","action":"onboarding_free"}
+            ]})
+            msg="\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text")
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"course_guides":courses}
+        elif ui_action == "onboarding_skip_course_guide":
+            conn_guide=db()
+            try:
+                with conn_guide.cursor() as cur_guide:
+                    cur_guide.execute("UPDATE user_learning_state SET course_guide_seen=TRUE, updated_at=NOW() WHERE user_id=%s", (user["id"],))
+                conn_guide.commit()
+            finally:
+                conn_guide.close()
+            msg="Được nhé! 🤖 Cậu có muốn Doraemon lập lộ trình học theo mục tiêu cho cậu không?"
+            blocks=[{"type":"text","text":msg},{"type":"choice","id":"plan_choice","options":[
+                {"label":"Học theo lộ trình","action":"onboarding_planned"},
+                {"label":"Học tự do","action":"onboarding_free"}
+            ]}]
+            return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
+
         if ui_action == "onboarding_planned":
             _set_learning_profile(user["id"], "planned", True)
             msg = ("Tuyệt! 🤖 Cậu muốn Doraemon lập lộ trình cho mình.\n\n"
@@ -7628,13 +7712,14 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
             # Mark the account as a fresh learner. The next /session/welcome
             # therefore returns the same onboarding flow as a brand-new user.
             cur.execute("""
-                INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,updated_at)
-                VALUES(%s,FALSE,1,NULL,FALSE,NOW())
+                INSERT INTO user_learning_state(user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,course_guide_seen,updated_at)
+                VALUES(%s,FALSE,1,NULL,FALSE,FALSE,NOW())
                 ON CONFLICT (user_id) DO UPDATE SET
                     welcome_seen=FALSE,
                     reset_count=user_learning_state.reset_count + 1,
                     learning_mode=NULL,
                     onboarding_completed=FALSE,
+                    course_guide_seen=FALSE,
                     study_session_active=FALSE,
                     study_session_content_type=NULL,
                     study_session_course=NULL,
@@ -7917,7 +8002,7 @@ def admin_courses(password: str):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id,code,name,language,level,status,sort_order,created_at,updated_at FROM courses ORDER BY sort_order,id")
+            cur.execute("SELECT id,code,name,language,level,status,sort_order,course_guide,created_at,updated_at FROM courses ORDER BY sort_order,id")
             return {"success":True,"courses":[dict(r) for r in cur.fetchall()]}
     finally:
         conn.close()
@@ -7936,7 +8021,7 @@ def admin_course_create(payload: dict):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM courses WHERE lower(code)=lower(%s) OR lower(name)=lower(%s) LIMIT 1",(code,name))
             if cur.fetchone(): raise HTTPException(409,'Mã hoặc tên khóa học đã tồn tại.')
-            cur.execute("INSERT INTO courses(code,name,language,level,status,updated_at) VALUES(%s,%s,%s,%s,'ACTIVE',NOW()) RETURNING id,code,name,language,level,status,sort_order,created_at,updated_at",(code,name,language,level))
+            cur.execute("INSERT INTO courses(code,name,language,level,status,course_guide,updated_at) VALUES(%s,%s,%s,%s,'ACTIVE','{}'::jsonb,NOW()) RETURNING id,code,name,language,level,status,sort_order,course_guide,created_at,updated_at",(code,name,language,level))
             row=dict(cur.fetchone())
         conn.commit(); return {'success':True,'course':row}
     except HTTPException:
@@ -7953,10 +8038,44 @@ def admin_course_update(course_id:int,payload:dict):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("UPDATE courses SET status=%s,updated_at=NOW() WHERE id=%s RETURNING id,code,name,language,level,status,sort_order,created_at,updated_at",(status,course_id))
+            cur.execute("UPDATE courses SET status=%s,updated_at=NOW() WHERE id=%s RETURNING id,code,name,language,level,status,sort_order,course_guide,created_at,updated_at",(status,course_id))
             row=cur.fetchone()
             if not row: raise HTTPException(404,'Không tìm thấy khóa học.')
         conn.commit(); return {'success':True,'course':dict(row)}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+@app.get("/admin/api/courses/{course_id}/guide")
+def admin_course_guide_get(course_id:int, password:str):
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,code,name,language,level,status,course_guide FROM courses WHERE id=%s",(course_id,))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,'Không tìm thấy khóa học.')
+            return {'success':True,'course':dict(row)}
+    finally:
+        conn.close()
+
+@app.patch("/admin/api/courses/{course_id}/guide")
+def admin_course_guide_update(course_id:int,payload:dict):
+    check_admin(str(payload.get('password') or ''))
+    raw=payload.get('course_guide')
+    if raw is None: raw={}
+    if not isinstance(raw,dict): raise HTTPException(400,'course_guide phải là object JSON.')
+    allowed=('summary','recommended_for','goals','main_content','study_method','recommended_duration','prerequisites','cta')
+    guide={k:str(raw.get(k) or '').strip() for k in allowed if str(raw.get(k) or '').strip()}
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("UPDATE courses SET course_guide=%s::jsonb,updated_at=NOW() WHERE id=%s RETURNING id,code,name,language,level,status,course_guide",(json.dumps(guide,ensure_ascii=False),course_id))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,'Không tìm thấy khóa học.')
+        conn.commit()
+        return {'success':True,'course':dict(row)}
     except HTTPException:
         conn.rollback(); raise
     finally:
@@ -9659,6 +9778,7 @@ button.gray{background:#666}button.red{background:#d93025}
   <button type="button" onclick="createCourse()">＋ Thêm khóa</button>
 </div>
 <div id="courseCatalogAdmin">Đang tải...</div>
+<div id="courseGuideEditor" style="display:none;margin-top:12px;padding:12px;border:1px solid #dbe2ea;border-radius:10px;background:#fafafa"></div>
 </div>
 <div class="card">
 <h3>🧠 AI Curriculum Studio</h3>
@@ -9808,6 +9928,7 @@ async function loadCourses(){
         <b>${esc(c.code)}</b><span>${esc(c.name)}</span><span>${esc(c.language||'')}</span><span>${esc(c.level||'')}</span>
         <span class="status-${esc(c.status||'ACTIVE')}">${esc(c.status||'ACTIVE')}</span>
         <span style="display:flex;gap:5px;justify-content:flex-end">
+          <button class="gray" type="button" onclick="editCourseGuide(${Number(c.id)})">📖 Course Guide</button>
           <button class="gray" type="button" onclick="toggleCourse(${Number(c.id)},'${String(c.status||'ACTIVE').toUpperCase()}')">${String(c.status||'ACTIVE').toUpperCase()==='ACTIVE'?'Tắt':'Bật'}</button>
           <button class="red" type="button" onclick="deleteCourse(${Number(c.id)})">Xóa</button>
         </span>
@@ -9837,6 +9958,35 @@ async function toggleCourse(id,status){
 async function deleteCourse(id,name){
   if(!confirm(`Xóa khóa học "${name}" khỏi danh mục? Chỉ khóa chưa có tài liệu mới được xóa.`))return;
   try{await api('/admin/api/courses/'+id,{method:'DELETE',body:JSON.stringify({password:pw})});await loadCourses();}
+  catch(e){alert('❌ '+e.message)}
+}
+async function editCourseGuide(id){
+  const host=document.getElementById('courseGuideEditor');
+  if(!host) return;
+  try{
+    const d=await api('/admin/api/courses/'+id+'/guide?password='+encodeURIComponent(pw));
+    const c=d.course||{}; const g=c.course_guide||{};
+    host.style.display='block';
+    host.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px"><div><b>📖 Course Guide · ${esc(c.code||'')} · ${esc(c.name||'')}</b><div class="small">Nội dung này dùng để Doraemon giới thiệu khóa học khi user mới bắt đầu. Không phải lesson và không đưa vào Knowledge/RAG.</div></div><button class="gray" type="button" onclick="closeCourseGuide()">Đóng</button></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <textarea id="cg_summary" rows="4" placeholder="Giới thiệu ngắn về khóa học">${esc(g.summary||'')}</textarea>
+        <textarea id="cg_recommended_for" rows="4" placeholder="Khóa học phù hợp với ai?">${esc(g.recommended_for||'')}</textarea>
+        <textarea id="cg_goals" rows="4" placeholder="Mục tiêu sau khóa học">${esc(g.goals||'')}</textarea>
+        <textarea id="cg_main_content" rows="4" placeholder="Nội dung chính">${esc(g.main_content||'')}</textarea>
+        <textarea id="cg_study_method" rows="4" placeholder="Cách học khuyến nghị">${esc(g.study_method||'')}</textarea>
+        <textarea id="cg_recommended_duration" rows="4" placeholder="Thời lượng khuyến nghị">${esc(g.recommended_duration||'')}</textarea>
+        <textarea id="cg_prerequisites" rows="4" placeholder="Điều kiện đầu vào (nếu có)">${esc(g.prerequisites||'')}</textarea>
+        <textarea id="cg_cta" rows="4" placeholder="Lời nhắn/kêu gọi hành động">${esc(g.cta||'')}</textarea>
+      </div>
+      <div style="margin-top:10px"><button type="button" onclick="saveCourseGuide(${Number(id)})">💾 Lưu Course Guide</button></div>`;
+    host.scrollIntoView({behavior:'smooth',block:'nearest'});
+  }catch(e){alert('❌ '+e.message)}
+}
+function closeCourseGuide(){const host=document.getElementById('courseGuideEditor');if(host){host.style.display='none';host.innerHTML='';}}
+async function saveCourseGuide(id){
+  const keys=['summary','recommended_for','goals','main_content','study_method','recommended_duration','prerequisites','cta'];
+  const guide={}; keys.forEach(k=>{const el=document.getElementById('cg_'+k); if(el) guide[k]=el.value.trim();});
+  try{await api('/admin/api/courses/'+id+'/guide',{method:'PATCH',body:JSON.stringify({password:pw,course_guide:guide})}); alert('✅ Đã lưu Course Guide.'); await loadCourses(); closeCourseGuide();}
   catch(e){alert('❌ '+e.message)}
 }
 function addMetaRow(values={}){
