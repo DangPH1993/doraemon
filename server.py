@@ -4455,12 +4455,31 @@ def _build_plan_choice_blocks(user_id: int, include_header: bool = True):
     return plans, blocks
 
 
-def _course_guides_for_welcome(user_id):
-    """Return course guides for onboarding: authorized courses first; otherwise active catalog.
-    Free users can read course introductions but are not granted course-learning entitlement."""
+def _course_guides_for_welcome(user_id, selected_course_id=None):
+    """Return the selected course guide when a course is explicitly selected.
+
+    Without a selected course, preserve the existing behavior: authorized active
+    courses first; if the user has no paid course entitlement, show active catalog
+    guides for discovery only.
+    """
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if selected_course_id not in (None, ""):
+                try:
+                    cid=int(selected_course_id)
+                except Exception:
+                    cid=None
+                if cid is not None:
+                    cur.execute("""
+                        SELECT c.id,c.code,c.name,c.language,c.level,c.course_guide
+                        FROM courses c
+                        WHERE c.id=%s AND upper(coalesce(c.status,'ACTIVE'))='ACTIVE'
+                        LIMIT 1
+                    """, (cid,))
+                    one=cur.fetchone()
+                    if one:
+                        return [dict(one)]
             cur.execute("""
                 SELECT DISTINCT ON (s.course_id) c.id,c.code,c.name,c.language,c.level,c.course_guide
                 FROM subscriptions s JOIN courses c ON c.id=s.course_id
@@ -4493,7 +4512,7 @@ def _format_course_guide_message(course):
     if g.get('cta'): lines.append(str(g['cta']).strip())
     return "\n".join(lines)
 
-def _build_welcome_for_user(user, mark_seen: bool = False):
+def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=None):
     """
     Build the same concise onboarding/returning-user message for both
     /session/welcome and a standalone 'Chào' sent through /api/proxy-chat.
@@ -4572,15 +4591,16 @@ def _build_welcome_for_user(user, mark_seen: bool = False):
     profile = _get_learning_profile(user["id"])
     active_plan = _active_plan(user["id"]) if profile.get("learning_mode") == "planned" else None
     if not profile.get("onboarding_completed") and not profile.get("learning_mode"):
-        courses=_course_guides_for_welcome(user["id"])
+        courses=_course_guides_for_welcome(user["id"], selected_course_id)
         guide_seen=bool(profile.get("course_guide_seen"))
         if courses and not guide_seen:
             names=[str(c.get("name") or "Khóa học").strip() for c in courses[:6] if str(c.get("name") or "").strip()]
             target=names[0] if len(names)==1 else "các khóa học của cậu"
             msg=(f"Chào {nickname}! 👋 Tớ là Doraemon. Trước khi bắt đầu, cậu muốn tớ giới thiệu "
                  f"tổng quan về {target} để biết nội dung, mục tiêu và cách học không? 😊")
+            guide_action = f"onboarding_show_course_guide:{courses[0].get('id')}" if courses else "onboarding_show_course_guide"
             blocks=[{"type":"text","text":msg},{"type":"choice","id":"course_guide_intro","options":[
-                {"label":"Giới thiệu khóa học","action":"onboarding_show_course_guide"},
+                {"label":"Giới thiệu khóa học","action":guide_action},
                 {"label":"Bỏ qua","action":"onboarding_skip_course_guide"}
             ]}]
             return {"success":True,"mode":"course_guide_prompt","message":msg,"content_blocks":blocks,"learning_history":unfinished_rows,"course_guides":courses}
@@ -5132,7 +5152,8 @@ def proxy_chat(
     plan_start_action = None
     if ui_action:
         if ui_action == "onboarding_show_course_guide":
-            courses=_course_guides_for_welcome(user["id"])
+            guide_course_id = action_plan_id if action_plan_id not in (None, "") else data.course_id
+            courses=_course_guides_for_welcome(user["id"], guide_course_id)
             conn_guide=db()
             try:
                 with conn_guide.cursor() as cur_guide:
@@ -5514,7 +5535,7 @@ def proxy_chat(
                 return {"reply":preview,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":preview},{"type":"choice","id":"plan_draft","options":[{"label":"Có","action":"plan_apply_draft"},{"label":"Không","action":"plan_cancel_draft"}]}],"learning_progress":None,"study_plan_draft_id":pid}
 
     if _is_pure_greeting(data.text):
-        welcome = _build_welcome_for_user(user, mark_seen=False)
+        welcome = _build_welcome_for_user(user, mark_seen=False, selected_course_id=data.course_id)
         return {
             "reply": welcome["message"],
             "model": GEMINI_MODEL,
@@ -7812,13 +7833,13 @@ TIN NHẮN HIỆN TẠI:
 
 
 @app.get("/session/welcome")
-def session_welcome(authorization: Optional[str] = Header(default=None)):
+def session_welcome(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     """
     Welcome/onboarding endpoint used after login.
     The same welcome logic is also used for a standalone "Chào" in chat.
     """
     user = require_active_user(authorization)
-    return _build_welcome_for_user(user, mark_seen=True)
+    return _build_welcome_for_user(user, mark_seen=True, selected_course_id=course_id)
 
 
 @app.post("/learning/reset")
