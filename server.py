@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.98-selected-course-plan-catalog-scope")
+print("[DORAEMON SERVER FINGERPRINT] 19.99-pending-plan-course-id-fix")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -322,6 +322,7 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_end_prompt_pending BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_content_type VARCHAR(30);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_scope VARCHAR(255);""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_course_id BIGINT;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS pending_plan_created_at TIMESTAMPTZ;""")
 
             cur.execute("""CREATE TABLE IF NOT EXISTS daily_question_usage (
