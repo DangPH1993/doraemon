@@ -1,7 +1,7 @@
-# VERSION: v19_94 — curriculum progress start/finish persistence fix
+# VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.94-curriculum-progress-persistence-fix"
+BASELINE_VERSION = "19.95-curriculum-progress-canonical"
 import os
 import ast
 import io
@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.88-curriculum-one-call")
+print("[DORAEMON SERVER FINGERPRINT] 19.95-curriculum-progress-canonical")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -144,6 +144,7 @@ def init_db():
                 is_read BOOLEAN NOT NULL DEFAULT FALSE);""")
             cur.execute("""CREATE TABLE IF NOT EXISTS learning_progress (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT,
                 subject VARCHAR(255) NOT NULL DEFAULT '',
                 content_type VARCHAR(30) NOT NULL DEFAULT 'Từ vựng',
                 content_id VARCHAR(255),
@@ -218,6 +219,8 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_courses_status_order ON courses(status,sort_order,id);")
             cur.execute("ALTER TABLE courses ADD COLUMN IF NOT EXISTS course_guide JSONB NOT NULL DEFAULT '{}'::jsonb;")
             cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS course_id BIGINT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_progress_user_course ON learning_progress(user_id,course_id,content_type,lesson,topic,last_studied_at DESC);")
             cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_course ON subscriptions(user_id,course_id,status,expires_at DESC);")
             cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
@@ -1151,11 +1154,12 @@ def _review_days(content_type, score=None, status="in_progress"):
 def record_learning_event(user_id, event):
     event = dict(event or {})
     content_type = _normalize_content_type(event.get("content_type"))
+    course_id = int(event.get("course_id")) if event.get("course_id") not in (None, "") else None
     subject = str(event.get("subject") or "Tiếng Nhật").strip()
     lesson = str(event.get("lesson") or "").strip() or None
     topic = str(event.get("topic") or "").strip() or None
     item_key = str(event.get("item_key") or lesson or topic or "").strip() or None
-    content_id = str(event.get("content_id") or f"{content_type}|{subject}|{lesson or ''}|{topic or ''}|{item_key or ''}")[:255]
+    content_id = str(event.get("content_id") or f"{content_type}|{course_id or ''}|{subject}|{lesson or ''}|{topic or ''}|{item_key or ''}")[:255]
     status = str(event.get("status") or "in_progress").strip()
     if status not in {"in_progress", "completed", "review", "needs_review"}:
         status = "in_progress"
@@ -1196,10 +1200,22 @@ def record_learning_event(user_id, event):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT id,attempt_count,correct_count,wrong_count
                            FROM learning_progress
-                           WHERE user_id=%s AND content_type=%s AND content_id=%s
+                           WHERE user_id=%s AND content_type=%s AND course_id IS NOT DISTINCT FROM %s AND content_id=%s
                            ORDER BY id DESC LIMIT 1""",
-                        (user_id, content_type, content_id))
+                        (user_id, content_type, course_id, content_id))
             old = cur.fetchone()
+            if not old and course_id is not None:
+                cur.execute(
+                    """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                       WHERE user_id=%s AND content_type=%s AND course_id IS NULL
+                         AND lower(coalesce(lesson,''))=lower(%s)
+                         AND lower(coalesce(topic,''))=lower(%s)
+                       ORDER BY id DESC LIMIT 1""",
+                    (user_id, content_type, lesson or "", topic or ""),
+                )
+                old = cur.fetchone()
+                if old:
+                    cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
             if old:
                 if content_type == "Bài tập":
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
@@ -1218,12 +1234,12 @@ def record_learning_event(user_id, event):
             else:
                 attempts = max(1, attempt_count) if content_type == "Bài tập" else 0
                 cur.execute("""INSERT INTO learning_progress
-                    (user_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempt_count,correct_count,wrong_count,
                      last_studied_at,next_review_at,completed_at)
                     VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                     RETURNING *""",
-                    (user_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
             row = dict(cur.fetchone())
         conn.commit()
@@ -1250,10 +1266,11 @@ def _ensure_learning_progress_started(user_id, study_session):
 
     subject = "Tiếng Nhật"
     topic = str(session.get("topic") or "").strip() or None
+    course_id = int(session.get("course_id")) if session.get("course_id") not in (None, "") else None
     item_key = lesson
     content_id = str(
         session.get("content_id")
-        or f"{content_type}|{subject}|{lesson}|{topic or ''}|{item_key}"
+        or f"{content_type}|{course_id or ''}|{subject}|{lesson}|{topic or ''}|{item_key}"
     )[:255]
 
     conn = db()
@@ -1262,11 +1279,26 @@ def _ensure_learning_progress_started(user_id, study_session):
             cur.execute(
                 """SELECT id,status,current_position,current_page
                    FROM learning_progress
-                   WHERE user_id=%s AND content_type=%s AND content_id=%s
+                   WHERE user_id=%s AND content_type=%s AND course_id IS NOT DISTINCT FROM %s AND content_id=%s
                    ORDER BY id DESC LIMIT 1""",
-                (user_id, content_type, content_id),
+                (user_id, content_type, course_id, content_id),
             )
             old = cur.fetchone()
+            # Backward compatibility: older progress rows were not course-scoped.
+            # Re-associate a matching legacy row with the current course instead of
+            # creating a second row that could downgrade a previously completed lesson.
+            if not old and course_id is not None:
+                cur.execute(
+                    """SELECT id,status,current_position,current_page FROM learning_progress
+                       WHERE user_id=%s AND content_type=%s AND course_id IS NULL
+                         AND lower(coalesce(lesson,''))=lower(%s)
+                         AND lower(coalesce(topic,''))=lower(%s)
+                       ORDER BY id DESC LIMIT 1""",
+                    (user_id, content_type, lesson, topic or ""),
+                )
+                old = cur.fetchone()
+                if old:
+                    cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
 
             if old:
                 # Never turn a completed record back into in_progress just because
@@ -1285,12 +1317,12 @@ def _ensure_learning_progress_started(user_id, study_session):
             else:
                 cur.execute(
                     """INSERT INTO learning_progress
-                       (user_id,subject,content_type,content_id,lesson,topic,item_key,
+                       (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,
                         score,status,current_position,current_page,attempt_count,
                         correct_count,wrong_count,last_studied_at,next_review_at,completed_at)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,NULL,'in_progress',0,NULL,0,0,0,NOW(),NULL,NULL)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,NULL,'in_progress',0,NULL,0,0,0,NOW(),NULL,NULL)
                        RETURNING *""",
-                    (user_id, subject, content_type, content_id, lesson, topic, item_key),
+                    (user_id, course_id, subject, content_type, content_id, lesson, topic, item_key),
                 )
             row = dict(cur.fetchone())
 
@@ -3543,7 +3575,7 @@ def _get_study_session(user_id, chatbox_id=None):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT study_session_active,study_session_content_type,study_session_course,
+                SELECT study_session_active,study_session_content_type,study_session_course,study_session_course_id,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending,study_session_chatbox_id,
                        curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result
@@ -3560,6 +3592,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 "active": True,
                 "content_type": _normalize_content_type(row.get("study_session_content_type")) or None,
                 "course": str(row.get("study_session_course") or "").strip() or None,
+                "course_id": int(row.get("study_session_course_id")) if row.get("study_session_course_id") is not None else None,
                 "lesson": str(row.get("study_session_lesson") or "").strip() or None,
                 "topic": str(row.get("study_session_topic") or "").strip() or None,
                 "started_at": row.get("study_session_started_at"),
@@ -3587,6 +3620,7 @@ def _start_study_session(user_id, scope, chatbox_id=None):
         raise ValueError("Study session requires an exact lesson.")
     content_type = _normalize_content_type(scope.get("content_type")) or None
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
+    course_id = int(scope.get("course_id")) if scope.get("course_id") not in (None, "") else None
     topic = str(scope.get("topic") or "").strip() or None
     chatbox = str(chatbox_id or "").strip() or None
     conn = db()
@@ -3595,14 +3629,15 @@ def _start_study_session(user_id, scope, chatbox_id=None):
             cur.execute("""
                 INSERT INTO user_learning_state(
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
-                    study_session_active,study_session_content_type,study_session_course,
+                    study_session_active,study_session_content_type,study_session_course,study_session_course_id,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
                     study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','','',NOW())
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','','',NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
                     study_session_course=%s,
+                    study_session_course_id=%s,
                     study_session_lesson=%s,
                     study_session_topic=%s,
                     study_session_chatbox_id=%s,
@@ -3619,8 +3654,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     curriculum_global_exercise_result='',
                     updated_at=NOW()
             """, (
-                user_id,content_type,course,lesson,topic,chatbox,
-                content_type,course,lesson,topic,chatbox
+                user_id,content_type,course,course_id,lesson,topic,chatbox,
+                content_type,course,course_id,lesson,topic,chatbox
             ))
         conn.commit()
     finally:
@@ -3633,7 +3668,7 @@ def _finish_study_session(user_id):
         with conn.cursor() as cur:
             cur.execute("""UPDATE user_learning_state
                            SET study_session_active=FALSE, study_end_prompt_pending=FALSE,
-                               study_session_chatbox_id=NULL, updated_at=NOW()
+                               study_session_chatbox_id=NULL, study_session_course_id=NULL, updated_at=NOW()
                            WHERE user_id=%s""", (user_id,))
         conn.commit()
     finally:
@@ -5021,6 +5056,7 @@ def proxy_chat(
                     user["id"],
                     {
                         "content_type": content_type,
+                        "course_id": (study_session or {}).get("course_id"),
                         "subject": "Tiếng Nhật",
                         "lesson": lesson_label,
                         "topic": (study_session or {}).get("topic") or "",
@@ -5039,9 +5075,6 @@ def proxy_chat(
             except Exception as exc:
                 print(f"[CURRICULUM FINISH] progress completion save failed: {type(exc).__name__}: {exc}")
                 completed_row = None
-            finally:
-                try: conn_done.close()
-                except Exception: pass
             try:
                 _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":content_type})
             except Exception as exc:
@@ -5507,10 +5540,10 @@ def proxy_chat(
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT subject,content_type,content_id,lesson,topic,item_key,score,status,
-                       current_position,current_page,attempt_count,correct_count,wrong_count,
-                       last_studied_at,next_review_at,completed_at
-                FROM learning_progress
+                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.status,
+                       lp.current_position,lp.current_page,lp.attempt_count,lp.correct_count,lp.wrong_count,
+                       lp.last_studied_at,lp.next_review_at,lp.completed_at
+                FROM learning_progress lp LEFT JOIN courses c ON c.id=lp.course_id
                 WHERE user_id=%s
                 ORDER BY last_studied_at DESC LIMIT 8
             """, (user["id"],))
@@ -7927,10 +7960,10 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT subject,content_type,content_id,lesson,topic,item_key,score,status,
-                       current_position,current_page,attempt_count,correct_count,wrong_count,
-                       last_studied_at,next_review_at,completed_at
-                FROM learning_progress
+                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.status,
+                       lp.current_position,lp.current_page,lp.attempt_count,lp.correct_count,lp.wrong_count,
+                       lp.last_studied_at,lp.next_review_at,lp.completed_at
+                FROM learning_progress lp LEFT JOIN courses c ON c.id=lp.course_id
                 WHERE user_id=%s
                 ORDER BY last_studied_at DESC LIMIT 80
             """,(user["id"],))
