@@ -1,7 +1,7 @@
-# VERSION: v19_93 — staged Course Guide onboarding + curriculum finish flow
+# VERSION: v19_94 — curriculum progress start/finish persistence fix
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.48-curriculum-step-delete-image-state"
+BASELINE_VERSION = "19.94-curriculum-progress-persistence-fix"
 import os
 import ast
 import io
@@ -1233,6 +1233,77 @@ def record_learning_event(user_id, event):
         conn.close()
 
 
+
+
+def _ensure_learning_progress_started(user_id, study_session):
+    """Create/keep an in_progress learning row when a structured lesson starts.
+
+    Do not downgrade an already-completed lesson when the user reopens it.
+    This makes the catalog show 'Đang học dở' immediately after lesson confirmation,
+    even though navigation buttons themselves do not emit learning events.
+    """
+    session = dict(study_session or {})
+    content_type = _normalize_content_type(session.get("content_type"))
+    lesson = str(session.get("lesson") or "").strip()
+    if not content_type or not lesson:
+        return None
+
+    subject = "Tiếng Nhật"
+    topic = str(session.get("topic") or "").strip() or None
+    item_key = lesson
+    content_id = str(
+        session.get("content_id")
+        or f"{content_type}|{subject}|{lesson}|{topic or ''}|{item_key}"
+    )[:255]
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id,status,current_position,current_page
+                   FROM learning_progress
+                   WHERE user_id=%s AND content_type=%s AND content_id=%s
+                   ORDER BY id DESC LIMIT 1""",
+                (user_id, content_type, content_id),
+            )
+            old = cur.fetchone()
+
+            if old:
+                # Never turn a completed record back into in_progress just because
+                # the learner re-opened the lesson.
+                if str(old.get("status") or "").lower() == "completed":
+                    return dict(old)
+
+                cur.execute(
+                    """UPDATE learning_progress
+                       SET subject=%s, lesson=%s, topic=%s, item_key=%s,
+                           status='in_progress', last_studied_at=NOW()
+                       WHERE id=%s
+                       RETURNING *""",
+                    (subject, lesson, topic, item_key, old["id"]),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO learning_progress
+                       (user_id,subject,content_type,content_id,lesson,topic,item_key,
+                        score,status,current_position,current_page,attempt_count,
+                        correct_count,wrong_count,last_studied_at,next_review_at,completed_at)
+                       VALUES(%s,%s,%s,%s,%s,%s,%s,NULL,'in_progress',0,NULL,0,0,0,NOW(),NULL,NULL)
+                       RETURNING *""",
+                    (user_id, subject, content_type, content_id, lesson, topic, item_key),
+                )
+            row = dict(cur.fetchone())
+
+        conn.commit()
+        return row
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 def _sync_active_plan_completion(user_id, row):
@@ -4946,26 +5017,28 @@ def proxy_chat(
         content_type=_normalize_content_type((study_session or {}).get("content_type"))
         if ui_action == "curriculum_finish_yes":
             try:
-                conn_done=db()
-                with conn_done.cursor(cursor_factory=RealDictCursor) as cur_done:
-                    cur_done.execute("""SELECT id FROM learning_progress
-                           WHERE user_id=%s AND LOWER(COALESCE(content_type,''))=LOWER(%s)
-                             AND LOWER(COALESCE(lesson,''))=LOWER(%s)
-                           ORDER BY last_studied_at DESC NULLS LAST, id DESC LIMIT 1""",
-                        (user["id"], content_type, lesson_label))
-                    lp=cur_done.fetchone()
-                    if lp:
-                        cur_done.execute("""UPDATE learning_progress
-                               SET status='completed', completed_at=NOW(), last_studied_at=NOW(),
-                                   next_review_at=%s, current_position=GREATEST(COALESCE(current_position,0), %s)
-                             WHERE id=%s""",
-                            (datetime.now(timezone.utc) + timedelta(days=7) if content_type in {"Từ vựng","Ngữ pháp"} else None,
-                             int((study_session or {}).get("curriculum_step") or 0), lp["id"]))
-                conn_done.commit()
+                completed_row = record_learning_event(
+                    user["id"],
+                    {
+                        "content_type": content_type,
+                        "subject": "Tiếng Nhật",
+                        "lesson": lesson_label,
+                        "topic": (study_session or {}).get("topic") or "",
+                        "item_key": lesson_label,
+                        "content_id": (study_session or {}).get("content_id") or "",
+                        "status": "completed",
+                        "completed": True,
+                        "current_position": int((study_session or {}).get("curriculum_step") or 0),
+                    },
+                )
+                print(
+                    f"[CURRICULUM FINISH] progress completed "
+                    f"user={user['id']} content_type={content_type!r} "
+                    f"lesson={lesson_label!r} progress_id={completed_row.get('id') if completed_row else None}"
+                )
             except Exception as exc:
-                try: conn_done.rollback()
-                except Exception: pass
                 print(f"[CURRICULUM FINISH] progress completion save failed: {type(exc).__name__}: {exc}")
+                completed_row = None
             finally:
                 try: conn_done.close()
                 except Exception: pass
@@ -5011,6 +5084,15 @@ def proxy_chat(
             lesson_confirmed_scope = decoded
             _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            try:
+                _ensure_learning_progress_started(user["id"], study_session)
+                print(
+                    f"[LESSON PROGRESS] user={user['id']} "
+                    f"content_type={(study_session or {}).get('content_type')!r} "
+                    f"lesson={(study_session or {}).get('lesson')!r} status=in_progress"
+                )
+            except Exception as exc:
+                print(f"[LESSON PROGRESS] start save skipped: {type(exc).__name__}: {exc}")
             print(f"[LESSON CONFIRM] user={user['id']} confirmed scope={lesson_confirmed_scope}; study_session=ACTIVE")
 
     plan_start_action = None
@@ -5083,6 +5165,11 @@ def proxy_chat(
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
             _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            try:
+                _ensure_learning_progress_started(user["id"], study_session)
+                print(f"[LESSON PROGRESS] plan-start user={user['id']} content_type={forced_content_type!r} lesson={forced_lesson!r} status=in_progress")
+            except Exception as exc:
+                print(f"[LESSON PROGRESS] plan-start save skipped: {type(exc).__name__}: {exc}")
 
         elif ui_action == "plan_today_no":
             # The selected plan is identified by action suffix: plan_today_no:<plan_id>.
@@ -5140,6 +5227,11 @@ def proxy_chat(
             plan_start_action = {"content_type": forced_content_type, "lesson": forced_lesson, "plan": active_plan}
             _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None}, data.chatbox_id)
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            try:
+                _ensure_learning_progress_started(user["id"], study_session)
+                print(f"[LESSON PROGRESS] plan-start user={user['id']} content_type={forced_content_type!r} lesson={forced_lesson!r} status=in_progress")
+            except Exception as exc:
+                print(f"[LESSON PROGRESS] plan-start save skipped: {type(exc).__name__}: {exc}")
         elif ui_action == "plan_start_cancel":
             msg="Được nhé! 🤖 Khi nào cậu muốn bắt đầu bài đầu tiên theo lộ trình, chỉ cần nói với Doraemon."
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
