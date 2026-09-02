@@ -7963,6 +7963,94 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
     return {"success":True,"progress":row}
 
 
+
+@app.get('/learning/review/today')
+def learning_review_today(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    selected_course_id, selected_course_name, authorized_courses = _resolve_request_course(user['id'], course_id)
+    if selected_course_id is None:
+        raise HTTPException(400, 'Cần chọn khóa học để ôn tập.')
+    due=_review_due_items(user['id'], selected_course_id)
+    return {'course_id':int(selected_course_id),'course':selected_course_name,'due':due,'count':len(due['vocabulary'])+len(due['grammar'])}
+
+@app.post('/learning/review/start')
+def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    course_id=int(payload.get('course_id') or 0)
+    selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
+    if selected_course_id is None:
+        raise HTTPException(403,'Khóa học không được phép.')
+    due=_review_due_items(user['id'], selected_course_id)
+    source_lesson='review_due'
+    if not due['vocabulary'] and not due['grammar']:
+        # First review after a completed lesson: take the vocabulary/grammar IDs
+        # mapped to the most recently completed published lesson in this course.
+        conn=db()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""SELECT cl.id,cl.lesson FROM learning_progress lp
+                    JOIN curriculum_lessons cl ON cl.course_id=%s AND cl.status='PUBLISHED' AND lower(cl.lesson)=lower(lp.lesson)
+                    WHERE lp.user_id=%s AND lp.course_id=%s AND lp.status='completed'
+                      AND lp.content_type IN ('Giáo trình','Truyện đọc','Ngữ pháp','Từ vựng','Bài tập')
+                    ORDER BY lp.completed_at DESC NULLS LAST, lp.last_studied_at DESC NULLS LAST LIMIT 1""",(selected_course_id,user['id'],selected_course_id))
+                last=cur.fetchone()
+                if last:
+                    source_lesson=str(last.get('lesson') or 'review').strip()
+                    cur.execute("SELECT DISTINCT item_type,item_id FROM curriculum_lesson_items WHERE lesson_id=%s",(int(last['id']),))
+                    for typ,iid in cur.fetchall() or []:
+                        key='vocabulary' if typ=='vocabulary' else 'grammar'
+                        due[key].append(int(iid))
+        finally:
+            conn.close()
+    if not due['vocabulary'] and not due['grammar']:
+        raise HTTPException(404,'Không có kiến thức cần ôn.')
+    # De-duplicate while preserving only the catalog IDs; question generation is GenAI-only.
+    due['vocabulary']=list(dict.fromkeys(due['vocabulary']))
+    due['grammar']=list(dict.fromkeys(due['grammar']))
+    data=_review_master_payload(selected_course_id, due)
+    max_q=max(1,min(10,int(payload.get('max_questions') or 8)))
+    questions=_review_genai_one_call(selected_course_id,data,max_q)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("INSERT INTO user_review_sessions(user_id,course_id,source_lesson,question_json) VALUES(%s,%s,%s,%s::jsonb) RETURNING id,created_at",(user['id'],int(selected_course_id),'review_due',json.dumps(questions,ensure_ascii=False)))
+            row=cur.fetchone(); conn.commit()
+    finally: conn.close()
+    return {'session_id':int(row['id']),'course_id':int(selected_course_id),'course':selected_course_name,'questions':questions}
+
+@app.post('/learning/review/answer')
+def learning_review_answer(payload: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    sid=int(payload.get('session_id') or 0); item_type=str(payload.get('item_type') or '').strip(); item_id=int(payload.get('item_id') or 0); correct=bool(payload.get('correct'))
+    if not sid or item_type not in {'vocabulary','grammar'} or not item_id:
+        raise HTTPException(400,'Dữ liệu review không hợp lệ.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM user_review_sessions WHERE id=%s AND user_id=%s FOR UPDATE",(sid,user['id']))
+            sess=cur.fetchone()
+            if not sess: raise HTTPException(404,'Không tìm thấy phiên review.')
+            course_id=int(sess['course_id'])
+        conn.commit()
+    finally: conn.close()
+    if correct:
+        _clear_success_review(user['id'],course_id,item_type,item_id)
+    else:
+        # wrong_count is read/updated atomically in the helper; schedule is intentionally outside GenAI.
+        _schedule_failed_review(user['id'],course_id,item_type,item_id)
+    return {'success':True,'item_type':item_type,'item_id':item_id,'correct':correct}
+
+@app.post('/learning/review/finish')
+def learning_review_finish(payload: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization); sid=int(payload.get('session_id') or 0)
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE user_review_sessions SET status='COMPLETED',completed_at=NOW(),answers_json=%s::jsonb WHERE id=%s AND user_id=%s",(json.dumps(payload.get('answers') or {},ensure_ascii=False),sid,user['id']))
+        conn.commit()
+    finally: conn.close()
+    return {'success':True}
+
 @app.get("/learning/plan")
 def get_learning_plan(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
@@ -9189,6 +9277,11 @@ YÊU CẦU: tạo ĐỦ các step bắt buộc của loại nội dung này tron
     if not isinstance(data,dict): data={}
     steps=data.get('steps') if isinstance(data.get('steps'),list) else []
     if not steps: raise HTTPException(500,'AI không tạo được nội dung các bước curriculum.')
+    for _st in steps:
+        if isinstance(_st,dict):
+            _st.setdefault('vocabulary_refs',[])
+            _st.setdefault('grammar_refs',[])
+
     if ct == 'Giáo trình':
         for st in steps:
             code=str(st.get('code') or '').upper()
@@ -9427,6 +9520,11 @@ async def admin_curriculum_draft_upload(
                     normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
                 print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s course_master=1 grammar_reference=%s' % (ct,len(normalized_steps),bool(grammar_reference)))
 
+            if course_id:
+                try:
+                    normalized_steps=_map_curriculum_steps_to_master(course_id, None, ls, normalized_steps)
+                except Exception as exc:
+                    print(f'[CURRICULUM ITEM MAP] pre-publish draft mapping warning: {type(exc).__name__}: {exc}')
             payload={
                 'source_file':source_file,
                 'course_id':course_id,
@@ -9830,6 +9928,25 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
         conn.rollback(); raise
     finally:
         conn.close()
+
+    if course_id_val:
+        try:
+            # Post-publish mapping: every curriculum step can carry vocab/grammar refs.
+            # This is intentionally after the lesson transaction commits so the mapping
+            # can safely create/update catalog items and lesson-item links.
+            conn_map_steps=db()
+            try:
+                with conn_map_steps.cursor(cursor_factory=RealDictCursor) as cur_map_steps:
+                    cur_map_steps.execute("SELECT step_code,title,step_type,content_json FROM curriculum_steps WHERE lesson_id=%s ORDER BY step_order,id",(lesson_id,))
+                    db_steps=[dict(r) for r in cur_map_steps.fetchall() or []]
+            finally:
+                conn_map_steps.close()
+            _map_curriculum_steps_to_master(course_id_val, lesson_id, lesson, [
+                {"code":r.get("step_code"),"title":r.get("title"),"type":r.get("step_type"),"content":r.get("content_json") if isinstance(r.get("content_json"),dict) else {}}
+                for r in db_steps
+            ])
+        except Exception as exc:
+            print(f"[CURRICULUM ITEM MAP] publish mapping skipped: {type(exc).__name__}: {exc}")
 
     _invalidate_catalog_cache()
     if course_id_val:
