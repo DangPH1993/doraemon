@@ -1,7 +1,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.101-curriculum-review-persistence-fix"
+BASELINE_VERSION = "19.102-selected-course-migration-review-fix"
 import os
 import ast
 import io
@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.101-curriculum-review-persistence-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.102-selected-course-migration-review-fix")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -184,6 +184,7 @@ def init_db():
             );""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course_id BIGINT;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS selected_course_id BIGINT;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, content_hash VARCHAR(128) NOT NULL,
                 subject VARCHAR(255) NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,
