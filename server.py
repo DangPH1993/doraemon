@@ -1,7 +1,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.102-selected-course-migration-review-fix"
+BASELINE_VERSION = "19.103-review-schedule-chat"
 import os
 import ast
 import io
@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.102-selected-course-migration-review-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.103-review-schedule-chat")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -395,6 +395,9 @@ def init_db():
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS wrong_count INTEGER DEFAULT 0;",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS last_studied_at TIMESTAMPTZ DEFAULT NOW();",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS next_review_at TIMESTAMPTZ;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS review_scheduled_at TIMESTAMPTZ;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS review_completed_at TIMESTAMPTZ;",
+                "CREATE INDEX IF NOT EXISTS idx_learning_progress_review_schedule ON learning_progress(user_id,course_id,next_review_at,status,content_type,lesson);",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();",
                 "ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS content_type VARCHAR(30) DEFAULT 'Từ vựng';",
@@ -1335,6 +1338,11 @@ def record_learning_event(user_id, event):
             row = dict(cur.fetchone())
         conn.commit()
         _sync_active_plan_completion(user_id, row)
+        if str(row.get("status") or "").lower() == "completed":
+            try:
+                _schedule_review_for_completed_lesson(row)
+            except Exception as exc:
+                print(f"[REVIEW SCHEDULE] create skipped user={user_id}: {type(exc).__name__}: {exc}")
         return row
     finally:
         conn.close()
@@ -4491,7 +4499,17 @@ def _confirm_latest_draft(user_id, course_id=None):
 
 def _study_plan_brief_for_auto_chat(user_id, course_id=None):
     plans=_active_plans(user_id, course_id=course_id) if course_id is not None else _active_plans(user_id)
-    if not plans: return ""
+    review_note=""
+    if course_id is not None:
+        try:
+            scheduled=_review_scheduled_lessons(user_id,course_id)
+            due=_review_due_items(user_id,course_id)
+            due_n=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
+            if scheduled or due_n:
+                names=', '.join(str(x.get('lesson') or '') for x in scheduled[:3] if x.get('lesson'))
+                review_note=f" Lịch ôn hôm nay={names or 'có kiến thức cần ôn'}; item cần ôn lại={due_n}."
+        except Exception as exc:
+            print(f"[REVIEW BRIEF] skipped: {type(exc).__name__}: {exc}")
     today=_now_local().date()
     summaries=[]
     for plan in plans[:5]:
@@ -4507,8 +4525,12 @@ def _study_plan_brief_for_auto_chat(user_id, course_id=None):
             state='BEHIND' if overdue else 'ON_TRACK'
         target=', '.join(x['lesson'] for x in todays[:4]) or 'không có bài mới hôm nay'
         summaries.append(f"[{plan.get('content_type')}] {plan.get('goal_name')}; status={state}; mục tiêu hôm nay={target}; đã hoàn thành={len(completed)}; quá hạn={len(overdue)}")
-    return (f"Hôm nay={today.isoformat()}; " + " | ".join(summaries) + " Hãy viết 1 câu ngắn, thân thiện bằng tiếng Việt để động viên/nhắc/chúc mừng phù hợp; không được tạo bài học mới.")
-
+    base=f"Hôm nay={today.isoformat()}; "
+    if summaries:
+        base += " | ".join(summaries)
+    elif not review_note:
+        return ""
+    return base + review_note + " Hãy viết 1 câu ngắn, thân thiện bằng tiếng Việt để động viên/nhắc/chúc mừng phù hợp; không được tạo bài học mới."
 
 def _is_pure_greeting(text: str) -> bool:
     """True for a standalone greeting (including common variants), not a greeting + request."""
@@ -5089,7 +5111,7 @@ def proxy_chat(
 
     # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
     # Standalone greetings are onboarding actions and do not consume a question.
-    if not _is_pure_greeting(data.text) and not data.proactive and not data.action:
+    if not _is_pure_greeting(data.text) and not _is_review_schedule_request(data.text) and not data.proactive and not data.action:
         enforce_question_limit(user["id"])
 
     # A standalone greeting is a session/onboarding action, NOT a knowledge
@@ -5118,6 +5140,15 @@ def proxy_chat(
     if selected_course_id is None and early_action:
         if early_action.startswith(("curriculum_","lesson_confirm_","study_end_")) and study_session:
             raise HTTPException(403,"Quyền học khóa hiện tại không còn hiệu lực. Vui lòng chọn khóa học đang được cấp quyền trong Cấu hình.")
+
+    if _is_review_schedule_request(data.text):
+        if selected_course_id is None:
+            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon xác định lịch ôn đúng khóa nhé."
+            blocks=[{"type":"text","text":msg}]
+        else:
+            msg,blocks=_build_review_schedule_chat_blocks(user["id"],selected_course_id,selected_course_name)
+        print(f"[REVIEW CHAT FASTPATH] user={user['id']} course_id={selected_course_id!r} genai=0")
+        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review_schedule":True}
 
     # Selected-text context is supplied by the desktop app when the learner
     # highlights text and chooses “Hỏi Doraemon”. Initialize it before ANY
@@ -5267,6 +5298,13 @@ def proxy_chat(
 
     plan_start_action = None
     if ui_action:
+        if ui_action == "review_open":
+            msg="🔄 Mở phiên ôn tập hôm nay cho cậu nhé. 🤖"
+            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        elif ui_action == "review_keep":
+            msg="Được nhé, mình giữ lịch ôn lại cho cậu. 🤖"
+            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
         if ui_action == "onboarding_show_course_guide":
             guide_course_id = action_plan_id if action_plan_id not in (None, "") else data.course_id
             courses=_course_guides_for_welcome(user["id"], guide_course_id)
@@ -8036,6 +8074,142 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
 
 
 
+def _review_lesson_item_ids(course_id, content_type, lesson):
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cli.item_type, cli.item_id
+                FROM curriculum_lesson_items cli
+                JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
+                WHERE cl.course_id=%s AND cl.content_type=%s
+                  AND lower(trim(cl.lesson))=lower(trim(%s))
+                  AND cl.status='PUBLISHED'
+                ORDER BY cli.item_type,cli.item_id
+            """, (course_id,content_type,lesson))
+            rows=[dict(r) for r in cur.fetchall()]
+            if not rows:
+                cur.execute("""SELECT id FROM curriculum_vocab_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s)) ORDER BY id""",(course_id,lesson))
+                rows += [{"item_type":"vocabulary","item_id":int(r["id"])} for r in cur.fetchall()]
+                cur.execute("""SELECT id FROM curriculum_grammar_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s)) ORDER BY id""",(course_id,lesson))
+                rows += [{"item_type":"grammar","item_id":int(r["id"])} for r in cur.fetchall()]
+            out={"vocabulary":[],"grammar":[]}
+            for r in rows:
+                typ=str(r.get('item_type') or '').strip()
+                if typ in out:
+                    out[typ].append(int(r.get('item_id')))
+            return out
+    finally:
+        conn.close()
+
+
+def _schedule_review_for_completed_lesson(row):
+    if not row or str(row.get('status') or '').lower() != 'completed':
+        return
+    content_type=str(row.get('content_type') or 'Giáo trình')
+    if content_type not in {'Giáo trình','Bài tập','Ngữ pháp','Từ vựng'}:
+        return
+    lesson=str(row.get('lesson') or '').strip()
+    course_id=row.get('course_id')
+    if not lesson or course_id in (None,''):
+        return
+    # For a lesson-level review schedule, a vocabulary/grammar mapping is enough.
+    ids=_review_lesson_item_ids(int(course_id),content_type,lesson)
+    if not ids['vocabulary'] and not ids['grammar']:
+        return
+    now=datetime.now(timezone.utc)
+    next_at=now+timedelta(days=1)
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE learning_progress SET review_scheduled_at=%s,review_completed_at=NULL,next_review_at=%s WHERE id=%s""",(now,next_at,row.get('id')))
+        conn.commit()
+        print(f"[REVIEW SCHEDULE] user={row.get('user_id')} course_id={course_id} lesson={lesson!r} due={next_at.isoformat()} vocab={len(ids['vocabulary'])} grammar={len(ids['grammar'])}")
+    finally:
+        conn.close()
+
+
+def _review_scheduled_lessons(user_id, course_id):
+    now=_now_local()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id,content_type,lesson,topic,completed_at,review_scheduled_at,next_review_at
+                FROM learning_progress
+                WHERE user_id=%s AND course_id=%s AND status='completed'
+                  AND next_review_at IS NOT NULL AND next_review_at<=%s
+                  AND (review_completed_at IS NULL OR review_completed_at < review_scheduled_at)
+                ORDER BY next_review_at ASC, completed_at ASC NULLS LAST, id ASC
+            """,(user_id,course_id,now))
+            rows=[]; seen=set()
+            for rr in cur.fetchall():
+                r=dict(rr)
+                key=(str(r.get('content_type') or ''),str(r.get('lesson') or '').casefold(),str(r.get('topic') or '').casefold())
+                if key in seen: continue
+                seen.add(key)
+                ids=_review_lesson_item_ids(int(course_id),str(r.get('content_type') or 'Giáo trình'),str(r.get('lesson') or ''))
+                r['vocabulary_ids']=ids['vocabulary']; r['grammar_ids']=ids['grammar']
+                r['vocabulary_count']=len(ids['vocabulary']); r['grammar_count']=len(ids['grammar'])
+                if ids['vocabulary'] or ids['grammar']:
+                    rows.append(r)
+            return rows
+    finally:
+        conn.close()
+
+
+def _mark_review_schedule_completed(user_id, course_id, source_lesson):
+    lesson=str(source_lesson or '').strip()
+    if not lesson: return
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE learning_progress SET review_completed_at=NOW(),next_review_at=NULL
+                           WHERE user_id=%s AND course_id=%s AND status='completed'
+                             AND lower(trim(coalesce(lesson,'')))=lower(trim(%s))
+                             AND review_scheduled_at IS NOT NULL
+                             AND (review_completed_at IS NULL OR review_completed_at < review_scheduled_at)""",(user_id,course_id,lesson))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_review_schedule_request(text):
+    low=str(text or '').strip().casefold()
+    phrases=(
+        'tôi muốn ôn tập','toi muon on tap','mình muốn ôn tập','minh muon on tap','muốn ôn tập','muon on tap',
+        'ôn tập hôm nay','on tap hom nay','hôm nay cần ôn gì','hom nay can on gi','hôm nay ôn gì','hom nay on gi',
+        'có gì cần ôn','co gi can on','cần ôn gì','can on gi','ôn lại','on lai','review hôm nay','review hom nay'
+    )
+    return bool(low) and any(p in low for p in phrases)
+
+
+def _build_review_schedule_chat_blocks(user_id, course_id, course_name):
+    due=_review_due_items(user_id,course_id)
+    scheduled=_review_scheduled_lessons(user_id,course_id)
+    lines=[f"🔄 Lịch ôn tập — {course_name or 'khóa học hiện tại'}"]
+    if scheduled:
+        lines.append(f"📚 Hôm nay có {len(scheduled)} bài cần ôn.")
+        for r in scheduled[:6]:
+            parts=[]
+            if r.get('vocabulary_count'): parts.append(f"{int(r['vocabulary_count'])} từ vựng")
+            if r.get('grammar_count'): parts.append(f"{int(r['grammar_count'])} ngữ pháp")
+            lines.append(f"• {r.get('lesson')}: {', '.join(parts) or 'kiến thức của bài'}")
+    else:
+        lines.append('✅ Hôm nay chưa có bài ôn đã đến lịch.')
+    extra=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
+    if extra:
+        lines.append(f"📌 Ngoài ra có {extra} kiến thức cần ôn lại do các lần review trước trả lời sai.")
+    msg='\n'.join(lines)
+    if scheduled or extra:
+        msg += "\n\nCậu có muốn mở phiên ôn tập ngay không?"
+        blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_choice","options":[{"label":"Bắt đầu ôn","action":"review_open"},{"label":"Để sau","action":"review_keep"}]}]
+    else:
+        msg += "\n\nKhi muốn ôn, cậu chỉ cần nói 'tôi muốn ôn tập' nhé."
+        blocks=[{"type":"text","text":msg}]
+    return msg,blocks
+
+
 def _review_due_items(user_id, course_id):
     now=_now_local()
     conn=db()
@@ -8061,31 +8235,26 @@ def _review_due_items(user_id, course_id):
 
 
 def _review_first_lesson_items(user_id, course_id):
-    """Return vocabulary/grammar introduced by the most recently completed lesson.
-    Uses canonical catalog first-seen lesson as a safe fallback when a lesson-item mapping
-    has not yet been backfilled by curriculum generation.
-    """
+    scheduled=_review_scheduled_lessons(user_id,course_id)
+    if scheduled:
+        r=scheduled[0]
+        return str(r.get('lesson') or '').strip(), {
+            'vocabulary':[{'id':int(x)} for x in r.get('vocabulary_ids') or []],
+            'grammar':[{'id':int(x)} for x in r.get('grammar_ids') or []],
+            'content_type':str(r.get('content_type') or 'Giáo trình'),
+            'scheduled':True,
+        }
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT lesson FROM learning_progress
-                           WHERE user_id=%s AND course_id=%s AND status='completed'
-                           ORDER BY completed_at DESC NULLS LAST,last_studied_at DESC LIMIT 1""",(user_id,course_id))
+            cur.execute("""SELECT lesson,content_type FROM learning_progress WHERE user_id=%s AND course_id=%s AND status='completed' ORDER BY completed_at DESC NULLS LAST,last_studied_at DESC LIMIT 1""",(user_id,course_id))
             lp=cur.fetchone()
-            if not lp: return None,{"vocabulary":[],"grammar":[]}
-            lesson=str(lp.get('lesson') or '').strip()
-            cur.execute("""SELECT id,writing,reading,pronunciation_vi,meaning,example
-                           FROM curriculum_vocab_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s))
-                           ORDER BY id""",(course_id,lesson))
-            vocab=[dict(x) for x in cur.fetchall()]
-            cur.execute("""SELECT id,pattern,meaning,explanation,example
-                           FROM curriculum_grammar_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s))
-                           ORDER BY id""",(course_id,lesson))
-            grammar=[dict(x) for x in cur.fetchall()]
-            return lesson,{"vocabulary":vocab,"grammar":grammar}
+        if not lp: return None,{'vocabulary':[],'grammar':[],'content_type':'Giáo trình','scheduled':False}
+        lesson=str(lp.get('lesson') or '').strip(); ct=str(lp.get('content_type') or 'Giáo trình')
+        ids=_review_lesson_item_ids(course_id,ct,lesson)
+        return lesson,{'vocabulary':[{'id':int(x)} for x in ids['vocabulary']], 'grammar':[{'id':int(x)} for x in ids['grammar']], 'content_type':ct,'scheduled':False}
     finally:
         conn.close()
-
 
 def _review_master_payload(course_id, due):
     conn=db()
@@ -8164,9 +8333,17 @@ def learning_review_today(course_id: Optional[int] = None, authorization: Option
     if selected_course_id is None:
         raise HTTPException(400, 'Cần chọn khóa học để ôn tập.')
     due=_review_due_items(user['id'], selected_course_id)
+    scheduled=_review_scheduled_lessons(user['id'], selected_course_id)
+    scheduled_payload=[{
+        'lesson':r.get('lesson'),'content_type':r.get('content_type'),
+        'vocabulary_count':int(r.get('vocabulary_count') or 0),'grammar_count':int(r.get('grammar_count') or 0),
+        'next_review_at':r.get('next_review_at'),'completed_at':r.get('completed_at')
+    } for r in scheduled]
+    count=len(due['vocabulary'])+len(due['grammar'])
     return {'course_id':int(selected_course_id),'course':selected_course_name,'course_name':selected_course_name,
             'due':due,'due_items':due,'pending_items':[],
-            'count':len(due['vocabulary'])+len(due['grammar'])}
+            'scheduled_lessons':scheduled_payload,'scheduled_count':len(scheduled_payload),
+            'count':count,'review_available':bool(count or scheduled_payload)}
 
 @app.post('/learning/review/start')
 def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
@@ -8256,10 +8433,14 @@ def learning_review_finish(payload: dict, authorization: Optional[str] = Header(
     user=require_active_user(authorization); sid=int(payload.get('session_id') or 0)
     conn=db()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT course_id,source_lesson FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
+            sess=cur.fetchone()
             cur.execute("UPDATE user_review_sessions SET status='COMPLETED',completed_at=NOW(),answers_json=%s::jsonb WHERE id=%s AND user_id=%s",(json.dumps(payload.get('answers') or {},ensure_ascii=False),sid,user['id']))
         conn.commit()
     finally: conn.close()
+    if sess:
+        _mark_review_schedule_completed(user['id'],int(sess['course_id']),sess.get('source_lesson'))
     return {'success':True}
 
 @app.get("/learning/plan")
