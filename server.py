@@ -1,7 +1,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.96-curriculum-progress-bootstrap-course-id-fix"
+BASELINE_VERSION = "19.101-curriculum-review-persistence-fix"
 import os
 import ast
 import io
@@ -85,7 +85,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.99-pending-plan-course-id-fix")
+print("[DORAEMON SERVER FINGERPRINT] 19.101-curriculum-review-persistence-fix")
 SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -278,6 +278,38 @@ def init_db():
             ]:
                 cur.execute(sql)
 
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_vocabulary_review (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT NOT NULL,
+                vocab_id BIGINT NOT NULL,
+                wrong_count INTEGER NOT NULL DEFAULT 1,
+                last_wrong_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                next_review_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(user_id,course_id,vocab_id)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_grammar_review (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT NOT NULL,
+                grammar_id BIGINT NOT NULL,
+                wrong_count INTEGER NOT NULL DEFAULT 1,
+                last_wrong_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                next_review_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY(user_id,course_id,grammar_id)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_review_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT NOT NULL,
+                source_lesson VARCHAR(255),
+                status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                question_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                answers_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_vocab_review_due ON user_vocabulary_review(user_id,course_id,next_review_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_grammar_review_due ON user_grammar_review(user_id,course_id,next_review_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_review_sessions_user ON user_review_sessions(user_id,course_id,created_at DESC);")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plans (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 version INTEGER NOT NULL DEFAULT 1, status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
@@ -592,6 +624,27 @@ def _authorized_courses(user_id):
     return rows
 
 
+def _get_saved_selected_course_id(user_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT selected_course_id FROM user_learning_state WHERE user_id=%s",(user_id,))
+            row=cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+def _set_saved_selected_course_id(user_id, course_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO user_learning_state(user_id,selected_course_id,updated_at)
+                           VALUES(%s,%s,NOW())
+                           ON CONFLICT(user_id) DO UPDATE SET selected_course_id=EXCLUDED.selected_course_id,updated_at=NOW()""",(user_id,course_id))
+        conn.commit()
+    finally:
+        conn.close()
+
 def _resolve_request_course(user_id, requested_course_id):
     courses=_authorized_courses(user_id)
     if requested_course_id not in (None, ""):
@@ -599,9 +652,16 @@ def _resolve_request_course(user_id, requested_course_id):
         except Exception: raise HTTPException(400,"course_id không hợp lệ.")
         hit=next((c for c in courses if int(c['course_id'])==cid),None)
         if not hit: raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
+        _set_saved_selected_course_id(user_id, cid)
         return int(hit['course_id']), str(hit['name']), courses
+    saved=_get_saved_selected_course_id(user_id)
+    if saved is not None:
+        hit=next((c for c in courses if int(c['course_id'])==saved),None)
+        if hit: return int(hit['course_id']), str(hit['name']), courses
     if len(courses)==1:
-        c=courses[0]; return int(c['course_id']), str(c['name']), courses
+        c=courses[0]
+        _set_saved_selected_course_id(user_id,int(c['course_id']))
+        return int(c['course_id']), str(c['name']), courses
     return None,None,courses
 
 
@@ -738,7 +798,17 @@ def login(data: LoginRequest):
 def me(authorization: Optional[str] = Header(default=None)):
     user = current_user(bearer(authorization))
     sub, msg = subscription_status(user["id"])
-    return {"user": user, "subscription": _package_info(user["id"]), "subscription_message": msg}
+    selected_course_id, selected_course_name, _ = _resolve_request_course(user["id"], None)
+    return {"user": user, "subscription": _package_info(user["id"]), "subscription_message": msg,
+            "selected_course_id": selected_course_id, "selected_course_name": selected_course_name}
+
+@app.post("/learning/select-course")
+def learning_select_course(payload: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    cid, name, _ = _resolve_request_course(user["id"], payload.get("course_id"))
+    if cid is None:
+        raise HTTPException(400,"Không xác định được khóa học.")
+    return {"success":True,"course_id":cid,"course_name":name}
 
 @app.get("/admin-chat/history")
 def history(limit: int = 100, authorization: Optional[str] = Header(default=None)):
@@ -7964,14 +8034,138 @@ def save_learning_progress(data: dict, authorization: Optional[str] = Header(def
 
 
 
+
+def _review_due_items(user_id, course_id):
+    now=_now_local()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT r.vocab_id AS item_id,r.wrong_count,r.next_review_at,
+                                  m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example
+                           FROM user_vocabulary_review r
+                           JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                           WHERE r.user_id=%s AND r.course_id=%s AND r.next_review_at<=%s
+                           ORDER BY r.next_review_at,r.vocab_id""",(user_id,course_id,now))
+            vocab=[dict(x) for x in cur.fetchall()]
+            cur.execute("""SELECT r.grammar_id AS item_id,r.wrong_count,r.next_review_at,
+                                  m.pattern,m.meaning,m.explanation,m.example
+                           FROM user_grammar_review r
+                           JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                           WHERE r.user_id=%s AND r.course_id=%s AND r.next_review_at<=%s
+                           ORDER BY r.next_review_at,r.grammar_id""",(user_id,course_id,now))
+            grammar=[dict(x) for x in cur.fetchall()]
+        return {"vocabulary":vocab,"grammar":grammar}
+    finally:
+        conn.close()
+
+
+def _review_first_lesson_items(user_id, course_id):
+    """Return vocabulary/grammar introduced by the most recently completed lesson.
+    Uses canonical catalog first-seen lesson as a safe fallback when a lesson-item mapping
+    has not yet been backfilled by curriculum generation.
+    """
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT lesson FROM learning_progress
+                           WHERE user_id=%s AND course_id=%s AND status='completed'
+                           ORDER BY completed_at DESC NULLS LAST,last_studied_at DESC LIMIT 1""",(user_id,course_id))
+            lp=cur.fetchone()
+            if not lp: return None,{"vocabulary":[],"grammar":[]}
+            lesson=str(lp.get('lesson') or '').strip()
+            cur.execute("""SELECT id,writing,reading,pronunciation_vi,meaning,example
+                           FROM curriculum_vocab_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s))
+                           ORDER BY id""",(course_id,lesson))
+            vocab=[dict(x) for x in cur.fetchall()]
+            cur.execute("""SELECT id,pattern,meaning,explanation,example
+                           FROM curriculum_grammar_master WHERE course_id=%s AND lower(trim(source_lesson))=lower(trim(%s))
+                           ORDER BY id""",(course_id,lesson))
+            grammar=[dict(x) for x in cur.fetchall()]
+            return lesson,{"vocabulary":vocab,"grammar":grammar}
+    finally:
+        conn.close()
+
+
+def _review_master_payload(course_id, due):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            vids=[int(x.get('item_id')) for x in due.get('vocabulary',[]) if x.get('item_id') is not None]
+            gids=[int(x.get('item_id')) for x in due.get('grammar',[]) if x.get('item_id') is not None]
+            vocab=[]; grammar=[]
+            if vids:
+                cur.execute("""SELECT id,writing,reading,pronunciation_vi,meaning,example
+                               FROM curriculum_vocab_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,vids))
+                vocab=[dict(x) for x in cur.fetchall()]
+            if gids:
+                cur.execute("""SELECT id,pattern,meaning,explanation,example
+                               FROM curriculum_grammar_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,gids))
+                grammar=[dict(x) for x in cur.fetchall()]
+            return {"vocabulary":vocab,"grammar":grammar}
+    finally:
+        conn.close()
+
+
+def _review_genai_one_call(course_id, data, max_q):
+    import json as _json
+    prompt=("Bạn là gia sư tiếng Nhật. Tạo tối đa %d câu ôn tập ngẫu nhiên từ dữ liệu dưới đây. "
+            "Chỉ dùng kiến thức đã cho. Từ vựng: hỏi nghĩa/trắc nghiệm/VN→JP/điền từ. "
+            "Ngữ pháp: trắc nghiệm/hoàn thành câu/đặt câu. Không lặp cùng item nếu chưa cần. "
+            "Trả JSON duy nhất dạng {\\\"questions\\\":[{\\\"item_type\\\":\\\"vocabulary\\\"|\\\"grammar\\\",\\\"item_id\\\":number,\\\"question_type\\\":\\\"...\\\",\\\"question\\\":\\\"...\\\",\\\"options\\\":[...],\\\"answer\\\":\\\"...\\\",\\\"answer_criteria\\\":\\\"...\\\"}]}.") % max_q
+    payload=_json.dumps(data,ensure_ascii=False,separators=(',',':'))
+    reply,model,_=_generate_chat_reply(prompt+"\nDATA="+payload,content_type=None,request_id=f"review-{course_id}-{int(time.time())}",gen_started=time.perf_counter(),user_text="",reasoning_profile="low")
+    text=reply.strip()
+    if text.startswith("```"):
+        text=re.sub(r"^```(?:json)?\\s*|\\s*```$","",text,flags=re.I|re.S).strip()
+    try:
+        out=_json.loads(text)
+    except Exception:
+        m=re.search(r"\\{.*\\}",text,re.S)
+        out=_json.loads(m.group(0)) if m else {"questions":[]}
+    qs=out.get('questions') if isinstance(out,dict) else []
+    return qs if isinstance(qs,list) else []
+
+
+def _clear_success_review(user_id, course_id, item_type, item_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            table='user_vocabulary_review' if item_type=='vocabulary' else 'user_grammar_review'
+            col='vocab_id' if item_type=='vocabulary' else 'grammar_id'
+            cur.execute(f"DELETE FROM {table} WHERE user_id=%s AND course_id=%s AND {col}=%s",(user_id,course_id,item_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _schedule_failed_review(user_id, course_id, item_type, item_id):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            table='user_vocabulary_review' if item_type=='vocabulary' else 'user_grammar_review'
+            col='vocab_id' if item_type=='vocabulary' else 'grammar_id'
+            cur.execute(f"SELECT wrong_count FROM {table} WHERE user_id=%s AND course_id=%s AND {col}=%s FOR UPDATE",(user_id,course_id,item_id))
+            old=cur.fetchone(); wrong_count=int(old.get('wrong_count') or 0)+1 if old else 1
+            delay={1:1,2:3,3:7}.get(wrong_count,14)
+            next_at=_now_local()+timedelta(days=delay)
+            if old:
+                cur.execute(f"UPDATE {table} SET wrong_count=%s,last_wrong_at=NOW(),next_review_at=%s WHERE user_id=%s AND course_id=%s AND {col}=%s",(wrong_count,next_at,user_id,course_id,item_id))
+            else:
+                cur.execute(f"INSERT INTO {table}(user_id,course_id,{col},wrong_count,last_wrong_at,next_review_at) VALUES(%s,%s,%s,%s,NOW(),%s)",(user_id,course_id,item_id,wrong_count,next_at))
+        conn.commit()
+    finally:
+        conn.close()
+
 @app.get('/learning/review/today')
 def learning_review_today(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    selected_course_id, selected_course_name, authorized_courses = _resolve_request_course(user['id'], course_id)
+    selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
     if selected_course_id is None:
         raise HTTPException(400, 'Cần chọn khóa học để ôn tập.')
     due=_review_due_items(user['id'], selected_course_id)
-    return {'course_id':int(selected_course_id),'course':selected_course_name,'due':due,'count':len(due['vocabulary'])+len(due['grammar'])}
+    return {'course_id':int(selected_course_id),'course':selected_course_name,'course_name':selected_course_name,
+            'due':due,'due_items':due,'pending_items':[],
+            'count':len(due['vocabulary'])+len(due['grammar'])}
 
 @app.post('/learning/review/start')
 def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
@@ -7983,62 +8177,78 @@ def learning_review_start(payload: dict, authorization: Optional[str] = Header(d
     due=_review_due_items(user['id'], selected_course_id)
     source_lesson='review_due'
     if not due['vocabulary'] and not due['grammar']:
-        # First review after a completed lesson: take the vocabulary/grammar IDs
-        # mapped to the most recently completed published lesson in this course.
-        conn=db()
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""SELECT cl.id,cl.lesson FROM learning_progress lp
-                    JOIN curriculum_lessons cl ON cl.course_id=%s AND cl.status='PUBLISHED' AND lower(cl.lesson)=lower(lp.lesson)
-                    WHERE lp.user_id=%s AND lp.course_id=%s AND lp.status='completed'
-                      AND lp.content_type IN ('Giáo trình','Truyện đọc','Ngữ pháp','Từ vựng','Bài tập')
-                    ORDER BY lp.completed_at DESC NULLS LAST, lp.last_studied_at DESC NULLS LAST LIMIT 1""",(selected_course_id,user['id'],selected_course_id))
-                last=cur.fetchone()
-                if last:
-                    source_lesson=str(last.get('lesson') or 'review').strip()
-                    cur.execute("SELECT DISTINCT item_type,item_id FROM curriculum_lesson_items WHERE lesson_id=%s",(int(last['id']),))
-                    for typ,iid in cur.fetchall() or []:
-                        key='vocabulary' if typ=='vocabulary' else 'grammar'
-                        due[key].append(int(iid))
-        finally:
-            conn.close()
+        source_lesson, first=_review_first_lesson_items(user['id'], selected_course_id)
+        if source_lesson:
+            due={'vocabulary':[{'item_id':x['id'],**x} for x in first['vocabulary']],
+                 'grammar':[{'item_id':x['id'],**x} for x in first['grammar']]}
     if not due['vocabulary'] and not due['grammar']:
         raise HTTPException(404,'Không có kiến thức cần ôn.')
-    # De-duplicate while preserving only the catalog IDs; question generation is GenAI-only.
-    due['vocabulary']=list(dict.fromkeys(due['vocabulary']))
-    due['grammar']=list(dict.fromkeys(due['grammar']))
-    data=_review_master_payload(selected_course_id, due)
+    due['vocabulary']=list({int(x['item_id']):x for x in due['vocabulary']}.values())
+    due['grammar']=list({int(x['item_id']):x for x in due['grammar']}.values())
+    data=_review_master_payload(selected_course_id,due)
+    # If first-review payload came directly from catalog, preserve it as-is.
+    if not data['vocabulary'] and due['vocabulary']:
+        data['vocabulary']=due['vocabulary']
+    if not data['grammar'] and due['grammar']:
+        data['grammar']=due['grammar']
     max_q=max(1,min(10,int(payload.get('max_questions') or 8)))
     questions=_review_genai_one_call(selected_course_id,data,max_q)
+    if not questions:
+        raise HTTPException(500,'Không tạo được câu hỏi ôn tập.')
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("INSERT INTO user_review_sessions(user_id,course_id,source_lesson,question_json) VALUES(%s,%s,%s,%s::jsonb) RETURNING id,created_at",(user['id'],int(selected_course_id),'review_due',json.dumps(questions,ensure_ascii=False)))
-            row=cur.fetchone(); conn.commit()
+            cur.execute("""INSERT INTO user_review_sessions(user_id,course_id,source_lesson,question_json)
+                           VALUES(%s,%s,%s,%s::jsonb) RETURNING id""",(user['id'],int(selected_course_id),source_lesson,json.dumps(questions,ensure_ascii=False)))
+            row=cur.fetchone()
+        conn.commit()
     finally: conn.close()
-    return {'session_id':int(row['id']),'course_id':int(selected_course_id),'course':selected_course_name,'questions':questions}
+    return {'session_id':int(row['id']),'course_id':int(selected_course_id),'course':selected_course_name,
+            'course_name':selected_course_name,'questions':questions}
 
 @app.post('/learning/review/answer')
 def learning_review_answer(payload: dict, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    sid=int(payload.get('session_id') or 0); item_type=str(payload.get('item_type') or '').strip(); item_id=int(payload.get('item_id') or 0); correct=bool(payload.get('correct'))
+    sid=int(payload.get('session_id') or 0)
+    item_type=str(payload.get('item_type') or '').strip()
+    item_id=int(payload.get('item_id') or 0)
+    answer=str(payload.get('answer') or '').strip()
     if not sid or item_type not in {'vocabulary','grammar'} or not item_id:
         raise HTTPException(400,'Dữ liệu review không hợp lệ.')
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM user_review_sessions WHERE id=%s AND user_id=%s FOR UPDATE",(sid,user['id']))
+            cur.execute("SELECT * FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
             sess=cur.fetchone()
-            if not sess: raise HTTPException(404,'Không tìm thấy phiên review.')
-            course_id=int(sess['course_id'])
-        conn.commit()
+        if not sess: raise HTTPException(404,'Không tìm thấy phiên review.')
     finally: conn.close()
-    if correct:
-        _clear_success_review(user['id'],course_id,item_type,item_id)
+    questions=sess.get('question_json') or []
+    q=next((x for x in questions if str(x.get('item_type'))==item_type and int(x.get('item_id') or 0)==item_id),None)
+    if not q: raise HTTPException(404,'Không tìm thấy câu hỏi tương ứng.')
+    correct=False; explanation=''
+    options=q.get('options') or []
+    expected=str(q.get('answer') or '').strip()
+    qtype=str(q.get('question_type') or '')
+    if options or qtype in {'meaning_choice','choice','multiple_choice','completion_choice'}:
+        correct=answer.casefold()==expected.casefold() or any(answer.casefold()==str(o).casefold() and str(o).casefold()==expected.casefold() for o in options)
+        if not correct and options and expected and expected.casefold() in [str(o).casefold() for o in options]:
+            correct=answer.casefold()==expected.casefold()
+    elif qtype=='sentence_creation':
+        rubric=str(q.get('answer_criteria') or expected).strip()
+        prompt=("Đánh giá câu trả lời tiếng Nhật. Trả JSON duy nhất {\"correct\":true|false,\"explanation\":\"...\"}. "
+                "Đúng nếu câu dùng đúng cấu trúc mục tiêu và phù hợp yêu cầu, cho phép nhiều cách diễn đạt đúng.\n"
+                f"Mẫu: {rubric}\nCâu hỏi: {q.get('question','')}\nTrả lời học sinh: {answer}")
+        reply,_,_=_generate_chat_reply(prompt,content_type='Ngữ pháp',request_id=f"review-eval-{sid}-{item_id}",gen_started=time.perf_counter(),user_text=answer,reasoning_profile='low')
+        try:
+            obj=json.loads(reply.strip().strip('`').replace('json\n','',1)); correct=bool(obj.get('correct')); explanation=str(obj.get('explanation') or '')
+        except Exception:
+            correct=False; explanation='Doraemon chưa xác định được câu trả lời, mình thử lại nhé.'
     else:
-        # wrong_count is read/updated atomically in the helper; schedule is intentionally outside GenAI.
-        _schedule_failed_review(user['id'],course_id,item_type,item_id)
-    return {'success':True,'item_type':item_type,'item_id':item_id,'correct':correct}
+        correct=answer.casefold()==expected.casefold()
+    course_id=int(sess['course_id'])
+    if correct: _clear_success_review(user['id'],course_id,item_type,item_id)
+    else: _schedule_failed_review(user['id'],course_id,item_type,item_id)
+    return {'success':True,'session_id':sid,'item_type':item_type,'item_id':item_id,'correct':correct,'explanation':explanation}
 
 @app.post('/learning/review/finish')
 def learning_review_finish(payload: dict, authorization: Optional[str] = Header(default=None)):
@@ -8059,12 +8269,17 @@ def get_learning_plan(course_id: Optional[int] = None, authorization: Optional[s
     authorized_ids=[int(c["course_id"]) for c in authorized if c.get("course_id") is not None]
     if course_id is not None:
         _resolve_request_course(user["id"], course_id)
-    elif len(authorized_ids)==1:
-        course_id=authorized_ids[0]
     else:
-        # Multiple courses require the client to explicitly select one. Never mix plans.
-        plans=[]; plan=None; draft=None
-        return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":None,"plans":[],"draft":None,"course_id":None,"requires_course_selection":bool(authorized_ids),"courses":authorized}
+        saved=_get_saved_selected_course_id(user["id"])
+        if saved in authorized_ids:
+            course_id=saved
+        elif len(authorized_ids)==1:
+            course_id=authorized_ids[0]
+            _set_saved_selected_course_id(user["id"],course_id)
+        else:
+            # Multiple courses require the client to explicitly select one. Never mix plans.
+            plans=[]; plan=None; draft=None
+            return {"learning_mode":profile.get("learning_mode"),"onboarding_completed":profile.get("onboarding_completed"),"plan":None,"plans":[],"draft":None,"course_id":None,"requires_course_selection":bool(authorized_ids),"courses":authorized}
     plans=_active_plans(user["id"], course_id=course_id)
     plan=plans[0] if plans else None
     draft=_latest_draft(user["id"], course_id)
@@ -8786,6 +9001,13 @@ def init_curriculum_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(source_file, content_type, lesson, version)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_lesson_items (
+                lesson_id BIGINT NOT NULL REFERENCES curriculum_lessons(id) ON DELETE CASCADE,
+                item_type VARCHAR(20) NOT NULL,
+                item_id BIGINT NOT NULL,
+                PRIMARY KEY(lesson_id,item_type,item_id)
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lesson_items_lesson ON curriculum_lesson_items(lesson_id,item_type);")
             cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_steps (
                 id BIGSERIAL PRIMARY KEY, lesson_id BIGINT NOT NULL REFERENCES curriculum_lessons(id) ON DELETE CASCADE,
                 step_code VARCHAR(20) NOT NULL, step_order INTEGER NOT NULL, title VARCHAR(500) NOT NULL DEFAULT '',
