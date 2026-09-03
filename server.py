@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.108-grammar-fill-ai-grading"
+BASELINE_VERSION = "19.109-review-wrong-only-fix"
 import os
 import ast
 import io
@@ -90,7 +90,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.108-grammar-fill-ai-grading")
-SERVER_VERSION = "2026-09-03-v19_108_grammar_fill_ai_grading"
+SERVER_VERSION = "2026-09-03-v19_109_review_wrong_only_fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -9199,62 +9199,6 @@ def _review_first_failed_lesson(user_id, course_id):
     finally:
         conn.close()
 
-
-def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12):
-    requested_lesson=str(lesson or '').strip()
-    requested_type=str(content_type or '').strip() or None
-    if requested_lesson:
-        ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
-        if not ids['vocabulary'] and not ids['grammar']:
-            raise HTTPException(404,f'Bài {requested_lesson!r} chưa được xác nhận hoàn thành hoặc chưa có từ vựng/ngữ pháp trong DB để ôn.')
-        due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
-        source_lesson=requested_lesson
-    else:
-        due=_review_due_items(user_id,course_id)
-        source_lesson='review_due'
-        if not due['vocabulary'] and not due['grammar']:
-            source_lesson, first=_review_first_lesson_items(user_id,course_id)
-            if not source_lesson:
-                raise HTTPException(404,'Không có bài đã học để ôn tập.')
-            due={'vocabulary':[{'item_id':int(x['id'])} for x in first['vocabulary']],
-                 'grammar':[{'item_id':int(x['id'])} for x in first['grammar']]}
-
-    due['vocabulary']=list({int(x['item_id']):x for x in due.get('vocabulary',[])}.values())
-    due['grammar']=list({int(x['item_id']):x for x in due.get('grammar',[])}.values())
-    data=_review_master_payload(int(course_id),due)
-    if not data['vocabulary'] and due['vocabulary']:
-        data['vocabulary']=due['vocabulary']
-    if not data['grammar'] and due['grammar']:
-        data['grammar']=due['grammar']
-    max_q=max(1,min(12,int(max_questions or 12)))
-    questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None)
-    if not questions:
-        # Last-resort DB-only questions, so a model-format failure never blocks review.
-        questions=[_review_vocab_question(x,data.get('vocabulary') or []) for x in (data.get('vocabulary') or [])[:min(9,max_q)]]
-        questions=questions[:max_q]
-    if not questions:
-        raise HTTPException(500,'Không có dữ liệu DB hợp lệ để tạo câu hỏi ôn tập.')
-
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                INSERT INTO user_review_sessions(user_id,course_id,source_lesson,chatbox_id,current_question_index,question_json,answers_json,status)
-                VALUES(%s,%s,%s,%s,0,%s::jsonb,'{}'::jsonb,'ACTIVE') RETURNING id
-            """,(user_id,int(course_id),source_lesson,str(chatbox_id or '').strip() or None,json.dumps(questions,ensure_ascii=False)))
-            row=cur.fetchone()
-        conn.commit()
-    finally:
-        conn.close()
-    sid=int(row['id'])
-    _,blocks=_review_question_blocks(sid,questions[0],0,len(questions))
-    msg=(f'🔄 Bắt đầu ôn bài **{source_lesson}** nhé.\n\n'
-         f'Doraemon sẽ hỏi từng câu một. Cậu trả lời xong, mình mới chuyển sang câu tiếp theo.')
-    # Put the first question immediately after the short introduction.
-    blocks=[{'type':'text','text':msg}]+blocks
-    first_text='\n\n'.join(str(b.get('text') or '') for b in blocks if b.get('type')=='text')
-    return {'session_id':sid,'course_id':int(course_id),'course':course_name,'source_lesson':source_lesson,
-            'questions':questions,'reply':first_text,'content_blocks':blocks}
 
 
 def _meaning_matches(answer, expected):
