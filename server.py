@@ -1,7 +1,8 @@
+# VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.103-review-schedule-chat"
+BASELINE_VERSION = "19.104-review-schedule-fix"
 import os
 import ast
 import io
@@ -14,6 +15,7 @@ from typing import Optional
 import json
 import base64
 import calendar
+import urllib.parse
 import hashlib
 import tempfile
 import gc
@@ -85,8 +87,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.103-review-schedule-chat")
-SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
+print("[DORAEMON SERVER FINGERPRINT] 19.104-review-schedule-fix")
+SERVER_VERSION = "2026-09-03-v19_104_review_schedule_fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -178,6 +180,7 @@ def init_db():
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                review_interval_days INTEGER NOT NULL DEFAULT 2,
                 welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -343,6 +346,7 @@ def init_db():
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
                 target TEXT NOT NULL DEFAULT '', status VARCHAR(20) NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ
             );""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 2;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS course_guide_seen BOOLEAN NOT NULL DEFAULT FALSE;""")
