@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.106-review-quiz-typed-wrong-only"
+BASELINE_VERSION = "19.108-grammar-fill-ai-grading"
 import os
 import ast
 import io
@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.104-review-schedule-fix")
-SERVER_VERSION = "2026-09-03-v19_104_review_schedule_fix"
+print("[DORAEMON SERVER FINGERPRINT] 19.108-grammar-fill-ai-grading")
+SERVER_VERSION = "2026-09-03-v19_108_grammar_fill_ai_grading"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5241,6 +5241,7 @@ def proxy_chat(
                 'learning_progress':None,'review':True}
 
     if _is_wrong_review_request(data.text):
+        print(f'[REVIEW INTENT] WRONG_ONLY text={data.text[:160]!r}')
         if selected_course_id is None:
             msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết bài cần làm lại nhé."
             return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
@@ -5344,7 +5345,7 @@ def proxy_chat(
     # Once a chatbox has started a review session, normal user text is an answer
     # to the current question. This keeps the review state authoritative without
     # requiring a special client textbox or a popup.
-    if selected_course_id is not None and data.text and not data.action:
+    if selected_course_id is not None and data.text and not data.action and not _is_wrong_review_request(data.text):
         active_review=_get_active_review_session(user['id'],int(selected_course_id),data.chatbox_id)
         if active_review:
             low_review=data.text.casefold().strip()
@@ -8343,19 +8344,58 @@ def _find_completed_lesson(user_id, course_id, text):
     return None
 
 
+def _strip_vietnamese_diacritics(text):
+    import unicodedata
+    s=str(text or '').casefold()
+    s=''.join(ch for ch in unicodedata.normalize('NFD', s)
+              if unicodedata.category(ch) != 'Mn')
+    return s.replace('đ','d').replace('Đ','D')
+
+
 def _is_wrong_review_request(text):
+    """Detect requests to redo only the items answered incorrectly before.
+
+    This must be more specific than the generic manual-review intent.  In particular
+    phrases such as "ôn lại bài Dã ngoại những phần chưa đúng" and
+    "làm lại những câu làm sai bài Dã ngoại" must be classified as WRONG_ONLY.
+    """
     q=str(text or '').strip().casefold()
     if not q:
         return False
+    nq=_strip_vietnamese_diacritics(q)
+
     markers=(
-        'làm lại những bài tôi làm sai', 'lam lai nhung bai toi lam sai',
-        'làm lại bài tôi làm sai', 'lam lai bai toi lam sai',
-        'làm lại những câu sai', 'lam lai nhung cau sai',
-        'ôn lại những câu sai', 'on lai nhung cau sai',
-        'ôn những câu sai', 'on nhung cau sai',
-        'làm lại phần sai', 'lam lai phan sai',
+        'lam lai nhung bai toi lam sai',
+        'lam lai bai toi lam sai',
+        'lam lai nhung cau sai',
+        'lam lai nhung cau lam sai',
+        'lam lai nhung cau chua dung',
+        'lam lai nhung phan sai',
+        'lam lai nhung phan chua dung',
+        'lam lai phan sai',
+        'lam lai phan chua dung',
+        'on lai nhung cau sai',
+        'on lai nhung cau lam sai',
+        'on lai nhung cau chua dung',
+        'on nhung cau sai',
+        'on nhung cau lam sai',
+        'on nhung cau chua dung',
+        'on lai nhung phan sai',
+        'on lai nhung phan chua dung',
+        'on nhung phan sai',
+        'on nhung phan chua dung',
     )
-    return any(m in q for m in markers)
+    if any(m in nq for m in markers):
+        return True
+
+    # Flexible forms where "bài/part/những phần" and "sai/chưa đúng" vary.
+    wrong=re.search(r'\b(?:sai|lam sai|chua dung|khong dung|tra loi sai|khong dung)\b', nq)
+    redo=re.search(r'\b(?:lam lai|on lai|on|lam lai nhung)\b', nq)
+    scoped=re.search(r'\b(?:bai|phan|cau|noi dung|nhung phan|nhung cau)\b', nq)
+    if wrong and redo and scoped:
+        return True
+    # Natural form: "ôn lại bài X những phần chưa đúng/sai".
+    return bool(re.search(r'\bon lai\b.*\bbai\b.+\b(?:chua dung|sai|lam sai|khong dung)\b', nq))
 
 
 def _is_manual_review_request(text):
@@ -8721,11 +8761,11 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             'Mỗi item chỉ dùng một lần trong phiên.',
             'Mỗi câu phải thuộc một trong hai dạng question_type: multiple_choice hoặc fill_blank.',
             'Với multiple_choice phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
-            'Với fill_blank phải có câu hỏi có chỗ trống và answer là đáp án ngắn cần điền.',
+            'Với fill_blank phải có câu ví dụ từ DATA bị khuyết đúng một từ/cụm từ. Trả thêm blank_target là đúng chuỗi có trong example, và tuyệt đối không chọn pattern/đuôi ngữ pháp làm blank_target. answer phải bằng blank_target.',
             'Vocabulary: dùng writing/reading của DATA để hỏi nghĩa tiếng Việt. Tuyệt đối không đưa meaning của chính item vào phần question.',
             'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống.',
             'Không hiển thị đáp án đúng trong question.',
-            'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"..."}]}.',
+            'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"...","blank_target":"..."}]}.',
         ],
         'DATA':{'vocabulary':selected_vocab,'grammar':selected_grammar},
     }
@@ -8789,6 +8829,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         question=str(ai_q.get('question') or '').strip()
         options=ai_q.get('options') if isinstance(ai_q.get('options'),list) else []
         answer=str(ai_q.get('answer') or '').strip()
+        blank_target=str(ai_q.get('blank_target') or '').strip()
         option_letters=ai_q.get('option_letters') if isinstance(ai_q.get('option_letters'),dict) else {}
 
         if qtype not in {'multiple_choice','fill_blank'}:
@@ -8841,24 +8882,68 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
                 })
                 continue
 
-        # Fill blank grammar: ensure the visible question actually contains a blank.
-        fill_answer=answer or pattern
-        if not fill_answer:
-            fill_answer=pattern or meaning
-        fill_question=question
-        if example and fill_answer and fill_answer in example:
-            fill_question=example.replace(fill_answer,'____',1)
-            fill_question=f'Hoàn thành câu theo cấu trúc **{pattern or "này"}**:\n{fill_question}'
-        elif not re.search(r'_{2,}|…{2,}|\.{3,}',fill_question):
-            fill_question=(f'Hoàn thành câu theo cấu trúc **{pattern or "này"}** bằng cách điền vào chỗ trống: ______\n'
-                           f'Ý nghĩa cần dùng: {meaning or explanation}')
-        # Never put the target answer itself in the question text.
-        if fill_answer and fill_answer in fill_question:
-            if example and fill_answer in example:
-                masked=example.replace(fill_answer,'____',1)
-                fill_question=f'Hoàn thành câu theo cấu trúc **{pattern or "này"}**:\n{masked}'
-            else:
-                fill_question=re.sub(re.escape(fill_answer), '____', fill_question, count=1)
+        # Fill blank grammar: hide one concrete word/phrase from the example sentence.
+        # The target should be a lexical/content word, not the grammar pattern itself.
+        fill_answer=answer.strip()
+
+        def _grammar_fill_target(example_text, grammar_pattern, preferred=''):
+            ex=str(example_text or '').strip()
+            pref=str(preferred or '').strip()
+            if pref and pref in ex and pref != grammar_pattern:
+                return pref
+            if not ex:
+                return ''
+
+            # Japanese has no spaces, so split the example around common particles
+            # first. This keeps lexical chunks such as ご飯 intact in
+            # ご飯を食べましょう while separating them from the grammar predicate.
+            pieces=re.split(r'(?:を|が|は|に|へ|で|と|も|の|から|まで|や|より)', ex)
+            candidates=[]
+            for piece in pieces:
+                piece=re.sub(r'^[^ぁ-んァ-ン一-龯々ー]+|[^ぁ-んァ-ン一-龯々ー]+$','',piece)
+                if piece:
+                    candidates.append(piece)
+            # Also consider contiguous Japanese runs as a fallback.
+            candidates.extend(re.findall(r'[ぁ-んァ-ン一-龯々ー]+', ex))
+            # Deduplicate while preserving order.
+            candidates=list(dict.fromkeys(candidates))
+            banned_endings=(
+                'ましょう','ましよう','ません','ました','ます','です','でした',
+                'ませんか','ましょうか','ください','たいです','たい','ない','なかった',
+                'かった','って','っている','ています','てください','たり','たりします'
+            )
+            normalized_pattern=str(grammar_pattern or '').strip()
+            scored=[]
+            for c in candidates:
+                c=str(c).strip()
+                if not c or c == normalized_pattern:
+                    continue
+                if len(c) <= 1:
+                    continue
+                if any(c.endswith(end) for end in banned_endings):
+                    continue
+                # Prefer words containing kanji; deprioritize common function words.
+                has_kanji=bool(re.search(r'[一-龯々]', c))
+                score=(100 if has_kanji else 0) + min(len(c),8)
+                scored.append((score,c))
+            if scored:
+                scored.sort(key=lambda x:(x[0],x[1]), reverse=True)
+                return scored[0][1]
+            # Last safe fallback: longest non-pattern Japanese run.
+            safe=[c for c in candidates if c and c != normalized_pattern and len(c)>1]
+            return max(safe,key=len) if safe else ''
+
+        target=_grammar_fill_target(example,pattern,preferred=(blank_target or answer))
+        if target and example and target in example:
+            fill_answer=target
+            masked=example.replace(target,'____',1)
+            fill_question=(f'Hoàn thành câu theo cấu trúc **{pattern or "này"}** bằng cách điền từ thích hợp:\n'
+                           f'🇯🇵 {masked}')
+        else:
+            # Never fall back to exposing the grammar meaning as the blank target.
+            # Ask for a concrete Japanese word only when the example cannot be masked.
+            fill_answer=fill_answer or pattern or ''
+            fill_question=(f'Hoàn thành câu theo cấu trúc **{pattern or "này"}** bằng cách điền từ tiếng Nhật còn thiếu: ______')
         questions.append({
             'item_type':'grammar','item_id':item_id,'question_type':'fill_blank',
             'question':fill_question,
@@ -9189,6 +9274,62 @@ def _meaning_matches(answer, expected):
     return any(a==c or (len(a)>=4 and (a in c or c in a)) for c in candidates)
 
 
+def _evaluate_grammar_fill_with_genai(q, answer):
+    """Judge grammar fill answers semantically, allowing valid alternatives.
+
+    Only the minimum information required for grading is sent to the LLM: the
+    target grammar pattern, the masked sentence, the learner's answer, and the
+    resulting completed sentence.  The DB example/meaning/explanation are not
+    copied into the grading prompt unless they are already necessary to identify
+    the target pattern.
+    """
+    pattern=str(q.get('pattern') or '').strip()
+    question=str(q.get('question') or '').strip()
+    answer_text=str(answer or '').strip()
+    example=str(q.get('example') or '').strip()
+
+    # Reconstruct the learner's sentence by replacing the first blank marker.
+    if '____' in question:
+        sentence_template=question.split('\n')[-1].strip()
+    elif example:
+        sentence_template=example
+    else:
+        sentence_template=question
+    completed_sentence=sentence_template.replace('____', answer_text, 1)
+
+    prompt=(
+        'Đánh giá đáp án bài điền từ tiếng Nhật. ' 
+        'Chỉ kiểm tra: câu sau khi điền có đúng ngữ pháp và tự nhiên theo mẫu mục tiêu không. '
+        'Cho phép đáp án khác đáp án mẫu nếu câu hợp lệ; không yêu cầu trùng đúng một từ. '
+        'Chỉ trả JSON: {"correct":true|false,"explanation":"..."}.\n'
+        f'Mẫu ngữ pháp: {pattern}\n'
+        f'Câu: {completed_sentence}\n'
+        f'Đáp án người học điền: {answer_text}'
+    )
+    try:
+        started=time.perf_counter()
+        reply,_,_=_generate_chat_reply(
+            prompt,
+            content_type='Ngữ pháp',
+            request_id=f"review-grade-{int(time.time()*1000)}",
+            gen_started=started,
+            user_text=answer_text,
+            reasoning_profile='low'
+        )
+        obj=_review_json_from_text(reply)
+        if not isinstance(obj,dict):
+            raise ValueError('LLM grader did not return a JSON object')
+        correct=bool(obj.get('correct'))
+        explanation=str(obj.get('explanation') or '').strip()
+        return correct, explanation
+    except Exception as exc:
+        print(f'[REVIEW GRAMMAR GRADE] fallback: {type(exc).__name__}: {exc}')
+        # Safe fallback when the grader is unavailable: exact match only.
+        expected=str(q.get('answer') or '').strip()
+        correct=_meaning_matches(answer_text, expected)
+        return correct,(f'Đáp án mẫu là **{expected}**.' if expected and not correct else '')
+
+
 def _evaluate_review_answer(q, answer):
     item_type=str(q.get('item_type') or '').strip()
     qtype=str(q.get('question_type') or '').strip()
@@ -9208,11 +9349,9 @@ def _evaluate_review_answer(q, answer):
         correct=_meaning_matches(ans,expected)
         return correct, (f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
 
-    # Grammar fill-in-the-blank: exact/normalized matching against the DB/AI target.
-    correct=_meaning_matches(ans,expected)
-    if not correct and str(q.get('answer_criteria') or '').strip():
-        correct=_meaning_matches(ans,str(q.get('answer_criteria') or ''))
-    return correct,(f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
+    # Grammar fill-in-the-blank: judge the completed sentence rather than requiring
+    # the learner to reproduce the exact DB example word.
+    return _evaluate_grammar_fill_with_genai(q, ans)
 
 
 def _process_review_answer(user_id, session_id, answer, expected_item_type=None, expected_item_id=None):
