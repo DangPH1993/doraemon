@@ -1,8 +1,7 @@
-# VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.104-review-schedule-fix"
+BASELINE_VERSION = "19.103-review-schedule-chat"
 import os
 import ast
 import io
@@ -15,10 +14,10 @@ from typing import Optional
 import json
 import base64
 import calendar
-import urllib.parse
 import hashlib
 import tempfile
 import gc
+import urllib.parse
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -87,8 +86,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.104-review-schedule-fix")
-SERVER_VERSION = "2026-09-03-v19_104_review_schedule_fix"
+print("[DORAEMON SERVER FINGERPRINT] 19.103-review-schedule-chat")
+SERVER_VERSION = "2026-08-27-v19_91_curriculum_edit_published"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -180,7 +179,6 @@ def init_db():
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                review_interval_days INTEGER NOT NULL DEFAULT 2,
                 welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -188,6 +186,7 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course_id BIGINT;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS selected_course_id BIGINT;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 2;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, content_hash VARCHAR(128) NOT NULL,
                 subject VARCHAR(255) NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,
@@ -346,7 +345,6 @@ def init_db():
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
                 target TEXT NOT NULL DEFAULT '', status VARCHAR(20) NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ
             );""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 2;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS course_guide_seen BOOLEAN NOT NULL DEFAULT FALSE;""")
@@ -410,6 +408,7 @@ def init_db():
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS meaning TEXT;",
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS associated_text TEXT;",
                 "ALTER TABLE knowledge_images ADD COLUMN IF NOT EXISTS bbox TEXT;",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 2;",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_step INTEGER NOT NULL DEFAULT 0;",
                 """DO $$
@@ -5158,6 +5157,18 @@ def proxy_chat(
         print(f"[REVIEW MANUAL FASTPATH] user={user['id']} course_id={selected_course_id!r} genai=0 lesson={lesson_row.get('lesson') if lesson_row else None!r}")
         return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review_schedule":True}
 
+    # Chat-native review answer: once a review session is active, the next user
+    # message is treated as the answer to the current review question. Manual
+    # review requests above intentionally take precedence so a learner can switch
+    # to another lesson without the text being mistaken for an answer.
+    if selected_course_id is not None and not data.action:
+        active_review=_get_active_review_session(user["id"],selected_course_id)
+        if active_review:
+            result=_handle_review_chat_answer(user["id"],selected_course_id,data.text)
+            if result:
+                print(f"[REVIEW CHAT ANSWER] user={user['id']} course_id={selected_course_id} session={active_review.get('id')}")
+                return {"reply":result["reply"],"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":result["content_blocks"],"learning_progress":None,"review_session_id":int(active_review.get('id') or 0)}
+
     if _is_review_schedule_request(data.text):
         if selected_course_id is None:
             msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon xác định lịch ôn đúng khóa nhé."
@@ -5315,9 +5326,33 @@ def proxy_chat(
 
     plan_start_action = None
     if ui_action:
-        if ui_action == "review_open":
-            msg="🔄 Mở phiên ôn tập hôm nay cho cậu nhé. 🤖"
-            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        if ui_action in {"review_open", "review_lesson", "review_answer_choice"}:
+            try:
+                if ui_action == "review_lesson":
+                    raw=action_plan_id or ""
+                    decoded=json.loads(urllib.parse.unquote(raw)) if raw else {}
+                    started=_start_review_chat_session(
+                        user["id"], selected_course_id, selected_course_name,
+                        requested_lesson=decoded.get("lesson"),
+                        requested_type=decoded.get("content_type"),
+                    )
+                elif ui_action == "review_answer_choice":
+                    raw=action_plan_id or ""
+                    decoded=json.loads(urllib.parse.unquote(raw)) if raw else {}
+                    active=_get_active_review_session(user["id"],selected_course_id)
+                    if int(decoded.get("session_id") or 0) <= 0 or int(decoded.get("session_id")) != int((active or {}).get("id") or 0):
+                        raise HTTPException(409,"Phiên ôn tập đã kết thúc hoặc đã được thay thế.")
+                    started=_handle_review_chat_answer(user["id"],selected_course_id,str(decoded.get("answer") or ""))
+                    if not started:
+                        raise HTTPException(409,"Không còn câu hỏi đang chờ trả lời.")
+                else:
+                    started=_start_review_chat_session(user["id"],selected_course_id,selected_course_name)
+                return {"reply":started["reply"],"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":started["content_blocks"],"learning_progress":None,"review_session_id":started.get("session_id")}
+            except HTTPException:
+                raise
+            except Exception as exc:
+                print(f"[REVIEW CHAT ACTION] error user={user['id']} action={ui_action}: {type(exc).__name__}: {exc}")
+                raise HTTPException(500,"Không thể bắt đầu phiên ôn tập lúc này.")
         elif ui_action == "review_keep":
             msg="Được nhé, mình giữ lịch ôn lại cho cậu. 🤖"
             return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
@@ -8284,6 +8319,193 @@ def _is_review_schedule_request(text):
         'có gì cần ôn','co gi can on','cần ôn gì','can on gi','ôn lại','on lai','review hôm nay','review hom nay'
     )
     return bool(low) and any(p in low for p in phrases)
+
+
+def _get_active_review_session(user_id, course_id=None):
+    """Return the newest active chat-review session for the user/course."""
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if course_id in (None, ""):
+                cur.execute("""SELECT * FROM user_review_sessions
+                               WHERE user_id=%s AND status='ACTIVE'
+                               ORDER BY created_at DESC, id DESC LIMIT 1""", (user_id,))
+            else:
+                cur.execute("""SELECT * FROM user_review_sessions
+                               WHERE user_id=%s AND course_id=%s AND status='ACTIVE'
+                               ORDER BY created_at DESC, id DESC LIMIT 1""", (user_id,int(course_id)))
+            row=cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _review_question_blocks(session_id, questions, index, feedback_prefix=""):
+    """Render one review question as normal chat content, never a popup."""
+    if not questions or index >= len(questions):
+        return [{"type":"text","text":"🎉 Cậu đã hoàn thành phiên ôn tập rồi!"}]
+    q=questions[index] or {}
+    qtext=str(q.get('question') or '').strip()
+    header=f"📝 Câu {index+1}/{len(questions)}"
+    text=(str(feedback_prefix).strip()+"\n\n" if str(feedback_prefix).strip() else "") + header + "\n\n" + (qtext or "Hãy trả lời câu hỏi này nhé.")
+    blocks=[{"type":"text","text":text}]
+    options=[str(x).strip() for x in (q.get('options') or []) if str(x).strip()]
+    if options:
+        opts=[]
+        for option in options:
+            payload=urllib.parse.quote(json.dumps({
+                "session_id":int(session_id),
+                "item_type":str(q.get('item_type') or ''),
+                "item_id":int(q.get('item_id') or 0),
+                "answer":option,
+            },ensure_ascii=False,separators=(',',':')))
+            opts.append({"label":option,"action":f"review_answer_choice:{payload}","display_label":option})
+        blocks.append({"type":"choice","id":f"review_q_{int(session_id)}_{index}","options":opts})
+    else:
+        blocks.append({"type":"text","text":"💬 Cậu hãy nhập câu trả lời vào ô chat nhé."})
+    return blocks
+
+
+def _start_review_chat_session(user_id, course_id, course_name, requested_lesson=None, requested_type=None):
+    """Create a chat-native review session and return its first question."""
+    requested_lesson=str(requested_lesson or '').strip()
+    requested_type=str(requested_type or '').strip() or None
+    if requested_lesson:
+        ids=_review_items_for_completed_lesson(user_id,int(course_id),requested_lesson,requested_type)
+        if not ids['vocabulary'] and not ids['grammar']:
+            raise HTTPException(404, f"Bài **{requested_lesson}** hiện chưa có dữ liệu từ vựng/ngữ pháp để ôn.")
+        source_lesson=requested_lesson
+        due={"vocabulary":[{"item_id":int(x)} for x in ids['vocabulary']],
+             "grammar":[{"item_id":int(x)} for x in ids['grammar']]}
+    else:
+        source_lesson, first=_review_first_lesson_items(user_id,int(course_id))
+        if not source_lesson:
+            raise HTTPException(404,'Không có bài đã học để ôn tập.')
+        due={"vocabulary":[{"item_id":int(x['id'])} for x in first['vocabulary']],
+             "grammar":[{"item_id":int(x['id'])} for x in first['grammar']]}
+        requested_type=str(first.get('content_type') or requested_type or 'Giáo trình')
+
+    data=_review_master_payload(int(course_id), due)
+    if not data['vocabulary'] and due['vocabulary']:
+        data['vocabulary']=due['vocabulary']
+    if not data['grammar'] and due['grammar']:
+        data['grammar']=due['grammar']
+    questions=_review_genai_one_call(int(course_id),data,8)
+    if not questions:
+        raise HTTPException(500,'Không tạo được câu hỏi ôn tập bằng GenAI.')
+
+    valid_pairs={("vocabulary",int(x.get('id'))) for x in data.get('vocabulary',[]) if x.get('id') is not None}
+    valid_pairs|={("grammar",int(x.get('id'))) for x in data.get('grammar',[]) if x.get('id') is not None}
+    clean=[]
+    for q in questions:
+        try:
+            pair=(str(q.get('item_type') or '').strip(),int(q.get('item_id') or 0))
+        except Exception:
+            continue
+        if pair in valid_pairs and str(q.get('question') or '').strip():
+            clean.append(q)
+    questions=clean[:10]
+    if not questions:
+        raise HTTPException(500,'GenAI không tạo được câu hỏi gắn với dữ liệu bài học.')
+
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE user_review_sessions SET status='CANCELLED' WHERE user_id=%s AND course_id=%s AND status='ACTIVE'",(user_id,int(course_id)))
+            cur.execute("""INSERT INTO user_review_sessions(user_id,course_id,source_lesson,status,question_json,answers_json)
+                           VALUES(%s,%s,%s,'ACTIVE',%s::jsonb,%s::jsonb) RETURNING id""",
+                        (user_id,int(course_id),source_lesson,json.dumps(questions,ensure_ascii=False),json.dumps({"current_index":0,"items":[]},ensure_ascii=False)))
+            row=cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    sid=int(row[0])
+    msg=f"🔄 Bắt đầu ôn tập bài **{source_lesson}** nhé!\n\nMình sẽ lần lượt hỏi các từ vựng/ngữ pháp của bài này. Cậu trả lời ngay trong khung chat; câu nào sai Doraemon sẽ lưu lại để ôn lại sau."
+    blocks=_review_question_blocks(sid,questions,0,feedback_prefix=msg)
+    return {
+        "session_id":sid,"source_lesson":source_lesson,"questions":questions,
+        "reply":"\n\n".join(str(b.get('text') or '') for b in blocks if b.get('type')=='text'),
+        "content_blocks":blocks,
+        "course_name":course_name,
+    }
+
+
+def _evaluate_review_answer(answer, q, session_id, item_id):
+    """Evaluate one review answer using deterministic checks or GenAI for sentence creation."""
+    answer=str(answer or '').strip()
+    correct=False; explanation=''
+    options=q.get('options') or []
+    expected=str(q.get('answer') or '').strip()
+    qtype=str(q.get('question_type') or '')
+    if options or qtype in {'meaning_choice','choice','multiple_choice','completion_choice'}:
+        correct=answer.casefold()==expected.casefold() or any(
+            answer.casefold()==str(o).casefold() and str(o).casefold()==expected.casefold() for o in options
+        )
+        if not correct and options and expected and expected.casefold() in [str(o).casefold() for o in options]:
+            correct=answer.casefold()==expected.casefold()
+    elif qtype=='sentence_creation':
+        rubric=str(q.get('answer_criteria') or expected).strip()
+        prompt=("Đánh giá câu trả lời tiếng Nhật. Trả JSON duy nhất {\"correct\":true|false,\"explanation\":\"...\"}. "
+                "Đúng nếu câu dùng đúng cấu trúc mục tiêu và phù hợp yêu cầu, cho phép nhiều cách diễn đạt đúng.\n"
+                f"Mẫu: {rubric}\nCâu hỏi: {q.get('question','')}\nTrả lời học sinh: {answer}")
+        reply,_,_=_generate_chat_reply(prompt,content_type='Ngữ pháp',request_id=f"review-eval-{session_id}-{item_id}",gen_started=time.perf_counter(),user_text=answer,reasoning_profile='low')
+        try:
+            obj=json.loads(reply.strip().strip('`').replace('json\n','',1))
+            correct=bool(obj.get('correct')); explanation=str(obj.get('explanation') or '')
+        except Exception:
+            correct=False; explanation='Doraemon chưa xác định được câu trả lời, mình thử lại nhé.'
+    else:
+        correct=answer.casefold()==expected.casefold()
+    return correct, explanation
+
+
+def _handle_review_chat_answer(user_id, course_id, answer):
+    """Grade the current chat answer, persist misses, and immediately ask the next question."""
+    sess=_get_active_review_session(user_id,course_id)
+    if not sess:
+        return None
+    questions=sess.get('question_json') or []
+    state=sess.get('answers_json') or {}
+    if not isinstance(state,dict): state={}
+    try: idx=int(state.get('current_index') or 0)
+    except Exception: idx=0
+    if idx<0: idx=0
+    if idx>=len(questions):
+        return None
+    q=questions[idx] or {}
+    item_type=str(q.get('item_type') or '').strip()
+    try: item_id=int(q.get('item_id') or 0)
+    except Exception: item_id=0
+    if item_type not in {'vocabulary','grammar'} or not item_id:
+        raise HTTPException(500,'Câu hỏi ôn tập không hợp lệ.')
+    correct,explanation=_evaluate_review_answer(answer,q,int(sess['id']),item_id)
+    if correct:
+        _clear_success_review(user_id,int(sess['course_id']),item_type,item_id)
+    else:
+        _schedule_failed_review(user_id,int(sess['course_id']),item_type,item_id)
+    items=state.get('items') if isinstance(state.get('items'),list) else []
+    items.append({"index":idx,"item_type":item_type,"item_id":item_id,"answer":str(answer or ''),"correct":bool(correct),"explanation":explanation})
+    next_idx=idx+1
+    state["current_index"]=next_idx
+    state["items"]=items
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            if next_idx>=len(questions):
+                cur.execute("UPDATE user_review_sessions SET status='COMPLETED',completed_at=NOW(),answers_json=%s::jsonb WHERE id=%s AND user_id=%s",(json.dumps(state,ensure_ascii=False),int(sess['id']),user_id))
+            else:
+                cur.execute("UPDATE user_review_sessions SET answers_json=%s::jsonb WHERE id=%s AND user_id=%s",(json.dumps(state,ensure_ascii=False),int(sess['id']),user_id))
+        conn.commit()
+    finally:
+        conn.close()
+    feedback=("✅ Chính xác!" if correct else "❌ Chưa đúng. "+(explanation or "Doraemon đã lưu nội dung này để ôn lại sau."))
+    if next_idx>=len(questions):
+        _mark_review_schedule_completed(user_id,int(sess['course_id']),sess.get('source_lesson'))
+        msg=feedback+"\n\n🎉 Cậu đã hoàn thành phiên ôn tập bài **%s**. Doraemon đã lưu những mục trả lời sai để lần sau ôn lại." % (sess.get('source_lesson') or 'này')
+        return {"reply":msg,"content_blocks":[{"type":"text","text":msg}]}
+    blocks=_review_question_blocks(int(sess['id']),questions,next_idx,feedback_prefix=feedback)
+    reply='\n\n'.join(str(b.get('text') or '') for b in blocks if b.get('type')=='text')
+    return {"reply":reply,"content_blocks":blocks}
 
 
 def _build_manual_review_chat_blocks(user_id, course_id, course_name, lesson_row):
