@@ -5141,6 +5141,19 @@ def proxy_chat(
         if early_action.startswith(("curriculum_","lesson_confirm_","study_end_")) and study_session:
             raise HTTPException(403,"Quyền học khóa hiện tại không còn hiệu lực. Vui lòng chọn khóa học đang được cấp quyền trong Cấu hình.")
 
+    if _is_manual_review_request(data.text):
+        if selected_course_id is None:
+            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết cần ôn bài nào nhé."
+            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        lesson_row=_find_completed_lesson(user["id"],selected_course_id,data.text)
+        if lesson_row:
+            msg,blocks=_build_manual_review_chat_blocks(user["id"],selected_course_id,selected_course_name,lesson_row)
+        else:
+            msg="Doraemon chưa tìm thấy bài đã học có tên này trong khóa đang chọn. Cậu thử nói rõ tên bài nhé."
+            blocks=[{"type":"text","text":msg}]
+        print(f"[REVIEW MANUAL FASTPATH] user={user['id']} course_id={selected_course_id!r} genai=0 lesson={lesson_row.get('lesson') if lesson_row else None!r}")
+        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review_schedule":True}
+
     if _is_review_schedule_request(data.text):
         if selected_course_id is None:
             msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon xác định lịch ôn đúng khóa nhé."
@@ -8103,6 +8116,86 @@ def _review_lesson_item_ids(course_id, content_type, lesson):
         conn.close()
 
 
+def _get_review_interval_days(user_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT review_interval_days FROM user_learning_state WHERE user_id=%s", (user_id,))
+            row=cur.fetchone()
+            try: days=int(row[0]) if row and row[0] is not None else 2
+            except Exception: days=2
+            return max(1,min(365,days))
+    finally:
+        conn.close()
+
+
+def _set_review_interval_days(user_id, days):
+    days=max(1,min(365,int(days)))
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO user_learning_state(user_id,review_interval_days,updated_at)
+                           VALUES(%s,%s,NOW())
+                           ON CONFLICT(user_id) DO UPDATE SET review_interval_days=EXCLUDED.review_interval_days,updated_at=NOW()""", (user_id,days))
+        conn.commit()
+    finally:
+        conn.close()
+    return days
+
+
+def _review_items_for_completed_lesson(user_id, course_id, lesson, content_type=None):
+    """Return catalog vocabulary/grammar IDs for a completed lesson only."""
+    lesson=str(lesson or '').strip()
+    if not lesson:
+        return {'vocabulary':[],'grammar':[]}
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params=[user_id,course_id,lesson]
+            type_clause=''
+            if content_type:
+                type_clause=' AND content_type=%s'
+                params.append(content_type)
+            cur.execute(f"""SELECT content_type,lesson FROM learning_progress
+                            WHERE user_id=%s AND course_id=%s AND status='completed'
+                              AND lower(trim(lesson))=lower(trim(%s)){type_clause}
+                            ORDER BY completed_at DESC NULLS LAST LIMIT 1""",tuple(params))
+            row=cur.fetchone()
+            if not row:
+                return {'vocabulary':[],'grammar':[]}
+        ids=_review_lesson_item_ids(int(course_id),str(row.get('content_type') or content_type or 'Giáo trình'),lesson)
+        return ids
+    finally:
+        conn.close()
+
+
+def _find_completed_lesson(user_id, course_id, text):
+    q=str(text or '').strip().casefold()
+    if not q:
+        return None
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT content_type,lesson,topic,completed_at
+                           FROM learning_progress
+                           WHERE user_id=%s AND course_id=%s AND status='completed' AND COALESCE(lesson,'')<>''
+                           ORDER BY completed_at DESC NULLS LAST,id DESC""",(user_id,course_id))
+            rows=[dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    for r in rows:
+        lesson=str(r.get('lesson') or '').strip()
+        if lesson and lesson.casefold() in q:
+            return r
+    return None
+
+
+def _is_manual_review_request(text):
+    q=str(text or '').strip().casefold()
+    markers=('ôn lại bài','ôn bài','on lai bai','on bai','review bài','review bai')
+    return any(m in q for m in markers) and bool(re.search(r'\bbài\s*\S+', q) or re.search(r'\breview\s+\S+', q))
+
+
 def _schedule_review_for_completed_lesson(row):
     if not row or str(row.get('status') or '').lower() != 'completed':
         return
@@ -8118,7 +8211,8 @@ def _schedule_review_for_completed_lesson(row):
     if not ids['vocabulary'] and not ids['grammar']:
         return
     now=datetime.now(timezone.utc)
-    next_at=now+timedelta(days=1)
+    interval_days=_get_review_interval_days(int(row.get('user_id')))
+    next_at=now+timedelta(days=interval_days)
     conn=db()
     try:
         with conn.cursor() as cur:
@@ -8159,17 +8253,21 @@ def _review_scheduled_lessons(user_id, course_id):
 
 
 def _mark_review_schedule_completed(user_id, course_id, source_lesson):
+    """Finish one lesson-review occurrence and schedule the next occurrence."""
     lesson=str(source_lesson or '').strip()
-    if not lesson: return
+    if not lesson or lesson == 'review_due':
+        return
+    interval_days=_get_review_interval_days(user_id)
+    next_at=datetime.now(timezone.utc)+timedelta(days=interval_days)
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE learning_progress SET review_completed_at=NOW(),next_review_at=NULL
+            cur.execute("""UPDATE learning_progress SET review_completed_at=NOW(),next_review_at=%s
                            WHERE user_id=%s AND course_id=%s AND status='completed'
                              AND lower(trim(coalesce(lesson,'')))=lower(trim(%s))
-                             AND review_scheduled_at IS NOT NULL
-                             AND (review_completed_at IS NULL OR review_completed_at < review_scheduled_at)""",(user_id,course_id,lesson))
+                             AND review_scheduled_at IS NOT NULL""",(next_at,user_id,course_id,lesson))
         conn.commit()
+        print(f"[REVIEW SCHEDULE] lesson reviewed user={user_id} course_id={course_id} lesson={lesson!r} next={next_at.isoformat()} interval_days={interval_days}")
     finally:
         conn.close()
 
@@ -8182,6 +8280,38 @@ def _is_review_schedule_request(text):
         'có gì cần ôn','co gi can on','cần ôn gì','can on gi','ôn lại','on lai','review hôm nay','review hom nay'
     )
     return bool(low) and any(p in low for p in phrases)
+
+
+def _build_manual_review_chat_blocks(user_id, course_id, course_name, lesson_row):
+    lesson=str(lesson_row.get('lesson') or '').strip()
+    content_type=str(lesson_row.get('content_type') or 'Giáo trình')
+    ids=_review_items_for_completed_lesson(user_id,course_id,lesson,content_type)
+    if not ids['vocabulary'] and not ids['grammar']:
+        msg=f"📚 Bài **{lesson}** đã học xong nhưng hiện chưa có từ vựng/ngữ pháp để ôn lại trong khóa **{course_name or 'hiện tại'}**."
+        return msg,[{"type":"text","text":msg}]
+    msg=(f"🔄 Cậu muốn ôn lại **{lesson}** đúng không?\n\n"
+         f"Doraemon sẽ kiểm tra lại {len(ids['vocabulary'])} từ vựng và {len(ids['grammar'])} ngữ pháp của bài này.")
+    action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':content_type},ensure_ascii=False,separators=(',',':')))
+    blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_lesson_choice","options":[{"label":"Bắt đầu ôn","action":f"review_lesson:{action}"},{"label":"Để sau","action":"review_keep"}]}]
+    return msg,blocks
+
+
+def _build_review_reminder_blocks(user_id, course_id, course_name):
+    scheduled=_review_scheduled_lessons(user_id,course_id)
+    due=_review_due_items(user_id,course_id)
+    if not scheduled:
+        return None
+    r=scheduled[0]
+    lesson=str(r.get('lesson') or '').strip()
+    ct=str(r.get('content_type') or 'Giáo trình')
+    parts=[]
+    if r.get('vocabulary_count'): parts.append(f"{int(r['vocabulary_count'])} từ vựng")
+    if r.get('grammar_count'): parts.append(f"{int(r['grammar_count'])} ngữ pháp")
+    msg=(f"🔔 Hôm nay mình ôn tập lại **{lesson}** nhé?\n\n"
+         f"Bài này có {', '.join(parts) or 'nội dung cần ôn'}. Cậu có muốn ôn ngay không?")
+    action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':ct},ensure_ascii=False,separators=(',',':')))
+    blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_reminder_choice","options":[{"label":"Ôn ngay","action":f"review_lesson:{action}"},{"label":"Để sau","action":"review_keep"}]}]
+    return msg,blocks
 
 
 def _build_review_schedule_chat_blocks(user_id, course_id, course_name):
@@ -8326,6 +8456,43 @@ def _schedule_failed_review(user_id, course_id, item_type, item_id):
     finally:
         conn.close()
 
+@app.get('/learning/review/settings')
+def learning_review_settings(authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    return {'review_interval_days':_get_review_interval_days(user['id']), 'default_review_interval_days':2}
+
+@app.post('/learning/review/settings')
+def learning_review_settings_update(payload: dict, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    try: days=int(payload.get('review_interval_days') or 2)
+    except Exception: raise HTTPException(400,'Số ngày ôn tập không hợp lệ.')
+    days=_set_review_interval_days(user['id'],days)
+    # Rebase future lesson-review schedules that have not yet been reviewed.
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE learning_progress
+                           SET next_review_at=completed_at + (%s * INTERVAL '1 day')
+                           WHERE user_id=%s AND status='completed' AND review_scheduled_at IS NOT NULL
+                             AND review_completed_at IS NULL AND completed_at IS NOT NULL""",(days,user['id']))
+        conn.commit()
+    finally:
+        conn.close()
+    return {'success':True,'review_interval_days':days}
+
+@app.get('/learning/review/reminder')
+def learning_review_reminder(authorization: Optional[str] = Header(default=None), course_id: Optional[int] = None):
+    user=require_active_user(authorization)
+    selected_course_id, selected_course_name, _=_resolve_request_course(user['id'],course_id)
+    if selected_course_id is None:
+        return {'review_available':False,'message':'Hãy chọn khóa học trong Cấu hình trước.','content_blocks':[]}
+    built=_build_review_reminder_blocks(user['id'],selected_course_id,selected_course_name)
+    if not built:
+        return {'review_available':False,'course_id':int(selected_course_id),'course':selected_course_name,'content_blocks':[]}
+    msg,blocks=built
+    return {'review_available':True,'course_id':int(selected_course_id),'course':selected_course_name,'message':msg,'content_blocks':blocks}
+
+
 @app.get('/learning/review/today')
 def learning_review_today(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
@@ -8352,9 +8519,16 @@ def learning_review_start(payload: dict, authorization: Optional[str] = Header(d
     selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
     if selected_course_id is None:
         raise HTTPException(403,'Khóa học không được phép.')
+    requested_lesson=str(payload.get('lesson') or '').strip()
+    requested_type=str(payload.get('content_type') or '').strip() or None
     due=_review_due_items(user['id'], selected_course_id)
     source_lesson='review_due'
-    if not due['vocabulary'] and not due['grammar']:
+    if requested_lesson:
+        ids=_review_items_for_completed_lesson(user['id'], selected_course_id, requested_lesson, requested_type)
+        if ids['vocabulary'] or ids['grammar']:
+            source_lesson=requested_lesson
+            due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
+    if source_lesson=='review_due' and not due['vocabulary'] and not due['grammar']:
         source_lesson, first=_review_first_lesson_items(user['id'], selected_course_id)
         if source_lesson:
             due={'vocabulary':[{'item_id':x['id'],**x} for x in first['vocabulary']],
