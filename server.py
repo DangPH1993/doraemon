@@ -1,8 +1,9 @@
+# VERSION: v19_105 — chat-native one-question review + DB-authoritative vocabulary + contextual ack
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.104-review-schedule-fix"
+BASELINE_VERSION = "19.105-review-chat-one-by-one"
 import os
 import ast
 import io
@@ -10,6 +11,7 @@ import uuid
 import re
 import time
 import threading
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import json
@@ -305,6 +307,8 @@ def init_db():
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 course_id BIGINT NOT NULL,
                 source_lesson VARCHAR(255),
+                chatbox_id VARCHAR(128),
+                current_question_index INTEGER NOT NULL DEFAULT 0,
                 status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
                 question_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 answers_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -313,7 +317,10 @@ def init_db():
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_vocab_review_due ON user_vocabulary_review(user_id,course_id,next_review_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_grammar_review_due ON user_grammar_review(user_id,course_id,next_review_at);")
+            cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS chatbox_id VARCHAR(128);")
+            cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS current_question_index INTEGER NOT NULL DEFAULT 0;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_review_sessions_user ON user_review_sessions(user_id,course_id,created_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_review_sessions_active_chatbox ON user_review_sessions(user_id,course_id,status,chatbox_id,created_at DESC);")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plans (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 version INTEGER NOT NULL DEFAULT 1, status VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
@@ -4554,6 +4561,46 @@ def _is_pure_greeting(text: str) -> bool:
     return any(re.fullmatch(pattern, normalized, flags=re.UNICODE) for pattern in patterns)
 
 
+def _is_short_acknowledgement(text):
+    low=str(text or '').strip().casefold()
+    return low in {
+        'ok','okay','oke','ừ','ừm','uhm','được','được rồi','được nhé','ừ được','vâng','dạ','yes','yep','đồng ý','đúng rồi'
+    }
+
+
+def _last_model_history_text(history):
+    for row in reversed(_normalize_chat_history(history or [], max_messages=12)):
+        if str(row.get('role') or '').lower() not in {'assistant','model'}:
+            continue
+        parts=row.get('parts') or []
+        texts=[]
+        for part in parts:
+            if isinstance(part,dict) and part.get('text') is not None:
+                texts.append(str(part.get('text') or ''))
+            elif isinstance(part,str):
+                texts.append(part)
+        text='\n'.join(x for x in texts if x).strip()
+        if text:
+            return text
+    return ''
+
+
+def _ack_context_reply(history):
+    prev=_last_model_history_text(history)
+    if not prev:
+        return None
+    low=prev.casefold()
+    if '?' not in prev and 'không?' not in low:
+        return None
+    if 'giải thích thêm' in low and 'ví dụ' in low:
+        return 'Được nhé 😊 Cậu muốn Doraemon giải thích thêm về từ vừa rồi hay cho cậu một ví dụ với từ đó?'
+    if 'có muốn ôn' in low or 'muốn ôn ngay' in low:
+        return 'Được nhé 😊 Cậu muốn ôn ngay hay để sau? Cậu nói rõ giúp Doraemon một lựa chọn nhé.'
+    if 'muốn học gì' in low or 'học gì hôm nay' in low:
+        return 'Được nhé 😊 Cậu nói tên bài hoặc nội dung muốn học, Doraemon sẽ tiếp tục đúng phần đó.'
+    return 'Được nhé 😊 Mình tiếp tục phần vừa rồi. Cậu trả lời câu hỏi Doraemon vừa hỏi nhé.'
+
+
 def _build_plan_choice_blocks(user_id: int, include_header: bool = True, course_id=None):
     """Build all active Study Plans with one inline Yes/No choice per plan."""
     plans = _active_plans(user_id, course_id=course_id) if course_id is not None else _active_plans(user_id)
@@ -5145,6 +5192,52 @@ def proxy_chat(
         if early_action.startswith(("curriculum_","lesson_confirm_","study_end_")) and study_session:
             raise HTTPException(403,"Quyền học khóa hiện tại không còn hiệu lực. Vui lòng chọn khóa học đang được cấp quyền trong Cấu hình.")
 
+    # Review chat actions are terminal routing decisions. They must never fall
+    # through to the normal lesson/RAG pipeline. The current chatbox id binds the
+    # session so a later message in another chatbox cannot answer an old review.
+    action_raw=str(data.action or '').strip()
+    action_head=action_raw.split(':',1)[0].casefold() if action_raw else ''
+    if action_head == 'review_lesson':
+        raw=action_raw.split(':',1)[1] if ':' in action_raw else ''
+        try:
+            decoded=json.loads(urllib.parse.unquote(raw))
+        except Exception:
+            decoded={}
+        lesson=str(decoded.get('lesson') or '').strip()
+        ctype=str(decoded.get('content_type') or '').strip() or None
+        if not lesson:
+            raise HTTPException(400,'Thiếu tên bài cần ôn.')
+        result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,lesson,ctype,data.chatbox_id,12)
+        print(f'[REVIEW CHAT START] user={user["id"]} course_id={selected_course_id} lesson={lesson!r} session={result["session_id"]} questions={len(result["questions"])}')
+        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':lesson}
+
+    if action_head == 'review_open':
+        result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,None,None,data.chatbox_id,12)
+        print(f'[REVIEW CHAT START] user={user["id"]} course_id={selected_course_id} lesson={result["source_lesson"]!r} session={result["session_id"]} questions={len(result["questions"])}')
+        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':result['source_lesson']}
+
+    if action_head == 'review_answer':
+        raw=action_raw.split(':',1)[1] if ':' in action_raw else ''
+        try:
+            decoded=json.loads(urllib.parse.unquote(raw))
+        except Exception:
+            decoded={}
+        sid=int(decoded.get('session_id') or 0)
+        answer=str(decoded.get('answer') or '').strip()
+        if not sid or not answer:
+            raise HTTPException(400,'Câu trả lời ôn tập không hợp lệ.')
+        result=_process_review_answer(user['id'],sid,answer)
+        print(f'[REVIEW CHAT ANSWER] user={user["id"]} session={sid} correct={int(result["correct"])} finished={int(result["finished"])} item={result["item_type"]}:{result["item_id"]}')
+        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                'learning_progress':None,'review_session_id':sid,'review':True,'review_answered':True,'correct':result['correct'],'finished':result['finished']}
+
+    if action_head == 'review_keep':
+        msg='Được nhé 🤖 Doraemon sẽ giữ lịch ôn lại, chưa bắt đầu phiên ôn này.'
+        return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
+                'learning_progress':None,'review':True}
+
     if _is_manual_review_request(data.text):
         if selected_course_id is None:
             msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết cần ôn bài nào nhé."
@@ -5222,6 +5315,37 @@ def proxy_chat(
         print(f"[CHATBOX CONTEXT] existing_chatbox history_messages={len(plan_recent_history)} bounded=10_exchanges")
     if plan_recent_history:
         print(f"[CHAT HISTORY PLAN] messages={len(plan_recent_history)}")
+
+    # Once a chatbox has started a review session, normal user text is an answer
+    # to the current question. This keeps the review state authoritative without
+    # requiring a special client textbox or a popup.
+    if selected_course_id is not None and data.text and not data.action:
+        active_review=_get_active_review_session(user['id'],int(selected_course_id),data.chatbox_id)
+        if active_review:
+            low_review=data.text.casefold().strip()
+            if any(x in low_review for x in ('dừng ôn','dung on','hủy ôn','huy on','thoát ôn','thoat on')):
+                conn_r=db()
+                try:
+                    with conn_r.cursor() as cur_r:
+                        cur_r.execute("UPDATE user_review_sessions SET status='ABANDONED',completed_at=NOW() WHERE id=%s AND user_id=%s",(int(active_review['id']),user['id']))
+                    conn_r.commit()
+                finally:
+                    conn_r.close()
+                msg='Được nhé 🤖 Doraemon đã dừng phiên ôn tập này. Khi nào muốn ôn lại, cậu nói với tớ nhé.'
+                return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}], 'learning_progress':None,'review':True}
+            result=_process_review_answer(user['id'],int(active_review['id']),data.text)
+            print(f'[REVIEW CHAT TEXT ANSWER] user={user["id"]} session={active_review["id"]} correct={int(result["correct"])} finished={int(result["finished"])} item={result["item_type"]}:{result["item_id"]}')
+            return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                    'learning_progress':None,'review_session_id':int(active_review['id']),'review':True,'review_answered':True,'correct':result['correct'],'finished':result['finished']}
+
+    # A short acknowledgement after a question should stay inside the current
+    # conversational context. Do not reinterpret "ok" as a fresh onboarding
+    # request or jump back to "what do you want to learn?".
+    if _is_short_acknowledgement(data.text) and plan_recent_history:
+        ack_reply=_ack_context_reply(plan_recent_history)
+        if ack_reply:
+            return {'reply':ack_reply,'model':'local-router','sources':[],'images':[],
+                    'content_blocks':[{'type':'text','text':ack_reply}],'learning_progress':None}
 
     # Structured UI actions from the Study Plan confirmation buttons.
     # These actions bypass text intent parsing and RAG completely.
@@ -8410,24 +8534,432 @@ def _review_master_payload(course_id, due):
         conn.close()
 
 
-def _review_genai_one_call(course_id, data, max_q):
-    import json as _json
-    prompt=("Bạn là gia sư tiếng Nhật. Tạo tối đa %d câu ôn tập ngẫu nhiên từ dữ liệu dưới đây. "
-            "Chỉ dùng kiến thức đã cho. Từ vựng: hỏi nghĩa/trắc nghiệm/VN→JP/điền từ. "
-            "Ngữ pháp: trắc nghiệm/hoàn thành câu/đặt câu. Không lặp cùng item nếu chưa cần. "
-            "Trả JSON duy nhất dạng {\\\"questions\\\":[{\\\"item_type\\\":\\\"vocabulary\\\"|\\\"grammar\\\",\\\"item_id\\\":number,\\\"question_type\\\":\\\"...\\\",\\\"question\\\":\\\"...\\\",\\\"options\\\":[...],\\\"answer\\\":\\\"...\\\",\\\"answer_criteria\\\":\\\"...\\\"}]}.") % max_q
-    payload=_json.dumps(data,ensure_ascii=False,separators=(',',':'))
-    reply,model,_=_generate_chat_reply(prompt+"\nDATA="+payload,content_type=None,request_id=f"review-{course_id}-{int(time.time())}",gen_started=time.perf_counter(),user_text="",reasoning_profile="low")
-    text=reply.strip()
-    if text.startswith("```"):
-        text=re.sub(r"^```(?:json)?\\s*|\\s*```$","",text,flags=re.I|re.S).strip()
+def _review_json_from_text(text):
+    """Best-effort extraction of a JSON object/array from an LLM response."""
+    raw=str(text or '').strip()
+    if not raw:
+        return None
+    if raw.startswith('```'):
+        raw=re.sub(r'^```(?:json)?\s*', '', raw, flags=re.I).strip()
+        raw=re.sub(r'\s*```$', '', raw, flags=re.I).strip()
     try:
-        out=_json.loads(text)
+        return json.loads(raw)
     except Exception:
-        m=re.search(r"\\{.*\\}",text,re.S)
-        out=_json.loads(m.group(0)) if m else {"questions":[]}
-    qs=out.get('questions') if isinstance(out,dict) else []
-    return qs if isinstance(qs,list) else []
+        pass
+    # Prefer the first complete object containing a questions list.
+    m=re.search(r'\{\s*["\']questions["\']\s*:\s*\[.*?\]\s*\}', raw, flags=re.I|re.S)
+    if m:
+        try:
+            return json.loads(m.group(0).replace("'questions'", '"questions"'))
+        except Exception:
+            pass
+    m=re.search(r'\{.*\}', raw, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return None
+
+
+def _review_vocab_question(item, all_vocab):
+    """Build a safe vocabulary question from authoritative DB data.
+
+    The Japanese prompt never includes the stored Vietnamese meaning.  The
+    answer/options are derived from DB values; GenAI may suggest distractors,
+    but the server validates the final shape before exposing it to the client.
+    """
+    item_id=int(item.get('id') or 0)
+    writing=str(item.get('writing') or '').strip()
+    reading=str(item.get('reading') or '').strip()
+    meaning=str(item.get('meaning') or '').strip()
+    shown=writing or reading or f'ID {item_id}'
+    if writing and reading and reading != writing:
+        shown=f'{writing}（{reading}）'
+    distractor_pool=[]
+    for other in all_vocab:
+        if int(other.get('id') or 0)==item_id:
+            continue
+        m=str(other.get('meaning') or '').strip()
+        if m and m.casefold()!=meaning.casefold() and m not in distractor_pool:
+            distractor_pool.append(m)
+    # Prefer four choices, but never fabricate a Vietnamese meaning.
+    options=[meaning] if meaning else []
+    if distractor_pool:
+        options.extend(distractor_pool[:3])
+    while len(options)<4 and meaning:
+        # A vocabulary lesson can legitimately have fewer than 3 other unique meanings.
+        # In that case the question becomes free response rather than inventing content.
+        options=[]
+        break
+    if len(options)>=4:
+        random.shuffle(options)
+        return {
+            'item_type':'vocabulary',
+            'item_id':item_id,
+            'question_type':'meaning_choice',
+            'question':f'Từ {shown} có nghĩa tiếng Việt là gì?',
+            'options':options[:4],
+            'answer':meaning,
+            'answer_criteria':meaning,
+        }
+    return {
+        'item_type':'vocabulary',
+        'item_id':item_id,
+        'question_type':'vocab_meaning',
+        'question':f'Từ {shown} có nghĩa tiếng Việt là gì?',
+        'options':[],
+        'answer':meaning,
+        'answer_criteria':meaning,
+    }
+
+
+def _review_genai_one_call(course_id, data, max_q, lesson=None):
+    """Generate one-at-a-time review question specs from DB-backed lesson items.
+
+    Vocabulary questions are normalized from the authoritative DB so the model can
+    never leak the Vietnamese meaning in the question. Grammar questions remain
+    GenAI-generated, but item IDs are restricted to the lesson's DB catalog.
+    """
+    vocab=list(data.get('vocabulary') or [])[:9]
+    grammar=list(data.get('grammar') or [])[:3]
+    selected_vocab=vocab
+    selected_grammar=grammar
+    target_count=min(max_q, len(selected_vocab)+len(selected_grammar))
+    selected_vocab=selected_vocab[:min(9,target_count)]
+    remaining=max(0,target_count-len(selected_vocab))
+    selected_grammar=selected_grammar[:min(3,remaining)]
+    selected_ids={('vocabulary',int(x.get('id') or 0)) for x in selected_vocab}
+    selected_ids.update({('grammar',int(x.get('id') or 0)) for x in selected_grammar})
+
+    prompt={
+        'task':'Tạo câu hỏi ôn tập tiếng Nhật từ đúng dữ liệu DB đã cung cấp.',
+        'lesson':str(lesson or ''),
+        'rules':[
+            'Mỗi item chỉ được dùng một lần.',
+            'Không được tạo item_id mới và không được dùng kiến thức ngoài DATA.',
+            'Thứ tự: toàn bộ vocabulary trước, sau đó grammar.',
+            'Vocabulary: question chỉ được viết từ tiếng Nhật (writing/reading) và hỏi nghĩa tiếng Việt; tuyệt đối không viết nghĩa tiếng Việt trong question.',
+            'Vocabulary: có thể là trắc nghiệm với 4 lựa chọn tiếng Việt; answer phải đúng meaning của DB.',
+            'Grammar: tạo câu hỏi hiểu/nghĩa/hoàn thành câu dựa đúng pattern/meaning/explanation/example đã cho.',
+            'Trả JSON duy nhất: {"questions":[...]}.',
+        ],
+        'DATA':{
+            'vocabulary':selected_vocab,
+            'grammar':selected_grammar,
+        }
+    }
+    payload=json.dumps(prompt,ensure_ascii=False,separators=(',',':'))
+    reply,model,_=_generate_chat_reply(
+        'Bạn là gia sư tiếng Nhật. Hãy tuân thủ tuyệt đối schema JSON trong yêu cầu sau.\n'+payload,
+        content_type=None,
+        request_id=f'review-{course_id}-{int(time.time()*1000)}',
+        gen_started=time.perf_counter(),
+        user_text='',
+        reasoning_profile='low'
+    )
+    parsed=_review_json_from_text(reply)
+    generated=[]
+    if isinstance(parsed,dict) and isinstance(parsed.get('questions'),list):
+        generated=parsed.get('questions') or []
+    elif isinstance(parsed,list):
+        generated=parsed
+
+    by_key={}
+    for q in generated:
+        if not isinstance(q,dict):
+            continue
+        try:
+            key=(str(q.get('item_type') or '').strip(),int(q.get('item_id') or 0))
+        except Exception:
+            continue
+        if key in selected_ids and key not in by_key:
+            by_key[key]=q
+
+    questions=[]
+    for item in selected_vocab:
+        item_id=int(item.get('id') or 0)
+        # DB is authoritative for the vocabulary meaning and the visible question.
+        q=_review_vocab_question(item, selected_vocab)
+        ai_q=by_key.get(('vocabulary',item_id)) or {}
+        ai_options=ai_q.get('options') if isinstance(ai_q,dict) else None
+        if isinstance(ai_options,list):
+            opts=[]
+            for x in ai_options:
+                x=str(x or '').strip()
+                if x and x not in opts:
+                    opts.append(x)
+            meaning=str(item.get('meaning') or '').strip()
+            if meaning and meaning in opts and len(opts)>=4:
+                random.shuffle(opts)
+                q['options']=opts[:4]
+                q['question_type']='meaning_choice'
+                q['answer']=meaning
+        questions.append(q)
+
+    for item in selected_grammar:
+        item_id=int(item.get('id') or 0)
+        ai_q=by_key.get(('grammar',item_id)) or {}
+        pattern=str(item.get('pattern') or '').strip()
+        meaning=str(item.get('meaning') or '').strip()
+        explanation=str(item.get('explanation') or '').strip()
+        example=str(item.get('example') or '').strip()
+        question=str(ai_q.get('question') or '').strip()
+        options=ai_q.get('options') if isinstance(ai_q.get('options'),list) else []
+        answer=str(ai_q.get('answer') or '').strip()
+        qtype=str(ai_q.get('question_type') or '').strip()
+        if not question:
+            question=f'Cấu trúc {pattern or "này"} có ý nghĩa/cách dùng như thế nào?'
+        if not answer:
+            answer=meaning
+        if qtype=='sentence_creation' and explanation:
+            criteria=str(ai_q.get('answer_criteria') or explanation).strip()
+        else:
+            criteria=str(ai_q.get('answer_criteria') or answer).strip()
+        clean_opts=[]
+        for x in options:
+            x=str(x or '').strip()
+            if x and x not in clean_opts:
+                clean_opts.append(x)
+        questions.append({
+            'item_type':'grammar',
+            'item_id':item_id,
+            'question_type':qtype or ('meaning_choice' if len(clean_opts)>=4 else 'grammar_open'),
+            'question':question,
+            'options':clean_opts[:4],
+            'answer':answer,
+            'answer_criteria':criteria,
+            'pattern':pattern,
+            'meaning':meaning,
+            'explanation':explanation,
+            'example':example,
+        })
+
+    if not questions:
+        print(f'[REVIEW GENAI] no parsed questions; falling back to DB-safe vocabulary questions model={model!r}')
+    return questions[:max_q]
+
+
+def _get_active_review_session(user_id, course_id, chatbox_id=None):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            requested=str(chatbox_id or '').strip()
+            if requested:
+                cur.execute("""
+                    SELECT * FROM user_review_sessions
+                    WHERE user_id=%s AND course_id=%s AND status='ACTIVE'
+                      AND chatbox_id=%s
+                    ORDER BY created_at DESC,id DESC LIMIT 1
+                """,(user_id,course_id,requested))
+            else:
+                cur.execute("""
+                    SELECT * FROM user_review_sessions
+                    WHERE user_id=%s AND course_id=%s AND status='ACTIVE'
+                    ORDER BY created_at DESC,id DESC LIMIT 1
+                """,(user_id,course_id))
+            row=cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _review_question_blocks(session_id, question, index, total):
+    q=dict(question or {})
+    item_type=str(q.get('item_type') or '').strip()
+    qtext=str(q.get('question') or '').strip()
+    if item_type=='vocabulary':
+        prefix=f'🔄 Câu {index+1}/{total} — Từ vựng\n\n🇯🇵 {qtext}'
+        if q.get('options'):
+            block_options=[]
+            for opt in q.get('options') or []:
+                label=str(opt or '').strip()
+                if not label: continue
+                packed=urllib.parse.quote(json.dumps({'session_id':int(session_id),'answer':label},ensure_ascii=False,separators=(',',':')))
+                block_options.append({'label':label,'action':f'review_answer:{packed}'})
+            if block_options:
+                return prefix+'\n\nCậu chọn nghĩa tiếng Việt đúng nhé:',[
+                    {'type':'text','text':prefix+'\n\nCậu chọn nghĩa tiếng Việt đúng nhé:'},
+                    {'type':'choice','id':f'review_q_{index}','options':block_options}
+                ]
+        return prefix+'\n\nCậu trả lời bằng tiếng Việt nhé.',[{'type':'text','text':prefix+'\n\nCậu trả lời bằng tiếng Việt nhé.'}]
+    prefix=f'🔄 Câu {index+1}/{total} — Ngữ pháp\n\n{qtext}'
+    if q.get('options'):
+        block_options=[]
+        for opt in q.get('options') or []:
+            label=str(opt or '').strip()
+            if not label: continue
+            packed=urllib.parse.quote(json.dumps({'session_id':int(session_id),'answer':label},ensure_ascii=False,separators=(',',':')))
+            block_options.append({'label':label,'action':f'review_answer:{packed}'})
+        if block_options:
+            return prefix+'\n\nCậu chọn đáp án đúng nhé:',[
+                {'type':'text','text':prefix+'\n\nCậu chọn đáp án đúng nhé:'},
+                {'type':'choice','id':f'review_q_{index}','options':block_options}
+            ]
+    return prefix+'\n\nCậu trả lời nhé.',[{'type':'text','text':prefix+'\n\nCậu trả lời nhé.'}]
+
+
+def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12):
+    requested_lesson=str(lesson or '').strip()
+    requested_type=str(content_type or '').strip() or None
+    if requested_lesson:
+        ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
+        if not ids['vocabulary'] and not ids['grammar']:
+            raise HTTPException(404,f'Bài {requested_lesson!r} chưa được xác nhận hoàn thành hoặc chưa có từ vựng/ngữ pháp trong DB để ôn.')
+        due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
+        source_lesson=requested_lesson
+    else:
+        due=_review_due_items(user_id,course_id)
+        source_lesson='review_due'
+        if not due['vocabulary'] and not due['grammar']:
+            source_lesson, first=_review_first_lesson_items(user_id,course_id)
+            if not source_lesson:
+                raise HTTPException(404,'Không có bài đã học để ôn tập.')
+            due={'vocabulary':[{'item_id':int(x['id'])} for x in first['vocabulary']],
+                 'grammar':[{'item_id':int(x['id'])} for x in first['grammar']]}
+
+    due['vocabulary']=list({int(x['item_id']):x for x in due.get('vocabulary',[])}.values())
+    due['grammar']=list({int(x['item_id']):x for x in due.get('grammar',[])}.values())
+    data=_review_master_payload(int(course_id),due)
+    if not data['vocabulary'] and due['vocabulary']:
+        data['vocabulary']=due['vocabulary']
+    if not data['grammar'] and due['grammar']:
+        data['grammar']=due['grammar']
+    max_q=max(1,min(12,int(max_questions or 12)))
+    questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None)
+    if not questions:
+        # Last-resort DB-only questions, so a model-format failure never blocks review.
+        questions=[_review_vocab_question(x,data.get('vocabulary') or []) for x in (data.get('vocabulary') or [])[:min(9,max_q)]]
+        questions=questions[:max_q]
+    if not questions:
+        raise HTTPException(500,'Không có dữ liệu DB hợp lệ để tạo câu hỏi ôn tập.')
+
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO user_review_sessions(user_id,course_id,source_lesson,chatbox_id,current_question_index,question_json,answers_json,status)
+                VALUES(%s,%s,%s,%s,0,%s::jsonb,'{}'::jsonb,'ACTIVE') RETURNING id
+            """,(user_id,int(course_id),source_lesson,str(chatbox_id or '').strip() or None,json.dumps(questions,ensure_ascii=False)))
+            row=cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    sid=int(row['id'])
+    _,blocks=_review_question_blocks(sid,questions[0],0,len(questions))
+    msg=(f'🔄 Bắt đầu ôn bài **{source_lesson}** nhé.\n\n'
+         f'Doraemon sẽ hỏi từng câu một. Cậu trả lời xong, mình mới chuyển sang câu tiếp theo.')
+    # Put the first question immediately after the short introduction.
+    blocks=[{'type':'text','text':msg}]+blocks
+    first_text='\n\n'.join(str(b.get('text') or '') for b in blocks if b.get('type')=='text')
+    return {'session_id':sid,'course_id':int(course_id),'course':course_name,'source_lesson':source_lesson,
+            'questions':questions,'reply':first_text,'content_blocks':blocks}
+
+
+def _meaning_matches(answer, expected):
+    import unicodedata
+    def norm(x):
+        x=str(x or '').strip().casefold()
+        x=''.join(ch for ch in unicodedata.normalize('NFD',x) if unicodedata.category(ch)!='Mn')
+        return re.sub(r'[^\w\s]+',' ',x,flags=re.UNICODE).strip()
+    a=norm(answer)
+    if not a: return False
+    candidates=[]
+    for raw in re.split(r'[/,;|]+',str(expected or '')):
+        n=norm(raw)
+        if n: candidates.append(n)
+    if not candidates:
+        candidates=[norm(expected)]
+    return any(a==c or (len(a)>=4 and (a in c or c in a)) for c in candidates)
+
+
+def _evaluate_review_answer(q, answer):
+    item_type=str(q.get('item_type') or '').strip()
+    expected=str(q.get('answer') or '').strip()
+    ans=str(answer or '').strip()
+    if item_type=='vocabulary':
+        correct=_meaning_matches(ans,expected)
+        return correct, (f'Đáp án đúng là **{expected}**.' if expected else '')
+    options=q.get('options') or []
+    qtype=str(q.get('question_type') or '')
+    if options or qtype in {'meaning_choice','choice','multiple_choice','completion_choice'}:
+        correct=ans.casefold()==expected.casefold()
+        return correct, (f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
+    if qtype=='sentence_creation':
+        rubric=str(q.get('answer_criteria') or expected).strip()
+        prompt=('Đánh giá câu trả lời tiếng Nhật. Trả JSON duy nhất {"correct":true|false,"explanation":"..."}. '
+                "Cho phép nhiều cách diễn đạt đúng nếu đúng cấu trúc mục tiêu.\n"
+                f'Mẫu tiêu chí: {rubric}\nCâu hỏi: {q.get("question","")}\nTrả lời: {ans}')
+        reply,_,_=_generate_chat_reply(prompt,content_type='Ngữ pháp',request_id=f'review-eval-{int(time.time()*1000)}',gen_started=time.perf_counter(),user_text=ans,reasoning_profile='low')
+        parsed=_review_json_from_text(reply)
+        if isinstance(parsed,dict):
+            return bool(parsed.get('correct')),str(parsed.get('explanation') or '')
+        return False,'Doraemon chưa xác định được câu trả lời. Mình sẽ thử lại nhé.'
+    correct=_meaning_matches(ans,expected)
+    return correct,(f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
+
+
+def _process_review_answer(user_id, session_id, answer, expected_item_type=None, expected_item_id=None):
+    sid=int(session_id)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM user_review_sessions WHERE id=%s AND user_id=%s FOR UPDATE",(sid,user_id))
+            sess=cur.fetchone()
+            if not sess: raise HTTPException(404,'Không tìm thấy phiên review.')
+            if str(sess.get('status') or '').upper()!='ACTIVE':
+                raise HTTPException(409,'Phiên ôn tập này đã kết thúc.')
+            questions=sess.get('question_json') or []
+            current_idx=int(sess.get('current_question_index') or 0)
+            q_index=current_idx
+            if expected_item_type and expected_item_id:
+                q_index=next((i for i,x in enumerate(questions) if str(x.get('item_type'))==str(expected_item_type) and int(x.get('item_id') or 0)==int(expected_item_id)),-1)
+                if q_index<0: raise HTTPException(404,'Không tìm thấy câu hỏi tương ứng.')
+            if q_index>=len(questions):
+                raise HTTPException(409,'Phiên ôn tập đã hết câu hỏi.')
+            q=dict(questions[q_index])
+            correct,explanation=_evaluate_review_answer(q,answer)
+            course_id=int(sess['course_id'])
+            item_type=str(q.get('item_type') or '')
+            item_id=int(q.get('item_id') or 0)
+            if correct: _clear_success_review(user_id,course_id,item_type,item_id)
+            else: _schedule_failed_review(user_id,course_id,item_type,item_id)
+            answers=sess.get('answers_json') or {}
+            if not isinstance(answers,dict): answers={}
+            answers[str(q_index)]={'item_type':item_type,'item_id':item_id,'answer':str(answer or ''),'correct':bool(correct),'answered_at':datetime.now(timezone.utc).isoformat()}
+            next_idx=max(current_idx,q_index+1)
+            if next_idx>=len(questions):
+                cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb,status='COMPLETED',completed_at=NOW() WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
+                conn.commit()
+                finished=True
+            else:
+                cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
+                conn.commit()
+                finished=False
+            result={'success':True,'session_id':sid,'course_id':course_id,'item_type':item_type,'item_id':item_id,
+                    'correct':bool(correct),'explanation':explanation,'finished':finished,
+                    'next_question_index':next_idx}
+            if finished:
+                source_lesson=str(sess.get('source_lesson') or '')
+                if source_lesson and source_lesson!='review_due':
+                    try: _mark_review_schedule_completed(user_id,course_id,source_lesson)
+                    except Exception as exc: print(f'[REVIEW SCHEDULE] finish skipped: {type(exc).__name__}: {exc}')
+                result['reply']=('✅ Chính xác!\n\n' if correct else f'❌ Chưa đúng. {explanation}\n\n')+'🎉 Cậu đã hoàn thành phiên ôn tập này rồi!'
+                result['content_blocks']=[{'type':'text','text':result['reply']}]
+            else:
+                next_q=questions[next_idx]
+                _,next_blocks=_review_question_blocks(sid,next_q,next_idx,len(questions))
+                feedback=('✅ Chính xác!' if correct else f'❌ Chưa đúng. {explanation}')
+                result['reply']=feedback+'\n\n'+str(next_blocks[0].get('text') or '')
+                result['content_blocks']=[{'type':'text','text':feedback}]+next_blocks
+            return result
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _clear_success_review(user_id, course_id, item_type, item_id):
@@ -8523,88 +9055,27 @@ def learning_review_start(payload: dict, authorization: Optional[str] = Header(d
     selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
     if selected_course_id is None:
         raise HTTPException(403,'Khóa học không được phép.')
-    requested_lesson=str(payload.get('lesson') or '').strip()
-    requested_type=str(payload.get('content_type') or '').strip() or None
-    due=_review_due_items(user['id'], selected_course_id)
-    source_lesson='review_due'
-    if requested_lesson:
-        ids=_review_items_for_completed_lesson(user['id'], selected_course_id, requested_lesson, requested_type)
-        if ids['vocabulary'] or ids['grammar']:
-            source_lesson=requested_lesson
-            due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
-    if source_lesson=='review_due' and not due['vocabulary'] and not due['grammar']:
-        source_lesson, first=_review_first_lesson_items(user['id'], selected_course_id)
-        if source_lesson:
-            due={'vocabulary':[{'item_id':x['id'],**x} for x in first['vocabulary']],
-                 'grammar':[{'item_id':x['id'],**x} for x in first['grammar']]}
-    if not due['vocabulary'] and not due['grammar']:
-        raise HTTPException(404,'Không có kiến thức cần ôn.')
-    due['vocabulary']=list({int(x['item_id']):x for x in due['vocabulary']}.values())
-    due['grammar']=list({int(x['item_id']):x for x in due['grammar']}.values())
-    data=_review_master_payload(selected_course_id,due)
-    # If first-review payload came directly from catalog, preserve it as-is.
-    if not data['vocabulary'] and due['vocabulary']:
-        data['vocabulary']=due['vocabulary']
-    if not data['grammar'] and due['grammar']:
-        data['grammar']=due['grammar']
-    max_q=max(1,min(10,int(payload.get('max_questions') or 8)))
-    questions=_review_genai_one_call(selected_course_id,data,max_q)
-    if not questions:
-        raise HTTPException(500,'Không tạo được câu hỏi ôn tập.')
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""INSERT INTO user_review_sessions(user_id,course_id,source_lesson,question_json)
-                           VALUES(%s,%s,%s,%s::jsonb) RETURNING id""",(user['id'],int(selected_course_id),source_lesson,json.dumps(questions,ensure_ascii=False)))
-            row=cur.fetchone()
-        conn.commit()
-    finally: conn.close()
-    return {'session_id':int(row['id']),'course_id':int(selected_course_id),'course':selected_course_name,
-            'course_name':selected_course_name,'questions':questions}
+    result=_start_review_chat_session(
+        user['id'],int(selected_course_id),selected_course_name,
+        lesson=str(payload.get('lesson') or '').strip() or None,
+        content_type=str(payload.get('content_type') or '').strip() or None,
+        chatbox_id=str(payload.get('chatbox_id') or '').strip() or None,
+        max_questions=int(payload.get('max_questions') or 12)
+    )
+    return {k:result[k] for k in ('session_id','course_id','course','questions','reply','content_blocks','source_lesson')}
+
 
 @app.post('/learning/review/answer')
 def learning_review_answer(payload: dict, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
     sid=int(payload.get('session_id') or 0)
-    item_type=str(payload.get('item_type') or '').strip()
-    item_id=int(payload.get('item_id') or 0)
+    item_type=str(payload.get('item_type') or '').strip() or None
+    item_id=int(payload.get('item_id') or 0) or None
     answer=str(payload.get('answer') or '').strip()
-    if not sid or item_type not in {'vocabulary','grammar'} or not item_id:
+    if not sid or not answer:
         raise HTTPException(400,'Dữ liệu review không hợp lệ.')
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
-            sess=cur.fetchone()
-        if not sess: raise HTTPException(404,'Không tìm thấy phiên review.')
-    finally: conn.close()
-    questions=sess.get('question_json') or []
-    q=next((x for x in questions if str(x.get('item_type'))==item_type and int(x.get('item_id') or 0)==item_id),None)
-    if not q: raise HTTPException(404,'Không tìm thấy câu hỏi tương ứng.')
-    correct=False; explanation=''
-    options=q.get('options') or []
-    expected=str(q.get('answer') or '').strip()
-    qtype=str(q.get('question_type') or '')
-    if options or qtype in {'meaning_choice','choice','multiple_choice','completion_choice'}:
-        correct=answer.casefold()==expected.casefold() or any(answer.casefold()==str(o).casefold() and str(o).casefold()==expected.casefold() for o in options)
-        if not correct and options and expected and expected.casefold() in [str(o).casefold() for o in options]:
-            correct=answer.casefold()==expected.casefold()
-    elif qtype=='sentence_creation':
-        rubric=str(q.get('answer_criteria') or expected).strip()
-        prompt=("Đánh giá câu trả lời tiếng Nhật. Trả JSON duy nhất {\"correct\":true|false,\"explanation\":\"...\"}. "
-                "Đúng nếu câu dùng đúng cấu trúc mục tiêu và phù hợp yêu cầu, cho phép nhiều cách diễn đạt đúng.\n"
-                f"Mẫu: {rubric}\nCâu hỏi: {q.get('question','')}\nTrả lời học sinh: {answer}")
-        reply,_,_=_generate_chat_reply(prompt,content_type='Ngữ pháp',request_id=f"review-eval-{sid}-{item_id}",gen_started=time.perf_counter(),user_text=answer,reasoning_profile='low')
-        try:
-            obj=json.loads(reply.strip().strip('`').replace('json\n','',1)); correct=bool(obj.get('correct')); explanation=str(obj.get('explanation') or '')
-        except Exception:
-            correct=False; explanation='Doraemon chưa xác định được câu trả lời, mình thử lại nhé.'
-    else:
-        correct=answer.casefold()==expected.casefold()
-    course_id=int(sess['course_id'])
-    if correct: _clear_success_review(user['id'],course_id,item_type,item_id)
-    else: _schedule_failed_review(user['id'],course_id,item_type,item_id)
-    return {'success':True,'session_id':sid,'item_type':item_type,'item_id':item_id,'correct':correct,'explanation':explanation}
+    result=_process_review_answer(user['id'],sid,answer,item_type,item_id)
+    return result
 
 @app.post('/learning/review/finish')
 def learning_review_finish(payload: dict, authorization: Optional[str] = Header(default=None)):
