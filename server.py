@@ -1,9 +1,9 @@
-# VERSION: v19_105 — chat-native one-question review + DB-authoritative vocabulary + contextual ack
+# VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.105-review-chat-one-by-one"
+BASELINE_VERSION = "19.106-review-quiz-typed-wrong-only"
 import os
 import ast
 import io
@@ -308,6 +308,7 @@ def init_db():
                 course_id BIGINT NOT NULL,
                 source_lesson VARCHAR(255),
                 chatbox_id VARCHAR(128),
+                review_scope VARCHAR(20) NOT NULL DEFAULT 'FULL',
                 current_question_index INTEGER NOT NULL DEFAULT 0,
                 status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
                 question_json JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -318,6 +319,7 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_vocab_review_due ON user_vocabulary_review(user_id,course_id,next_review_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_grammar_review_due ON user_grammar_review(user_id,course_id,next_review_at);")
             cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS chatbox_id VARCHAR(128);")
+            cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS review_scope VARCHAR(20) NOT NULL DEFAULT 'FULL';")
             cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS current_question_index INTEGER NOT NULL DEFAULT 0;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_review_sessions_user ON user_review_sessions(user_id,course_id,created_at DESC);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_review_sessions_active_chatbox ON user_review_sessions(user_id,course_id,status,chatbox_id,created_at DESC);")
@@ -5238,6 +5240,29 @@ def proxy_chat(
         return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
                 'learning_progress':None,'review':True}
 
+    if _is_wrong_review_request(data.text):
+        if selected_course_id is None:
+            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết bài cần làm lại nhé."
+            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        lesson_row=_find_completed_lesson(user["id"],selected_course_id,data.text)
+        lesson=str(lesson_row.get('lesson') or '').strip() if lesson_row else ''
+        if not lesson:
+            msg="Doraemon chưa xác định được tên bài. Cậu nói rõ tên bài nhé, ví dụ: 'mình muốn làm lại những câu sai của bài Dã ngoại'."
+            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+        try:
+            result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,lesson=lesson,
+                                              content_type=(lesson_row or {}).get('content_type'),chatbox_id=data.chatbox_id,
+                                              max_questions=12,only_failed=True)
+        except HTTPException as exc:
+            if exc.status_code==404:
+                msg=f"Bài **{lesson}** hiện chưa có nội dung nào bị trả lời sai trong các lần ôn trước. 😊"
+                return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
+                        'learning_progress':None,'review':True,'review_wrong_only':True,'review_lesson':lesson}
+            raise
+        print(f'[REVIEW WRONG-ONLY START] user={user["id"]} course_id={selected_course_id} lesson={lesson!r} session={result["session_id"]} questions={len(result["questions"])}')
+        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':lesson}
+
     if _is_manual_review_request(data.text):
         if selected_course_id is None:
             msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết cần ôn bài nào nhé."
@@ -8318,6 +8343,21 @@ def _find_completed_lesson(user_id, course_id, text):
     return None
 
 
+def _is_wrong_review_request(text):
+    q=str(text or '').strip().casefold()
+    if not q:
+        return False
+    markers=(
+        'làm lại những bài tôi làm sai', 'lam lai nhung bai toi lam sai',
+        'làm lại bài tôi làm sai', 'lam lai bai toi lam sai',
+        'làm lại những câu sai', 'lam lai nhung cau sai',
+        'ôn lại những câu sai', 'on lai nhung cau sai',
+        'ôn những câu sai', 'on nhung cau sai',
+        'làm lại phần sai', 'lam lai phan sai',
+    )
+    return any(m in q for m in markers)
+
+
 def _is_manual_review_request(text):
     q=str(text or '').strip().casefold()
     markers=('ôn lại bài','ôn bài','on lai bai','on bai','review bài','review bai')
@@ -8562,12 +8602,11 @@ def _review_json_from_text(text):
     return None
 
 
-def _review_vocab_question(item, all_vocab):
-    """Build a safe vocabulary question from authoritative DB data.
+def _review_vocab_question(item, all_vocab, mode=None):
+    """Create one vocabulary review question from authoritative curriculum DB data.
 
-    The Japanese prompt never includes the stored Vietnamese meaning.  The
-    answer/options are derived from DB values; GenAI may suggest distractors,
-    but the server validates the final shape before exposing it to the client.
+    mode can be 'mcq' or 'fill'.  The stored Vietnamese meaning is never placed
+    in the question itself.  For MCQ, all four answer texts come from the DB.
     """
     item_id=int(item.get('id') or 0)
     writing=str(item.get('writing') or '').strip()
@@ -8576,6 +8615,30 @@ def _review_vocab_question(item, all_vocab):
     shown=writing or reading or f'ID {item_id}'
     if writing and reading and reading != writing:
         shown=f'{writing}（{reading}）'
+    mode = mode or ('mcq' if random.random() < 0.75 else 'fill')
+
+    if mode == 'fill' or not meaning:
+        example=str(item.get('example') or '').strip()
+        fill_sentence=''
+        if example:
+            for target in [writing,reading]:
+                if target and target in example:
+                    fill_sentence=example.replace(target,'____',1)
+                    break
+        if fill_sentence:
+            question=f'🇯🇵 Điền từ vựng thích hợp vào chỗ trống:\n{fill_sentence}\n\nGợi ý: từ tiếng Nhật trong bài.'
+            answer=writing or reading or meaning
+        else:
+            question=f'🇯🇵 {shown}\n\nĐiền nghĩa tiếng Việt của từ này vào chỗ trống: ______'
+            answer=meaning
+        return {
+            'item_type':'vocabulary','item_id':item_id,
+            'question_type':'fill_blank',
+            'question':question,
+            'options':[], 'option_letters':{}, 'answer':answer,
+            'answer_criteria':answer,
+        }
+
     distractor_pool=[]
     for other in all_vocab:
         if int(other.get('id') or 0)==item_id:
@@ -8583,75 +8646,92 @@ def _review_vocab_question(item, all_vocab):
         m=str(other.get('meaning') or '').strip()
         if m and m.casefold()!=meaning.casefold() and m not in distractor_pool:
             distractor_pool.append(m)
-    # Prefer four choices, but never fabricate a Vietnamese meaning.
-    options=[meaning] if meaning else []
-    if distractor_pool:
-        options.extend(distractor_pool[:3])
-    while len(options)<4 and meaning:
-        # A vocabulary lesson can legitimately have fewer than 3 other unique meanings.
-        # In that case the question becomes free response rather than inventing content.
-        options=[]
-        break
-    if len(options)>=4:
-        random.shuffle(options)
+    if len(distractor_pool) < 3:
+        example=str(item.get('example') or '').strip()
+        fill_sentence=''
+        for target in [writing,reading]:
+            if target and target in example:
+                fill_sentence=example.replace(target,'____',1)
+                break
+        if fill_sentence:
+            question=f'🇯🇵 Điền từ vựng thích hợp vào chỗ trống:\n{fill_sentence}\n\nGợi ý: từ tiếng Nhật trong bài.'
+            answer=writing or reading or meaning
+        else:
+            question=f'🇯🇵 {shown}\n\nĐiền nghĩa tiếng Việt của từ này vào chỗ trống: ______'
+            answer=meaning
         return {
-            'item_type':'vocabulary',
-            'item_id':item_id,
-            'question_type':'meaning_choice',
-            'question':f'Từ {shown} có nghĩa tiếng Việt là gì?',
-            'options':options[:4],
-            'answer':meaning,
-            'answer_criteria':meaning,
+            'item_type':'vocabulary','item_id':item_id,
+            'question_type':'fill_blank',
+            'question':question,
+            'options':[], 'option_letters':{}, 'answer':answer,
+            'answer_criteria':answer,
         }
+    options=[meaning]+random.sample(distractor_pool,3)
+    random.shuffle(options)
+    letters=['A','B','C','D']
+    option_letters={letters[i]:options[i] for i in range(4)}
+    correct_letter=next(k for k,v in option_letters.items() if v==meaning)
     return {
-        'item_type':'vocabulary',
-        'item_id':item_id,
-        'question_type':'vocab_meaning',
-        'question':f'Từ {shown} có nghĩa tiếng Việt là gì?',
-        'options':[],
-        'answer':meaning,
+        'item_type':'vocabulary','item_id':item_id,
+        'question_type':'multiple_choice',
+        'question':f'🇯🇵 {shown}\n\nTừ này có nghĩa tiếng Việt là gì?',
+        'options':[f'{k}. {option_letters[k]}' for k in letters],
+        'option_letters':option_letters,
+        'answer':correct_letter,
+        'answer_text':meaning,
         'answer_criteria':meaning,
     }
 
 
-def _review_genai_one_call(course_id, data, max_q, lesson=None):
-    """Generate one-at-a-time review question specs from DB-backed lesson items.
+def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=False):
+    """Build one-question-at-a-time review specs using only DB-backed lesson items.
 
-    Vocabulary questions are normalized from the authoritative DB so the model can
-    never leak the Vietnamese meaning in the question. Grammar questions remain
-    GenAI-generated, but item IDs are restricted to the lesson's DB catalog.
+    The model is used to generate grammar MCQ/fill-blank wording and vocabulary
+    distractors only. The authoritative vocabulary/grammar item IDs come from DB.
     """
-    vocab=list(data.get('vocabulary') or [])[:9]
-    grammar=list(data.get('grammar') or [])[:3]
+    vocab=list(data.get('vocabulary') or [])
+    grammar=list(data.get('grammar') or [])
+    max_q=max(1,min(12,int(max_q or 12)))
+
+    # Keep the review balanced while still respecting the requested max.
+    random.shuffle(vocab)
+    random.shuffle(grammar)
+    if only_failed:
+        # Wrong-only reviews can be any size up to max_q.
+        vocab=vocab[:max_q]
+        remaining=max(0,max_q-len(vocab))
+        grammar=grammar[:remaining]
+    else:
+        vocab=vocab[:9]
+        grammar=grammar[:3]
+        if len(vocab)+len(grammar)>max_q:
+            vocab=vocab[:min(9,max_q)]
+            grammar=grammar[:max(0,max_q-len(vocab))]
+
+    selected_ids={('vocabulary',int(x.get('id') or 0)) for x in vocab}
+    selected_ids.update({('grammar',int(x.get('id') or 0)) for x in grammar})
     selected_vocab=vocab
     selected_grammar=grammar
-    target_count=min(max_q, len(selected_vocab)+len(selected_grammar))
-    selected_vocab=selected_vocab[:min(9,target_count)]
-    remaining=max(0,target_count-len(selected_vocab))
-    selected_grammar=selected_grammar[:min(3,remaining)]
-    selected_ids={('vocabulary',int(x.get('id') or 0)) for x in selected_vocab}
-    selected_ids.update({('grammar',int(x.get('id') or 0)) for x in selected_grammar})
 
-    prompt={
-        'task':'Tạo câu hỏi ôn tập tiếng Nhật từ đúng dữ liệu DB đã cung cấp.',
+    prompt_data={
+        'task':'Tạo câu hỏi ôn tập tiếng Nhật theo kiểu quiz, MỖI LẦN CHỈ 1 CÂU cho người học.',
         'lesson':str(lesson or ''),
         'rules':[
-            'Mỗi item chỉ được dùng một lần.',
-            'Không được tạo item_id mới và không được dùng kiến thức ngoài DATA.',
-            'Thứ tự: toàn bộ vocabulary trước, sau đó grammar.',
-            'Vocabulary: question chỉ được viết từ tiếng Nhật (writing/reading) và hỏi nghĩa tiếng Việt; tuyệt đối không viết nghĩa tiếng Việt trong question.',
-            'Vocabulary: có thể là trắc nghiệm với 4 lựa chọn tiếng Việt; answer phải đúng meaning của DB.',
-            'Grammar: tạo câu hỏi hiểu/nghĩa/hoàn thành câu dựa đúng pattern/meaning/explanation/example đã cho.',
-            'Trả JSON duy nhất: {"questions":[...]}.',
+            'Chỉ sử dụng đúng item_id có trong DATA. Không tạo item_id mới và không dùng kiến thức ngoài DATA.',
+            'Mỗi item chỉ dùng một lần trong phiên.',
+            'Mỗi câu phải thuộc một trong hai dạng question_type: multiple_choice hoặc fill_blank.',
+            'Với multiple_choice phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
+            'Với fill_blank phải có câu hỏi có chỗ trống và answer là đáp án ngắn cần điền.',
+            'Vocabulary: dùng writing/reading của DATA để hỏi nghĩa tiếng Việt. Tuyệt đối không đưa meaning của chính item vào phần question.',
+            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống.',
+            'Không hiển thị đáp án đúng trong question.',
+            'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"..."}]}.',
         ],
-        'DATA':{
-            'vocabulary':selected_vocab,
-            'grammar':selected_grammar,
-        }
+        'DATA':{'vocabulary':selected_vocab,'grammar':selected_grammar},
     }
-    payload=json.dumps(prompt,ensure_ascii=False,separators=(',',':'))
+    payload=json.dumps(prompt_data,ensure_ascii=False,separators=(',',':'))
     reply,model,_=_generate_chat_reply(
-        'Bạn là gia sư tiếng Nhật. Hãy tuân thủ tuyệt đối schema JSON trong yêu cầu sau.\n'+payload,
+        'Bạn là gia sư tiếng Nhật. Hãy tạo quiz đúng dữ liệu DB và trả JSON duy nhất.\n'+payload,
         content_type=None,
         request_id=f'review-{course_id}-{int(time.time()*1000)}',
         gen_started=time.perf_counter(),
@@ -8659,11 +8739,8 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None):
         reasoning_profile='low'
     )
     parsed=_review_json_from_text(reply)
-    generated=[]
-    if isinstance(parsed,dict) and isinstance(parsed.get('questions'),list):
-        generated=parsed.get('questions') or []
-    elif isinstance(parsed,list):
-        generated=parsed
+    generated=(parsed.get('questions') if isinstance(parsed,dict) else parsed) or []
+    if not isinstance(generated,list): generated=[]
 
     by_key={}
     for q in generated:
@@ -8679,22 +8756,26 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None):
     questions=[]
     for item in selected_vocab:
         item_id=int(item.get('id') or 0)
-        # DB is authoritative for the vocabulary meaning and the visible question.
-        q=_review_vocab_question(item, selected_vocab)
         ai_q=by_key.get(('vocabulary',item_id)) or {}
-        ai_options=ai_q.get('options') if isinstance(ai_q,dict) else None
-        if isinstance(ai_options,list):
-            opts=[]
-            for x in ai_options:
-                x=str(x or '').strip()
-                if x and x not in opts:
-                    opts.append(x)
+        ai_type=str(ai_q.get('question_type') or '').strip()
+        # Vocabulary wording and correct answer remain DB-authoritative.
+        mode='fill' if ai_type=='fill_blank' else 'mcq'
+        q=_review_vocab_question(item,selected_vocab,mode=mode)
+        # AI can provide distractors, but only if they are four unique strings and
+        # include the authoritative meaning exactly once.
+        if mode=='mcq':
             meaning=str(item.get('meaning') or '').strip()
-            if meaning and meaning in opts and len(opts)>=4:
-                random.shuffle(opts)
-                q['options']=opts[:4]
-                q['question_type']='meaning_choice'
-                q['answer']=meaning
+            ai_opts=ai_q.get('option_letters')
+            if isinstance(ai_opts,dict):
+                raw=[]
+                for letter in ('A','B','C','D'):
+                    val=str(ai_opts.get(letter) or '').strip()
+                    if val: raw.append(val)
+                if len(raw)==4 and meaning in raw and len({x.casefold() for x in raw})==4:
+                    q['option_letters']={k:raw[i] for i,k in enumerate(('A','B','C','D'))}
+                    q['options']=[f'{k}. {q["option_letters"][k]}' for k in ('A','B','C','D')]
+                    q['answer']=next(k for k in ('A','B','C','D') if q['option_letters'][k]==meaning)
+                    q['answer_text']=meaning
         questions.append(q)
 
     for item in selected_grammar:
@@ -8704,40 +8785,98 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None):
         meaning=str(item.get('meaning') or '').strip()
         explanation=str(item.get('explanation') or '').strip()
         example=str(item.get('example') or '').strip()
+        qtype=str(ai_q.get('question_type') or '').strip()
         question=str(ai_q.get('question') or '').strip()
         options=ai_q.get('options') if isinstance(ai_q.get('options'),list) else []
         answer=str(ai_q.get('answer') or '').strip()
-        qtype=str(ai_q.get('question_type') or '').strip()
+        option_letters=ai_q.get('option_letters') if isinstance(ai_q.get('option_letters'),dict) else {}
+
+        if qtype not in {'multiple_choice','fill_blank'}:
+            qtype='multiple_choice'
         if not question:
-            question=f'Cấu trúc {pattern or "này"} có ý nghĩa/cách dùng như thế nào?'
-        if not answer:
-            answer=meaning
-        if qtype=='sentence_creation' and explanation:
-            criteria=str(ai_q.get('answer_criteria') or explanation).strip()
-        else:
-            criteria=str(ai_q.get('answer_criteria') or answer).strip()
-        clean_opts=[]
-        for x in options:
-            x=str(x or '').strip()
-            if x and x not in clean_opts:
-                clean_opts.append(x)
+            if qtype=='fill_blank' and example:
+                question=f'Điền vào chỗ trống theo cấu trúc **{pattern or "này"}**:\n{example}'
+            else:
+                question=f'Cấu trúc **{pattern or "này"}** được dùng như thế nào?'
+        if qtype=='multiple_choice':
+            clean=[]
+            # Prefer the model-provided explicit A-D map.
+            for letter in ('A','B','C','D'):
+                val=str(option_letters.get(letter) or '').strip()
+                if val: clean.append(val)
+            if len(clean)!=4:
+                for x in options:
+                    x=str(x or '').strip()
+                    if x:
+                        # Strip a leading A./B./C./D. if the model included it.
+                        x=re.sub(r'^[A-D][.)]\s*','',x,flags=re.I)
+                        if x not in clean: clean.append(x)
+                    if len(clean)==4: break
+            if len(clean)==4:
+                option_letters={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+                if answer.upper() in {'A','B','C','D'}:
+                    correct_letter=answer.upper()
+                elif answer in clean:
+                    correct_letter=next(k for k,v in option_letters.items() if v==answer)
+                else:
+                    # Safe fallback: ask the meaning as a deterministic MCQ.
+                    correct_text=meaning or explanation or example
+                    distractors=[m for m in [explanation,example] if m and m!=correct_text]
+                    pool=[correct_text]+[x for x in distractors if x not in (correct_text,)]
+                    while len(pool)<4:
+                        pool.append(f'Không phải cách dùng của {pattern or "cấu trúc này"}.')
+                    clean=random.sample(pool[:4],4) if len(pool)>=4 else pool[:4]
+                    option_letters={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+                    correct_letter=next(k for k,v in option_letters.items() if v==correct_text)
+                question=question
+                questions.append({
+                    'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
+                    'question':question,
+                    'options':[f'{k}. {option_letters[k]}' for k in ('A','B','C','D')],
+                    'option_letters':option_letters,
+                    'answer':correct_letter,
+                    'answer_text':option_letters[correct_letter],
+                    'answer_criteria':meaning or explanation or option_letters[correct_letter],
+                    'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example,
+                })
+                continue
+
+        # Fill blank grammar: ensure the visible question actually contains a blank.
+        fill_answer=answer or pattern
+        if not fill_answer:
+            fill_answer=pattern or meaning
+        fill_question=question
+        if example and fill_answer and fill_answer in example:
+            fill_question=example.replace(fill_answer,'____',1)
+            fill_question=f'Hoàn thành câu theo cấu trúc **{pattern or "này"}**:\n{fill_question}'
+        elif not re.search(r'_{2,}|…{2,}|\.{3,}',fill_question):
+            fill_question=(f'Hoàn thành câu theo cấu trúc **{pattern or "này"}** bằng cách điền vào chỗ trống: ______\n'
+                           f'Ý nghĩa cần dùng: {meaning or explanation}')
+        # Never put the target answer itself in the question text.
+        if fill_answer and fill_answer in fill_question:
+            if example and fill_answer in example:
+                masked=example.replace(fill_answer,'____',1)
+                fill_question=f'Hoàn thành câu theo cấu trúc **{pattern or "này"}**:\n{masked}'
+            else:
+                fill_question=re.sub(re.escape(fill_answer), '____', fill_question, count=1)
         questions.append({
-            'item_type':'grammar',
-            'item_id':item_id,
-            'question_type':qtype or ('meaning_choice' if len(clean_opts)>=4 else 'grammar_open'),
-            'question':question,
-            'options':clean_opts[:4],
-            'answer':answer,
-            'answer_criteria':criteria,
-            'pattern':pattern,
-            'meaning':meaning,
-            'explanation':explanation,
-            'example':example,
+            'item_type':'grammar','item_id':item_id,'question_type':'fill_blank',
+            'question':fill_question,
+            'options':[],'option_letters':{},'answer':fill_answer,
+            'answer_text':fill_answer,
+            'answer_criteria':str(ai_q.get('answer_criteria') or fill_answer or meaning or explanation or pattern).strip(),
+            'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example,
         })
 
-    if not questions:
-        print(f'[REVIEW GENAI] no parsed questions; falling back to DB-safe vocabulary questions model={model!r}')
-    return questions[:max_q]
+    # Enforce uniqueness and the maximum. Preserve the lesson order: vocabulary first,
+    # then grammar, while allowing the question type to vary by item.
+    seen=set(); out=[]
+    for q in questions:
+        key=(str(q.get('item_type') or ''),int(q.get('item_id') or 0))
+        if key in seen: continue
+        seen.add(key); out.append(q)
+        if len(out)>=max_q: break
+    return out
 
 
 def _get_active_review_session(user_id, course_id, chatbox_id=None):
@@ -8765,38 +8904,215 @@ def _get_active_review_session(user_id, course_id, chatbox_id=None):
 
 
 def _review_question_blocks(session_id, question, index, total):
+    """Render exactly one review question as plain chat text.
+
+    There are intentionally no clickable answer buttons.  The learner types A/B/C/D
+    for MCQ or the answer text for fill-in-the-blank.
+    """
     q=dict(question or {})
     item_type=str(q.get('item_type') or '').strip()
+    qtype=str(q.get('question_type') or '').strip()
     qtext=str(q.get('question') or '').strip()
-    if item_type=='vocabulary':
-        prefix=f'🔄 Câu {index+1}/{total} — Từ vựng\n\n🇯🇵 {qtext}'
-        if q.get('options'):
-            block_options=[]
-            for opt in q.get('options') or []:
-                label=str(opt or '').strip()
-                if not label: continue
-                packed=urllib.parse.quote(json.dumps({'session_id':int(session_id),'answer':label},ensure_ascii=False,separators=(',',':')))
-                block_options.append({'label':label,'action':f'review_answer:{packed}'})
-            if block_options:
-                return prefix+'\n\nCậu chọn nghĩa tiếng Việt đúng nhé:',[
-                    {'type':'text','text':prefix+'\n\nCậu chọn nghĩa tiếng Việt đúng nhé:'},
-                    {'type':'choice','id':f'review_q_{index}','options':block_options}
-                ]
-        return prefix+'\n\nCậu trả lời bằng tiếng Việt nhé.',[{'type':'text','text':prefix+'\n\nCậu trả lời bằng tiếng Việt nhé.'}]
-    prefix=f'🔄 Câu {index+1}/{total} — Ngữ pháp\n\n{qtext}'
-    if q.get('options'):
-        block_options=[]
-        for opt in q.get('options') or []:
-            label=str(opt or '').strip()
-            if not label: continue
-            packed=urllib.parse.quote(json.dumps({'session_id':int(session_id),'answer':label},ensure_ascii=False,separators=(',',':')))
-            block_options.append({'label':label,'action':f'review_answer:{packed}'})
-        if block_options:
-            return prefix+'\n\nCậu chọn đáp án đúng nhé:',[
-                {'type':'text','text':prefix+'\n\nCậu chọn đáp án đúng nhé:'},
-                {'type':'choice','id':f'review_q_{index}','options':block_options}
-            ]
-    return prefix+'\n\nCậu trả lời nhé.',[{'type':'text','text':prefix+'\n\nCậu trả lời nhé.'}]
+    prefix=f'🔄 Câu {index+1}/{total} — {"Từ vựng" if item_type=="vocabulary" else "Ngữ pháp"}'
+    if qtype=='multiple_choice':
+        opts=q.get('options') or []
+        opts_text='\n'.join(str(x) for x in opts[:4])
+        text=f'{prefix}\n\n{qtext}\n\n{opts_text}\n\n👉 Cậu chỉ cần gõ **A**, **B**, **C** hoặc **D**.'
+    else:
+        text=f'{prefix}\n\n{qtext}\n\n👉 Cậu điền đáp án rồi gửi cho Doraemon nhé.'
+    return text,[{'type':'text','text':text}]
+
+
+def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12, only_failed=False):
+    requested_lesson=str(lesson or '').strip()
+    requested_type=str(content_type or '').strip() or None
+    if requested_lesson:
+        if only_failed:
+            data=_review_failed_items_for_lesson(user_id,course_id,requested_lesson,requested_type)
+            if not data['vocabulary'] and not data['grammar']:
+                raise HTTPException(404,f'Bài {requested_lesson!r} hiện chưa có từ vựng/ngữ pháp nào bị trả lời sai để làm lại.')
+        else:
+            ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
+            if not ids['vocabulary'] and not ids['grammar']:
+                raise HTTPException(404,f'Bài {requested_lesson!r} chưa được xác nhận hoàn thành hoặc chưa có từ vựng/ngữ pháp trong DB để ôn.')
+            due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
+            data=_review_master_payload(int(course_id),due)
+        source_lesson=requested_lesson
+    else:
+        if only_failed:
+            source_lesson, first=_review_first_failed_lesson(user_id,course_id)
+            if not source_lesson:
+                raise HTTPException(404,'Không có bài nào có nội dung đã trả lời sai để làm lại.')
+            data=_review_failed_items_for_lesson(user_id,course_id,source_lesson,None)
+        else:
+            due=_review_due_items(user_id,course_id)
+            source_lesson='review_due'
+            if not due['vocabulary'] and not due['grammar']:
+                source_lesson, first=_review_first_lesson_items(user_id,course_id)
+                if not source_lesson:
+                    raise HTTPException(404,'Không có bài đã học để ôn tập.')
+                due={'vocabulary':[{'item_id':int(x['id'])} for x in first['vocabulary']],
+                     'grammar':[{'item_id':int(x['id'])} for x in first['grammar']]}
+            data=_review_master_payload(int(course_id),due)
+
+    max_q=max(1,min(12,int(max_questions or 12)))
+    questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None,only_failed=only_failed)
+    if not questions:
+        # DB-safe fallback: vocabulary MCQ/fill and simple grammar meaning MCQ.
+        questions=[]
+        for item in (data.get('vocabulary') or [])[:max_q]:
+            questions.append(_review_vocab_question(item,data.get('vocabulary') or []))
+        for item in (data.get('grammar') or []):
+            if len(questions)>=max_q: break
+            meaning=str(item.get('meaning') or '').strip()
+            pattern=str(item.get('pattern') or '').strip()
+            pool=[meaning]
+            for other in (data.get('grammar') or []):
+                m=str(other.get('meaning') or '').strip()
+                if m and m not in pool: pool.append(m)
+            if len(pool)>=4:
+                opts=random.sample(pool[:4],4)
+                letter=next(k for k,v in zip('ABCD',opts) if v==meaning)
+                q={
+                    'item_type':'grammar','item_id':int(item.get('id') or 0),'question_type':'multiple_choice',
+                    'question':f'Cấu trúc {pattern or "này"} có ý nghĩa/cách dùng nào đúng?',
+                    'options':[f'{k}. {v}' for k,v in zip('ABCD',opts)],
+                    'option_letters':{k:v for k,v in zip('ABCD',opts)},'answer':letter,'answer_text':meaning,
+                    'answer_criteria':meaning,'pattern':pattern,
+                }
+                questions.append(q)
+            else:
+                questions.append({
+                    'item_type':'grammar','item_id':int(item.get('id') or 0),'question_type':'fill_blank',
+                    'question':f'Điền ý nghĩa tiếng Việt của cấu trúc {pattern or "này"}: ______',
+                    'options':[],'option_letters':{},'answer':meaning,'answer_text':meaning,'answer_criteria':meaning,
+                    'pattern':pattern,
+                })
+    if not questions:
+        raise HTTPException(500,'Không có dữ liệu DB hợp lệ để tạo câu hỏi ôn tập.')
+
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO user_review_sessions(user_id,course_id,source_lesson,chatbox_id,review_scope,current_question_index,question_json,answers_json,status)
+                VALUES(%s,%s,%s,%s,%s,0,%s::jsonb,'{}'::jsonb,'ACTIVE') RETURNING id
+            """,(user_id,int(course_id),source_lesson,str(chatbox_id or '').strip() or None,
+                  'WRONG_ONLY' if only_failed else 'FULL',json.dumps(questions,ensure_ascii=False)))
+            row=cur.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    sid=int(row['id'])
+    first_text,_=_review_question_blocks(sid,questions[0],0,len(questions))
+    intro=f'🔄 Bắt đầu {"làm lại các nội dung đã sai của" if only_failed else "ôn lại"} bài **{source_lesson}** nhé.\n\nDoraemon sẽ hỏi từng câu một; cậu trả lời xong mình mới sang câu tiếp theo.'
+    first_text=first_text
+    blocks=[{'type':'text','text':intro},{'type':'text','text':first_text}]
+    return {'session_id':sid,'course_id':int(course_id),'course':course_name,'source_lesson':source_lesson,
+            'questions':questions,'reply':intro+'\n\n'+first_text,'content_blocks':blocks}
+
+
+def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=None):
+    """Return only vocabulary/grammar items previously answered incorrectly in one lesson.
+
+    Lesson membership is resolved primarily through curriculum_lesson_items so an item
+    that appears elsewhere in the course cannot be incorrectly attributed to this lesson.
+    """
+    lesson=str(lesson or '').strip()
+    if not lesson:
+        return {'vocabulary':[],'grammar':[]}
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT r.vocab_id AS id,
+                       m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
+                FROM user_vocabulary_review r
+                JOIN curriculum_vocab_master m
+                  ON m.id=r.vocab_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM curriculum_lesson_items cli
+                      JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
+                      WHERE cli.item_type='vocabulary' AND cli.item_id=m.id
+                        AND cl.course_id=%s
+                        AND cl.status='PUBLISHED'
+                        AND lower(trim(cl.lesson))=lower(trim(%s))
+                  )
+                ORDER BY r.vocab_id
+            """,(user_id,course_id,course_id,lesson))
+            vocab=[dict(x) for x in cur.fetchall()]
+            cur.execute("""
+                SELECT DISTINCT r.grammar_id AS id,
+                       m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
+                FROM user_grammar_review r
+                JOIN curriculum_grammar_master m
+                  ON m.id=r.grammar_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM curriculum_lesson_items cli
+                      JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
+                      WHERE cli.item_type='grammar' AND cli.item_id=m.id
+                        AND cl.course_id=%s
+                        AND cl.status='PUBLISHED'
+                        AND lower(trim(cl.lesson))=lower(trim(%s))
+                  )
+                ORDER BY r.grammar_id
+            """,(user_id,course_id,course_id,lesson))
+            grammar=[dict(x) for x in cur.fetchall()]
+            # Backward compatibility for older curriculum rows that have no lesson-item map.
+            if not vocab:
+                cur.execute("""
+                    SELECT DISTINCT r.vocab_id AS id,
+                           m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
+                    FROM user_vocabulary_review r
+                    JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                    WHERE r.user_id=%s AND r.course_id=%s
+                      AND lower(trim(m.source_lesson))=lower(trim(%s))
+                    ORDER BY r.vocab_id
+                """,(user_id,course_id,lesson))
+                vocab=[dict(x) for x in cur.fetchall()]
+            if not grammar:
+                cur.execute("""
+                    SELECT DISTINCT r.grammar_id AS id,
+                           m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
+                    FROM user_grammar_review r
+                    JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                    WHERE r.user_id=%s AND r.course_id=%s
+                      AND lower(trim(m.source_lesson))=lower(trim(%s))
+                    ORDER BY r.grammar_id
+                """,(user_id,course_id,lesson))
+                grammar=[dict(x) for x in cur.fetchall()]
+            return {'vocabulary':vocab,'grammar':grammar}
+    finally:
+        conn.close()
+
+
+def _review_first_failed_lesson(user_id, course_id):
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                FROM user_vocabulary_review r
+                JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
+                GROUP BY m.source_lesson
+                UNION ALL
+                SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                FROM user_grammar_review r
+                JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
+                GROUP BY m.source_lesson
+                ORDER BY first_wrong_at ASC
+                LIMIT 1
+            """,(user_id,course_id,user_id,course_id))
+            row=cur.fetchone()
+            return (str(row.get('lesson') or '').strip() if row else None, None)
+    finally:
+        conn.close()
 
 
 def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12):
@@ -8875,27 +9191,27 @@ def _meaning_matches(answer, expected):
 
 def _evaluate_review_answer(q, answer):
     item_type=str(q.get('item_type') or '').strip()
-    expected=str(q.get('answer') or '').strip()
+    qtype=str(q.get('question_type') or '').strip()
     ans=str(answer or '').strip()
+    if qtype=='multiple_choice':
+        letter=ans.upper().strip()
+        if letter not in {'A','B','C','D'}:
+            return False,'Cậu hãy trả lời bằng A, B, C hoặc D nhé.'
+        correct=letter==str(q.get('answer') or '').upper().strip()
+        if correct:
+            return True,''
+        correct_text=str(q.get('answer_text') or '').strip()
+        return False,(f'Đáp án đúng là **{str(q.get("answer") or "").upper()}** — {correct_text}.' if correct_text else '')
+
+    expected=str(q.get('answer') or '').strip()
     if item_type=='vocabulary':
         correct=_meaning_matches(ans,expected)
-        return correct, (f'Đáp án đúng là **{expected}**.' if expected else '')
-    options=q.get('options') or []
-    qtype=str(q.get('question_type') or '')
-    if options or qtype in {'meaning_choice','choice','multiple_choice','completion_choice'}:
-        correct=ans.casefold()==expected.casefold()
         return correct, (f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
-    if qtype=='sentence_creation':
-        rubric=str(q.get('answer_criteria') or expected).strip()
-        prompt=('Đánh giá câu trả lời tiếng Nhật. Trả JSON duy nhất {"correct":true|false,"explanation":"..."}. '
-                "Cho phép nhiều cách diễn đạt đúng nếu đúng cấu trúc mục tiêu.\n"
-                f'Mẫu tiêu chí: {rubric}\nCâu hỏi: {q.get("question","")}\nTrả lời: {ans}')
-        reply,_,_=_generate_chat_reply(prompt,content_type='Ngữ pháp',request_id=f'review-eval-{int(time.time()*1000)}',gen_started=time.perf_counter(),user_text=ans,reasoning_profile='low')
-        parsed=_review_json_from_text(reply)
-        if isinstance(parsed,dict):
-            return bool(parsed.get('correct')),str(parsed.get('explanation') or '')
-        return False,'Doraemon chưa xác định được câu trả lời. Mình sẽ thử lại nhé.'
+
+    # Grammar fill-in-the-blank: exact/normalized matching against the DB/AI target.
     correct=_meaning_matches(ans,expected)
+    if not correct and str(q.get('answer_criteria') or '').strip():
+        correct=_meaning_matches(ans,str(q.get('answer_criteria') or ''))
     return correct,(f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
 
 
@@ -8919,6 +9235,13 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
                 raise HTTPException(409,'Phiên ôn tập đã hết câu hỏi.')
             q=dict(questions[q_index])
             correct,explanation=_evaluate_review_answer(q,answer)
+            # Invalid MCQ input must not advance the session.
+            if str(q.get('question_type') or '')=='multiple_choice' and str(answer or '').strip().upper() not in {'A','B','C','D'}:
+                return {'success':True,'session_id':sid,'course_id':int(sess['course_id']),'item_type':q.get('item_type'),'item_id':int(q.get('item_id') or 0),
+                        'correct':False,'invalid_answer':True,'explanation':explanation,'finished':False,
+                        'next_question_index':current_idx,
+                        'reply':explanation,
+                        'content_blocks':[{'type':'text','text':explanation}]}
             course_id=int(sess['course_id'])
             item_type=str(q.get('item_type') or '')
             item_id=int(q.get('item_id') or 0)
@@ -8930,34 +9253,30 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             next_idx=max(current_idx,q_index+1)
             if next_idx>=len(questions):
                 cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb,status='COMPLETED',completed_at=NOW() WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
-                conn.commit()
-                finished=True
+                conn.commit(); finished=True
             else:
                 cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
-                conn.commit()
-                finished=False
+                conn.commit(); finished=False
             result={'success':True,'session_id':sid,'course_id':course_id,'item_type':item_type,'item_id':item_id,
-                    'correct':bool(correct),'explanation':explanation,'finished':finished,
-                    'next_question_index':next_idx}
+                    'correct':bool(correct),'explanation':explanation,'finished':finished,'next_question_index':next_idx}
+            feedback=('✅ Chính xác!' if correct else f'❌ Chưa đúng. {explanation}')
             if finished:
                 source_lesson=str(sess.get('source_lesson') or '')
-                if source_lesson and source_lesson!='review_due':
+                if str(sess.get('review_scope') or 'FULL').upper() == 'FULL' and source_lesson and source_lesson!='review_due':
                     try: _mark_review_schedule_completed(user_id,course_id,source_lesson)
                     except Exception as exc: print(f'[REVIEW SCHEDULE] finish skipped: {type(exc).__name__}: {exc}')
-                result['reply']=('✅ Chính xác!\n\n' if correct else f'❌ Chưa đúng. {explanation}\n\n')+'🎉 Cậu đã hoàn thành phiên ôn tập này rồi!'
+                result['reply']=feedback+'\n\n🎉 Cậu đã hoàn thành phiên ôn tập này rồi!'
                 result['content_blocks']=[{'type':'text','text':result['reply']}]
             else:
                 next_q=questions[next_idx]
                 _,next_blocks=_review_question_blocks(sid,next_q,next_idx,len(questions))
-                feedback=('✅ Chính xác!' if correct else f'❌ Chưa đúng. {explanation}')
                 result['reply']=feedback+'\n\n'+str(next_blocks[0].get('text') or '')
-                result['content_blocks']=[{'type':'text','text':feedback}]+next_blocks
+                result['content_blocks']=[{'type':'text','text':feedback},next_blocks[0]]
             return result
     except HTTPException:
         raise
     except Exception:
-        conn.rollback()
-        raise
+        conn.rollback(); raise
     finally:
         conn.close()
 
