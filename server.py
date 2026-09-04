@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.110-review-persistence-stable-ids"
+BASELINE_VERSION = "19.114-review-session-temporary-state"
 import os
 import ast
 import io
@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.111-review-latest-session-wrong-only")
-SERVER_VERSION = "2026-09-04-v19_110_review_persistence_stable_ids"
+print("[DORAEMON SERVER FINGERPRINT] 19.113-review-question-type-consistency")
+SERVER_VERSION = "2026-09-04-v19_114_review_session_temporary_state"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -302,6 +302,8 @@ def init_db():
                 next_review_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY(user_id,course_id,grammar_id)
             );""")
+            # Temporary state only: active quiz questions/answers live here while a
+            # review chat is in progress. Completed/abandoned sessions are deleted.
             cur.execute("""CREATE TABLE IF NOT EXISTS user_review_sessions (
                 id BIGSERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -517,6 +519,18 @@ def startup():
             print(f"[REVIEW PERSISTENCE] repaired={repaired}")
         except Exception as exc:
             print("[REVIEW PERSISTENCE] repair skipped:", type(exc).__name__, str(exc))
+        try:
+            conn_cleanup = db()
+            try:
+                with conn_cleanup.cursor() as cur_cleanup:
+                    cur_cleanup.execute("DELETE FROM user_review_sessions WHERE status <> 'ACTIVE'")
+                    removed_sessions = cur_cleanup.rowcount
+                conn_cleanup.commit()
+            finally:
+                conn_cleanup.close()
+            print(f"[REVIEW SESSION CLEANUP] removed_non_active={removed_sessions}")
+        except Exception as exc:
+            print("[REVIEW SESSION CLEANUP] skipped:", type(exc).__name__, str(exc))
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
@@ -5358,7 +5372,7 @@ def proxy_chat(
                 conn_r=db()
                 try:
                     with conn_r.cursor() as cur_r:
-                        cur_r.execute("UPDATE user_review_sessions SET status='ABANDONED',completed_at=NOW() WHERE id=%s AND user_id=%s",(int(active_review['id']),user['id']))
+                        cur_r.execute("DELETE FROM user_review_sessions WHERE id=%s AND user_id=%s",(int(active_review['id']),user['id']))
                     conn_r.commit()
                 finally:
                     conn_r.close()
@@ -8681,6 +8695,7 @@ def _review_vocab_question(item, all_vocab, mode=None):
             'question_type':'fill_blank',
             'question':question,
             'options':[], 'option_letters':{}, 'answer':answer,
+            'answer_variants':[x for x in (writing,reading) if x],
             'answer_criteria':answer,
         }
 
@@ -8709,6 +8724,7 @@ def _review_vocab_question(item, all_vocab, mode=None):
             'question_type':'fill_blank',
             'question':question,
             'options':[], 'option_letters':{}, 'answer':answer,
+            'answer_variants':[x for x in (writing,reading) if x],
             'answer_criteria':answer,
         }
     options=[meaning]+random.sample(distractor_pool,3)
@@ -9001,7 +9017,7 @@ def _review_question_blocks(session_id, question, index, total):
     """
     q=dict(question or {})
     item_type=str(q.get('item_type') or '').strip()
-    qtype=str(q.get('question_type') or '').strip()
+    qtype=_review_effective_question_type(q)
     qtext=str(q.get('question') or '').strip()
     prefix=f'🔄 Câu {index+1}/{total} — {"Từ vựng" if item_type=="vocabulary" else "Ngữ pháp"}'
     if qtype=='multiple_choice':
@@ -9103,14 +9119,12 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
 
 
 def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=None):
-    """Return only the questions answered incorrectly in the latest completed review session for one lesson.
+    """Return the current durable wrong-review state for one lesson.
 
-    This is intentionally session-based, not cumulative across the whole lifetime of the lesson.
-    Example: if yesterday's 12-question review had 6 wrong answers, today's WRONG_ONLY review
-    must contain exactly those 6 items. Older unresolved mistakes from previous sessions are not
-    silently added to the current retry set.
-
-    If no completed review session exists (legacy data), fall back to the durable review tables.
+    Review sessions are temporary quiz state. The durable source of truth for
+    "làm lại phần sai" is ONLY user_vocabulary_review/user_grammar_review.
+    Any item answered correctly is removed from those tables; any item still
+    present is therefore currently in the learner's retry queue.
     """
     lesson=str(lesson or '').strip()
     if not lesson:
@@ -9118,65 +9132,6 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1) Find the latest completed review session for this exact lesson/course.
-            cur.execute("""
-                SELECT id,question_json,answers_json,completed_at,review_scope
-                FROM user_review_sessions
-                WHERE user_id=%s AND course_id=%s
-                  AND status='COMPLETED'
-                  AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
-                ORDER BY completed_at DESC NULLS LAST,id DESC
-                LIMIT 1
-            """, (user_id,int(course_id),lesson))
-            sess=cur.fetchone()
-
-            wrong_refs=[]
-            if sess:
-                questions=sess.get('question_json') or []
-                answers=sess.get('answers_json') or {}
-                if isinstance(answers,dict):
-                    for k,v in answers.items():
-                        if not isinstance(v,dict) or bool(v.get('correct')):
-                            continue
-                        try:
-                            idx=int(k)
-                        except Exception:
-                            idx=-1
-                        if 0 <= idx < len(questions) and isinstance(questions[idx],dict):
-                            q=questions[idx]
-                            typ=str(q.get('item_type') or '').strip()
-                            iid=int(q.get('item_id') or 0)
-                            if typ in {'vocabulary','grammar'} and iid:
-                                wrong_refs.append((typ,iid))
-
-            # 2) Resolve those exact item IDs against the current curriculum master.
-            vocab_ids=[iid for typ,iid in wrong_refs if typ=='vocabulary']
-            grammar_ids=[iid for typ,iid in wrong_refs if typ=='grammar']
-            vocab=[]; grammar=[]
-            if vocab_ids:
-                cur.execute("""
-                    SELECT id,writing,reading,pronunciation_vi,meaning,example,source_lesson
-                    FROM curriculum_vocab_master
-                    WHERE course_id=%s AND id=ANY(%s)
-                """,(int(course_id),vocab_ids))
-                rows={int(r['id']):dict(r) for r in cur.fetchall()}
-                vocab=[rows[i] for i in vocab_ids if i in rows]
-            if grammar_ids:
-                cur.execute("""
-                    SELECT id,pattern,meaning,explanation,example,source_lesson
-                    FROM curriculum_grammar_master
-                    WHERE course_id=%s AND id=ANY(%s)
-                """,(int(course_id),grammar_ids))
-                rows={int(r['id']):dict(r) for r in cur.fetchall()}
-                grammar=[rows[i] for i in grammar_ids if i in rows]
-
-            if sess and (vocab or grammar):
-                print(f"[REVIEW WRONG-ONLY SOURCE] lesson={lesson!r} session={int(sess['id'])} "
-                      f"wrong_vocab={len(vocab)} wrong_grammar={len(grammar)}")
-                return {'vocabulary':vocab,'grammar':grammar}
-
-            # 3) Legacy fallback: if the account has no usable completed session yet,
-            #    use currently persisted wrong items tied to this lesson.
             cur.execute("""
                 SELECT DISTINCT r.vocab_id AS id,
                        m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
@@ -9194,6 +9149,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                 ORDER BY r.vocab_id
             """,(user_id,int(course_id),int(course_id),lesson))
             vocab=[dict(x) for x in cur.fetchall()]
+
             cur.execute("""
                 SELECT DISTINCT r.grammar_id AS id,
                        m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
@@ -9212,15 +9168,16 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
             """,(user_id,int(course_id),int(course_id),lesson))
             grammar=[dict(x) for x in cur.fetchall()]
 
-            # Older curriculum rows may not have lesson-item mapping.
+            # Backward compatibility for curriculum rows without lesson-item mapping.
             if not vocab:
                 cur.execute("""
                     SELECT DISTINCT r.vocab_id AS id,
                            m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
                     FROM user_vocabulary_review r
-                    JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                    JOIN curriculum_vocab_master m
+                      ON m.id=r.vocab_id AND m.course_id=r.course_id
                     WHERE r.user_id=%s AND r.course_id=%s
-                      AND lower(trim(m.source_lesson))=lower(trim(%s))
+                      AND lower(trim(coalesce(m.source_lesson,'')))=lower(trim(%s))
                     ORDER BY r.vocab_id
                 """,(user_id,int(course_id),lesson))
                 vocab=[dict(x) for x in cur.fetchall()]
@@ -9229,43 +9186,31 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                     SELECT DISTINCT r.grammar_id AS id,
                            m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
                     FROM user_grammar_review r
-                    JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                    JOIN curriculum_grammar_master m
+                      ON m.id=r.grammar_id AND m.course_id=r.course_id
                     WHERE r.user_id=%s AND r.course_id=%s
-                      AND lower(trim(m.source_lesson))=lower(trim(%s))
+                      AND lower(trim(coalesce(m.source_lesson,'')))=lower(trim(%s))
                     ORDER BY r.grammar_id
                 """,(user_id,int(course_id),lesson))
                 grammar=[dict(x) for x in cur.fetchall()]
-            print(f"[REVIEW WRONG-ONLY FALLBACK] lesson={lesson!r} vocab={len(vocab)} grammar={len(grammar)}")
+
+            print(f"[REVIEW WRONG-ONLY STATE] lesson={lesson!r} vocab={len(vocab)} grammar={len(grammar)}")
             return {'vocabulary':vocab,'grammar':grammar}
     finally:
         conn.close()
 
-
 def _review_first_failed_lesson(user_id, course_id):
+    """Return the lesson with current unresolved review items.
+
+    No review-session history is consulted; the durable review tables are the
+    only source of truth for what still needs retry.
+    """
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Prefer the lesson from the most recent completed review session that
-            # actually contains at least one incorrect answer.
             cur.execute("""
-                SELECT source_lesson AS lesson, completed_at
-                FROM user_review_sessions
-                WHERE user_id=%s AND course_id=%s AND status='COMPLETED'
-                  AND COALESCE(trim(source_lesson),'')<>''
-                  AND EXISTS (
-                      SELECT 1
-                      FROM jsonb_each(COALESCE(answers_json,'{}'::jsonb)) a
-                      WHERE COALESCE((a.value->>'correct')::boolean,FALSE)=FALSE
-                  )
-                ORDER BY completed_at DESC NULLS LAST,id DESC
-                LIMIT 1
-            """,(user_id,int(course_id)))
-            row=cur.fetchone()
-            if row:
-                return str(row.get('lesson') or '').strip(), None
-            # Legacy fallback to currently persisted wrong items.
-            cur.execute("""
-                SELECT lesson,first_wrong_at FROM (
+                SELECT lesson,MIN(first_wrong_at) AS first_wrong_at
+                FROM (
                     SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
                     FROM user_vocabulary_review r
                     JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
@@ -9278,6 +9223,7 @@ def _review_first_failed_lesson(user_id, course_id):
                     WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
                     GROUP BY m.source_lesson
                 ) x
+                GROUP BY lesson
                 ORDER BY first_wrong_at DESC NULLS LAST, lesson
                 LIMIT 1
             """,(user_id,int(course_id),user_id,int(course_id)))
@@ -9285,8 +9231,6 @@ def _review_first_failed_lesson(user_id, course_id):
             return (str(row.get('lesson') or '').strip() if row else None, None)
     finally:
         conn.close()
-
-
 
 def _meaning_matches(answer, expected):
     import unicodedata
@@ -9357,10 +9301,57 @@ def _evaluate_grammar_fill_with_genai(q, answer):
             return True,''
         return False,(f'Chưa đúng theo câu mẫu. Một đáp án phù hợp là **{expected}**.' if expected else 'Cách điền này chưa phù hợp với mẫu ngữ pháp.')
 
+def _review_effective_question_type(q):
+    """Return the question type that matches what the chat actually renders.
+
+    Older sessions can contain an inconsistent question_type field. The renderer
+    uses four actual options for MCQ; a blank question without four options is
+    treated as fill_blank so grading cannot ask for A/B/C/D by mistake.
+    """
+    q=dict(q or {})
+    declared=str(q.get('question_type') or '').strip()
+    options=q.get('options') or []
+    question=str(q.get('question') or '').strip()
+    if declared == 'fill_blank':
+        return 'fill_blank'
+    if declared == 'multiple_choice':
+        if isinstance(options,list) and len(options) >= 4:
+            return 'multiple_choice'
+        low=question.casefold()
+        if '____' in question or 'điền' in low or 'chỗ trống' in low:
+            return 'fill_blank'
+    if '____' in question:
+        return 'fill_blank'
+    return declared or 'multiple_choice'
+
+
+def _jp_answer_matches(answer, expected, variants=None):
+    import unicodedata
+    def norm(x):
+        x=str(x or '').strip()
+        x=unicodedata.normalize('NFKC',x)
+        x=re.sub(r'\s+','',x)
+        return x.casefold()
+    a=norm(answer)
+    if not a:
+        return False
+    vals=[]
+    raw_values=[]
+    if isinstance(variants,list):
+        raw_values.extend(variants)
+    raw_values.append(expected)
+    for raw in raw_values:
+        n=norm(raw)
+        if n and n not in vals:
+            vals.append(n)
+    return a in vals
+
+
 def _evaluate_review_answer(q, answer):
     item_type=str(q.get('item_type') or '').strip()
-    qtype=str(q.get('question_type') or '').strip()
+    qtype=_review_effective_question_type(q)
     ans=str(answer or '').strip()
+
     if qtype=='multiple_choice':
         letter=ans.upper().strip()
         if letter not in {'A','B','C','D'}:
@@ -9373,11 +9364,15 @@ def _evaluate_review_answer(q, answer):
 
     expected=str(q.get('answer') or '').strip()
     if item_type=='vocabulary':
-        correct=_meaning_matches(ans,expected)
-        return correct, (f'Đáp án đúng là **{expected}**.' if expected and not correct else '')
+        # Vocabulary fill asks for the Japanese word, not its Vietnamese meaning.
+        variants=q.get('answer_variants') if isinstance(q.get('answer_variants'),list) else []
+        correct=_jp_answer_matches(ans,expected,variants)
+        if correct:
+            return True,''
+        shown=expected or (variants[0] if variants else '')
+        return False,(f'Đáp án phù hợp là **{shown}**.' if shown else 'Cậu hãy điền từ tiếng Nhật thích hợp nhé.')
 
-    # Grammar fill-in-the-blank: judge the completed sentence rather than requiring
-    # the learner to reproduce the exact DB example word.
+    # Grammar fill-in-the-blank: judge the completed sentence semantically.
     return _evaluate_grammar_fill_with_genai(q, ans)
 
 
@@ -9401,8 +9396,10 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
                 raise HTTPException(409,'Phiên ôn tập đã hết câu hỏi.')
             q=dict(questions[q_index])
             correct,explanation=_evaluate_review_answer(q,answer)
-            # Invalid MCQ input must not advance the session.
-            if str(q.get('question_type') or '')=='multiple_choice' and str(answer or '').strip().upper() not in {'A','B','C','D'}:
+            # Invalid MCQ input must not advance the session. Use the same effective
+            # type as the renderer/grader so a fill-blank question can never be
+            # mistaken for an A/B/C/D question.
+            if _review_effective_question_type(q)=='multiple_choice' and str(answer or '').strip().upper() not in {'A','B','C','D'}:
                 return {'success':True,'session_id':sid,'course_id':int(sess['course_id']),'item_type':q.get('item_type'),'item_id':int(q.get('item_id') or 0),
                         'correct':False,'invalid_answer':True,'explanation':explanation,'finished':False,
                         'next_question_index':current_idx,
@@ -9418,7 +9415,9 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             answers[str(q_index)]={'item_type':item_type,'item_id':item_id,'answer':str(answer or ''),'correct':bool(correct),'answered_at':datetime.now(timezone.utc).isoformat()}
             next_idx=max(current_idx,q_index+1)
             if next_idx>=len(questions):
-                cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb,status='COMPLETED',completed_at=NOW() WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
+                # Review session is temporary state. The durable wrong-state is already
+                # persisted in user_vocabulary_review/user_grammar_review above.
+                cur.execute("DELETE FROM user_review_sessions WHERE id=%s",(sid,))
                 conn.commit(); finished=True
             else:
                 cur.execute("UPDATE user_review_sessions SET current_question_index=%s,answers_json=%s::jsonb WHERE id=%s",(next_idx,json.dumps(answers,ensure_ascii=False),sid))
@@ -9570,7 +9569,7 @@ def learning_review_finish(payload: dict, authorization: Optional[str] = Header(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT course_id,source_lesson FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
             sess=cur.fetchone()
-            cur.execute("UPDATE user_review_sessions SET status='COMPLETED',completed_at=NOW(),answers_json=%s::jsonb WHERE id=%s AND user_id=%s",(json.dumps(payload.get('answers') or {},ensure_ascii=False),sid,user['id']))
+            cur.execute("DELETE FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
         conn.commit()
     finally: conn.close()
     if sess:
