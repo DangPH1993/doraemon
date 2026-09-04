@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.115-review-content-list"
+BASELINE_VERSION = "19.116-review-corrected-list"
 import os
 import ast
 import io
@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.113-review-question-type-consistency")
-SERVER_VERSION = "2026-09-04-v19_115_review_content_list"
+print("[DORAEMON SERVER FINGERPRINT] 19.116-review-corrected-list")
+SERVER_VERSION = "2026-09-04-v19_116_review_corrected_list"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -182,7 +182,7 @@ def init_db():
                 bbox TEXT, width INTEGER, height INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_learning_state (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                review_interval_days INTEGER NOT NULL DEFAULT 2,
+                review_interval_days INTEGER NOT NULL DEFAULT 1,
                 welcome_seen BOOLEAN NOT NULL DEFAULT FALSE,
                 reset_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -357,7 +357,7 @@ def init_db():
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
                 target TEXT NOT NULL DEFAULT '', status VARCHAR(20) NOT NULL DEFAULT 'pending', completed_at TIMESTAMPTZ
             );""")
-            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 2;""")
+            cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS review_interval_days INTEGER NOT NULL DEFAULT 1;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS learning_mode VARCHAR(20);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS course_guide_seen BOOLEAN NOT NULL DEFAULT FALSE;""")
@@ -8295,8 +8295,8 @@ def _get_review_interval_days(user_id):
         with conn.cursor() as cur:
             cur.execute("SELECT review_interval_days FROM user_learning_state WHERE user_id=%s", (user_id,))
             row=cur.fetchone()
-            try: days=int(row[0]) if row and row[0] is not None else 2
-            except Exception: days=2
+            try: days=int(row[0]) if row and row[0] is not None else 1
+            except Exception: days=1
             return max(1,min(365,days))
     finally:
         conn.close()
@@ -8674,9 +8674,9 @@ def _review_vocab_question(item, all_vocab, mode=None):
     shown=writing or reading or f'ID {item_id}'
     if writing and reading and reading != writing:
         shown=f'{writing}（{reading}）'
-    mode = mode or ('mcq' if random.random() < 0.75 else 'fill')
+    mode = 'mcq'
 
-    if mode == 'fill' or not meaning:
+    if not meaning:
         example=str(item.get('example') or '').strip()
         fill_sentence=''
         if example:
@@ -8820,7 +8820,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         ai_q=by_key.get(('vocabulary',item_id)) or {}
         ai_type=str(ai_q.get('question_type') or '').strip()
         # Vocabulary wording and correct answer remain DB-authoritative.
-        mode='fill' if ai_type=='fill_blank' else 'mcq'
+        mode='mcq'
         q=_review_vocab_question(item,selected_vocab,mode=mode)
         # AI can provide distractors, but only if they are four unique strings and
         # include the authoritative meaning exactly once.
@@ -9054,11 +9054,7 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
             due=_review_due_items(user_id,course_id)
             source_lesson='review_due'
             if not due['vocabulary'] and not due['grammar']:
-                source_lesson, first=_review_first_lesson_items(user_id,course_id)
-                if not source_lesson:
-                    raise HTTPException(404,'Không có bài đã học để ôn tập.')
-                due={'vocabulary':[{'item_id':int(x['id'])} for x in first['vocabulary']],
-                     'grammar':[{'item_id':int(x['id'])} for x in first['grammar']]}
+                raise HTTPException(404,'Hiện chưa có nội dung nào trong danh sách ôn tập cần làm lại.')
             data=_review_master_payload(int(course_id),due)
 
     max_q=max(1,min(12,int(max_questions or 12)))
@@ -9479,7 +9475,7 @@ def _schedule_failed_review(user_id, course_id, item_type, item_id):
 @app.get('/learning/review/settings')
 def learning_review_settings(authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
-    return {'review_interval_days':_get_review_interval_days(user['id']), 'default_review_interval_days':2}
+    return {'review_interval_days':_get_review_interval_days(user['id']), 'default_review_interval_days':1}
 
 @app.post('/learning/review/settings')
 def learning_review_settings_update(payload: dict, authorization: Optional[str] = Header(default=None)):
@@ -9514,110 +9510,65 @@ def learning_review_reminder(authorization: Optional[str] = Header(default=None)
 
 
 def _review_planned_content(user_id, course_id):
-    """Return every vocabulary/grammar item in the user's review plan.
+    """Return ONLY items that the learner actually answered incorrectly during review.
 
-    The planned date is the lesson-level Doraemon schedule unless that specific
-    item has its own durable review schedule in user_*_review (for a previous
-    wrong answer), in which case the item-level date takes precedence.
+    The lesson-level schedule is used only for Doraemon's proactive reminder.
+    It must NOT populate "Nội dung cần ôn tập" by itself. An item enters this list
+    only when a review answer is wrong and a durable row is written to
+    user_vocabulary_review/user_grammar_review. A correct answer removes that row.
     """
-    now=_now_local()
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, content_type, lesson, topic, completed_at, next_review_at,
-                       review_scheduled_at, review_completed_at
-                FROM learning_progress
-                WHERE user_id=%s AND course_id=%s AND status='completed'
-                  AND next_review_at IS NOT NULL
-                  AND review_scheduled_at IS NOT NULL
-                ORDER BY next_review_at ASC, completed_at ASC NULLS LAST, id ASC
-            """,(user_id,course_id))
-            lesson_rows=[dict(r) for r in cur.fetchall()]
-
-            cur.execute("""
                 SELECT r.vocab_id AS item_id, r.wrong_count, r.next_review_at,
-                       m.writing, m.reading, m.pronunciation_vi, m.meaning, m.example,
-                       m.source_lesson
+                       m.source_lesson, m.writing, m.reading, m.pronunciation_vi, m.meaning, m.example
                 FROM user_vocabulary_review r
-                JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                JOIN curriculum_vocab_master m
+                  ON m.id=r.vocab_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
-                ORDER BY r.next_review_at, r.vocab_id
+                ORDER BY r.next_review_at, lower(trim(coalesce(m.source_lesson,''))), r.vocab_id
             """,(user_id,course_id))
-            wrong_vocab={int(r['item_id']):dict(r) for r in cur.fetchall()}
+            vocab=[dict(r) for r in cur.fetchall()]
 
             cur.execute("""
                 SELECT r.grammar_id AS item_id, r.wrong_count, r.next_review_at,
-                       m.pattern, m.meaning, m.explanation, m.example,
-                       m.source_lesson
+                       m.source_lesson, m.pattern, m.meaning, m.explanation, m.example
                 FROM user_grammar_review r
-                JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                JOIN curriculum_grammar_master m
+                  ON m.id=r.grammar_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
-                ORDER BY r.next_review_at, r.grammar_id
+                ORDER BY r.next_review_at, lower(trim(coalesce(m.source_lesson,''))), r.grammar_id
             """,(user_id,course_id))
-            wrong_grammar={int(r['item_id']):dict(r) for r in cur.fetchall()}
+            grammar=[dict(r) for r in cur.fetchall()]
 
-            items=[]; seen=set()
-            for lr in lesson_rows:
-                lesson=str(lr.get('lesson') or '').strip()
-                ct=str(lr.get('content_type') or 'Giáo trình').strip()
-                if not lesson:
-                    continue
-                ids=_review_lesson_item_ids(int(course_id),ct,lesson)
-                lesson_due=lr.get('next_review_at')
-                for vid in ids.get('vocabulary') or []:
-                    if not vid or ('vocabulary',int(vid)) in seen: continue
-                    seen.add(('vocabulary',int(vid)))
-                    cur.execute("""SELECT id,writing,reading,pronunciation_vi,meaning,example,source_lesson
-                                   FROM curriculum_vocab_master WHERE id=%s AND course_id=%s""",(int(vid),course_id))
-                    m=cur.fetchone()
-                    if not m: continue
-                    m=dict(m); wr=wrong_vocab.get(int(vid))
-                    items.append({
-                        'item_type':'vocabulary','item_id':int(vid),'lesson':lesson,'content_type':ct,
-                        'label':m.get('writing') or m.get('reading') or str(vid),
-                        'writing':m.get('writing'),'reading':m.get('reading'),'meaning':m.get('meaning'),'example':m.get('example'),
-                        'next_review_at':(wr or {}).get('next_review_at') or lesson_due,
-                        'source':'wrong_review' if wr else 'lesson_schedule','wrong_count':int((wr or {}).get('wrong_count') or 0)
-                    })
-                for gid in ids.get('grammar') or []:
-                    if not gid or ('grammar',int(gid)) in seen: continue
-                    seen.add(('grammar',int(gid)))
-                    cur.execute("""SELECT id,pattern,meaning,explanation,example,source_lesson
-                                   FROM curriculum_grammar_master WHERE id=%s AND course_id=%s""",(int(gid),course_id))
-                    m=cur.fetchone()
-                    if not m: continue
-                    m=dict(m); wr=wrong_grammar.get(int(gid))
-                    items.append({
-                        'item_type':'grammar','item_id':int(gid),'lesson':lesson,'content_type':ct,
-                        'label':m.get('pattern') or str(gid),
-                        'pattern':m.get('pattern'),'meaning':m.get('meaning'),'explanation':m.get('explanation'),'example':m.get('example'),
-                        'next_review_at':(wr or {}).get('next_review_at') or lesson_due,
-                        'source':'wrong_review' if wr else 'lesson_schedule','wrong_count':int((wr or {}).get('wrong_count') or 0)
-                    })
-
-            # Keep durable wrong-review items even when a legacy lesson mapping is missing.
-            for vid,wr in wrong_vocab.items():
-                if ('vocabulary',vid) in seen: continue
-                seen.add(('vocabulary',vid))
+            items=[]
+            for r in vocab:
                 items.append({
-                    'item_type':'vocabulary','item_id':vid,'lesson':str(wr.get('source_lesson') or '').strip(),
-                    'content_type':'Từ vựng','label':wr.get('writing') or wr.get('reading') or str(vid),
-                    'writing':wr.get('writing'),'reading':wr.get('reading'),'meaning':wr.get('meaning'),'example':wr.get('example'),
-                    'next_review_at':wr.get('next_review_at'),'source':'wrong_review','wrong_count':int(wr.get('wrong_count') or 0)
+                    'item_type':'vocabulary','item_id':int(r['item_id']),
+                    'lesson':str(r.get('source_lesson') or '').strip(),
+                    'content_type':'Từ vựng',
+                    'label':r.get('writing') or r.get('reading') or str(r['item_id']),
+                    'writing':r.get('writing'),'reading':r.get('reading'),
+                    'meaning':r.get('meaning'),'example':r.get('example'),
+                    'next_review_at':r.get('next_review_at'),
+                    'source':'wrong_review','wrong_count':int(r.get('wrong_count') or 0)
                 })
-            for gid,wr in wrong_grammar.items():
-                if ('grammar',gid) in seen: continue
-                seen.add(('grammar',gid))
+            for r in grammar:
                 items.append({
-                    'item_type':'grammar','item_id':gid,'lesson':str(wr.get('source_lesson') or '').strip(),
-                    'content_type':'Ngữ pháp','label':wr.get('pattern') or str(gid),
-                    'pattern':wr.get('pattern'),'meaning':wr.get('meaning'),'explanation':wr.get('explanation'),'example':wr.get('example'),
-                    'next_review_at':wr.get('next_review_at'),'source':'wrong_review','wrong_count':int(wr.get('wrong_count') or 0)
+                    'item_type':'grammar','item_id':int(r['item_id']),
+                    'lesson':str(r.get('source_lesson') or '').strip(),
+                    'content_type':'Ngữ pháp',
+                    'label':r.get('pattern') or str(r['item_id']),
+                    'pattern':r.get('pattern'),'meaning':r.get('meaning'),
+                    'explanation':r.get('explanation'),'example':r.get('example'),
+                    'next_review_at':r.get('next_review_at'),
+                    'source':'wrong_review','wrong_count':int(r.get('wrong_count') or 0)
                 })
 
-            # Stable ordering: earliest planned date first, then lesson, then type/item.
-            items.sort(key=lambda x:(x.get('next_review_at') or now, str(x.get('lesson') or '').casefold(), str(x.get('item_type') or ''), int(x.get('item_id') or 0)))
+            items.sort(key=lambda x:(x.get('next_review_at') or datetime.max.replace(tzinfo=timezone.utc),
+                                     str(x.get('lesson') or '').casefold(),
+                                     str(x.get('item_type') or ''), int(x.get('item_id') or 0)))
             return items
     finally:
         conn.close()
@@ -9684,7 +9635,7 @@ def learning_review_finish(payload: dict, authorization: Optional[str] = Header(
             cur.execute("DELETE FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
         conn.commit()
     finally: conn.close()
-    if sess:
+    if sess and str(sess.get('review_scope') or 'FULL').upper() == 'FULL':
         _mark_review_schedule_completed(user['id'],int(sess['course_id']),sess.get('source_lesson'))
     return {'success':True}
 
