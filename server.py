@@ -9306,20 +9306,18 @@ def _meaning_matches(answer, expected):
 
 
 def _evaluate_grammar_fill_with_genai(q, answer):
-    """Judge grammar fill answers semantically, allowing valid alternatives.
+    """Semantically grade a grammar fill answer with a tiny prompt.
 
-    Only the minimum information required for grading is sent to the LLM: the
-    target grammar pattern, the masked sentence, the learner's answer, and the
-    resulting completed sentence.  The DB example/meaning/explanation are not
-    copied into the grading prompt unless they are already necessary to identify
-    the target pattern.
+    The learner only fills the blank. The grader judges the resulting sentence
+    against the target grammar pattern and does not require the exact source word
+    or the learner to repeat the whole sentence. The LLM returns only a boolean;
+    user-facing feedback is generated locally in Vietnamese.
     """
     pattern=str(q.get('pattern') or '').strip()
     question=str(q.get('question') or '').strip()
     answer_text=str(answer or '').strip()
     example=str(q.get('example') or '').strip()
 
-    # Reconstruct the learner's sentence by replacing the first blank marker.
     if '____' in question:
         sentence_template=question.split('\n')[-1].strip()
     elif example:
@@ -9329,37 +9327,35 @@ def _evaluate_grammar_fill_with_genai(q, answer):
     completed_sentence=sentence_template.replace('____', answer_text, 1)
 
     prompt=(
-        'Đánh giá đáp án bài điền từ tiếng Nhật. ' 
-        'Chỉ kiểm tra: câu sau khi điền có đúng ngữ pháp và tự nhiên theo mẫu mục tiêu không. '
-        'Cho phép đáp án khác đáp án mẫu nếu câu hợp lệ; không yêu cầu trùng đúng một từ. '
-        'Chỉ trả JSON: {"correct":true|false,"explanation":"..."}.\n'
+        'Chấm bài điền từ tiếng Nhật. Chỉ trả JSON duy nhất: {"correct":true|false}.\n'
         f'Mẫu ngữ pháp: {pattern}\n'
-        f'Câu: {completed_sentence}\n'
-        f'Đáp án người học điền: {answer_text}'
+        f'Câu sau khi điền: {completed_sentence}\n'
+        f'Phần người học điền: {answer_text}\n'
+        'Chỉ đánh giá phần điền có làm câu hoàn chỉnh đúng ngữ pháp và tự nhiên theo mẫu hay không. '
+        'Không yêu cầu phần điền giống từ trong ví dụ và không yêu cầu người học nhập lại toàn bộ câu. '
+        'Nếu câu hoàn chỉnh đúng thì correct=true.'
     )
     try:
         started=time.perf_counter()
         reply,_,_=_generate_chat_reply(
             prompt,
             content_type='Ngữ pháp',
-            request_id=f"review-grade-{int(time.time()*1000)}",
+            request_id=f'review-grade-{int(time.time()*1000)}',
             gen_started=started,
-            user_text=answer_text,
-            reasoning_profile='low'
+            user_text='',
+            reasoning_profile='medium'
         )
         obj=_review_json_from_text(reply)
-        if not isinstance(obj,dict):
-            raise ValueError('LLM grader did not return a JSON object')
-        correct=bool(obj.get('correct'))
-        explanation=str(obj.get('explanation') or '').strip()
-        return correct, explanation
+        if not isinstance(obj,dict) or 'correct' not in obj:
+            raise ValueError('LLM grader did not return a valid correct field')
+        return bool(obj.get('correct')), ''
     except Exception as exc:
         print(f'[REVIEW GRAMMAR GRADE] fallback: {type(exc).__name__}: {exc}')
-        # Safe fallback when the grader is unavailable: exact match only.
         expected=str(q.get('answer') or '').strip()
         correct=_meaning_matches(answer_text, expected)
-        return correct,(f'Đáp án mẫu là **{expected}**.' if expected and not correct else '')
-
+        if correct:
+            return True,''
+        return False,(f'Chưa đúng theo câu mẫu. Một đáp án phù hợp là **{expected}**.' if expected else 'Cách điền này chưa phù hợp với mẫu ngữ pháp.')
 
 def _evaluate_review_answer(q, answer):
     item_type=str(q.get('item_type') or '').strip()
