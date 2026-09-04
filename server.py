@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.109-review-wrong-only-fix"
+BASELINE_VERSION = "19.110-review-persistence-stable-ids"
 import os
 import ast
 import io
@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.108-grammar-fill-ai-grading")
-SERVER_VERSION = "2026-09-03-v19_109_review_wrong_only_fix"
+print("[DORAEMON SERVER FINGERPRINT] 19.110-review-persistence-stable-ids")
+SERVER_VERSION = "2026-09-04-v19_110_review_persistence_stable_ids"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -512,6 +512,11 @@ def startup():
             _backfill_all_curriculum_knowledge_masters()
         except Exception as exc:
             print("[CURRICULUM KNOWLEDGE MASTER] startup backfill skipped:", type(exc).__name__, str(exc))
+        try:
+            repaired = _repair_review_item_ids_from_history()
+            print(f"[REVIEW PERSISTENCE] repaired={repaired}")
+        except Exception as exc:
+            print("[REVIEW PERSISTENCE] repair skipped:", type(exc).__name__, str(exc))
         print("PostgreSQL: OK")
     else:
         print("WARNING: DATABASE_URL chưa được cấu hình.")
@@ -10525,7 +10530,13 @@ def _grammar_master_key(item):
 
 
 def _rebuild_course_curriculum_knowledge_master(course_id):
-    """Rebuild published-course vocabulary/grammar master tables from DB only."""
+    """Refresh published-course master tables without changing existing item IDs.
+
+    Review rows store vocab_id/grammar_id. The previous implementation deleted every
+    master row and reinserted it, which changed BIGSERIAL IDs on every server restart and
+    orphaned user review history. We now upsert by the stable normalized_key and only
+    remove stale rows that are not referenced by review history.
+    """
     if course_id in (None, ''):
         return {'vocab':0,'grammar':0}
     cid=int(course_id)
@@ -10545,12 +10556,14 @@ def _rebuild_course_curriculum_knowledge_master(course_id):
                 items=content.get('items') if isinstance(content.get('items'),list) else []
                 code=str(row.get('step_code') or '').upper(); lesson=str(row.get('lesson') or '').strip()
                 for item in items:
-                    if not isinstance(item,dict): continue
+                    if not isinstance(item,dict):
+                        continue
                     key=_vocab_master_key(item) if code=='B1' else _grammar_master_key(item)
-                    if not key: continue
+                    if not key:
+                        continue
                     target=vocab if code=='B1' else grammar
                     target.setdefault(key,(lesson,item))
-            cur.execute('DELETE FROM curriculum_vocab_master WHERE course_id=%s',(cid,))
+
             for key,(lesson,item) in vocab.items():
                 writing=str(item.get('writing') or item.get('word') or item.get('term') or item.get('kanji') or '').strip()
                 reading=str(item.get('reading') or item.get('hiragana') or item.get('kana') or item.get('yomikata') or '').strip()
@@ -10564,7 +10577,7 @@ def _rebuild_course_curriculum_knowledge_master(course_id):
                       writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
                       meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()""",
                     (cid,key,writing,reading,pron,meaning,example,lesson))
-            cur.execute('DELETE FROM curriculum_grammar_master WHERE course_id=%s',(cid,))
+
             for key,(lesson,item) in grammar.items():
                 pattern=str(item.get('pattern') or item.get('structure') or item.get('grammar') or '').strip()
                 meaning=str(item.get('meaning') or item.get('definition') or item.get('translation') or '').strip()
@@ -10577,11 +10590,172 @@ def _rebuild_course_curriculum_knowledge_master(course_id):
                       pattern=EXCLUDED.pattern,meaning=EXCLUDED.meaning,explanation=EXCLUDED.explanation,
                       example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()""",
                     (cid,key,pattern,meaning,explanation,example,lesson))
+
+            # Remove stale non-reviewed rows. Referenced review rows are intentionally
+            # preserved so historical review mistakes can be repaired after a restart.
+            if vocab:
+                cur.execute("""DELETE FROM curriculum_vocab_master m
+                               WHERE m.course_id=%s
+                                 AND m.normalized_key <> ALL(%s)
+                                 AND NOT EXISTS (SELECT 1 FROM user_vocabulary_review r
+                                                 WHERE r.course_id=m.course_id AND r.vocab_id=m.id)""",
+                            (cid,list(vocab.keys())))
+            else:
+                cur.execute("""DELETE FROM curriculum_vocab_master m
+                               WHERE m.course_id=%s
+                                 AND NOT EXISTS (SELECT 1 FROM user_vocabulary_review r
+                                                 WHERE r.course_id=m.course_id AND r.vocab_id=m.id)""",(cid,))
+            if grammar:
+                cur.execute("""DELETE FROM curriculum_grammar_master m
+                               WHERE m.course_id=%s
+                                 AND m.normalized_key <> ALL(%s)
+                                 AND NOT EXISTS (SELECT 1 FROM user_grammar_review r
+                                                 WHERE r.course_id=m.course_id AND r.grammar_id=m.id)""",
+                            (cid,list(grammar.keys())))
+            else:
+                cur.execute("""DELETE FROM curriculum_grammar_master m
+                               WHERE m.course_id=%s
+                                 AND NOT EXISTS (SELECT 1 FROM user_grammar_review r
+                                                 WHERE r.course_id=m.course_id AND r.grammar_id=m.id)""",(cid,))
         conn.commit()
     finally:
         conn.close()
-    print(f"[CURRICULUM KNOWLEDGE MASTER] course_id={cid} vocab={len(vocab)} grammar={len(grammar)} rebuilt=1")
+    print(f"[CURRICULUM KNOWLEDGE MASTER] course_id={cid} vocab={len(vocab)} grammar={len(grammar)} rebuilt=stable-upsert")
     return {'vocab':len(vocab),'grammar':len(grammar)}
+
+
+def _repair_review_item_ids_from_history():
+    """Repair review rows orphaned by older builds that recreated master BIGSERIAL IDs.
+
+    Older deployments deleted/reinserted the master tables at startup, so user review rows
+    could still point to the previous IDs. Completed review sessions preserve the old item_id
+    plus enough item metadata to map each failed question back to the current master row.
+    """
+    conn=db(); repaired=0
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT r.user_id,r.course_id,r.vocab_id,r.wrong_count,r.last_wrong_at,r.next_review_at
+                           FROM user_vocabulary_review r
+                           LEFT JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                           WHERE m.id IS NULL
+                           ORDER BY r.user_id,r.course_id,r.vocab_id""")
+            orphan_vocab=[dict(x) for x in cur.fetchall()]
+            cur.execute("""SELECT r.user_id,r.course_id,r.grammar_id,r.wrong_count,r.last_wrong_at,r.next_review_at
+                           FROM user_grammar_review r
+                           LEFT JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                           WHERE m.id IS NULL
+                           ORDER BY r.user_id,r.course_id,r.grammar_id""")
+            orphan_grammar=[dict(x) for x in cur.fetchall()]
+
+            if orphan_vocab or orphan_grammar:
+                cur.execute("""SELECT id,user_id,course_id,source_lesson,question_json,answers_json
+                               FROM user_review_sessions
+                               WHERE status IN ('ACTIVE','COMPLETED')
+                               ORDER BY created_at DESC,id DESC
+                               LIMIT 5000""")
+                sessions=[dict(x) for x in cur.fetchall()]
+            else:
+                sessions=[]
+
+            def answers_for(sess):
+                a=sess.get('answers_json') or {}
+                return a if isinstance(a,dict) else {}
+
+            # Cache current masters for quick matching.
+            vocab_rows={}; grammar_rows={}
+            if orphan_vocab:
+                cur.execute("""SELECT id,course_id,writing,reading,meaning,example,source_lesson
+                               FROM curriculum_vocab_master""")
+                for r in cur.fetchall():
+                    rr=dict(r); vocab_rows.setdefault(int(rr['course_id']),[]).append(rr)
+            if orphan_grammar:
+                cur.execute("""SELECT id,course_id,pattern,meaning,example,source_lesson
+                               FROM curriculum_grammar_master""")
+                for r in cur.fetchall():
+                    rr=dict(r); grammar_rows.setdefault(int(rr['course_id']),[]).append(rr)
+
+            def norm(v):
+                return re.sub(r'\s+',' ',str(v or '').strip()).casefold()
+
+            def q_by_old_id(sessions, course_id, old_id, typ):
+                for sess in sessions:
+                    if int(sess.get('course_id') or 0)!=int(course_id):
+                        continue
+                    qs=sess.get('question_json') or []
+                    ans=answers_for(sess)
+                    if not isinstance(qs,list):
+                        continue
+                    for idx,q in enumerate(qs):
+                        if not isinstance(q,dict) or str(q.get('item_type') or '')!=typ:
+                            continue
+                        try:
+                            qid=int(q.get('item_id') or 0)
+                        except Exception:
+                            continue
+                        if qid!=int(old_id):
+                            continue
+                        ar=ans.get(str(idx),{})
+                        if isinstance(ar,dict) and not bool(ar.get('correct')):
+                            return q, str(sess.get('source_lesson') or '').strip()
+                return None,None
+
+            for row in orphan_vocab:
+                q,lesson=q_by_old_id(sessions,row['course_id'],row['vocab_id'],'vocabulary')
+                if not q:
+                    continue
+                answer_text=norm(q.get('answer_text') or q.get('answer_criteria') or '')
+                qtext=norm(q.get('question') or '')
+                candidates=[]
+                for m in vocab_rows.get(int(row['course_id']),[]):
+                    if lesson and norm(m.get('source_lesson'))!=norm(lesson):
+                        continue
+                    score=0
+                    if answer_text and answer_text==norm(m.get('meaning')): score+=100
+                    if qtext and norm(m.get('writing')) and norm(m.get('writing')) in qtext: score+=80
+                    if qtext and norm(m.get('reading')) and norm(m.get('reading')) in qtext: score+=70
+                    if score: candidates.append((score,int(m['id'])))
+                if candidates:
+                    new_id=max(candidates)[1]
+                    cur.execute("""INSERT INTO user_vocabulary_review(user_id,course_id,vocab_id,wrong_count,last_wrong_at,next_review_at)
+                                   VALUES(%s,%s,%s,%s,%s,%s)
+                                   ON CONFLICT(user_id,course_id,vocab_id) DO UPDATE SET
+                                     wrong_count=GREATEST(user_vocabulary_review.wrong_count,EXCLUDED.wrong_count),
+                                     last_wrong_at=LEAST(user_vocabulary_review.last_wrong_at,EXCLUDED.last_wrong_at),
+                                     next_review_at=LEAST(user_vocabulary_review.next_review_at,EXCLUDED.next_review_at)""",
+                                (row['user_id'],row['course_id'],new_id,row['wrong_count'],row['last_wrong_at'],row['next_review_at']))
+                    cur.execute("DELETE FROM user_vocabulary_review WHERE user_id=%s AND course_id=%s AND vocab_id=%s",(row['user_id'],row['course_id'],row['vocab_id']))
+                    repaired+=1
+
+            for row in orphan_grammar:
+                q,lesson=q_by_old_id(sessions,row['course_id'],row['grammar_id'],'grammar')
+                if not q:
+                    continue
+                pat=norm(q.get('pattern') or '')
+                if not pat:
+                    pat=norm(q.get('answer_criteria') or '')
+                candidates=[]
+                for m in grammar_rows.get(int(row['course_id']),[]):
+                    if lesson and norm(m.get('source_lesson'))!=norm(lesson):
+                        continue
+                    score=100 if pat and pat==norm(m.get('pattern')) else 0
+                    if score: candidates.append((score,int(m['id'])))
+                if candidates:
+                    new_id=max(candidates)[1]
+                    cur.execute("""INSERT INTO user_grammar_review(user_id,course_id,grammar_id,wrong_count,last_wrong_at,next_review_at)
+                                   VALUES(%s,%s,%s,%s,%s,%s)
+                                   ON CONFLICT(user_id,course_id,grammar_id) DO UPDATE SET
+                                     wrong_count=GREATEST(user_grammar_review.wrong_count,EXCLUDED.wrong_count),
+                                     last_wrong_at=LEAST(user_grammar_review.last_wrong_at,EXCLUDED.last_wrong_at),
+                                     next_review_at=LEAST(user_grammar_review.next_review_at,EXCLUDED.next_review_at)""",
+                                (row['user_id'],row['course_id'],new_id,row['wrong_count'],row['last_wrong_at'],row['next_review_at']))
+                    cur.execute("DELETE FROM user_grammar_review WHERE user_id=%s AND course_id=%s AND grammar_id=%s",(row['user_id'],row['course_id'],row['grammar_id']))
+                    repaired+=1
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    return repaired
 
 
 def _get_course_curriculum_knowledge(course_id, source_digest=''):
