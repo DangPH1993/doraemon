@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.114-review-session-temporary-state"
+BASELINE_VERSION = "19.115-review-content-list"
 import os
 import ast
 import io
@@ -90,7 +90,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.113-review-question-type-consistency")
-SERVER_VERSION = "2026-09-04-v19_114_review_session_temporary_state"
+SERVER_VERSION = "2026-09-04-v19_115_review_content_list"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -9513,24 +9513,136 @@ def learning_review_reminder(authorization: Optional[str] = Header(default=None)
     return {'review_available':True,'course_id':int(selected_course_id),'course':selected_course_name,'message':msg,'content_blocks':blocks}
 
 
+def _review_planned_content(user_id, course_id):
+    """Return every vocabulary/grammar item in the user's review plan.
+
+    The planned date is the lesson-level Doraemon schedule unless that specific
+    item has its own durable review schedule in user_*_review (for a previous
+    wrong answer), in which case the item-level date takes precedence.
+    """
+    now=_now_local()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, content_type, lesson, topic, completed_at, next_review_at,
+                       review_scheduled_at, review_completed_at
+                FROM learning_progress
+                WHERE user_id=%s AND course_id=%s AND status='completed'
+                  AND next_review_at IS NOT NULL
+                  AND review_scheduled_at IS NOT NULL
+                ORDER BY next_review_at ASC, completed_at ASC NULLS LAST, id ASC
+            """,(user_id,course_id))
+            lesson_rows=[dict(r) for r in cur.fetchall()]
+
+            cur.execute("""
+                SELECT r.vocab_id AS item_id, r.wrong_count, r.next_review_at,
+                       m.writing, m.reading, m.pronunciation_vi, m.meaning, m.example,
+                       m.source_lesson
+                FROM user_vocabulary_review r
+                JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s
+                ORDER BY r.next_review_at, r.vocab_id
+            """,(user_id,course_id))
+            wrong_vocab={int(r['item_id']):dict(r) for r in cur.fetchall()}
+
+            cur.execute("""
+                SELECT r.grammar_id AS item_id, r.wrong_count, r.next_review_at,
+                       m.pattern, m.meaning, m.explanation, m.example,
+                       m.source_lesson
+                FROM user_grammar_review r
+                JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                WHERE r.user_id=%s AND r.course_id=%s
+                ORDER BY r.next_review_at, r.grammar_id
+            """,(user_id,course_id))
+            wrong_grammar={int(r['item_id']):dict(r) for r in cur.fetchall()}
+
+            items=[]; seen=set()
+            for lr in lesson_rows:
+                lesson=str(lr.get('lesson') or '').strip()
+                ct=str(lr.get('content_type') or 'Giáo trình').strip()
+                if not lesson:
+                    continue
+                ids=_review_lesson_item_ids(int(course_id),ct,lesson)
+                lesson_due=lr.get('next_review_at')
+                for vid in ids.get('vocabulary') or []:
+                    if not vid or ('vocabulary',int(vid)) in seen: continue
+                    seen.add(('vocabulary',int(vid)))
+                    cur.execute("""SELECT id,writing,reading,pronunciation_vi,meaning,example,source_lesson
+                                   FROM curriculum_vocab_master WHERE id=%s AND course_id=%s""",(int(vid),course_id))
+                    m=cur.fetchone()
+                    if not m: continue
+                    m=dict(m); wr=wrong_vocab.get(int(vid))
+                    items.append({
+                        'item_type':'vocabulary','item_id':int(vid),'lesson':lesson,'content_type':ct,
+                        'label':m.get('writing') or m.get('reading') or str(vid),
+                        'writing':m.get('writing'),'reading':m.get('reading'),'meaning':m.get('meaning'),'example':m.get('example'),
+                        'next_review_at':(wr or {}).get('next_review_at') or lesson_due,
+                        'source':'wrong_review' if wr else 'lesson_schedule','wrong_count':int((wr or {}).get('wrong_count') or 0)
+                    })
+                for gid in ids.get('grammar') or []:
+                    if not gid or ('grammar',int(gid)) in seen: continue
+                    seen.add(('grammar',int(gid)))
+                    cur.execute("""SELECT id,pattern,meaning,explanation,example,source_lesson
+                                   FROM curriculum_grammar_master WHERE id=%s AND course_id=%s""",(int(gid),course_id))
+                    m=cur.fetchone()
+                    if not m: continue
+                    m=dict(m); wr=wrong_grammar.get(int(gid))
+                    items.append({
+                        'item_type':'grammar','item_id':int(gid),'lesson':lesson,'content_type':ct,
+                        'label':m.get('pattern') or str(gid),
+                        'pattern':m.get('pattern'),'meaning':m.get('meaning'),'explanation':m.get('explanation'),'example':m.get('example'),
+                        'next_review_at':(wr or {}).get('next_review_at') or lesson_due,
+                        'source':'wrong_review' if wr else 'lesson_schedule','wrong_count':int((wr or {}).get('wrong_count') or 0)
+                    })
+
+            # Keep durable wrong-review items even when a legacy lesson mapping is missing.
+            for vid,wr in wrong_vocab.items():
+                if ('vocabulary',vid) in seen: continue
+                seen.add(('vocabulary',vid))
+                items.append({
+                    'item_type':'vocabulary','item_id':vid,'lesson':str(wr.get('source_lesson') or '').strip(),
+                    'content_type':'Từ vựng','label':wr.get('writing') or wr.get('reading') or str(vid),
+                    'writing':wr.get('writing'),'reading':wr.get('reading'),'meaning':wr.get('meaning'),'example':wr.get('example'),
+                    'next_review_at':wr.get('next_review_at'),'source':'wrong_review','wrong_count':int(wr.get('wrong_count') or 0)
+                })
+            for gid,wr in wrong_grammar.items():
+                if ('grammar',gid) in seen: continue
+                seen.add(('grammar',gid))
+                items.append({
+                    'item_type':'grammar','item_id':gid,'lesson':str(wr.get('source_lesson') or '').strip(),
+                    'content_type':'Ngữ pháp','label':wr.get('pattern') or str(gid),
+                    'pattern':wr.get('pattern'),'meaning':wr.get('meaning'),'explanation':wr.get('explanation'),'example':wr.get('example'),
+                    'next_review_at':wr.get('next_review_at'),'source':'wrong_review','wrong_count':int(wr.get('wrong_count') or 0)
+                })
+
+            # Stable ordering: earliest planned date first, then lesson, then type/item.
+            items.sort(key=lambda x:(x.get('next_review_at') or now, str(x.get('lesson') or '').casefold(), str(x.get('item_type') or ''), int(x.get('item_id') or 0)))
+            return items
+    finally:
+        conn.close()
+
+
 @app.get('/learning/review/today')
 def learning_review_today(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
     user=require_active_user(authorization)
     selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
     if selected_course_id is None:
-        raise HTTPException(400, 'Cần chọn khóa học để ôn tập.')
+        raise HTTPException(400, 'Cần chọn khóa học để xem nội dung cần ôn tập.')
     due=_review_due_items(user['id'], selected_course_id)
     scheduled=_review_scheduled_lessons(user['id'], selected_course_id)
+    planned=_review_planned_content(user['id'], selected_course_id)
     scheduled_payload=[{
         'lesson':r.get('lesson'),'content_type':r.get('content_type'),
         'vocabulary_count':int(r.get('vocabulary_count') or 0),'grammar_count':int(r.get('grammar_count') or 0),
         'next_review_at':r.get('next_review_at'),'completed_at':r.get('completed_at')
     } for r in scheduled]
-    count=len(due['vocabulary'])+len(due['grammar'])
+    count=len(planned)
     return {'course_id':int(selected_course_id),'course':selected_course_name,'course_name':selected_course_name,
             'due':due,'due_items':due,'pending_items':[],
             'scheduled_lessons':scheduled_payload,'scheduled_count':len(scheduled_payload),
-            'count':count,'review_available':bool(count or scheduled_payload)}
+            'review_items':planned,'review_items_count':count,
+            'count':count,'review_available':bool(count)}
 
 @app.post('/learning/review/start')
 def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
