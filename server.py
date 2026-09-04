@@ -89,7 +89,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.110-review-persistence-stable-ids")
+print("[DORAEMON SERVER FINGERPRINT] 19.111-review-latest-session-wrong-only")
 SERVER_VERSION = "2026-09-04-v19_110_review_persistence_stable_ids"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -9103,10 +9103,14 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
 
 
 def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=None):
-    """Return only vocabulary/grammar items previously answered incorrectly in one lesson.
+    """Return only the questions answered incorrectly in the latest completed review session for one lesson.
 
-    Lesson membership is resolved primarily through curriculum_lesson_items so an item
-    that appears elsewhere in the course cannot be incorrectly attributed to this lesson.
+    This is intentionally session-based, not cumulative across the whole lifetime of the lesson.
+    Example: if yesterday's 12-question review had 6 wrong answers, today's WRONG_ONLY review
+    must contain exactly those 6 items. Older unresolved mistakes from previous sessions are not
+    silently added to the current retry set.
+
+    If no completed review session exists (legacy data), fall back to the durable review tables.
     """
     lesson=str(lesson or '').strip()
     if not lesson:
@@ -9114,6 +9118,65 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # 1) Find the latest completed review session for this exact lesson/course.
+            cur.execute("""
+                SELECT id,question_json,answers_json,completed_at,review_scope
+                FROM user_review_sessions
+                WHERE user_id=%s AND course_id=%s
+                  AND status='COMPLETED'
+                  AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
+                ORDER BY completed_at DESC NULLS LAST,id DESC
+                LIMIT 1
+            """, (user_id,int(course_id),lesson))
+            sess=cur.fetchone()
+
+            wrong_refs=[]
+            if sess:
+                questions=sess.get('question_json') or []
+                answers=sess.get('answers_json') or {}
+                if isinstance(answers,dict):
+                    for k,v in answers.items():
+                        if not isinstance(v,dict) or bool(v.get('correct')):
+                            continue
+                        try:
+                            idx=int(k)
+                        except Exception:
+                            idx=-1
+                        if 0 <= idx < len(questions) and isinstance(questions[idx],dict):
+                            q=questions[idx]
+                            typ=str(q.get('item_type') or '').strip()
+                            iid=int(q.get('item_id') or 0)
+                            if typ in {'vocabulary','grammar'} and iid:
+                                wrong_refs.append((typ,iid))
+
+            # 2) Resolve those exact item IDs against the current curriculum master.
+            vocab_ids=[iid for typ,iid in wrong_refs if typ=='vocabulary']
+            grammar_ids=[iid for typ,iid in wrong_refs if typ=='grammar']
+            vocab=[]; grammar=[]
+            if vocab_ids:
+                cur.execute("""
+                    SELECT id,writing,reading,pronunciation_vi,meaning,example,source_lesson
+                    FROM curriculum_vocab_master
+                    WHERE course_id=%s AND id=ANY(%s)
+                """,(int(course_id),vocab_ids))
+                rows={int(r['id']):dict(r) for r in cur.fetchall()}
+                vocab=[rows[i] for i in vocab_ids if i in rows]
+            if grammar_ids:
+                cur.execute("""
+                    SELECT id,pattern,meaning,explanation,example,source_lesson
+                    FROM curriculum_grammar_master
+                    WHERE course_id=%s AND id=ANY(%s)
+                """,(int(course_id),grammar_ids))
+                rows={int(r['id']):dict(r) for r in cur.fetchall()}
+                grammar=[rows[i] for i in grammar_ids if i in rows]
+
+            if sess and (vocab or grammar):
+                print(f"[REVIEW WRONG-ONLY SOURCE] lesson={lesson!r} session={int(sess['id'])} "
+                      f"wrong_vocab={len(vocab)} wrong_grammar={len(grammar)}")
+                return {'vocabulary':vocab,'grammar':grammar}
+
+            # 3) Legacy fallback: if the account has no usable completed session yet,
+            #    use currently persisted wrong items tied to this lesson.
             cur.execute("""
                 SELECT DISTINCT r.vocab_id AS id,
                        m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
@@ -9122,16 +9185,14 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                   ON m.id=r.vocab_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
                   AND EXISTS (
-                      SELECT 1
-                      FROM curriculum_lesson_items cli
+                      SELECT 1 FROM curriculum_lesson_items cli
                       JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
                       WHERE cli.item_type='vocabulary' AND cli.item_id=m.id
-                        AND cl.course_id=%s
-                        AND cl.status='PUBLISHED'
+                        AND cl.course_id=%s AND cl.status='PUBLISHED'
                         AND lower(trim(cl.lesson))=lower(trim(%s))
                   )
                 ORDER BY r.vocab_id
-            """,(user_id,course_id,course_id,lesson))
+            """,(user_id,int(course_id),int(course_id),lesson))
             vocab=[dict(x) for x in cur.fetchall()]
             cur.execute("""
                 SELECT DISTINCT r.grammar_id AS id,
@@ -9141,18 +9202,17 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                   ON m.id=r.grammar_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
                   AND EXISTS (
-                      SELECT 1
-                      FROM curriculum_lesson_items cli
+                      SELECT 1 FROM curriculum_lesson_items cli
                       JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
                       WHERE cli.item_type='grammar' AND cli.item_id=m.id
-                        AND cl.course_id=%s
-                        AND cl.status='PUBLISHED'
+                        AND cl.course_id=%s AND cl.status='PUBLISHED'
                         AND lower(trim(cl.lesson))=lower(trim(%s))
                   )
                 ORDER BY r.grammar_id
-            """,(user_id,course_id,course_id,lesson))
+            """,(user_id,int(course_id),int(course_id),lesson))
             grammar=[dict(x) for x in cur.fetchall()]
-            # Backward compatibility for older curriculum rows that have no lesson-item map.
+
+            # Older curriculum rows may not have lesson-item mapping.
             if not vocab:
                 cur.execute("""
                     SELECT DISTINCT r.vocab_id AS id,
@@ -9162,7 +9222,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                     WHERE r.user_id=%s AND r.course_id=%s
                       AND lower(trim(m.source_lesson))=lower(trim(%s))
                     ORDER BY r.vocab_id
-                """,(user_id,course_id,lesson))
+                """,(user_id,int(course_id),lesson))
                 vocab=[dict(x) for x in cur.fetchall()]
             if not grammar:
                 cur.execute("""
@@ -9173,8 +9233,9 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                     WHERE r.user_id=%s AND r.course_id=%s
                       AND lower(trim(m.source_lesson))=lower(trim(%s))
                     ORDER BY r.grammar_id
-                """,(user_id,course_id,lesson))
+                """,(user_id,int(course_id),lesson))
                 grammar=[dict(x) for x in cur.fetchall()]
+            print(f"[REVIEW WRONG-ONLY FALLBACK] lesson={lesson!r} vocab={len(vocab)} grammar={len(grammar)}")
             return {'vocabulary':vocab,'grammar':grammar}
     finally:
         conn.close()
@@ -9184,21 +9245,42 @@ def _review_first_failed_lesson(user_id, course_id):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Prefer the lesson from the most recent completed review session that
+            # actually contains at least one incorrect answer.
             cur.execute("""
-                SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
-                FROM user_vocabulary_review r
-                JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
-                WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
-                GROUP BY m.source_lesson
-                UNION ALL
-                SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
-                FROM user_grammar_review r
-                JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
-                WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
-                GROUP BY m.source_lesson
-                ORDER BY first_wrong_at ASC
+                SELECT source_lesson AS lesson, completed_at
+                FROM user_review_sessions
+                WHERE user_id=%s AND course_id=%s AND status='COMPLETED'
+                  AND COALESCE(trim(source_lesson),'')<>''
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_each(COALESCE(answers_json,'{}'::jsonb)) a
+                      WHERE COALESCE((a.value->>'correct')::boolean,FALSE)=FALSE
+                  )
+                ORDER BY completed_at DESC NULLS LAST,id DESC
                 LIMIT 1
-            """,(user_id,course_id,user_id,course_id))
+            """,(user_id,int(course_id)))
+            row=cur.fetchone()
+            if row:
+                return str(row.get('lesson') or '').strip(), None
+            # Legacy fallback to currently persisted wrong items.
+            cur.execute("""
+                SELECT lesson,first_wrong_at FROM (
+                    SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                    FROM user_vocabulary_review r
+                    JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
+                    WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
+                    GROUP BY m.source_lesson
+                    UNION ALL
+                    SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                    FROM user_grammar_review r
+                    JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
+                    WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
+                    GROUP BY m.source_lesson
+                ) x
+                ORDER BY first_wrong_at DESC NULLS LAST, lesson
+                LIMIT 1
+            """,(user_id,int(course_id),user_id,int(course_id)))
             row=cur.fetchone()
             return (str(row.get('lesson') or '').strip() if row else None, None)
     finally:
