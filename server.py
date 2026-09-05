@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.117-review-scheduled-plus-wrong-union"
+BASELINE_VERSION = "19.118-review-date-due-union"
 import os
 import ast
 import io
@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.116-review-corrected-list")
-SERVER_VERSION = "2026-09-05-v19_117_review_scheduled_plus_wrong_union"
+print("[DORAEMON SERVER FINGERPRINT] 19.118-review-date-due-union")
+SERVER_VERSION = "2026-09-05-v19_118_review_date_due_union"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -8459,10 +8459,11 @@ def _review_scheduled_lessons(user_id, course_id):
                 SELECT id,content_type,lesson,topic,completed_at,review_scheduled_at,next_review_at
                 FROM learning_progress
                 WHERE user_id=%s AND course_id=%s AND status='completed'
-                  AND next_review_at IS NOT NULL AND next_review_at<=%s
+                  AND next_review_at IS NOT NULL
+                  AND (next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
                   AND (review_completed_at IS NULL OR review_completed_at < review_scheduled_at)
                 ORDER BY next_review_at ASC, completed_at ASC NULLS LAST, id ASC
-            """,(user_id,course_id,now))
+            """,(user_id,course_id))
             rows=[]; seen=set()
             for rr in cur.fetchall():
                 r=dict(rr)
@@ -8589,15 +8590,17 @@ def _review_due_items(user_id, course_id):
                                   m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example
                            FROM user_vocabulary_review r
                            JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
-                           WHERE r.user_id=%s AND r.course_id=%s AND r.next_review_at<=%s
-                           ORDER BY r.next_review_at,r.vocab_id""",(user_id,course_id,now))
+                           WHERE r.user_id=%s AND r.course_id=%s
+                             AND (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                           ORDER BY r.next_review_at,r.vocab_id""",(user_id,course_id))
             vocab=[dict(x) for x in cur.fetchall()]
             cur.execute("""SELECT r.grammar_id AS item_id,r.wrong_count,r.next_review_at,
                                   m.pattern,m.meaning,m.explanation,m.example
                            FROM user_grammar_review r
                            JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
-                           WHERE r.user_id=%s AND r.course_id=%s AND r.next_review_at<=%s
-                           ORDER BY r.next_review_at,r.grammar_id""",(user_id,course_id,now))
+                           WHERE r.user_id=%s AND r.course_id=%s
+                             AND (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                           ORDER BY r.next_review_at,r.grammar_id""",(user_id,course_id))
             grammar=[dict(x) for x in cur.fetchall()]
         return {"vocabulary":vocab,"grammar":grammar}
     finally:
