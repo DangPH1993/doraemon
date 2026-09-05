@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.116-review-corrected-list"
+BASELINE_VERSION = "19.117-review-scheduled-plus-wrong-union"
 import os
 import ast
 import io
@@ -90,7 +90,7 @@ b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
 print("[DORAEMON SERVER FINGERPRINT] 19.116-review-corrected-list")
-SERVER_VERSION = "2026-09-04-v19_116_review_corrected_list"
+SERVER_VERSION = "2026-09-05-v19_117_review_scheduled_plus_wrong_union"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3482,7 +3482,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, course_id=No
                 WHERE status='PUBLISHED'
                   AND lower(trim(content_type))=lower(trim(%s))
                   AND (lower(trim(lesson))=lower(trim(%s)) OR
-                       regexp_replace(lower(trim(lesson)), '^bài\s+', '', 'g')=regexp_replace(lower(trim(%s)), '^bài\s+', '', 'g'))
+                       regexp_replace(lower(trim(lesson)), '^bài\\s+', '', 'g')=regexp_replace(lower(trim(%s)), '^bài\\s+', '', 'g'))
                   AND (%s IS NULL OR course_id=%s)
                 ORDER BY version DESC,id DESC
                 LIMIT 1
@@ -8542,24 +8542,37 @@ def _build_review_reminder_blocks(user_id, course_id, course_name):
 
 
 def _build_review_schedule_chat_blocks(user_id, course_id, course_name):
+    """Show the union of scheduled lesson reviews and overdue item reviews."""
     due=_review_due_items(user_id,course_id)
     scheduled=_review_scheduled_lessons(user_id,course_id)
     lines=[f"🔄 Lịch ôn tập — {course_name or 'khóa học hiện tại'}"]
+    scheduled_keys=set()
+    for r in scheduled:
+        key=(str(r.get('lesson') or '').strip().casefold(), str(r.get('content_type') or '').strip().casefold())
+        scheduled_keys.add(key)
     if scheduled:
-        lines.append(f"📚 Hôm nay có {len(scheduled)} bài cần ôn.")
-        for r in scheduled[:6]:
+        lines.append(f"📚 Hôm nay có {len(scheduled)} bài đến lịch ôn định kỳ:")
+        for r in scheduled:
             parts=[]
             if r.get('vocabulary_count'): parts.append(f"{int(r['vocabulary_count'])} từ vựng")
             if r.get('grammar_count'): parts.append(f"{int(r['grammar_count'])} ngữ pháp")
             lines.append(f"• {r.get('lesson')}: {', '.join(parts) or 'kiến thức của bài'}")
-    else:
-        lines.append('✅ Hôm nay chưa có bài ôn đã đến lịch.')
+
     extra=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
     if extra:
-        lines.append(f"📌 Ngoài ra có {extra} kiến thức cần ôn lại do các lần review trước trả lời sai.")
+        lines.append(f"📌 Có {extra} nội dung cần ôn lại do các lần review trước trả lời sai.")
+        for x in (due.get('vocabulary') or []):
+            lines.append(f"• Từ vựng: {x.get('writing') or x.get('reading')}")
+        for x in (due.get('grammar') or []):
+            lines.append(f"• Ngữ pháp: {x.get('pattern')}")
+
+    if not scheduled and not extra:
+        lines.append('✅ Hôm nay chưa có nội dung ôn tập nào đến lịch.')
     msg='\n'.join(lines)
-    if scheduled or extra:
-        msg += "\n\nCậu có muốn mở phiên ôn tập ngay không?"
+    available=bool(scheduled or extra)
+    if available:
+        msg += "\n\nCậu có muốn bắt đầu ôn ngay không?"
+        # review_open must route to the same union: scheduled lessons first, then overdue wrong items.
         blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_choice","options":[{"label":"Bắt đầu ôn","action":"review_open"},{"label":"Để sau","action":"review_keep"}]}]
     else:
         msg += "\n\nKhi muốn ôn, cậu chỉ cần nói 'tôi muốn ôn tập' nhé."
@@ -9029,6 +9042,46 @@ def _review_question_blocks(session_id, question, index, total):
     return text,[{'type':'text','text':text}]
 
 
+def _review_default_session_data(user_id, course_id):
+    """Build the default review set: all lesson-level reviews due now plus overdue wrong items."""
+    scheduled=_review_scheduled_lessons(user_id,course_id)
+    due=_review_due_items(user_id,course_id)
+    lesson_ids=[]
+    seen_lessons=set()
+    for r in scheduled:
+        lesson=str(r.get('lesson') or '').strip()
+        ct=str(r.get('content_type') or 'Giáo trình').strip()
+        key=(lesson.casefold(),ct.casefold())
+        if not lesson or key in seen_lessons: continue
+        seen_lessons.add(key)
+        lesson_ids.append((lesson,ct))
+    vocab=[]; grammar=[]; seen_v=set(); seen_g=set()
+    for lesson,ct in lesson_ids:
+        ids=_review_lesson_item_ids(int(course_id),ct,lesson)
+        payload=_review_master_payload(int(course_id),{
+            'vocabulary':[{'item_id':int(x)} for x in ids.get('vocabulary') or []],
+            'grammar':[{'item_id':int(x)} for x in ids.get('grammar') or []]
+        })
+        for x in payload.get('vocabulary') or []:
+            iid=int(x.get('id') or 0)
+            if iid and iid not in seen_v: seen_v.add(iid); vocab.append(x)
+        for x in payload.get('grammar') or []:
+            iid=int(x.get('id') or 0)
+            if iid and iid not in seen_g: seen_g.add(iid); grammar.append(x)
+    # Add overdue wrong items that are not already covered by today's scheduled lessons.
+    for x in due.get('vocabulary') or []:
+        iid=int(x.get('item_id') or 0)
+        if iid and iid not in seen_v:
+            payload={'id':iid,'writing':x.get('writing'),'reading':x.get('reading'),'pronunciation_vi':x.get('pronunciation_vi'),'meaning':x.get('meaning'),'example':x.get('example')}
+            seen_v.add(iid); vocab.append(payload)
+    for x in due.get('grammar') or []:
+        iid=int(x.get('item_id') or 0)
+        if iid and iid not in seen_g:
+            payload={'id':iid,'pattern':x.get('pattern'),'meaning':x.get('meaning'),'explanation':x.get('explanation'),'example':x.get('example')}
+            seen_g.add(iid); grammar.append(payload)
+    return {'vocabulary':vocab,'grammar':grammar}
+
+
 def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12, only_failed=False):
     requested_lesson=str(lesson or '').strip()
     requested_type=str(content_type or '').strip() or None
@@ -9051,16 +9104,15 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
                 raise HTTPException(404,'Không có bài nào có nội dung đã trả lời sai để làm lại.')
             data=_review_failed_items_for_lesson(user_id,course_id,source_lesson,None)
         else:
-            due=_review_due_items(user_id,course_id)
+            data=_review_default_session_data(user_id,course_id)
             source_lesson='review_due'
-            if not due['vocabulary'] and not due['grammar']:
-                raise HTTPException(404,'Hiện chưa có nội dung nào trong danh sách ôn tập cần làm lại.')
-            data=_review_master_payload(int(course_id),due)
+            if not data['vocabulary'] and not data['grammar']:
+                raise HTTPException(404,'Hiện chưa có nội dung nào đến lịch ôn tập.')
 
     max_q=max(1,min(12,int(max_questions or 12)))
     questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None,only_failed=only_failed)
     if not questions:
-        # DB-safe fallback: vocabulary MCQ/fill and simple grammar meaning MCQ.
+        # DB-safe fallback: vocabulary MCQ and simple grammar meaning MCQ.
         questions=[]
         for item in (data.get('vocabulary') or [])[:max_q]:
             questions.append(_review_vocab_question(item,data.get('vocabulary') or []))
