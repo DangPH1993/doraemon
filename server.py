@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.118-review-date-due-union"
+BASELINE_VERSION = "19.119-review-orchestrator"
 import os
 import ast
 import io
@@ -89,7 +89,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.118-review-date-due-union")
+print("[DORAEMON SERVER FINGERPRINT] 19.119-review-orchestrator")
 SERVER_VERSION = "2026-09-05-v19_118_review_date_due_union"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -4859,13 +4859,28 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             "learning_history": [],
         }
 
+    # Returning users always receive one deterministic daily briefing: what is due
+    # today plus the next lesson from the active study plan. No LLM call is needed.
+    daily_blocks=[]
+    daily_parts=[f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖"]
+    review_msg, review_blocks, review_available=_review_selection_blocks(user["id"], selected_course_id, None) if selected_course_id is not None else ("",[],False)
+    if review_available:
+        daily_blocks.extend(review_blocks)
+    else:
+        daily_blocks.append({"type":"text","text":"✅ Hôm nay chưa có nội dung ôn tập nào đến lịch."})
+    next_lesson=_next_plan_lesson_for_welcome(user["id"],selected_course_id)
+    if next_lesson:
+        daily_blocks.append({"type":"text","text":f"🎯 Theo lộ trình, bài học tiếp theo của cậu là **{str(next_lesson.get('lesson') or '').strip()}**."})
+    if daily_blocks:
+        daily_blocks.insert(0,{"type":"text","text":"\n\n".join(daily_parts)})
+
     # Planned users with one or more unfinished plans are asked per plan whether
     # they want to follow that plan today. Fully completed plans are hidden.
     if profile.get("learning_mode") == "planned":
         active_plans, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False, course_id=selected_course_id)
         if active_plans:
-            header=(f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n{curriculum}\n\n")
-            blocks=[{"type":"text","text":header.rstrip()}] + plan_blocks
+            header=(f"Mừng cậu quay lại với Doraemon! 🤖\n\n{curriculum}\n\n")
+            blocks=daily_blocks + [{"type":"text","text":header.rstrip()}] + plan_blocks
             if unfinished_rows:
                 seen_old=set(); parts_old=[]
                 for row in unfinished_rows:
@@ -4880,7 +4895,8 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
                     if len(parts_old)>=8: break
                 if parts_old:
                     blocks.append({"type":"text","text":"📖 Những phần cậu đang học dở/cần ôn từ các phiên học trước:\n" + "\n".join(parts_old)})
-            return {"success":True,"mode":"planned_returning","message":header.rstrip(),"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
+            message="\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=='text')
+            return {"success":True,"mode":"planned_returning","message":message,"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
 
     parts = []
     seen = set()
@@ -4938,16 +4954,18 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
         )
         closing = "\n\nCậu muốn bắt đầu hoặc chọn một phần để học tiếp? 😊"
 
-    message = (
-        f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖\n\n"
+    base_return = (
         f"{curriculum}\n\n"
         f"{progress_text}"
         f"{closing}"
     )
+    blocks=daily_blocks + [{"type":"text","text":base_return}]
+    message="\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=='text')
     return {
         "success": True,
         "mode": "returning",
         "message": message,
+        "content_blocks": blocks,
         "learning_history": unfinished_rows,
     }
 
@@ -5233,11 +5251,30 @@ def proxy_chat(
         return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
                 'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':lesson}
 
-    if action_head == 'review_open':
-        result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,None,None,data.chatbox_id,12)
-        print(f'[REVIEW CHAT START] user={user["id"]} course_id={selected_course_id} lesson={result["source_lesson"]!r} session={result["session_id"]} questions={len(result["questions"])}')
+    if action_head in {'review_open','review_choose'}:
+        msg,blocks,_=_review_selection_blocks(user['id'],int(selected_course_id),selected_course_name)
+        return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':blocks,
+                'learning_progress':None,'review':True,'review_selection':True}
+
+    if action_head in {'review_wrong','review_wrong_lesson'}:
+        requested_lesson=None
+        requested_type=None
+        if ':' in action_raw:
+            raw=action_raw.split(':',1)[1]
+            try:
+                decoded=json.loads(urllib.parse.unquote(raw))
+            except Exception:
+                decoded={}
+            requested_lesson=str(decoded.get('lesson') or '').strip() or None
+            requested_type=str(decoded.get('content_type') or '').strip() or None
+        if action_head=='review_wrong' and requested_lesson is None:
+            requested_lesson, _=_review_first_failed_lesson(user['id'],int(selected_course_id))
+        result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
+                                          lesson=requested_lesson,content_type=requested_type,
+                                          chatbox_id=data.chatbox_id,max_questions=12,only_failed=True)
+        print(f'[REVIEW WRONG CHAT START] user={user["id"]} course_id={selected_course_id} lesson={result["source_lesson"]!r} session={result["session_id"]} questions={len(result["questions"])}')
         return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
-                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':result['source_lesson']}
+                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':result['source_lesson']}
 
     if action_head == 'review_answer':
         raw=action_raw.split(':',1)[1] if ':' in action_raw else ''
@@ -8524,60 +8561,138 @@ def _build_manual_review_chat_blocks(user_id, course_id, course_name, lesson_row
     return msg,blocks
 
 
-def _build_review_reminder_blocks(user_id, course_id, course_name):
+
+def _next_plan_lesson_for_welcome(user_id, course_id):
+    """Return the next unfinished lesson from the user's active study plan."""
+    if course_id is None:
+        return None
+    try:
+        plans=_active_plans(user_id, course_id=int(course_id))
+    except Exception as exc:
+        print(f"[WELCOME PLAN] skipped: {type(exc).__name__}: {exc}")
+        return None
+    candidates=[]
+    for plan in plans:
+        for item in plan.get('items') or []:
+            if str(item.get('status') or '').lower() == 'completed':
+                continue
+            lesson=str(item.get('lesson') or '').strip()
+            if not lesson:
+                continue
+            candidates.append((item.get('plan_date'), int(item.get('unit_index') or 0), lesson, item))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x:(x[0] if x[0] is not None else date.max, x[1], x[2].casefold()))
+    return candidates[0][3]
+
+
+def _review_selection_blocks(user_id, course_id, course_name, *, greeting_prefix=None):
+    """Build one deterministic review briefing used by chat, welcome and proactive reminders.
+
+    Scheduled lesson reviews and due wrong-answer items are separate queues.  The
+    learner chooses which queue/lesson to do first; no review session is started here.
+    """
     scheduled=_review_scheduled_lessons(user_id,course_id)
     due=_review_due_items(user_id,course_id)
-    if not scheduled:
-        return None
-    r=scheduled[0]
-    lesson=str(r.get('lesson') or '').strip()
-    ct=str(r.get('content_type') or 'Giáo trình')
+
     parts=[]
-    if r.get('vocabulary_count'): parts.append(f"{int(r['vocabulary_count'])} từ vựng")
-    if r.get('grammar_count'): parts.append(f"{int(r['grammar_count'])} ngữ pháp")
-    msg=(f"🔔 Hôm nay mình ôn tập lại **{lesson}** nhé?\n\n"
-         f"Bài này có {', '.join(parts) or 'nội dung cần ôn'}. Cậu có muốn ôn ngay không?")
-    action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':ct},ensure_ascii=False,separators=(',',':')))
-    blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_reminder_choice","options":[{"label":"Ôn ngay","action":f"review_lesson:{action}"},{"label":"Để sau","action":"review_keep"}]}]
-    return msg,blocks
+    if greeting_prefix:
+        parts.append(greeting_prefix.rstrip())
+
+    scheduled_choices=[]
+    if scheduled:
+        if len(scheduled)==1:
+            r=scheduled[0]
+            lesson=str(r.get('lesson') or '').strip()
+            counts=[]
+            if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
+            if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
+            parts.append(f"📚 Hôm nay cậu cần ôn lại bài **{lesson}**{(' (' + ', '.join(counts) + ')') if counts else ''}.")
+            action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':str(r.get('content_type') or 'Giáo trình')},ensure_ascii=False,separators=(',',':')))
+            scheduled_choices.append({'label':f'Ôn bài {lesson}','action':f'review_lesson:{action}'})
+        else:
+            parts.append(f"📚 Hôm nay cậu có **{len(scheduled)} bài đến lịch ôn định kỳ**:")
+            for r in scheduled[:8]:
+                lesson=str(r.get('lesson') or '').strip()
+                counts=[]
+                if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
+                if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
+                parts.append(f"• **{lesson}**{(' – ' + ', '.join(counts)) if counts else ''}")
+                action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':str(r.get('content_type') or 'Giáo trình')},ensure_ascii=False,separators=(',',':')))
+                scheduled_choices.append({'label':f'Ôn {lesson}','action':f'review_lesson:{action}'})
+
+    wrong_count=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
+    if wrong_count:
+        parts.append(f"📝 Ngoài ra, cậu có **{wrong_count} nội dung đã làm sai** và đã đến lịch làm lại.")
+
+    available=bool(scheduled_choices or wrong_count)
+    if not available:
+        parts.append('✅ Hôm nay chưa có nội dung ôn tập nào đến lịch.')
+        msg='\n\n'.join(parts)
+        return msg,[{'type':'text','text':msg}],False
+
+    parts.append("Cậu muốn ôn tập phần nào trước?")
+    msg='\n\n'.join(parts)
+    blocks=[{'type':'text','text':msg}]
+
+    # Show lesson choices first, then one wrong-only choice. The wrong queue is
+    # intentionally started from the most relevant unresolved lesson by server.
+    all_choices=list(scheduled_choices[:8])
+    if wrong_count:
+        all_choices.append({'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong'})
+    if all_choices:
+        blocks.append({'type':'choice','id':'review_selection','options':all_choices})
+    return msg,blocks,True
+
+
+def _build_post_review_next_step(user_id, course_id, course_name, finished_scope, source_lesson):
+    """Describe the next review queue after a session finishes, without auto-starting it."""
+    scope=str(finished_scope or 'FULL').upper()
+    lesson=str(source_lesson or '').strip()
+
+    # Immediately after a full lesson review, the learner should see items that
+    # were just answered incorrectly, even though their retry date may be tomorrow.
+    immediate_wrong=[]
+    if scope=='FULL' and lesson and lesson!='review_due':
+        try:
+            immediate_wrong=_review_failed_items_for_lesson(user_id,course_id,lesson,None)
+        except Exception as exc:
+            print(f'[REVIEW NEXT] lesson wrong-state lookup skipped: {type(exc).__name__}: {exc}')
+            immediate_wrong={'vocabulary':[],'grammar':[]}
+    immediate_wrong_count=len(immediate_wrong.get('vocabulary') or [])+len(immediate_wrong.get('grammar') or [])
+    if immediate_wrong_count:
+        action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':None},ensure_ascii=False,separators=(',',':')))
+        msg=(f'🎉 Cậu đã ôn xong bài **{lesson}** rồi!\n\n'
+             f'Trong lúc ôn, cậu còn **{immediate_wrong_count} nội dung** chưa đúng. '
+             'Giờ mình làm lại những nội dung này nhé?')
+        blocks=[{'type':'text','text':msg},{'type':'choice','id':'review_next_wrong','options':[
+            {'label':f'Làm lại phần sai ({immediate_wrong_count})','action':f'review_wrong_lesson:{action}'},
+            {'label':'Để sau','action':'review_keep'}
+        ]}]
+        return msg,blocks
+
+    # Then look for another scheduled lesson or due wrong queue.
+    scheduled=_review_scheduled_lessons(user_id,course_id)
+    due=_review_due_items(user_id,course_id)
+    if scheduled or due.get('vocabulary') or due.get('grammar'):
+        msg,blocks,_=_review_selection_blocks(user_id,course_id,course_name,
+            greeting_prefix=f'🎉 Cậu đã hoàn thành phần ôn tập **{lesson or "vừa rồi"}**!')
+        return msg,blocks
+
+    msg=f'🎉 Cậu đã hoàn thành phần ôn tập **{lesson or "vừa rồi"}** và hiện không còn nội dung ôn nào đến lịch. 🤖'
+    return msg,[{'type':'text','text':msg}]
+
+
+def _build_review_reminder_blocks(user_id, course_id, course_name):
+    """Return the same review briefing used by chat and app-start reminders."""
+    result=_review_selection_blocks(user_id,course_id,course_name,
+        greeting_prefix=f"🔔 Chào cậu! Doraemon đã kiểm tra lịch ôn hôm nay cho **{course_name or 'khóa học hiện tại'}**.")
+    msg,blocks,available=result
+    return (msg,blocks) if available else None
 
 
 def _build_review_schedule_chat_blocks(user_id, course_id, course_name):
-    """Show the union of scheduled lesson reviews and overdue item reviews."""
-    due=_review_due_items(user_id,course_id)
-    scheduled=_review_scheduled_lessons(user_id,course_id)
-    lines=[f"🔄 Lịch ôn tập — {course_name or 'khóa học hiện tại'}"]
-    scheduled_keys=set()
-    for r in scheduled:
-        key=(str(r.get('lesson') or '').strip().casefold(), str(r.get('content_type') or '').strip().casefold())
-        scheduled_keys.add(key)
-    if scheduled:
-        lines.append(f"📚 Hôm nay có {len(scheduled)} bài đến lịch ôn định kỳ:")
-        for r in scheduled:
-            parts=[]
-            if r.get('vocabulary_count'): parts.append(f"{int(r['vocabulary_count'])} từ vựng")
-            if r.get('grammar_count'): parts.append(f"{int(r['grammar_count'])} ngữ pháp")
-            lines.append(f"• {r.get('lesson')}: {', '.join(parts) or 'kiến thức của bài'}")
-
-    extra=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
-    if extra:
-        lines.append(f"📌 Có {extra} nội dung cần ôn lại do các lần review trước trả lời sai.")
-        for x in (due.get('vocabulary') or []):
-            lines.append(f"• Từ vựng: {x.get('writing') or x.get('reading')}")
-        for x in (due.get('grammar') or []):
-            lines.append(f"• Ngữ pháp: {x.get('pattern')}")
-
-    if not scheduled and not extra:
-        lines.append('✅ Hôm nay chưa có nội dung ôn tập nào đến lịch.')
-    msg='\n'.join(lines)
-    available=bool(scheduled or extra)
-    if available:
-        msg += "\n\nCậu có muốn bắt đầu ôn ngay không?"
-        # review_open must route to the same union: scheduled lessons first, then overdue wrong items.
-        blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_choice","options":[{"label":"Bắt đầu ôn","action":"review_open"},{"label":"Để sau","action":"review_keep"}]}]
-    else:
-        msg += "\n\nKhi muốn ôn, cậu chỉ cần nói 'tôi muốn ôn tập' nhé."
-        blocks=[{"type":"text","text":msg}]
+    msg,blocks,_=_review_selection_blocks(user_id,course_id,course_name)
     return msg,blocks
 
 
@@ -9478,11 +9593,13 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             feedback=('✅ Chính xác!' if correct else f'❌ Chưa đúng. {explanation}')
             if finished:
                 source_lesson=str(sess.get('source_lesson') or '')
-                if str(sess.get('review_scope') or 'FULL').upper() == 'FULL' and source_lesson and source_lesson!='review_due':
+                review_scope=str(sess.get('review_scope') or 'FULL').upper()
+                if review_scope == 'FULL' and source_lesson and source_lesson!='review_due':
                     try: _mark_review_schedule_completed(user_id,course_id,source_lesson)
                     except Exception as exc: print(f'[REVIEW SCHEDULE] finish skipped: {type(exc).__name__}: {exc}')
-                result['reply']=feedback+'\n\n🎉 Cậu đã hoàn thành phiên ôn tập này rồi!'
-                result['content_blocks']=[{'type':'text','text':result['reply']}]
+                next_msg,next_blocks=_build_post_review_next_step(user_id,course_id,'',review_scope,source_lesson)
+                result['reply']=feedback+'\n\n'+next_msg
+                result['content_blocks']=[{'type':'text','text':feedback}]+next_blocks
             else:
                 next_q=questions[next_idx]
                 _,next_blocks=_review_question_blocks(sid,next_q,next_idx,len(questions))
