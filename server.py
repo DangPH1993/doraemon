@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.119-review-orchestrator"
+BASELINE_VERSION = "19.121-review-post-step-robust"
 import os
 import ast
 import io
@@ -89,7 +89,7 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.119-review-orchestrator")
+print("[DORAEMON SERVER FINGERPRINT] 19.121-review-post-step-robust")
 SERVER_VERSION = "2026-09-05-v19_118_review_date_due_union"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -8652,10 +8652,21 @@ def _build_post_review_next_step(user_id, course_id, course_name, finished_scope
 
     # Immediately after a full lesson review, the learner should see items that
     # were just answered incorrectly, even though their retry date may be tomorrow.
-    immediate_wrong=[]
+    immediate_wrong={'vocabulary':[],'grammar':[]}
     if scope=='FULL' and lesson and lesson!='review_due':
         try:
-            immediate_wrong=_review_failed_items_for_lesson(user_id,course_id,lesson,None)
+            raw_wrong=_review_failed_items_for_lesson(user_id,course_id,lesson,None)
+            # Be defensive against legacy/older helper implementations that may
+            # return a flat list instead of the canonical {vocabulary, grammar} dict.
+            if isinstance(raw_wrong, dict):
+                immediate_wrong={
+                    'vocabulary':raw_wrong.get('vocabulary') or [],
+                    'grammar':raw_wrong.get('grammar') or [],
+                }
+            elif isinstance(raw_wrong, list):
+                immediate_wrong={'vocabulary':[],'grammar':raw_wrong}
+            else:
+                immediate_wrong={'vocabulary':[],'grammar':[]}
         except Exception as exc:
             print(f'[REVIEW NEXT] lesson wrong-state lookup skipped: {type(exc).__name__}: {exc}')
             immediate_wrong={'vocabulary':[],'grammar':[]}
