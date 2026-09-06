@@ -8793,10 +8793,11 @@ def _review_json_from_text(text):
 
 
 def _review_vocab_question(item, all_vocab, mode=None):
-    """Create one vocabulary review question from authoritative curriculum DB data.
+    """Create a self-contained vocabulary MCQ from authoritative curriculum DB data.
 
-    mode can be 'mcq' or 'fill'.  The stored Vietnamese meaning is never placed
-    in the question itself.  For MCQ, all four answer texts come from the DB.
+    Vocabulary review intentionally has ONE format only: multiple choice A/B/C/D.
+    The learner sees the Japanese word itself and selects its Vietnamese meaning, so
+    the question does not depend on the lesson name or any previous chat context.
     """
     item_id=int(item.get('id') or 0)
     writing=str(item.get('writing') or '').strip()
@@ -8805,74 +8806,90 @@ def _review_vocab_question(item, all_vocab, mode=None):
     shown=writing or reading or f'ID {item_id}'
     if writing and reading and reading != writing:
         shown=f'{writing}（{reading}）'
-    mode = 'mcq'
 
-    if not meaning:
-        example=str(item.get('example') or '').strip()
-        fill_sentence=''
-        if example:
-            for target in [writing,reading]:
-                if target and target in example:
-                    fill_sentence=example.replace(target,'____',1)
-                    break
-        if fill_sentence:
-            question=f'🇯🇵 Điền từ vựng thích hợp vào chỗ trống:\n{fill_sentence}\n\nGợi ý: từ tiếng Nhật trong bài.'
-            answer=writing or reading or meaning
-        else:
-            question=f'🇯🇵 {shown}\n\nĐiền nghĩa tiếng Việt của từ này vào chỗ trống: ______'
-            answer=meaning
-        return {
-            'item_type':'vocabulary','item_id':item_id,
-            'question_type':'fill_blank',
-            'question':question,
-            'options':[], 'option_letters':{}, 'answer':answer,
-            'answer_variants':[x for x in (writing,reading) if x],
-            'answer_criteria':answer,
-        }
+    letters=['A','B','C','D']
 
+    # Use DB-backed meanings as distractors whenever possible.
     distractor_pool=[]
-    for other in all_vocab:
+    for other in all_vocab or []:
         if int(other.get('id') or 0)==item_id:
             continue
         m=str(other.get('meaning') or '').strip()
         if m and m.casefold()!=meaning.casefold() and m not in distractor_pool:
             distractor_pool.append(m)
-    if len(distractor_pool) < 3:
-        example=str(item.get('example') or '').strip()
-        fill_sentence=''
-        for target in [writing,reading]:
-            if target and target in example:
-                fill_sentence=example.replace(target,'____',1)
+
+    if meaning:
+        pool=[]
+        for m in distractor_pool:
+            if m and m.casefold()!=meaning.casefold() and m not in pool:
+                pool.append(m)
+            if len(pool)>=3:
                 break
-        if fill_sentence:
-            question=f'🇯🇵 Điền từ vựng thích hợp vào chỗ trống:\n{fill_sentence}\n\nGợi ý: từ tiếng Nhật trong bài.'
-            answer=writing or reading or meaning
-        else:
-            question=f'🇯🇵 {shown}\n\nĐiền nghĩa tiếng Việt của từ này vào chỗ trống: ______'
-            answer=meaning
-        return {
-            'item_type':'vocabulary','item_id':item_id,
-            'question_type':'fill_blank',
-            'question':question,
-            'options':[], 'option_letters':{}, 'answer':answer,
-            'answer_variants':[x for x in (writing,reading) if x],
-            'answer_criteria':answer,
-        }
-    options=[meaning]+random.sample(distractor_pool,3)
-    random.shuffle(options)
-    letters=['A','B','C','D']
-    option_letters={letters[i]:options[i] for i in range(4)}
-    correct_letter=next(k for k,v in option_letters.items() if v==meaning)
-    return {
-        'item_type':'vocabulary','item_id':item_id,
-        'question_type':'multiple_choice',
-        'question':f'🇯🇵 {shown}\n\nTừ này có nghĩa tiếng Việt là gì?',
-        'options':[f'{k}. {option_letters[k]}' for k in letters],
-        'option_letters':option_letters,
-        'answer':correct_letter,
-        'answer_text':meaning,
-        'answer_criteria':meaning,
-    }
+
+        # Never fall back to a vocabulary fill question. For a valid DB meaning,
+        # guarantee the requested four-choice format with clearly incorrect
+        # category-level distractors only when the lesson/course pool is too small.
+        if len(pool)<3:
+            generic=[
+                'Một hoạt động hằng ngày',
+                'Một địa điểm',
+                'Một đồ vật',
+                'Một tính chất/trạng thái',
+                'Một người hoặc nhóm người',
+                'Một hành động',
+                'Một khoảng thời gian',
+                'Một phương tiện',
+            ]
+            for g in generic:
+                if g.casefold()!=meaning.casefold() and g not in pool:
+                    pool.append(g)
+                if len(pool)>=3:
+                    break
+
+        if len(pool)==3:
+            options=[meaning]+pool
+            random.shuffle(options)
+            option_letters={letters[i]:options[i] for i in range(4)}
+            correct_letter=next(k for k,v in option_letters.items() if v==meaning)
+            return {
+                'item_type':'vocabulary','item_id':item_id,
+                'question_type':'multiple_choice',
+                'question':f'🇯🇵 **{shown}**\n\nTừ này có nghĩa tiếng Việt là gì?',
+                'options':[f'{k}. {option_letters[k]}' for k in letters],
+                'option_letters':option_letters,
+                'answer':correct_letter,
+                'answer_text':meaning,
+                'answer_criteria':meaning,
+            }
+
+    # Incomplete vocabulary master data should not produce an unusable fill-in
+    # question. If reading is available, test reading with an MCQ instead.
+    if reading:
+        reading_pool=[]
+        for other in all_vocab or []:
+            if int(other.get('id') or 0)==item_id:
+                continue
+            r=str(other.get('reading') or '').strip()
+            if r and r.casefold()!=reading.casefold() and r not in reading_pool:
+                reading_pool.append(r)
+        if len(reading_pool)>=3:
+            options=[reading]+random.sample(reading_pool,3)
+            random.shuffle(options)
+            option_letters={letters[i]:options[i] for i in range(4)}
+            correct_letter=next(k for k,v in option_letters.items() if v==reading)
+            return {
+                'item_type':'vocabulary','item_id':item_id,
+                'question_type':'multiple_choice',
+                'question':f'🇯🇵 **{writing or reading}**\n\nCách đọc đúng của từ này là gì?',
+                'options':[f'{k}. {option_letters[k]}' for k in letters],
+                'option_letters':option_letters,
+                'answer':correct_letter,
+                'answer_text':reading,
+                'answer_criteria':reading,
+            }
+
+    # No complete vocabulary item available for a safe quiz question.
+    return None
 
 
 def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=False):
@@ -8914,8 +8931,8 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             'Mỗi câu phải thuộc một trong hai dạng question_type: multiple_choice hoặc fill_blank.',
             'Với multiple_choice phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
             'Với fill_blank phải có câu ví dụ từ DATA bị khuyết đúng một từ/cụm từ. Trả thêm blank_target là đúng chuỗi có trong example, và tuyệt đối không chọn pattern/đuôi ngữ pháp làm blank_target. answer phải bằng blank_target.',
-            'Vocabulary: dùng writing/reading của DATA để hỏi nghĩa tiếng Việt. Tuyệt đối không đưa meaning của chính item vào phần question.',
-            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống.',
+            'Vocabulary: chỉ tạo multiple_choice. Câu hỏi phải tự đủ ngữ cảnh: hiển thị chính từ tiếng Nhật và hỏi nghĩa tiếng Việt; tuyệt đối không dùng kiểu "Điền từ..." và không phụ thuộc vào tên bài hoặc đoạn chat trước.',
+            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống. Câu hỏi phải tự đủ ngữ cảnh để user trả lời mà không cần biết tên bài hay đọc lại chat trước.',
             'Không hiển thị đáp án đúng trong question.',
             'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"...","blank_target":"..."}]}.',
         ],
@@ -8951,23 +8968,23 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         ai_q=by_key.get(('vocabulary',item_id)) or {}
         ai_type=str(ai_q.get('question_type') or '').strip()
         # Vocabulary wording and correct answer remain DB-authoritative.
-        mode='mcq'
-        q=_review_vocab_question(item,selected_vocab,mode=mode)
-        # AI can provide distractors, but only if they are four unique strings and
-        # include the authoritative meaning exactly once.
-        if mode=='mcq':
-            meaning=str(item.get('meaning') or '').strip()
-            ai_opts=ai_q.get('option_letters')
-            if isinstance(ai_opts,dict):
-                raw=[]
-                for letter in ('A','B','C','D'):
-                    val=str(ai_opts.get(letter) or '').strip()
-                    if val: raw.append(val)
-                if len(raw)==4 and meaning in raw and len({x.casefold() for x in raw})==4:
-                    q['option_letters']={k:raw[i] for i,k in enumerate(('A','B','C','D'))}
-                    q['options']=[f'{k}. {q["option_letters"][k]}' for k in ('A','B','C','D')]
-                    q['answer']=next(k for k in ('A','B','C','D') if q['option_letters'][k]==meaning)
-                    q['answer_text']=meaning
+        q=_review_vocab_question(item,selected_vocab,mode='mcq')
+        if q is None:
+            continue
+        meaning=str(item.get('meaning') or '').strip()
+        ai_opts=ai_q.get('option_letters')
+        # AI can refine distractors only when the DB-backed question already has
+        # a valid MCQ structure and the authoritative meaning is present exactly once.
+        if meaning and isinstance(ai_opts,dict):
+            raw=[]
+            for letter in ('A','B','C','D'):
+                val=str(ai_opts.get(letter) or '').strip()
+                if val: raw.append(val)
+            if len(raw)==4 and meaning in raw and len({x.casefold() for x in raw})==4:
+                q['option_letters']={k:raw[i] for i,k in enumerate(('A','B','C','D'))}
+                q['options']=[f'{k}. {q["option_letters"][k]}' for k in ('A','B','C','D')]
+                q['answer']=next(k for k in ('A','B','C','D') if q['option_letters'][k]==meaning)
+                q['answer_text']=meaning
         questions.append(q)
 
     for item in selected_grammar:
