@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.123-genai-learning-intent-orchestrator"
+BASELINE_VERSION = "19.124-genai-discovery-natural-wording"
 import os
 import ast
 import io
@@ -5036,7 +5036,13 @@ def _is_learning_intent_candidate(text: str):
 
 
 def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LEARN_RECOMMENDATION'):
-    """Build the daily learning/review briefing after GenAI identifies intent."""
+    """Build a natural daily learning/review briefing after GenAI identifies intent.
+
+    Wording is contextual: avoid saying "ngoài ra" when the wrong-answer queue is
+    the only actionable item. The same DB state drives both LEARN_RECOMMENDATION
+    and REVIEW_RECOMMENDATION, while the text clearly distinguishes lesson-review
+    schedules from wrong-answer retry schedules.
+    """
     intent=str(intent or 'LEARN_RECOMMENDATION').upper()
     scheduled=_review_scheduled_lessons(user_id,course_id)
     due=_review_due_items(user_id,course_id)
@@ -5046,7 +5052,7 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     parts=[]
     if intent=='LEARN_RECOMMENDATION':
-        parts.append(f'👋 Chào cậu! Doraemon đã xem lịch học và ôn tập hôm nay.')
+        parts.append('👋 Chào cậu! Doraemon đã xem lịch học và ôn tập hôm nay.')
         if next_plan:
             next_lesson=str(next_plan.get('lesson') or '').strip()
             plan_date=next_plan.get('plan_date')
@@ -5067,7 +5073,7 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
             if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
             parts.append(f'📚 Hôm nay cậu cần ôn lại bài **{lesson}**{(" ("+", ".join(counts)+")") if counts else ""}.')
         else:
-            parts.append(f'📚 Hôm nay có **{len(scheduled)} bài đến lịch ôn định kỳ**:')
+            parts.append(f'📚 Hôm nay cậu có **{len(scheduled)} bài đến lịch ôn tập**:')
             for r in scheduled[:10]:
                 lesson=str(r.get('lesson') or '').strip()
                 counts=[]
@@ -5075,53 +5081,52 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
                 if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
                 parts.append(f'• **{lesson}**{(" – "+", ".join(counts)) if counts else ""}')
 
+    # The wrong-answer queue gets context-sensitive wording. If there is no
+    # lesson/review content before it, use "Nhưng" rather than "Ngoài ra".
     if wrong_count:
-        parts.append(f'📝 Ngoài ra, cậu có **{wrong_count} nội dung đã làm sai** và đã đến lịch làm lại.')
+        primary_exists=bool(scheduled or next_plan)
+        lead='📝 Ngoài ra, cậu có' if primary_exists else '📝 Nhưng cậu có'
+        parts.append(f'{lead} **{wrong_count} nội dung đã làm sai** và đã đến lịch làm lại.')
+
         wrong_lessons=[]
         for it in wrong_items:
-            # _review_due_items already comes from the durable review tables.
             lesson=str(it.get('source_lesson') or '').strip()
             if lesson and lesson.casefold() not in [x.casefold() for x in wrong_lessons]:
                 wrong_lessons.append(lesson)
-        if not wrong_lessons:
-            # Resolve labels only when the due query does not already expose them.
-            conn=None
-            try:
-                conn=db()
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    for it in wrong_items:
-                        iid=int(it.get('item_id') or 0)
-                        if str(it.get('writing') or '').strip() or str(it.get('reading') or '').strip():
-                            cur.execute('SELECT source_lesson FROM curriculum_vocab_master WHERE id=%s AND course_id=%s',(iid,course_id))
-                        else:
-                            cur.execute('SELECT source_lesson FROM curriculum_grammar_master WHERE id=%s AND course_id=%s',(iid,course_id))
-                        rr=cur.fetchone(); lesson=str((rr or {}).get('source_lesson') or '').strip()
-                        if lesson and lesson.casefold() not in [x.casefold() for x in wrong_lessons]:
-                            wrong_lessons.append(lesson)
-            except Exception as exc:
-                print(f'[LEARNING DISCOVERY] wrong lesson labels skipped: {type(exc).__name__}: {exc}')
-            finally:
-                if conn: conn.close()
         if wrong_lessons:
             parts.append('📌 Các bài có nội dung sai cần làm lại: ' + ', '.join(f'**{x}**' for x in wrong_lessons[:10]) + '.')
+
+    # Explicitly explain the absence of lesson-level work when the user asks
+    # what to LEARN today, matching the requested natural wording.
+    if intent=='LEARN_RECOMMENDATION' and not next_plan and not scheduled:
+        if wrong_count:
+            parts.insert(1, '📚 Hôm nay cậu không có bài học nào theo lộ trình và không có bài nào cần ôn tập.')
+        else:
+            parts.append('📚 Hôm nay cậu không có bài học nào theo lộ trình và không có bài nào cần ôn tập.')
+
+    if intent=='REVIEW_RECOMMENDATION' and not scheduled:
+        if wrong_count:
+            parts.insert(0, '📚 Hôm nay cậu không có bài ôn tập định kỳ đến lịch.')
+        else:
+            parts.append('✅ Hôm nay cậu chưa có bài ôn tập nào đến lịch.')
 
     choices=[]
     for r in scheduled[:10]:
         lesson=str(r.get('lesson') or '').strip()
-        if not lesson: continue
+        if not lesson:
+            continue
         ct=str(r.get('content_type') or 'Giáo trình')
         action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':ct},ensure_ascii=False,separators=(',',':')))
         choices.append({'label':f'Ôn {lesson}','action':f'review_lesson:{action}'})
     if wrong_count:
         choices.append({'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'})
 
-    if not scheduled and not wrong_count and intent=='REVIEW_RECOMMENDATION':
-        parts.append('✅ Hôm nay chưa có nội dung nào đến lịch ôn tập.')
-    elif not scheduled and not wrong_count and intent=='LEARN_RECOMMENDATION' and not next_plan:
-        parts.append('📚 Hiện chưa có bài ôn định kỳ hoặc bài học tiếp theo trong lộ trình.')
-
     if choices:
-        parts.append('Cậu muốn ôn tập phần nào trước?')
+        if scheduled or next_plan:
+            parts.append('Cậu muốn ôn tập phần nào trước?')
+        else:
+            parts.append('Cậu muốn làm lại phần sai trước chứ?')
+
     blocks=[{'type':'text','text':'\n\n'.join(parts)}]
     if choices:
         blocks.append({'type':'choice','id':'learning_discovery_selection','options':choices})
