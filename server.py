@@ -89,8 +89,8 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
-print("[DORAEMON SERVER FINGERPRINT] 19.123-genai-learning-intent-orchestrator")
-SERVER_VERSION = "2026-09-07-v19_123_genai_learning_intent_orchestrator"
+print("[DORAEMON SERVER FINGERPRINT] 19.126-genai-followup-intent-all-turns")
+SERVER_VERSION = "2026-09-07-v19_126_genai_followup_intent_all_turns"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -4968,6 +4968,49 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
 
 
 
+def _classify_chat_followup(text: str, history):
+    """Use GenAI to decide whether the current message depends on prior chat context.
+
+    The classifier receives only the last three user/model exchanges plus the current
+    message. It intentionally ignores learning/DB state; it answers one question only:
+    can the current message be understood as a continuation of the recent conversation?
+    """
+    raw = str(text or '').strip()
+    if not raw:
+        return False
+    hist = list(history or [])[-6:]  # 3 user/model exchanges
+    context = "\n".join(
+        f"{h.get('role')}: {str(h.get('text') or '')[-700:]}" for h in hist
+    )
+    prompt = (
+        'Phân loại tin nhắn hiện tại có phải là câu hỏi/phản hồi tiếp nối cuộc trò chuyện ngay trước đó hay không.\n'
+        'FOLLOW_UP = tin nhắn phụ thuộc vào nội dung trước đó để hiểu đầy đủ, ví dụ dùng đại từ, nói "cái này", "phần này", "sao vậy", "thế còn", sửa/chất vấn câu trước, xác nhận/tiếp tục một đề nghị trước.\n'
+        'NEW_TOPIC = yêu cầu/tin nhắn mới có thể hiểu đầy đủ mà không cần nội dung trước đó.\n'
+        'Chỉ trả về một nhãn: FOLLOW_UP hoặc NEW_TOPIC.\n\n'
+        f'LỊCH SỬ GẦN NHẤT (tối đa 3 lượt):\n{context or "(không có)"}\n\n'
+        f'TIN NHẮN HIỆN TẠI:\n{raw}'
+    )
+    try:
+        started = time.perf_counter()
+        reply, model, _ = _generate_chat_reply(
+            prompt, content_type=None,
+            request_id=f'followup-{int(time.time()*1000)}',
+            gen_started=started, user_text='', reasoning_profile='low'
+        )
+        label = str(reply or '').upper().strip()
+        if 'FOLLOW_UP' in label and 'NEW_TOPIC' not in label:
+            result = True
+        elif 'NEW_TOPIC' in label:
+            result = False
+        else:
+            raise ValueError(f'unrecognized follow-up label: {label!r}')
+        print(f'[GENAI FOLLOW-UP] text={raw[:120]!r} follow_up={int(result)} model={model!r} history_messages={len(hist)}')
+        return result
+    except Exception as exc:
+        print(f'[GENAI FOLLOW-UP] fallback: {type(exc).__name__}: {exc}')
+        return False
+
+
 def _classify_learning_intent(text: str):
     """Primary GenAI classifier for learning/review discovery turns.
 
@@ -5361,6 +5404,15 @@ def proxy_chat(
     if not data.text and not data.action:
         raise HTTPException(400, "Tin nhắn không được để trống.")
 
+    # Every plain-text user turn gets a tiny GenAI follow-up classification before
+    # any intent-specific early return. Structured UI actions are explicit state
+    # transitions and do not need conversational follow-up detection.
+    plan_recent_history = _normalize_chat_history(data.chat_history, max_messages=20)
+    chat_followup_detected = None
+    if not data.action and data.text:
+        chat_followup_detected = _classify_chat_followup(data.text, plan_recent_history)
+        print(f'[CHAT FOLLOW-UP ROUTER] request={request_id} follow_up={int(bool(chat_followup_detected))}')
+
     # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
     # Standalone greetings are onboarding actions and do not consume a question.
     if not _is_pure_greeting(data.text) and not _is_review_schedule_request(data.text) and not _is_learning_intent_candidate(data.text) and not data.proactive and not data.action:
@@ -5574,7 +5626,6 @@ def proxy_chat(
     # initial context. Once the boxchat is open, the frontend continues sending
     # the current thread history; the server only keeps the same bounded window.
     # `chatbox_new` is optional for backward compatibility.
-    plan_recent_history = _normalize_chat_history(data.chat_history, max_messages=20)
     if data.chatbox_new:
         plan_recent_history = plan_recent_history[-20:]
         print(f"[CHATBOX CONTEXT] new_chatbox=1 history_messages={len(plan_recent_history)} initial_only=10_exchanges")
@@ -6680,6 +6731,10 @@ Tin nhắn hiện tại:
         and not ambiguous_study_request
         and not recommendation_only_request
     )
+    # A GenAI-classified follow-up should stay attached to the current thread
+    # unless the learner explicitly requests a switch.
+    if chat_followup_detected and thread_scope and not thread_switch_requested and not named_lesson_topic:
+        thread_scope_locked = True
     if correction_followup and thread_scope:
         thread_scope_locked = True
     if thread_scope_locked:
@@ -6781,7 +6836,7 @@ Tin nhắn hiện tại:
             )
         rag_query_text = f"Ngữ cảnh học tập: {scope_label}.{position_label}\nTin nhắn: {query_text}"
     elif recent_history:
-        history_tail = recent_history[-2:]
+        history_tail = recent_history[-6:] if chat_followup_detected else recent_history[-2:]
         history_context = " ".join(f"{h['role']}: {h['text'][-500:]}" for h in history_tail)
         rag_query_text = f"Ngữ cảnh gần đây: {history_context}\nTin nhắn: {query_text}"
 
@@ -7825,6 +7880,11 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
     else:
         prompt_history = (recent_history[-4:] if runtime_cache_hit else (recent_history[-20:] if study_retrieval_allowed else recent_history[-2:])) if recent_history else []
 
+    # When GenAI classifies the current turn as a follow-up, deliberately widen
+    # the teacher prompt to the last three user/model exchanges.
+    if chat_followup_detected and recent_history:
+        prompt_history = recent_history[-6:]
+
     # Do not send the full catalog on every request. Only expose a compact
     # catalog when the user is actually asking what to study / for a
     # recommendation. For ordinary questions this stays empty.
@@ -7976,6 +8036,8 @@ RAG CONTEXT:
 
 RECENT CHAT — NGỮ CẢNH ƯU TIÊN CỦA BOXCHAT ĐANG MỞ (tối đa 10 lượt gần nhất):
 {json.dumps(prompt_history, ensure_ascii=False, default=str, separators=(",", ":"))}
+- GenAI đã phân loại lượt hiện tại là: {"FOLLOW_UP" if chat_followup_detected else "NEW_TOPIC" if chat_followup_detected is not None else "UNCLASSIFIED"}.
+- Nếu là FOLLOW_UP, 3 lượt hội thoại gần nhất là ngữ cảnh bắt buộc để hiểu câu hiện tại.
 - Đây là lịch sử của chính boxchat hiện tại, không phải lịch sử học tập chung.
 - Dùng nó để hiểu "cậu", "đó", "bảng này", "sáng thứ 6", "mình nói ý này", "câu trước", v.v.
 - Không được bỏ qua ngữ cảnh này để nhảy sang bài khác chỉ vì ACTIVE LEARNING STATE hoặc RAG metadata cũ gợi ý một lesson khác.
