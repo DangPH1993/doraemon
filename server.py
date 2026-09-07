@@ -3,7 +3,7 @@
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.128-followup-one-history-gated-context-llm-ops-logs"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct"
 import os
 import ast
 import io
@@ -4995,8 +4995,7 @@ def _classify_chat_followup(text: str, history):
         reply, model, _ = _generate_chat_reply(
             prompt, content_type=None,
             request_id=f'followup-{int(time.time()*1000)}',
-            gen_started=started, user_text='', reasoning_profile='low',
-            operation='followup_classification'
+            gen_started=started, user_text='', reasoning_profile='low'
         )
         label = str(reply or '').upper().strip()
         if 'FOLLOW_UP' in label and 'NEW_TOPIC' not in label:
@@ -5005,7 +5004,7 @@ def _classify_chat_followup(text: str, history):
             result = False
         else:
             raise ValueError(f'unrecognized follow-up label: {label!r}')
-        print(f'[GENAI FOLLOW-UP] request=followup-* text={raw[:120]!r} follow_up={int(result)} model={model!r} history_messages={len(hist)} token_operation=followup_classification')
+        print(f'[GENAI FOLLOW-UP] text={raw[:120]!r} follow_up={int(result)} model={model!r} history_messages={len(hist)}')
         return result
     except Exception as exc:
         print(f'[GENAI FOLLOW-UP] fallback: {type(exc).__name__}: {exc}')
@@ -5037,14 +5036,13 @@ def _classify_learning_intent(text: str):
         reply,model,_=_generate_chat_reply(
             prompt, content_type=None,
             request_id=f'intent-{int(time.time()*1000)}',
-            gen_started=started, user_text='', reasoning_profile='low',
-            operation='learning_intent_classification'
+            gen_started=started, user_text='', reasoning_profile='low'
         )
         label=str(reply or '').upper().strip()
         m=re.search(r'(LEARN_RECOMMENDATION|REVIEW_RECOMMENDATION|WRONG_ONLY_REVIEW|SPECIFIC_LESSON_REVIEW|OTHER)',label)
         if m:
             result=m.group(1)
-            print(f'[GENAI INTENT] request=intent-* text={raw[:120]!r} intent={result} model={model!r} token_operation=learning_intent_classification')
+            print(f'[GENAI INTENT] text={raw[:120]!r} intent={result} model={model!r}')
             return result
     except Exception as exc:
         print(f'[GENAI INTENT] fallback: {type(exc).__name__}: {exc}')
@@ -5301,17 +5299,12 @@ def _generate_chat_reply(
     gen_started: float,
     user_text: str = "",
     reasoning_profile: str = "low",
-    operation: str = "chat_generation",
 ):
     """
     Provider-neutral chat adapter.
     Gemini remains the legacy/default provider. OpenAI is a drop-in alternative
     for the same final prompt so RAG, Study Plan, chat history, routing and
     content_blocks stay unchanged.
-
-    ``operation`` is used only for observability/cost accounting in provider
-    token logs (e.g. followup_classification, learning_intent_classification,
-    chat_generation). It does not change model behavior.
     """
     prompt = _with_global_language_directive(prompt, user_text)
     # Runtime audit: this adapter receives a text-only prompt. If image_parts=0,
@@ -5354,7 +5347,7 @@ def _generate_chat_reply(
             )
             kwargs["reasoning"] = {"effort": reasoning_effort}
         response = openai_client.responses.create(**kwargs)
-        _log_openai_usage(response, operation=operation, request_id=request_id)
+        _log_openai_usage(response, operation="chat_generation", request_id=request_id)
         reply = getattr(response, "output_text", "") or ""
         elapsed = time.perf_counter() - gen_started
         print(
@@ -5384,7 +5377,7 @@ def _generate_chat_reply(
             thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
         ),
     )
-    _log_gemini_usage(response, operation=operation, request_id=request_id)
+    _log_gemini_usage(response, operation="chat_generation", request_id=request_id)
     reply = response.text or ""
     elapsed = time.perf_counter() - gen_started
     print(
@@ -6623,21 +6616,32 @@ Tin nhắn hiện tại:
     # Pinecone, embedding, or image stack.
     if not active_session_scope and not lesson_confirmed_scope and not forced_plan_scope and not data.action:
         if not (named_lesson_topic or _is_specific_lesson_request(query_text) or requested_content_type):
-            light_history = recent_history[-2:]
+            # Lightweight chat still respects the GenAI follow-up classifier.
+            # FOLLOW_UP -> pass exactly 3 recent user/model exchanges (6 messages)
+            # so short requests such as "ví dụ", "có", "thế còn..." can be fulfilled
+            # from context. NEW_TOPIC -> no chat history.
+            light_history = recent_history[-6:] if chat_followup_detected else []
             light_context = "\n".join(
-                f"{h.get('role')}: {str(h.get('text') or '')[-350:]}" for h in light_history
+                f"{h.get('role')}: {str(h.get('text') or '')[-700:]}" for h in light_history
+            )
+            followup_rules = (
+                "\nQUY TẮC FOLLOW-UP: Đây là lượt tiếp nối. Hãy dùng đúng lịch sử 3 lượt user/model gần nhất để hiểu yêu cầu hiện tại. "
+                "Nếu người dùng yêu cầu thực hiện một việc đã được đề nghị ở lượt trước (ví dụ: 'ví dụ', 'có', 'cho mình xem'), "
+                "hãy thực hiện ngay trong lượt này; KHÔNG hỏi lại cùng một câu xin xác nhận.\n"
+                if chat_followup_detected else
+                "\nQUY TẮC NEW_TOPIC: Đây là chủ đề mới. Không sử dụng lịch sử chat của boxchat để suy diễn ngữ cảnh.\n"
             )
             minimal_prompt = f"""Bạn là Doraemon, một người bạn/gia sư thân thiện.
 Đây là cuộc trò chuyện chưa mở bài học. Trả lời trực tiếp, tự nhiên và ngắn gọn. Quy tắc ngôn ngữ toàn cục ở đầu prompt quyết định ngôn ngữ trả lời.
 Không tự mở bài học, không dùng RAG/Pinecone, không đính kèm ảnh học tập.
 Nếu người dùng muốn học một bài cụ thể, hãy yêu cầu họ nêu tên bài để Doraemon xác nhận Có/Không trước khi bắt đầu.
-
-Lịch sử rất ngắn của boxchat (chỉ để hiểu đại từ nếu cần):
-{light_context}
+{followup_rules}
+Lịch sử boxchat được phép dùng:
+{light_context or "(không có)"}
 
 Tin nhắn hiện tại:
 {query_text}"""
-            print("[CHAT ROUTING] no active study session: lightweight chat; no embedding/Pinecone/RAG/images")
+            print(f"[CHAT ROUTING] no active study session: lightweight chat; follow_up={int(bool(chat_followup_detected))} prompt_history_messages={len(light_history)}")
             gen_started = time.perf_counter()
             reply, model_used, _ = _generate_chat_reply(
                 minimal_prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=query_text
