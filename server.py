@@ -7958,12 +7958,9 @@ QUY TẮC RIÊNG CHO YÊU CẦU HỌC CHƯA RÕ Ý (BẮT BUỘC):
     if requested_content_type == "Bài tập":
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO BÀI TẬP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
-- Nếu đây là lượt RA BÀI / bắt đầu một bài tập và học sinh chưa nộp đáp án: hãy đưa ra đề bài rõ ràng, đúng dữ liệu RAG; ngay bên dưới phải có mục **💡 Gợi ý cách làm**. Gợi ý chỉ hướng dẫn phương pháp/định hướng, KHÔNG nói luôn đáp án.
 - Nếu học sinh đã gửi đáp án hoặc lời giải: coi đó là BÀI NỘP. Hãy tự chấm bằng RAG và ảnh đúng chunk, nêu rõ ĐÚNG/SAI cho từng câu/ý, đáp án đúng (nếu có), rồi giải thích cách giải cụ thể, từng bước, để học sinh hiểu vì sao.
-- Với bài tính tiền/gọi món: đọc đúng món và giá từ CHUNK + ẢNH của đúng khách/order; thực hiện phép tính đầy đủ; không suy đoán giá hoặc món không có trong nguồn.
 - Nếu học sinh sai: chỉ ra chính xác bước sai, giải thích lỗi và làm mẫu lại từ đầu/đến bước cần thiết. Nếu đúng: vẫn giải thích vì sao đúng, không chỉ nói “đúng”.
 - Không yêu cầu học sinh tự kiểm tra lại khi nguồn đã đủ dữ kiện để chấm.
-- Sau khi giải xong, có thể đưa câu tiếp theo hoặc bài luyện tương tự ngắn nếu phù hợp, nhưng không làm mất trọng tâm bài đang học.
 """
     elif requested_content_type == "Ngữ pháp":
         mode_specific_rules = """
@@ -7976,12 +7973,7 @@ QUY TẮC RIÊNG CHO NGỮ PHÁP — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC
     elif requested_content_type == "Giáo trình":
         mode_specific_rules = """
 QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘC):
-- Khi học sinh yêu cầu học một bài/lesson của Giáo trình, trước tiên phải có **📚 Mở đầu bài học**: giới thiệu ngắn gọn mục đích của bài, bài này giúp học sinh làm được gì và các kiến thức/chủ điểm chính sẽ học.
-- Sau phần mở đầu, dạy **từng phần của giáo trình theo đúng thứ tự nguồn RAG**. Mỗi phần phải được giải thích chi tiết, dễ hiểu, có ví dụ từ chính nguồn khi nguồn có, và liên hệ với mục tiêu của bài. Không chỉ tóm tắt toàn bài trong một đoạn ngắn.
-- Khi có nhiều mục/điểm kiến thức, trình bày tuần tự: giải thích → ví dụ → lưu ý/dễ nhầm (nếu nguồn hỗ trợ) → chuyển sang mục tiếp theo.
-- Cuối bài phải có **📝 Tổng kết**: tổng hợp các từ vựng mới và ngữ pháp/cấu trúc mới xuất hiện trong bài, bám theo RAG CONTEXT; không tự bịa danh sách ngoài nguồn.
-- Không tự thêm bài tập bổ sung. Chỉ cho người học làm câu hỏi/yêu cầu thực sự có trong từng chunk nguồn.
-- Nếu học sinh chỉ hỏi một chi tiết nhỏ của giáo trình, không cần ép toàn bộ cấu trúc trên; chỉ áp dụng đầy đủ khi học sinh yêu cầu học/trình bày cả bài hoặc một phần bài đủ lớn.
+- Đóng vai giáo viên dạy đúng giáo trình trong DB
 """
     elif any(
         _normalize_chunk_text_for_match(c.get("metadata",{}).get("content_type")) == "giáo trình"
@@ -7992,8 +7984,6 @@ QUY TẮC RIÊNG CHO GIÁO TRÌNH — PHẢI ĐÓNG VAI GIÁO VIÊN (BẮT BUỘ
 QUY TẮC RIÊNG CHO NỘI DUNG CÓ BẢNG:
 - FACTS NGUỒN CỦA BẢNG là dữ kiện đã được Vision đọc từ ẢNH gốc. Dùng chúng để suy luận, không chỉ mô tả lại bảng.
 - Khi câu hỏi yêu cầu tìm một thời điểm/ngày/giá trị từ nhiều bảng, hãy thực hiện phép đối chiếu logic giữa các facts rồi đưa ra đáp án nếu dữ kiện đủ.
-- Với bảng lịch, ô trống có thể mang nghĩa "rảnh" nếu chính bố cục bảng thể hiện không có hoạt động ở khung đó; ký hiệu ／ không đồng nghĩa với ô trống/rảnh.
-- Không yêu cầu học sinh tự kiểm tra lại nếu chính các facts nguồn đã đủ để suy ra đáp án.
 - Nếu có nhiều bảng trong cùng bài, giữ đúng quan hệ giữa từng bảng và ảnh của bảng đó.
 """
 
@@ -8005,27 +7995,9 @@ QUY TẮC NGÔN NGỮ:
 
 
 NGUYÊN TẮC:
-- Thực hiện ngay yêu cầu học tập cụ thể; không hỏi lại nếu đã rõ bài/chủ đề.
-- Nếu người học chỉ nói chung chung "muốn học" mà chưa nói học theo lộ trình, học tiếp bài đang dở hay học bài/chủ đề cụ thể, PHẢI hỏi họ chọn hướng; tuyệt đối không tự chọn một bài dựa trên RAG hoặc tiến độ cũ.
-- Nội dung gồm đúng 5 loại ngang hàng: Giáo trình, Từ vựng, Ngữ pháp, Bài tập, Truyện đọc. Kanji và Bộ thủ là lesson của Từ vựng, không phải content type.
-- Mỗi content type có thể có nhiều sách/tài liệu; chỉ sử dụng đúng nguồn mà RAG và ACTIVE LEARNING STATE xác định.
-- Với Giáo trình: học theo FLOW CỐ ĐỊNH của server: B0 giới thiệu mục tiêu + từ vựng cần học + ngữ pháp cần học; B1..Bn mỗi bước chỉ giải thích đúng MỘT CHUNK của Knowledge Cache; sau mỗi chunk chỉ bắt người học làm bài nếu chính LLM khi dạy chunk đó xác định trong source/vision facts có bài tập thật; không được tự bịa. Bước cuối luôn là Tổng kết. Không được tự đổi thứ tự hoặc gộp nhiều chunk vào một teaching step.
-- Bài tập nằm trong chunk của Giáo trình vẫn thuộc content type Giáo trình. Khi chấm câu hỏi đó, được phép lấy toàn bộ các chunk của đúng bài để đối chiếu nếu câu hỏi liên quan nhiều phần.
-- Khi người học yêu cầu học/trình bày trọn một bài của Giáo trình, sau phần nội dung chính hãy thêm một mục ngắn “🤖 Doraemon nhận xét” (khoảng 3-5 ý hoặc đoạn ngắn): nêu bài này trọng tâm gì, 1-3 điểm cần nhớ, một lỗi dễ nhầm hoặc mẹo học, và gợi ý bước luyện tiếp. Nhận xét phải được suy ra từ chính RAG CONTEXT/ACTIVE LEARNING STATE, không bịa thêm kiến thức ngoài nguồn.
-- “Doraemon nhận xét” là phần hỗ trợ sư phạm, không thay thế hay viết lại toàn bộ giáo trình. Nếu người học chỉ hỏi một chi tiết nhỏ trong bài, không cần ép thêm một phần nhận xét dài; chỉ thêm khi phù hợp hoặc khi người học đang kết thúc/ôn lại toàn bài.
 - RECENT CHAT chỉ được dùng theo kết quả của bộ phân loại FOLLOW_UP: nếu là FOLLOW_UP thì dùng đúng 3 lượt user/model gần nhất; nếu là NEW_TOPIC thì không dùng chat history. ACTIVE LEARNING STATE chỉ là ngữ cảnh trạng thái học tập riêng, không được coi là chat history.
-- Nếu RECENT CHAT cho thấy tin nhắn hiện tại đang sửa/chất vấn câu trả lời trước (ví dụ "...có lịch rồi mà", "không đúng", "cậu nhầm"), bắt buộc coi đó là PHẢN HỒI TIẾP NỐI của bài đang học: xem lại câu trả lời ngay trước, đối chiếu RAG/ảnh nguồn, sửa đúng chi tiết bị chỉ ra và KHÔNG chuyển sang lesson/content type/bài tập khác.
-- Chỉ chuyển sang lesson/content type khác khi chính tin nhắn hiện tại thể hiện rõ yêu cầu chuyển (ví dụ "chuyển sang...", "mình muốn học bài...").
-- Không được lấy một tên bài xuất hiện trong câu trả lời cũ để tự chuyển lesson khi học sinh chỉ đang sửa một chi tiết.
 - Với Giáo trình đang chạy curriculum flow, KHÔNG dùng marker `[[LESSON_END_READY]]`; server tự điều khiển bước tiếp theo bằng state/buttons.
 - Với Bài tập: để học sinh làm trước, nhưng ngay khi học sinh gửi đáp án/câu trả lời, phải tự chấm bằng nguồn RAG và ảnh đúng chunk; không bắt học sinh tự tính lại nếu dữ kiện đã đủ.
-- Với Truyện đọc: bám tài liệu được RAG cung cấp. Nếu chunk nguồn có OCR/text thì coi đó là văn bản nguồn hợp lệ.
-- Không bịa nội dung/trang không có trong RAG.
-- Với Study Plan: khi người học đã đi đến cuối một bài/đơn vị học và câu hỏi cho thấy họ đang kết thúc bài, hãy hỏi ngắn: "Cậu đã học xong bài này chưa? Nếu xong báo Doraemon nhé." Không tự đánh dấu completed chỉ vì đã trình bày nội dung. Chỉ khi người học xác nhận thì hệ thống mới coi bài là completed.
-- Khi bài hiện tại mới kết thúc và Doraemon chỉ đang gợi ý/nhắc bài tiếp theo, KHÔNG được dạy nội dung của bài tiếp theo và KHÔNG được chèn ảnh của bài tiếp theo. Chỉ bắt đầu lấy nội dung/ảnh bài mới sau khi người học xác nhận hoặc yêu cầu học bài mới rõ ràng.
-- Quan trọng: ảnh không được tìm theo độ giống câu hỏi. Ảnh table phải thuộc đúng CHUNK chứa explanation của chính table đó.
-- Ảnh có image_scope=lesson là ngoại lệ có chủ đích: đó là hình minh họa chung cho toàn bài/lesson, chỉ được dùng khi trả lời trong đúng lesson và không được coi là ảnh của riêng một table chunk.
-- Không được dùng ảnh của chunk khác, trang khác hoặc lesson khác chỉ vì nó có vẻ phù hợp.
 {image_marker_rule}
 
 {mode_specific_rules}
