@@ -1478,10 +1478,30 @@ def _sync_active_plan_completion(user_id, row):
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()
-                FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'
-                AND lower(i.lesson)=lower(%s) AND lower(coalesce(p.content_type,''))=lower(coalesce(%s,''))
-                AND i.status<>'completed'""",(user_id,lesson,row.get('content_type') or ''))
+            content_type=str(row.get('content_type') or '')
+            if _normalize_content_type(content_type) == 'Từ vựng':
+                cur.execute("""
+                    UPDATE study_plan_items i SET status='completed', completed_at=NOW()
+                    FROM study_plans p
+                    WHERE i.id=(
+                        SELECT i2.id
+                        FROM study_plan_items i2
+                        JOIN study_plans p2 ON p2.id=i2.study_plan_id
+                        WHERE p2.user_id=%s AND p2.status='ACTIVE'
+                          AND lower(trim(coalesce(p2.content_type,'')))=lower(trim('Từ vựng'))
+                          AND lower(trim(coalesce(i2.lesson,'')))=lower(trim(%s))
+                          AND i2.status<>'completed'
+                          AND i2.plan_date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                        ORDER BY i2.plan_date ASC, i2.unit_index ASC, i2.id ASC
+                        LIMIT 1
+                    )
+                    WHERE p.id=i.study_plan_id
+                """,(user_id,lesson))
+            else:
+                cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()
+                    FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'
+                    AND lower(i.lesson)=lower(%s) AND lower(coalesce(p.content_type,''))=lower(coalesce(%s,''))
+                    AND i.status<>'completed'""",(user_id,lesson,content_type))
         conn.commit()
     finally: conn.close()
 
@@ -3392,17 +3412,134 @@ def _published_curriculum_answer_step(cache):
     return None
 
 
-def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False):
+def _planned_vocab_slice(user_id, course_id, lesson):
+    """Return the exact daily vocabulary slice required by an active vocab plan.
+
+    The vocabulary master table is the source of truth. A plan item with
+    units_per_day=5 and unit_index=1 means master items 1..5; unit_index=2
+    means items 6..10, etc. If no matching active daily-count plan exists,
+    return None so normal lesson access can show the full DB vocabulary.
+    """
+    if user_id in (None, '') or course_id in (None, '') or not lesson:
+        return None
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT p.id AS plan_id, p.units_per_day, i.unit_index, i.plan_date, i.status
+                FROM study_plans p
+                JOIN study_plan_items i ON i.study_plan_id=p.id
+                WHERE p.user_id=%s AND p.course_id=%s AND p.status='ACTIVE'
+                  AND lower(trim(coalesce(p.content_type,'')))=lower(trim('Từ vựng'))
+                  AND lower(trim(coalesce(i.lesson,'')))=lower(trim(%s))
+                  AND i.status <> 'completed'
+                  AND i.plan_date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                  AND p.units_per_day IS NOT NULL AND p.units_per_day > 0
+                ORDER BY i.plan_date ASC, i.unit_index ASC, i.id ASC
+                LIMIT 1
+            """, (user_id, int(course_id), str(lesson).strip()))
+            row=cur.fetchone()
+            if not row:
+                return None
+            quota=max(1, int(round(float(row.get('units_per_day') or 1))))
+            unit_index=max(1, int(row.get('unit_index') or 1))
+            return {
+                'plan_id': int(row.get('plan_id')),
+                'quota': quota,
+                'unit_index': unit_index,
+                'start_index': (unit_index-1)*quota,
+                'plan_date': row.get('plan_date'),
+            }
+    finally:
+        conn.close()
+
+
+def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
+    """Load vocabulary exclusively from curriculum_vocab_master.
+
+    Published curriculum_steps may contain AI-generated vocabulary, so runtime
+    teaching of a Từ vựng lesson deliberately bypasses those items and reads the
+    canonical course master instead.
+    """
+    if course_id in (None, '') or not lesson:
+        return [], None
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, writing, reading, pronunciation_vi, meaning, example
+                FROM curriculum_vocab_master
+                WHERE course_id=%s
+                  AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
+                ORDER BY id
+            """, (int(course_id), str(lesson).strip()))
+            rows=[dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+
+    plan_slice=_planned_vocab_slice(user_id, course_id, lesson) if user_id is not None else None
+    if plan_slice:
+        a=plan_slice['start_index']
+        b=a+plan_slice['quota']
+        rows=rows[a:b]
+    items=[]
+    for r in rows:
+        item={
+            'writing':str(r.get('writing') or '').strip(),
+            'reading':str(r.get('reading') or '').strip(),
+            'pronunciation_vi':str(r.get('pronunciation_vi') or '').strip(),
+            'meaning':str(r.get('meaning') or '').strip(),
+            'example':str(r.get('example') or '').strip(),
+            '_master_id': int(r.get('id')),
+        }
+        if any(item[k] for k in ('writing','reading','meaning')):
+            items.append(item)
+    return items, plan_slice
+
+
+def _vocabulary_master_text(items):
+    lines=[]
+    for i,item in enumerate(items or [],1):
+        row=[f"{i}. {item.get('writing') or ''}".rstrip()]
+        if item.get('reading'): row.append(f"   📖 Cách đọc: {item['reading']}")
+        if item.get('pronunciation_vi'): row.append(f"   🔊 Phát âm tiếng Việt: {item['pronunciation_vi']}")
+        if item.get('meaning'): row.append(f"   🇻🇳 Nghĩa: {item['meaning']}")
+        if item.get('example'): row.append(f"   Ví dụ: {item['example']}")
+        lines.append("\n".join(row))
+    return "\n\n".join(lines).strip()
+
+
+def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False, course_id=None, user_id=None):
     """Deterministic DB-first UI for Từ vựng/Ngữ pháp/Bài tập/Truyện đọc.
 
-    All visible teaching/answer text comes from curriculum_steps.content_json.
-    The only generated UI text is navigation chrome (labels/prompts).
+    Từ vựng is a special hard rule: runtime teaching reads curriculum_vocab_master,
+    never AI-generated curriculum_steps.items. Other content types keep their
+    published curriculum_steps content.
     """
     if not step: return []
     ct=str(content_type or "").strip()
     blocks=[]
     title=f"**{step['code']} · {step['title']}**" if step.get("title") else f"**{step['code']}**"
-    text=_published_curriculum_vocabulary_text(step) if ct == "Từ vựng" else str(step.get("text") or "").strip()
+    if ct == "Từ vựng":
+        master_items, plan_slice = _vocabulary_items_from_master(
+            course_id, cache.get('lesson') if isinstance(cache, dict) else None, user_id=user_id
+        )
+        # Hard rule: runtime Từ vựng must never fall back to AI-generated
+        # curriculum_steps.items. The DB master is the only teaching source.
+        if not master_items:
+            msg=(
+                f"🤖 Chưa có dữ liệu từ vựng trong DB master cho bài **{cache.get('lesson') if isinstance(cache, dict) else step.get('title') or 'này'}**. "
+                "Doraemon sẽ không tự tạo từ vựng thay thế."
+            )
+            return [{"type":"text","text":msg}]
+        text=_vocabulary_master_text(master_items)
+        if plan_slice:
+            text=(
+                f"🎯 Lộ trình hôm nay: **{plan_slice['quota']} từ** "
+                f"(ngày {plan_slice['unit_index']}).\n\n" + text
+            )
+    else:
+        text=str(step.get("text") or "").strip()
     if text:
         blocks.append({"type":"text","text":(title+"\n\n"+text).strip()})
     for im in step.get("images") or []:
@@ -4368,6 +4505,25 @@ def _clear_pending_plan_request(user_id):
     finally:
         conn.close()
 
+def _vocabulary_master_count(course_id, lesson):
+    """Count canonical vocabulary items for a course/lesson in DB master."""
+    if course_id in (None, '') or not lesson:
+        return 0
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM curriculum_vocab_master
+                WHERE course_id=%s
+                  AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
+            """, (int(course_id), str(lesson).strip()))
+            row=cur.fetchone()
+            return int(row[0] or 0) if row else 0
+    finally:
+        conn.close()
+
+
 def _build_plan_preview(user_id, req, existing_plan_id=None):
     requested_type = req.get('content_type') or 'Giáo trình'
     course_id = req.get('course_id')
@@ -4389,7 +4545,18 @@ def _build_plan_preview(user_id, req, existing_plan_id=None):
     if not target:
         units_per_day=req.get('units_per_day') or 1.0
         days_per_unit=req.get('days_per_unit') or 0
-        if days_per_unit:
+        if (req.get('content_type') == 'Từ vựng' and req.get('units_per_day')
+                and req.get('unit_label') and req.get('scope')):
+            vocab_total=_vocabulary_master_count(course_id, req.get('scope'))
+            if vocab_total > 0:
+                total_days=max(1, math.ceil(vocab_total / float(req.get('units_per_day'))))
+                target=start+timedelta(days=total_days-1)
+                print(f"[STUDY PLAN VOCAB] course_id={course_id} lesson={req.get('scope')!r} total_vocab={vocab_total} quota={req.get('units_per_day')} total_days={total_days}")
+            elif days_per_unit:
+                target=start+timedelta(days=max(1, int(days_per_unit*len(lessons))-1))
+            else:
+                target=start+timedelta(days=max(0, int((len(lessons)/units_per_day))-1))
+        elif days_per_unit:
             target=start+timedelta(days=max(1, int(days_per_unit*len(lessons))-1))
         else:
             target=start+timedelta(days=max(0, int((len(lessons)/units_per_day))-1))
@@ -7156,9 +7323,9 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
             if requested_content_type == "Bài tập" and answered:
-                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=True)
+                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=True,course_id=selected_course_id,user_id=user["id"])
             else:
-                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False)
+                blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False,course_id=selected_course_id,user_id=user["id"])
 
             # A question step waits for an answer but still exposes Tiếp theo, as requested.
             if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B0" and not answered:
