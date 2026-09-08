@@ -4841,7 +4841,6 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
         "2. Ngữ pháp\n"
         "3. Bài tập\n"
         "4. Từ vựng\n"
-        "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
         "5. Truyện đọc"
     )
 
@@ -4941,7 +4940,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             f"{unfinished_summary}"
         )
         closing = (
-            "\n\nCậu muốn học tiếp từ chỗ đang dở hay chọn một phần khác? 😊"
+            "\n\nHôm nay cậu muốn học gì nói cho mình biết nhé! 😊"
         )
     else:
         progress_text = (
