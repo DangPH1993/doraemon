@@ -6289,21 +6289,44 @@ Câu hỏi của người dùng:
     thread_switch_requested = _is_explicit_thread_switch(query_text)
     next_lesson_scope = None
 
-    # Referential follow-ups such as "ok, học bài này" should resolve to the
-    # concrete lesson Doraemon just mentioned in the current chatbox. The
-    # thread scope is already extracted from the recent assistant/user exchange
-    # and is therefore a safer source than trying to match the literal pronoun
-    # "này" against the catalog. Treat this as an explicit confirmation so the
-    # lesson opens immediately instead of asking "bài nào?" a second time.
+    # Referential follow-ups and explicit acknowledgements should resolve to the
+    # concrete lesson Doraemon just mentioned in the current chatbox. The thread
+    # scope is already extracted from the recent assistant/user exchange and is
+    # therefore safer than trying to match pronouns such as "này" against catalog.
+    #
+    # IMPORTANT: do not force the learner through a second confirmation turn.
+    # These are the two valid conversational confirmations:
+    #   1) "ok, học bài này" / "được, học bài này"
+    #   2) plain "ok" immediately after Doraemon has recommended/asked to start
+    #      the concrete lesson in the same chatbox.
     referential_query = _strip_vietnamese_diacritics(query_text)
+    short_ack = _is_short_acknowledgement(query_text)
+    latest_assistant_text = ""
+    if recent_history:
+        for _h in reversed(recent_history):
+            if str(_h.get('role') or '').strip().lower() == 'model':
+                latest_assistant_text = str(_h.get('text') or '').strip()
+                break
+    latest_assistant_norm = _strip_vietnamese_diacritics(latest_assistant_text)
+    assistant_is_lesson_offer = bool(
+        latest_assistant_text
+        and re.search(
+            r"(?:bai hoc tiep theo la|bai tiep theo la|hoc bai nay|muon hoc bai nay|co phai.*hoc bai nay|bat dau hoc.*(?:bai|phan))",
+            latest_assistant_norm,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+    )
     referential_lesson_confirm = bool(
         chat_followup_detected
         and thread_scope
         and thread_scope.get('lesson')
-        and re.search(
-            r"\b(?:hoc|vao hoc|mo|bat dau)(?:\s+ngay)?\s+(?:bai\s+)?(?:nay|do|day|tren)\b|\b(?:ok|okay|oke|duoc|u|vang)\s*[,! ]+.*\b(?:bai|phan)\s+(?:nay|do|day)\b",
-            referential_query,
-            flags=re.UNICODE,
+        and (
+            bool(re.search(
+                r"\b(?:hoc|vao hoc|mo|bat dau)(?:\s+ngay)?\s+(?:bai\s+)?(?:nay|do|day|tren)\b|\b(?:ok|okay|oke|duoc|u|vang)\s*[,! ]+.*\b(?:bai|phan)\s+(?:nay|do|day)\b",
+                referential_query,
+                flags=re.UNICODE,
+            ))
+            or (short_ack and assistant_is_lesson_offer)
         )
     )
     if referential_lesson_confirm:
