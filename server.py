@@ -5258,12 +5258,27 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
     due=_review_due_items(user_id,course_id)
     wrong_items=[*(due.get('vocabulary') or []),*(due.get('grammar') or [])]
     wrong_count=len(wrong_items)
-    next_plan=_next_plan_lesson_for_welcome(user_id,course_id) if intent=='LEARN_RECOMMENDATION' else None
+    today_plan_items=_today_learning_plan_items(user_id,course_id) if intent=='LEARN_RECOMMENDATION' else []
+    next_plan=today_plan_items[0] if today_plan_items else (_next_plan_lesson_for_welcome(user_id,course_id) if intent=='LEARN_RECOMMENDATION' else None)
 
     parts=[]
     if intent=='LEARN_RECOMMENDATION':
         parts.append('👋 Chào cậu! Doraemon đã xem lịch học và ôn tập hôm nay.')
-        if next_plan:
+        if today_plan_items:
+            parts.append(f'🎯 Hôm nay cậu có **{len(today_plan_items)} nội dung học theo lộ trình**:')
+            for item in today_plan_items[:12]:
+                ct=str(item.get('content_type') or 'Giáo trình')
+                lesson=str(item.get('lesson') or '').strip()
+                plan_date=item.get('plan_date')
+                date_text=''
+                if plan_date:
+                    try:
+                        date_text=f' ({plan_date.strftime("%d/%m/%Y") if hasattr(plan_date,"strftime") else str(plan_date)})'
+                    except Exception:
+                        date_text=f' ({plan_date})'
+                target_text=str(item.get('target') or '').strip()
+                parts.append(f'• **{lesson}** ({ct}){date_text}{(" – "+target_text) if target_text else ""}')
+        elif next_plan:
             next_lesson=str(next_plan.get('lesson') or '').strip()
             plan_date=next_plan.get('plan_date')
             plan_text=''
@@ -5308,7 +5323,7 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     # Explicitly explain the absence of lesson-level work when the user asks
     # what to LEARN today, matching the requested natural wording.
-    if intent=='LEARN_RECOMMENDATION' and not next_plan and not scheduled:
+    if intent=='LEARN_RECOMMENDATION' and not today_plan_items and not scheduled:
         if wrong_count:
             parts.insert(1, '📚 Hôm nay cậu không có bài học nào theo lộ trình và không có bài nào cần ôn tập.')
         else:
@@ -5321,6 +5336,22 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
             parts.append('✅ Hôm nay cậu chưa có bài ôn tập nào đến lịch.')
 
     choices=[]
+    if intent=='LEARN_RECOMMENDATION' and today_plan_items:
+        for item in today_plan_items[:12]:
+            lesson=str(item.get('lesson') or '').strip()
+            if not lesson:
+                continue
+            ct=str(item.get('content_type') or 'Giáo trình')
+            token=urllib.parse.quote(json.dumps({
+                'plan_id':int(item.get('plan_id')),
+                'item_id':int(item.get('item_id')),
+                'content_type':ct,
+                'lesson':lesson,
+            },ensure_ascii=False,separators=(',',':')))
+            label=f'Học {lesson}'
+            if ct=='Từ vựng' and item.get('target'):
+                label += f' ({str(item.get("target"))})'
+            choices.append({'label':label,'action':f'plan_start_item:{token}'})
     for r in scheduled[:10]:
         lesson=str(r.get('lesson') or '').strip()
         if not lesson:
@@ -5332,7 +5363,9 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
         choices.append({'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'})
 
     if choices:
-        if scheduled or next_plan:
+        if today_plan_items:
+            parts.append('Cậu muốn bắt đầu nội dung nào trước?')
+        elif scheduled or next_plan:
             parts.append('Cậu muốn ôn tập phần nào trước?')
         else:
             parts.append('Cậu muốn làm lại phần sai trước chứ?')
@@ -5999,6 +6032,32 @@ def proxy_chat(
             return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],
                     "content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
+        elif ui_action == "plan_start_item":
+            try:
+                decoded=json.loads(urllib.parse.unquote(action_plan_id or ''))
+            except Exception:
+                decoded={}
+            target_plan_id=int(decoded.get('plan_id') or 0)
+            target_item_id=int(decoded.get('item_id') or 0)
+            active_plan=_active_plan(user["id"], target_plan_id, course_id=selected_course_id) if target_plan_id else None
+            planned_start_item=next((x for x in (active_plan or {}).get('items', [])
+                                     if int(x.get('id') or 0)==target_item_id
+                                     and str(x.get('status') or '').lower()!='completed'), None)
+            if not planned_start_item:
+                msg="🤖 Doraemon không còn thấy nội dung này trong lộ trình đang học. Cậu mở lại 'Hôm nay học gì' để xem danh sách mới nhất nhé."
+                return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+            forced_content_type=_normalize_content_type((active_plan or {}).get('content_type') or decoded.get('content_type') or 'Giáo trình')
+            forced_lesson=str(planned_start_item.get('lesson') or decoded.get('lesson') or '').strip()
+            print(f"[STUDY PLAN] item_start user={user['id']} plan={target_plan_id} item={target_item_id} lesson={forced_lesson!r} content_type={forced_content_type!r}")
+            plan_start_action={"content_type":forced_content_type,"lesson":forced_lesson,"plan":active_plan,"item_id":target_item_id}
+            _start_study_session(user["id"], {"content_type":forced_content_type,"lesson":forced_lesson,"topic":None,"course":None,"course_id":selected_course_id}, data.chatbox_id)
+            study_session=dict(_get_study_session(user["id"], data.chatbox_id) or {})
+            try:
+                _ensure_learning_progress_started(user["id"], study_session)
+                print(f"[LESSON PROGRESS] plan-item-start user={user['id']} content_type={forced_content_type!r} lesson={forced_lesson!r} status=in_progress")
+            except Exception as exc:
+                print(f"[LESSON PROGRESS] plan-item-start save skipped: {type(exc).__name__}: {exc}")
+
         elif ui_action == "plan_today_yes":
             # The selected plan is identified by action suffix: plan_today_yes:<plan_id>.
             # This avoids ambiguity when several plans show identical Có/Không buttons.
@@ -6134,7 +6193,10 @@ def proxy_chat(
     active_plan = None
     if plan_start_action:
         active_plan = plan_start_action["plan"]
-        planned_start_item = next((x for x in active_plan.get("items",[]) if str(x.get("status")).lower() != "completed" and str(x.get("lesson") or "").strip() == plan_start_action["lesson"]), None)
+        planned_start_item = next((x for x in active_plan.get("items",[])
+                                   if str(x.get("status")).lower() != "completed"
+                                   and str(x.get("lesson") or "").strip() == plan_start_action["lesson"]
+                                   and (not plan_start_action.get("item_id") or int(x.get("id") or 0)==int(plan_start_action.get("item_id")))), None)
 
     # If a previous message requested a NEW plan and asked the user for the target,
     # consume the next concrete target message here before any RAG. This prevents the
@@ -7290,6 +7352,21 @@ Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra
                         blocks.extend(_curriculum_continue_blocks(current_step))
                     print(f"[CURRICULUM DB QUESTION DIRECT] request={request_id} type=Từ vựng mode=direct_db genai=0 embedding=0 pinecone=0")
                     return {"reply":direct_answer,"model":"db-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
+
+            # Starting a Từ vựng lesson is deterministic: render the canonical
+            # vocabulary items from curriculum_vocab_master and NEVER ask GenAI to
+            # compose/reconstruct the vocabulary list. GenAI is reserved for a real
+            # learner question after the DB lesson content has been shown.
+            if requested_content_type == "Từ vựng" and not data.action and (
+                    plan_start_action or lesson_confirmed_scope or
+                    (curriculum_flow_active if 'curriculum_flow_active' in locals() else False) and int(current_step)==0):
+                blocks=_published_curriculum_non_giao_trinh_blocks(
+                    step, runtime_lesson_cache, requested_content_type, answered=False,
+                    course_id=selected_course_id, user_id=user['id']
+                )
+                _set_curriculum_flow(user["id"],step=current_step,waiting="continue",exercise_answered=False)
+                print(f"[CURRICULUM DB-FIRST VOCAB START] request={request_id} lesson={requested_lesson!r} genai=0 embedding=0 pinecone=0 source=curriculum_vocab_master")
+                return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":"db-direct","sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Any other ordinary learner question in the active lesson is a
             # separate GenAI teacher turn, grounded by the current DB step.
@@ -9068,6 +9145,35 @@ def _build_manual_review_chat_blocks(user_id, course_id, course_name, lesson_row
     blocks=[{"type":"text","text":msg},{"type":"choice","id":"review_lesson_choice","options":[{"label":"Bắt đầu ôn","action":f"review_lesson:{action}"},{"label":"Để sau","action":"review_keep"}]}]
     return msg,blocks
 
+
+
+def _today_learning_plan_items(user_id, course_id):
+    """Return every unfinished active Study Plan item due today or overdue.
+
+    This is the source for the daily learning briefing. It intentionally does not
+    collapse multiple active plans/content types into a single "next lesson".
+    """
+    if course_id in (None, ''):
+        return []
+    today=_now_local().date()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT p.id AS plan_id,p.content_type,p.goal_name,p.units_per_day,p.days_per_unit,
+                       i.id AS item_id,i.plan_date,i.unit_index,i.lesson,i.target,i.status
+                FROM study_plans p
+                JOIN study_plan_items i ON i.study_plan_id=p.id
+                WHERE p.user_id=%s
+                  AND p.course_id=%s
+                  AND p.status='ACTIVE'
+                  AND COALESCE(lower(trim(i.status)),'pending') <> 'completed'
+                  AND i.plan_date <= %s
+                ORDER BY i.plan_date ASC, p.id ASC, i.unit_index ASC, i.id ASC
+            """, (user_id,int(course_id),today))
+            return [dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
 
 
 def _next_plan_lesson_for_welcome(user_id, course_id):
