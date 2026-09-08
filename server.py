@@ -4984,7 +4984,7 @@ def _classify_chat_followup(text: str, history):
     )
     prompt = (
         'Phân loại tin nhắn hiện tại có phải là câu hỏi/phản hồi tiếp nối cuộc trò chuyện ngay trước đó hay không.\n'
-        'FOLLOW_UP = tin nhắn phụ thuộc vào nội dung trước đó để hiểu đầy đủ, ví dụ dùng đại từ, nói "cái này", "phần này", "sao vậy", "thế còn", sửa/chất vấn câu trước, xác nhận/tiếp tục một đề nghị trước.\n'
+        'FOLLOW_UP = tin nhắn phụ thuộc vào nội dung trước đó để hiểu đầy đủ.\n'
         'NEW_TOPIC = yêu cầu/tin nhắn mới có thể hiểu đầy đủ mà không cần nội dung trước đó.\n'
         'Chỉ trả về một nhãn: FOLLOW_UP hoặc NEW_TOPIC.\n\n'
         f'LỊCH SỬ NGAY TRƯỚC (tối đa 1 lượt):\n{context or "(không có)"}\n\n'
@@ -9208,9 +9208,9 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             'Mỗi item chỉ dùng một lần trong phiên.',
             'Mỗi câu phải thuộc một trong hai dạng question_type: multiple_choice hoặc fill_blank.',
             'Với multiple_choice phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
-            'Với fill_blank phải có câu ví dụ từ DATA bị khuyết đúng một từ/cụm từ. Trả thêm blank_target là đúng chuỗi có trong example, và tuyệt đối không chọn pattern/đuôi ngữ pháp làm blank_target. answer phải bằng blank_target.',
-            'Vocabulary: chỉ tạo multiple_choice. Câu hỏi phải tự đủ ngữ cảnh: hiển thị chính từ tiếng Nhật và hỏi nghĩa tiếng Việt; tuyệt đối không dùng kiểu "Điền từ..." và không phụ thuộc vào tên bài hoặc đoạn chat trước.',
-            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống. Câu hỏi phải tự đủ ngữ cảnh để user trả lời mà không cần biết tên bài hay đọc lại chat trước.',
+            'Với fill_blank phải có câu ví dụ từ DATA bị khuyết đúng một từ/cụm từ.',
+            'Vocabulary: chỉ tạo multiple_choice. Câu hỏi phải tự đủ ngữ cảnh',
+            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống. Câu hỏi phải tự đủ ngữ cảnh.',
             'Không hiển thị đáp án đúng trong question.',
             'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"...","blank_target":"..."}]}.',
         ],
@@ -9747,7 +9747,6 @@ def _evaluate_grammar_fill_with_genai(q, answer):
         f'Câu sau khi điền: {completed_sentence}\n'
         f'Phần người học điền: {answer_text}\n'
         'Chỉ đánh giá phần điền có làm câu hoàn chỉnh đúng ngữ pháp và tự nhiên theo mẫu hay không. '
-        'Không yêu cầu phần điền giống từ trong ví dụ và không yêu cầu người học nhập lại toàn bộ câu. '
         'Nếu câu hoàn chỉnh đúng thì correct=true.'
     )
     try:
