@@ -4841,6 +4841,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
         "2. Ngữ pháp\n"
         "3. Bài tập\n"
         "4. Từ vựng\n"
+        "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
         "5. Truyện đọc"
     )
 
@@ -4940,7 +4941,7 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             f"{unfinished_summary}"
         )
         closing = (
-            "\n\nHôm nay cậu muốn học gì nói cho mình biết nhé! 😊"
+            "\n\nCậu muốn học tiếp từ chỗ đang dở hay chọn một phần khác? 😊"
         )
     else:
         progress_text = (
@@ -5516,9 +5517,24 @@ def proxy_chat(
     # GenAI is the primary intent classifier for learning/review discovery.
     # Skip it for an active review answer and for explicit structured actions.
     intent_result=None
+    # Explicit Study Plan requests must reach the Study Plan parser first.
+    # Otherwise a sentence such as "mình muốn học giáo trình trong 2 ngày"
+    # is classified as LEARN_RECOMMENDATION and the discovery fast-path returns
+    # before the concrete plan target (2 days) can be parsed.
+    plan_text_low = _strip_vietnamese_diacritics(str(data.text or '').casefold()).strip()
+    explicit_plan_phrase = any(k in plan_text_low for k in (
+        'lo trinh', 'theo lo trinh', 'hoc lo trinh', 'muon lo trinh',
+        'can lo trinh', 'co lo trinh', 'tao lo trinh', 'lap lo trinh',
+        'them lo trinh', 'hoc theo giao trinh', 'hoc giao trinh',
+    ))
+    plan_target = _parse_plan_request(data.text) if data.text else {}
+    explicit_plan_request = explicit_plan_phrase and bool(
+        plan_target.get('target_date') or plan_target.get('units_per_day') or plan_target.get('days_per_unit')
+    )
     if (not data.action and selected_course_id is not None and data.text
             and not _is_short_acknowledgement(data.text)
-            and _is_learning_intent_candidate(data.text)):
+            and _is_learning_intent_candidate(data.text)
+            and not explicit_plan_request):
         active_review_for_intent=_get_active_review_session(user['id'],int(selected_course_id),data.chatbox_id)
         if not active_review_for_intent:
             # A brand-new user keeps the onboarding greeting flow. Returning-user
@@ -8459,9 +8475,21 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
     conn = db()
     try:
         with conn.cursor() as cur:
+            # Reset ALL user-specific learning/review state.
+            # learning_progress contains the lesson-level review schedule, while
+            # user_vocabulary_review/user_grammar_review contain the durable
+            # wrong-answer queue shown as "Nội dung cần ôn tập".
+            # user_review_sessions contains any currently open review quiz.
             cur.execute("DELETE FROM learning_progress WHERE user_id=%s", (user["id"],))
             deleted = cur.rowcount
             cur.execute("DELETE FROM study_plans WHERE user_id=%s", (user["id"],))
+            deleted_plans = cur.rowcount
+            cur.execute("DELETE FROM user_vocabulary_review WHERE user_id=%s", (user["id"],))
+            deleted_vocab_review = cur.rowcount
+            cur.execute("DELETE FROM user_grammar_review WHERE user_id=%s", (user["id"],))
+            deleted_grammar_review = cur.rowcount
+            cur.execute("DELETE FROM user_review_sessions WHERE user_id=%s", (user["id"],))
+            deleted_review_sessions = cur.rowcount
 
             # Mark the account as a fresh learner. The next /session/welcome
             # therefore returns the same onboarding flow as a brand-new user.
@@ -8481,6 +8509,10 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
                     study_session_topic=NULL,
                     study_session_started_at=NULL,
                     study_end_prompt_pending=FALSE,
+                    pending_plan_content_type=NULL,
+                    pending_plan_scope=NULL,
+                    pending_plan_course_id=NULL,
+                    pending_plan_created_at=NULL,
                     updated_at=NOW()
             """, (user["id"],))
         conn.commit()
@@ -8490,7 +8522,11 @@ def reset_learning(authorization: Optional[str] = Header(default=None)):
     return {
         "success": True,
         "deleted_progress": deleted,
-        "message": "Đã xóa lịch sử học và reset giáo trình về trạng thái ban đầu."
+        "deleted_study_plans": deleted_plans,
+        "deleted_vocab_review": deleted_vocab_review,
+        "deleted_grammar_review": deleted_grammar_review,
+        "deleted_review_sessions": deleted_review_sessions,
+        "message": "Đã xóa lịch sử học, nội dung cần ôn tập và reset giáo trình về trạng thái ban đầu."
     }
 
 
