@@ -6288,6 +6288,64 @@ Câu hỏi của người dùng:
     thread_scope = _extract_thread_scope(recent_history, catalog)
     thread_switch_requested = _is_explicit_thread_switch(query_text)
     next_lesson_scope = None
+
+    # Referential follow-ups such as "ok, học bài này" should resolve to the
+    # concrete lesson Doraemon just mentioned in the current chatbox. The
+    # thread scope is already extracted from the recent assistant/user exchange
+    # and is therefore a safer source than trying to match the literal pronoun
+    # "này" against the catalog. Treat this as an explicit confirmation so the
+    # lesson opens immediately instead of asking "bài nào?" a second time.
+    referential_query = _strip_vietnamese_diacritics(query_text)
+    referential_lesson_confirm = bool(
+        chat_followup_detected
+        and thread_scope
+        and thread_scope.get('lesson')
+        and re.search(
+            r"\b(?:hoc|vao hoc|mo|bat dau)(?:\s+ngay)?\s+(?:bai\s+)?(?:nay|do|day|tren)\b|\b(?:ok|okay|oke|duoc|u|vang)\s*[,! ]+.*\b(?:bai|phan)\s+(?:nay|do|day)\b",
+            referential_query,
+            flags=re.UNICODE,
+        )
+    )
+    if referential_lesson_confirm:
+        next_lesson_scope = {
+            'course': thread_scope.get('course') or selected_course_name,
+            'content_type': _normalize_content_type(thread_scope.get('content_type') or 'Giáo trình'),
+            'lesson': str(thread_scope.get('lesson') or '').strip() or None,
+            'topic': str(thread_scope.get('topic') or '').strip() or None,
+        }
+        forced_plan_scope = {
+            'course': None,
+            'content_type': next_lesson_scope.get('content_type'),
+            'lesson': next_lesson_scope.get('lesson'),
+            'topic': next_lesson_scope.get('topic'),
+        }
+        lesson_confirmed_scope = {
+            'course_id': selected_course_id,
+            'course': selected_course_name or next_lesson_scope.get('course'),
+            'content_type': next_lesson_scope.get('content_type'),
+            'lesson': next_lesson_scope.get('lesson'),
+            'topic': next_lesson_scope.get('topic'),
+        }
+        query_text = (
+            f"Hãy bắt đầu dạy đúng bài: {lesson_confirmed_scope['lesson']}. "
+            f"Loại nội dung: {lesson_confirmed_scope['content_type']}. "
+            "Không chuyển sang lesson hoặc content type khác. "
+            "Dạy theo đúng nội dung có trong kho kiến thức của bài này."
+        )
+        _start_study_session(
+            user['id'], lesson_confirmed_scope, data.chatbox_id
+        )
+        study_session = dict(_get_study_session(user['id'], data.chatbox_id) or {})
+        try:
+            _ensure_learning_progress_started(user['id'], study_session)
+            print(
+                f"[LESSON FOLLOWUP CONFIRM] user={user['id']} "
+                f"content_type={lesson_confirmed_scope.get('content_type')!r} "
+                f"lesson={lesson_confirmed_scope.get('lesson')!r} status=in_progress"
+            )
+        except Exception as exc:
+            print(f"[LESSON FOLLOWUP CONFIRM] start save skipped: {type(exc).__name__}: {exc}")
+
     if thread_switch_requested and thread_scope and any(
         phrase in low for phrase in ("học bài tiếp", "học bài tiếp theo", "học tiếp bài", "bài tiếp theo")
     ):
