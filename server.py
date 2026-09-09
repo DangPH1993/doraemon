@@ -5336,22 +5336,12 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
             parts.append('✅ Hôm nay cậu chưa có bài ôn tập nào đến lịch.')
 
     choices=[]
+    # Với nhiều nội dung đến lịch trong Study Plan, KHÔNG render từng bài thành
+    # button. Chatbox thu nhỏ có chiều rộng/chiều cao hạn chế, nhiều button sẽ
+    # tràn hoặc bị che mất. Chỉ liệt kê tên bài bằng text để người dùng gõ tên
+    # bài muốn học; router hiện tại sẽ xử lý lesson/content_type từ câu nhập đó.
     if intent=='LEARN_RECOMMENDATION' and today_plan_items:
-        for item in today_plan_items[:12]:
-            lesson=str(item.get('lesson') or '').strip()
-            if not lesson:
-                continue
-            ct=str(item.get('content_type') or 'Giáo trình')
-            token=urllib.parse.quote(json.dumps({
-                'plan_id':int(item.get('plan_id')),
-                'item_id':int(item.get('item_id')),
-                'content_type':ct,
-                'lesson':lesson,
-            },ensure_ascii=False,separators=(',',':')))
-            label=f'Học {lesson}'
-            if ct=='Từ vựng' and item.get('target'):
-                label += f' ({str(item.get("target"))})'
-            choices.append({'label':label,'action':f'plan_start_item:{token}'})
+        parts.append('👉 Cậu chỉ cần **gõ tên bài muốn học** (ví dụ: `dã ngoại` hoặc `danh từ`), Doraemon sẽ mở đúng nội dung theo lộ trình.')
     for r in scheduled[:10]:
         lesson=str(r.get('lesson') or '').strip()
         if not lesson:
@@ -5364,11 +5354,15 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     if choices:
         if today_plan_items:
-            parts.append('Cậu muốn bắt đầu nội dung nào trước?')
+            parts.append('Cậu muốn ôn tập phần nào trước?')
         elif scheduled or next_plan:
             parts.append('Cậu muốn ôn tập phần nào trước?')
         else:
             parts.append('Cậu muốn làm lại phần sai trước chứ?')
+    elif intent=='LEARN_RECOMMENDATION' and today_plan_items:
+        # Không tạo choice block cho các bài học theo lộ trình; giữ toàn bộ danh
+        # sách ở dạng text để thao tác được ổn định cả ở chatbox thu nhỏ.
+        pass
 
     blocks=[{'type':'text','text':'\n\n'.join(parts)}]
     if choices:
