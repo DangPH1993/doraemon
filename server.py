@@ -3564,7 +3564,7 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
     sections=list((cache or {}).get("sections") or [])
     is_exercise = ct == "Bài tập"
     is_answer_step = str(step.get("code") or "").upper() in {"B2","ANSWER"}
-    is_question_step = (ct == "Bài tập" and str(step.get("code") or "").upper() == "B0") or (ct == "Từ vựng" and str(step.get("code") or "").upper() == "B2")
+    is_question_step = (ct == "Bài tập" and str(step.get("code") or "").upper() == "B1") or (ct == "Từ vựng" and str(step.get("code") or "").upper() == "B2")
 
     if answered and is_exercise:
         answer_step=_published_curriculum_answer_step(cache)
@@ -4213,7 +4213,7 @@ def _exercise_simple_direct_answer(query_text, step, cache=None, current_step=No
         # On an answer/review step, a learner saying they cannot do it should
         # reveal the official DB answer instead of spending a GenAI turn.
         code=str(step.get('code') or '').upper()
-        if code in {'B0','B1'} and any(x in q for x in ('khó','chịu','không làm được','bó tay')):
+        if code in {'B1','B2'} and any(x in q for x in ('khó','chịu','không làm được','bó tay')):
             ans=_published_curriculum_answer_step(cache or {}) if cache else None
             at=str((ans or {}).get('text') or '').strip()
             if at:
@@ -7308,25 +7308,34 @@ Tin nhắn hiện tại:
             # Exercise submission uses GenAI for evaluation/explanation, but the
             # official answer shown to the learner always comes verbatim from DB.
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
+                question_step=step if str(step.get('code') or '').upper() == 'B1' else None
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
-                official_answer=str((answer_step or {}).get("text") or "").strip()
-                one_exchange=_last_chat_exchange(recent_history)
-                one_exchange_text="\n".join(f"{h['role']}: {h['text'][-900:]}" for h in one_exchange)
-                exercise_context = selected_context or one_exchange_text
-                exercise_context_label = "ĐOẠN ĐƯỢC CHỌN" if selected_context else "LƯỢT HỘI THOẠI TRƯỚC"
-                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Đây là một lượt hỏi đáp ngắn trong bài tập.
-Chỉ dùng đúng một context: đoạn user chọn hoặc một lượt hội thoại gần nhất; không cần toàn bộ lịch sử chat.
+                exercise_text=str((question_step or {}).get('text') or '').strip()
+                official_answer=str((answer_step or {}).get('text') or '').strip()
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Hãy chấm bài làm của học sinh dựa HOÀN TOÀN vào nội dung bài tập và đáp án OCR dưới đây.
 
-{exercise_context_label}:
-{exercise_context}
+=== B1 · ĐỀ BÀI NGUYÊN VĂN (OCR) ===
+{exercise_text}
 
-TIN NHẮN HIỆN TẠI / CÂU TRẢ LỜI CỦA HỌC SINH:
-{query_text.strip()}
-
-ĐÁP ÁN CHÍNH THỨC TRONG DB:
+=== B2 · ĐÁP ÁN CHÍNH THỨC (OCR) ===
 {official_answer}
 
-Hãy đánh giá ngắn gọn đúng/sai hoặc mức độ phù hợp, chỉ ra lỗi và giải thích cách sửa. Không được thay đổi đáp án chính thức."""
+=== BÀI LÀM CỦA HỌC SINH ===
+{query_text.strip()}
+
+YÊU CẦU CHẤM:
+- So sánh bài làm với B2. Không được tự tạo đáp án khác hoặc thay đổi đáp án chính thức.
+- Cho điểm từ 0 đến 10; nếu bài có nhiều ý/câu, chấm theo mức độ hoàn thành chung.
+- Nêu rõ phần đúng.
+- Nêu rõ lỗi/sai ở đâu và cách sửa.
+- Nêu 1-3 điểm người học cần cải thiện dựa trên lỗi thực tế.
+- Nếu bài làm chưa đủ thông tin để chấm toàn bộ, nói rõ phần nào còn thiếu và chấm theo phần đã có.
+- Trả lời bằng tiếng Việt, dễ hiểu, có cấu trúc rõ ràng:
+  **Điểm: x/10**
+  **Nhận xét:** ...
+  **Điểm cần cải thiện:** ...
+
+ĐÁP ÁN CHÍNH THỨC PHẢI ĐƯỢC GIỮ NGUYÊN KHI HIỂN THỊ Ở PHẦN SAU."""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
@@ -7414,7 +7423,7 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
                 blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False,course_id=selected_course_id,user_id=user["id"])
 
             # A question step waits for an answer but still exposes Tiếp theo, as requested.
-            if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B0" and not answered:
+            if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B1" and not answered:
                 _set_curriculum_flow(user["id"],step=current_step,waiting="exercise_answer",exercise_answered=False)
                 study_session["curriculum_waiting"]="exercise_answer"
             elif not step.get("is_final") and waiting != "continue":
@@ -11315,10 +11324,8 @@ CURRICULUM_STEP_RULES = {
         {'code':'B2','title':'Một số bài tập','type':'exercise'},
     ],
     'Bài tập': [
-        {'code':'B0','title':'Giới thiệu bài tập','type':'exercise_intro'},
-        {'code':'B1','title':'Đánh giá câu trả lời user','type':'evaluation'},
-        {'code':'B2','title':'Đáp án','type':'answer'},
-        {'code':'B3','title':'Bài tập tương tự','type':'similar_exercise'},
+        {'code':'B1','title':'Bài tập · Làm bài','type':'exercise_intro'},
+        {'code':'B2','title':'Đáp án · Chấm và nhận xét','type':'answer'},
     ],
     'Truyện đọc': [
         {'code':'B0','title':'Nội dung truyện','type':'story'},
@@ -11375,6 +11382,15 @@ def reindex_curriculum_draft_steps_safe(content_type, steps):
             x['code']=f'B{i}'; out.append(x)
         if final is not None:
             final['code']='FINAL'; out.append(final)
+        return out
+    if ct == 'Bài tập':
+        b1=next((x for x in raw if str(x.get('code') or '').upper() in {'B1','B0'}), None)
+        b2=next((x for x in raw if str(x.get('code') or '').upper() in {'B2','ANSWER'}), None)
+        out=[]
+        if b1 is not None:
+            b1['code']='B1'; out.append(b1)
+        if b2 is not None:
+            b2['code']='B2'; out.append(b2)
         return out
     out=[]
     for i,x in enumerate(raw):
@@ -11847,12 +11863,63 @@ def _backfill_all_curriculum_knowledge_masters():
         except Exception as exc: print(f"[CURRICULUM KNOWLEDGE MASTER] backfill failed course_id={cid}: {type(exc).__name__}: {exc}")
 
 
-def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference=''):
+def _exercise_source_digest(label, pages):
+    parts=[]
+    for pg in pages or []:
+        text=str(pg.get('text') or '').strip()
+        if text:
+            parts.append(f"[TRANG {pg.get('page')}]\n{text}")
+        for img in (pg.get('images') or []):
+            vision=img.get('vision') or {}
+            desc='; '.join(str(vision.get(k) or '').strip() for k in ('term','reading','meaning','associated_text','description','explanation','caption') if str(vision.get(k) or '').strip())
+            line=f"[ẢNH NGUỒN trang {pg.get('page')}] image_key={img.get('image_key') or ''} image_url={img.get('image_url') or ''}"
+            if desc:
+                line += f" vision={desc}"
+            parts.append(line)
+    body='\n\n'.join(parts).strip()
+    return f"[{label}]\n{body}" if body else f"[{label}]\n(Không có OCR text.)"
+
+
+def _exercise_generate_deterministic_steps(lesson, question_pages, answer_pages):
+    """Build exercise curriculum steps directly from OCR/Vision source.
+
+    Exercise text and official answers are authoritative source material. They must
+    never be paraphrased, summarized, translated, or regenerated by the LLM.
+    """
+    q_text='\n\n'.join(str(pg.get('text') or '').strip() for pg in (question_pages or []) if str(pg.get('text') or '').strip()).strip()
+    a_text='\n\n'.join(str(pg.get('text') or '').strip() for pg in (answer_pages or []) if str(pg.get('text') or '').strip()).strip()
+    q_refs=[{'page':pg.get('page'),'reason':'OCR nguyên văn trang bài tập'} for pg in question_pages or [] if str(pg.get('text') or '').strip()]
+    a_refs=[{'page':pg.get('page'),'reason':'OCR nguyên văn trang đáp án'} for pg in answer_pages or [] if str(pg.get('text') or '').strip()]
+    q_images=[]
+    for pg in question_pages or []:
+        for im in pg.get('images') or []:
+            if im.get('image_key'):
+                q_images.append({'image_key':im.get('image_key'),'image_url':im.get('image_url'),'page':pg.get('page'),'caption':str((im.get('vision') or {}).get('description') or (im.get('vision') or {}).get('caption') or '').strip()})
+    a_images=[]
+    for pg in answer_pages or []:
+        for im in pg.get('images') or []:
+            if im.get('image_key'):
+                a_images.append({'image_key':im.get('image_key'),'image_url':im.get('image_url'),'page':pg.get('page'),'caption':str((im.get('vision') or {}).get('description') or (im.get('vision') or {}).get('caption') or '').strip()})
+    if not q_text:
+        raise HTTPException(400,f'Bài tập {lesson}: không OCR được nội dung trang bài tập đã cấu hình.')
+    if not a_text:
+        raise HTTPException(400,f'Bài tập {lesson}: không OCR được nội dung trang đáp án đã cấu hình.')
+    return [
+        {'code':'B1','title':'Bài tập · Làm bài','type':'exercise_intro','content':q_text,'source_refs':q_refs,'images':q_images,'items':[],'vocabulary_refs':[],'grammar_refs':[]},
+        {'code':'B2','title':'Đáp án · Chấm và nhận xét','type':'answer','content':a_text,'source_refs':a_refs,'images':a_images,'items':[],'vocabulary_refs':[],'grammar_refs':[]},
+    ]
+
+
+def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference='', *, exercise_question_pages=None, exercise_answer_pages=None):
     """Generate all curriculum steps in exactly ONE GenAI call per lesson.
 
     OCR/Vision has already completed before this function runs.
     """
     ct=str(content_type or '').strip()
+    if ct == 'Bài tập' and exercise_question_pages is not None and exercise_answer_pages is not None:
+        steps=_exercise_generate_deterministic_steps(lesson, exercise_question_pages, exercise_answer_pages)
+        print(f'[CURRICULUM EXERCISE SOURCE-FIRST] lesson={lesson!r} genai_calls=0 steps=2 question_pages={len(exercise_question_pages or [])} answer_pages={len(exercise_answer_pages or [])}')
+        return steps
     rules=json.dumps(CURRICULUM_STEP_RULES.get(ct) or [], ensure_ascii=False)
     common=f"""Bạn là AI biên soạn giáo trình cho Doraemon.
 LOẠI NỘI DUNG: {ct}
@@ -12051,7 +12118,9 @@ async def admin_curriculum_draft_upload(
             pg=str(cfg.get('pages') or cfg.get('page_ranges') or '').strip()
             if not ls:
                 raise HTTPException(400,f'Bài #{idx}: Tên bài học là bắt buộc.')
-            normalized.append({'content_type':ct,'lesson':ls,'pages':pg})
+            qpg=str(cfg.get('question_pages') or '').strip()
+            apg=str(cfg.get('answer_pages') or '').strip()
+            normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg})
         configs=normalized
 
     source_file=os.path.basename(file.filename)
@@ -12068,15 +12137,39 @@ async def admin_curriculum_draft_upload(
         if total_pages<=0:
             raise HTTPException(400,'PDF không có trang.')
 
-        # Parse the selected page ranges before touching OCR/Vision.
+        # Parse page ranges before touching OCR/Vision. Exercise lessons use
+        # separate question/answer scopes; every other content type keeps the
+        # historical single 'pages' scope.
         for idx,cfg in enumerate(configs,1):
-            if not str(cfg.get('pages') or '').strip():
-                raise HTTPException(400,f'Bài #{idx} ({cfg.get("lesson") or ""}): phải nhập số trang, ví dụ 7-8.')
-            try:
-                cfg['selected_pages']=_parse_curriculum_page_ranges(cfg['pages'], total_pages)
-            except ValueError as exc:
-                raise HTTPException(400,f'Bài #{idx} ({cfg.get("lesson") or ""}): {exc}')
-            cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+            ct=str(cfg.get('content_type') or '').strip()
+            lesson_name=str(cfg.get('lesson') or '').strip()
+            if ct == 'Bài tập':
+                qraw=str(cfg.get('question_pages') or '').strip()
+                araw=str(cfg.get('answer_pages') or '').strip()
+                if not qraw:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Bài tập cần nhập Trang bài tập, ví dụ 7-8.')
+                if not araw:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Bài tập cần nhập Trang đáp án, ví dụ 20-21.')
+                try:
+                    cfg['question_selected_pages']=_parse_curriculum_page_ranges(qraw,total_pages)
+                    cfg['answer_selected_pages']=_parse_curriculum_page_ranges(araw,total_pages)
+                except ValueError as exc:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): {exc}')
+                overlap=sorted(set(cfg['question_selected_pages']) & set(cfg['answer_selected_pages']))
+                if overlap:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Trang bài tập và Trang đáp án bị chồng lấn: {", ".join(map(str,overlap))}.')
+                cfg['selected_pages']=sorted(set(cfg['question_selected_pages']) | set(cfg['answer_selected_pages']))
+                cfg['question_pages_label']=_curriculum_page_range_label(cfg['question_selected_pages'])
+                cfg['answer_pages_label']=_curriculum_page_range_label(cfg['answer_selected_pages'])
+                cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+            else:
+                if not str(cfg.get('pages') or '').strip():
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): phải nhập số trang, ví dụ 7-8.')
+                try:
+                    cfg['selected_pages']=_parse_curriculum_page_ranges(cfg['pages'], total_pages)
+                except ValueError as exc:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): {exc}')
+                cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
 
         # Do not allow overlapping configured pages. One PDF page should have one
         # curriculum owner, otherwise B2/image provenance would become ambiguous.
@@ -12097,9 +12190,16 @@ async def admin_curriculum_draft_upload(
             ct=str(cfg['content_type']).strip()
             ls=str(cfg['lesson']).strip()
             selected_pages=cfg['selected_pages']
-            page_texts,page_images,page_units=process_pdf_pages(
-                temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
-            )
+            if ct == 'Bài tập':
+                page_texts,page_images,page_units=process_exercise_pdf_pages(
+                    temp_pdf_path, reader, source_file, subject, ls,
+                    question_pages=cfg.get('question_selected_pages'),
+                    answer_pages=cfg.get('answer_selected_pages'),
+                )
+            else:
+                page_texts,page_images,page_units=process_pdf_pages(
+                    temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
+                )
             pages=[]
             selected_set=set(int(x) for x in selected_pages)
             for page_no in selected_pages:
@@ -12118,7 +12218,22 @@ async def admin_curriculum_draft_upload(
             digest=_curriculum_source_digest(pages)
             normalized_steps=[]
             _, grammar_reference = _get_course_curriculum_knowledge(course_id, digest)
-            if ct == 'Truyện đọc':
+            if ct == 'Bài tập':
+                selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
+                question_pages=[selected_by_page[p] for p in cfg.get('question_selected_pages',[]) if p in selected_by_page]
+                answer_pages=[selected_by_page[p] for p in cfg.get('answer_selected_pages',[]) if p in selected_by_page]
+                generated=_curriculum_generate_all_steps(
+                    ct,ls,digest,grammar_reference,
+                    exercise_question_pages=question_pages,
+                    exercise_answer_pages=answer_pages,
+                )
+                for st in generated:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content, pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print(f'[CURRICULUM EXERCISE DRAFT] lesson={ls!r} question_pages={cfg.get("question_pages_label","")} answer_pages={cfg.get("answer_pages_label","")} source_only=1')
+            elif ct == 'Truyện đọc':
                 # B0 stays deterministic from source; B1-B3 are generated together in ONE call.
                 story_text = "\n\n".join(
                     str(pg.get('text') or '').strip()
@@ -12176,6 +12291,8 @@ async def admin_curriculum_draft_upload(
                 'lesson':ls,
                 'page_ranges':cfg['pages_label'],
                 'selected_pages':selected_pages,
+                'question_pages':cfg.get('question_pages_label',''),
+                'answer_pages':cfg.get('answer_pages_label',''),
                 'page_count':len(pages),
                 'pages':pages,
                 'steps':normalized_steps,
@@ -12194,6 +12311,7 @@ async def admin_curriculum_draft_upload(
                 'draft_id':draft_id,'status':'AI_DRAFT','version':version,
                 'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
                 'page_ranges':cfg['pages_label'],'selected_pages':selected_pages,
+                'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
                 'selected_page_count':len(selected_pages),
                 'steps':normalized_steps,'pages':pages,'page_count':len(pages),
             })
@@ -12355,6 +12473,8 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 'lesson':str(lesson['lesson'] or ''),
                 'page_ranges':page_ranges,
                 'selected_pages':selected_pages,
+                'question_pages':raw_source.get('question_pages') if isinstance(raw_source,dict) else '',
+                'answer_pages':raw_source.get('answer_pages') if isinstance(raw_source,dict) else '',
                 'page_count':len(pages),
                 'pages':pages,
                 'steps':steps,
@@ -12761,7 +12881,7 @@ button.gray{background:#666}button.red{background:#d93025}
 </div>
 <div class="card">
 <h3>🧠 AI Curriculum Studio</h3>
-<div class="small" style="margin-bottom:10px">Chọn khóa học từ danh mục → Upload 1 bài học → Gemini OCR/Vision → AI dựng số bước → AI soạn từng bước → Admin sửa/duyệt → Publish.</div>
+<div class="small" style="margin-bottom:10px">Chọn khóa học từ danh mục → Upload 1 bài học → OCR/Vision đúng các trang cấu hình → dựng Draft → Admin sửa/duyệt → Publish. Riêng Bài tập, đề và đáp án được giữ nguyên văn từ OCR; AI chỉ dùng để chấm bài user.</div>
 <form onsubmit="createCurriculumDraft(event)">
 <input id="curPdf" type="file" accept=".pdf,application/pdf" required style="width:100%;margin-bottom:8px">
 <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -12769,7 +12889,7 @@ button.gray{background:#666}button.red{background:#d93025}
 </div>
 <div style="margin-top:12px;padding:10px;border:1px solid #ddd;border-radius:9px;background:#fafafa">
   <div style="font-weight:700;margin-bottom:6px">📚 Cấu hình các bài trong PDF</div>
-  <div class="small" style="margin-bottom:8px">Một PDF có thể tạo nhiều bài. Với mỗi bài, nhập <b>loại nội dung</b>, <b>tên bài</b> và <b>số trang</b> (ví dụ <b>7-8</b> hoặc <b>7,9-10</b>). Chỉ các trang được cấu hình mới được OCR/Vision, lưu ảnh và đưa vào AI Draft.</div>
+  <div class="small" style="margin-bottom:8px">Một PDF có thể tạo nhiều bài. Với <b>Bài tập</b>, nhập riêng <b>Trang bài tập</b> và <b>Trang đáp án</b>; hệ thống chỉ OCR/Vision đúng hai phạm vi này. Các loại khác vẫn nhập <b>Số trang</b>. Tuyệt đối không OCR toàn bộ PDF.</div>
   <div id="curArticleRows"></div>
   <button type="button" class="gray" onclick="addCurriculumArticleRow()" style="margin-top:8px">＋ Thêm bài</button>
 </div>
@@ -13038,12 +13158,20 @@ function curriculumTypeOptions(selected){
 function addCurriculumArticleRow(values={}){
   const wrap=document.getElementById('curArticleRows'); if(!wrap)return;
   const row=document.createElement('div'); row.className='cur-article-row';
-  row.style.cssText='display:grid;grid-template-columns:1.1fr 1.5fr 1fr auto;gap:7px;margin-bottom:7px;align-items:center';
+  row.style.cssText='display:grid;grid-template-columns:1fr 1.2fr 1fr 1fr 1fr auto;gap:7px;margin-bottom:7px;align-items:center';
   const ct=values.content_type||'Giáo trình';
   row.innerHTML=`<select class="cur-a-type" style="min-width:0">${curriculumTypeOptions(ct)}</select>
   <input class="cur-a-lesson" placeholder="Tên bài học" value="${esc(values.lesson||'')}">
-  <input class="cur-a-pages" placeholder="Số trang, ví dụ 7-8" value="${esc(values.pages||'')}">
+  <input class="cur-a-pages" placeholder="Trang bài: 7-8" value="${esc(values.pages||'')}">
+  <input class="cur-a-question-pages" placeholder="Trang bài tập: 8-10" value="${esc(values.question_pages||'')}" style="display:${ct==='Bài tập'?'block':'none'}">
+  <input class="cur-a-answer-pages" placeholder="Trang đáp án: 20-21" value="${esc(values.answer_pages||'')}" style="display:${ct==='Bài tập'?'block':'none'}">
   <button type="button" class="red" title="Xóa dòng" onclick="this.parentElement.remove()">✕</button>`;
+  const typeSel=row.querySelector('.cur-a-type');
+  const pages=row.querySelector('.cur-a-pages');
+  const qpages=row.querySelector('.cur-a-question-pages');
+  const apages=row.querySelector('.cur-a-answer-pages');
+  function sync(){const isEx=typeSel.value==='Bài tập'; pages.style.display=isEx?'none':'block'; qpages.style.display=isEx?'block':'none'; apages.style.display=isEx?'block':'none';}
+  typeSel.addEventListener('change',sync); sync();
   wrap.appendChild(row);
 }
 function clearCurriculumArticleRows(){
@@ -13054,7 +13182,9 @@ function getCurriculumArticleRows(){
     index:idx+1,
     content_type:row.querySelector('.cur-a-type')?.value||'Giáo trình',
     lesson:(row.querySelector('.cur-a-lesson')?.value||'').trim(),
-    pages:(row.querySelector('.cur-a-pages')?.value||'').trim()
+    pages:(row.querySelector('.cur-a-pages')?.value||'').trim(),
+    question_pages:(row.querySelector('.cur-a-question-pages')?.value||'').trim(),
+    answer_pages:(row.querySelector('.cur-a-answer-pages')?.value||'').trim()
   }));
 }
 addCurriculumArticleRow();
@@ -13062,9 +13192,9 @@ addCurriculumArticleRow();
 async function createCurriculumDraft(event){
  event.preventDefault(); const btn=document.getElementById('curGenBtn'); const st=document.getElementById('curStatus'); const file=document.getElementById('curPdf').files[0]; if(!file)return;
  const rows=getCurriculumArticleRows().filter(x=>x.lesson||x.pages);
- if(!rows.length){st.textContent='❌ Hãy thêm ít nhất 1 bài và nhập tên bài + số trang.';return;}
- for(const r of rows){if(!r.lesson||!r.pages){st.textContent=`❌ Bài #${r.index}: cần đủ tên bài và số trang.`;return;}}
- btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài, chỉ OCR/Vision các trang đã cấu hình...`;
+ if(!rows.length){st.textContent='❌ Hãy thêm ít nhất 1 bài và nhập đủ thông tin trang.';return;}
+ for(const r of rows){if(!r.lesson){st.textContent=`❌ Bài #${r.index}: cần nhập tên bài.`;return;} if(r.content_type==='Bài tập'){if(!r.question_pages||!r.answer_pages){st.textContent=`❌ Bài #${r.index}: Bài tập cần đủ Trang bài tập + Trang đáp án.`;return;}} else if(!r.pages){st.textContent=`❌ Bài #${r.index}: cần nhập số trang.`;return;}}
+ btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài. Bài tập sẽ OCR/Vision riêng Trang bài tập + Trang đáp án, không đụng các trang khác...`;
  try{
    const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('course_id',document.getElementById('curCourse').value); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
    const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
@@ -14208,6 +14338,81 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
     finally:
         doc.close()
     return stored
+
+def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
+    """OCR + Vision ONLY the explicitly configured exercise/answer pages.
+
+    Every selected page is sent through Gemini page OCR so text is authoritative
+    and every meaningful image can be converted into a persisted knowledge image.
+    No page outside question_pages/answer_pages is rendered, OCRed, or sent to
+    Vision. Exercise page handling intentionally avoids the generic table pipeline
+    because the user wants the original exercise and original answer verbatim.
+    """
+    q_pages=[int(x) for x in (question_pages or [])]
+    a_pages=[int(x) for x in (answer_pages or [])]
+    selected=sorted(set(q_pages)|set(a_pages))
+    qset=set(q_pages)
+    aset=set(a_pages)
+    if not selected:
+        raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
+
+    page_texts={}; page_images={}; page_units={}
+    for page_no in selected:
+        tag='question' if page_no in qset else 'answer'
+        png=render_pdf_page(pdf_source,page_no,dpi=140)
+        ocr_text, detected=gemini_ocr_page(png,page_no,source_file=source_file)
+        ocr_text=str(ocr_text or '').strip()
+        page_texts[page_no]=ocr_text
+        units=[]
+        if ocr_text:
+            units.append({
+                'type':'normal',
+                'unit_id':f'exercise:{tag}:page:{page_no}:text',
+                'text':ocr_text,
+                'image_keys':[],
+            })
+        stored=[]
+        for img_idx,item in enumerate(detected or [],1):
+            if not isinstance(item,dict):
+                continue
+            cropped=crop_image_from_page(png,item.get('box'))
+            if not cropped:
+                continue
+            image_bytes,(width,height)=cropped
+            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{img_idx:02d}.jpg"
+            b2_put_bytes(key,image_bytes,'image/jpeg')
+            description=str(item.get('description') or '').strip()
+            term=str(item.get('term') or '').strip()
+            reading=str(item.get('reading') or '').strip()
+            meaning=str(item.get('meaning') or '').strip()
+            associated_text=str(item.get('associated_text') or '').strip()
+            bbox=json.dumps(item.get('box'),ensure_ascii=False) if isinstance(item.get('box'),(list,tuple)) else ''
+            conn=db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO knowledge_images
+                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),description,term,reading,meaning,associated_text,bbox,width,height))
+                conn.commit()
+            finally:
+                conn.close()
+            stored.append({
+                'key':key,'description':description,'term':term,'reading':reading,
+                'meaning':meaning,'associated_text':associated_text,'bbox':bbox,'page':page_no,
+                'vision':dict(item),
+            })
+        if stored:
+            page_images[page_no]=stored
+            if units:
+                units[0]['image_keys']=[str(x.get('key')) for x in stored if x.get('key')]
+        page_units[page_no]=units
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} detected_images={len(stored)} text_chars={len(ocr_text)}')
+        try: del png
+        except Exception: pass
+        gc.collect()
+    return page_texts,page_images,page_units
+
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
