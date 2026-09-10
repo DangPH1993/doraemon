@@ -230,9 +230,7 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_progress_user_course ON learning_progress(user_id,course_id,content_type,lesson,topic,last_studied_at DESC);")
             cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_course ON subscriptions(user_id,course_id,status,expires_at DESC);")
-            cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_documents_course ON knowledge_documents(course_id,content_type,lesson,topic);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
             cur.execute("""UPDATE knowledge_documents kd SET course_id=c.id
                            FROM courses c
                            WHERE kd.course_id IS NULL
@@ -337,21 +335,6 @@ def init_db():
             cur.execute("""ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS parent_plan_id BIGINT REFERENCES study_plans(id) ON DELETE SET NULL;""")
             cur.execute("ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_study_plans_user_course_status ON study_plans(user_id,course_id,status,start_date,id);")
-            cur.execute("""UPDATE study_plans p SET course_id=x.course_id
-                FROM (
-                    SELECT p2.id, MIN(src.course_id) AS course_id
-                    FROM study_plans p2
-                    JOIN study_plan_items i ON i.study_plan_id=p2.id
-                    JOIN (
-                        SELECT DISTINCT course_id,content_type,lesson FROM knowledge_documents WHERE course_id IS NOT NULL
-                        UNION
-                        SELECT DISTINCT course_id,content_type,lesson FROM curriculum_lessons WHERE course_id IS NOT NULL AND status='PUBLISHED'
-                    ) src ON lower(trim(coalesce(src.content_type,'')))=lower(trim(coalesce(p2.content_type,'')))
-                         AND lower(trim(src.lesson))=lower(trim(i.lesson))
-                    WHERE p2.course_id IS NULL
-                    GROUP BY p2.id
-                    HAVING COUNT(DISTINCT src.course_id)=1
-                ) x WHERE p.id=x.id AND p.course_id IS NULL;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plan_items (
                 id BIGSERIAL PRIMARY KEY, study_plan_id BIGINT NOT NULL REFERENCES study_plans(id) ON DELETE CASCADE,
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
@@ -11335,6 +11318,24 @@ def init_curriculum_db():
                            WHERE cl.course_id IS NULL
                              AND lower(trim(cl.subject))=lower(trim(c.name))""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_steps_lesson ON curriculum_steps(lesson_id, step_order);")
+            # study_plans and study_plan_items are committed by init_db() before this function runs.
+            # Keep curriculum-dependent backfill here so a brand-new database can bootstrap
+            # without referencing curriculum_lessons before that table exists.
+            cur.execute("""UPDATE study_plans p SET course_id=x.course_id
+                FROM (
+                    SELECT p2.id, MIN(src.course_id) AS course_id
+                    FROM study_plans p2
+                    JOIN study_plan_items i ON i.study_plan_id=p2.id
+                    JOIN (
+                        SELECT DISTINCT course_id,content_type,lesson FROM knowledge_documents WHERE course_id IS NOT NULL
+                        UNION
+                        SELECT DISTINCT course_id,content_type,lesson FROM curriculum_lessons WHERE course_id IS NOT NULL AND status='PUBLISHED'
+                    ) src ON lower(trim(coalesce(src.content_type,'')))=lower(trim(coalesce(p2.content_type,'')))
+                         AND lower(trim(src.lesson))=lower(trim(i.lesson))
+                    WHERE p2.course_id IS NULL
+                    GROUP BY p2.id
+                    HAVING COUNT(DISTINCT src.course_id)=1
+                ) x WHERE p.id=x.id AND p.course_id IS NULL;""")
         conn.commit()
     finally:
         conn.close()
