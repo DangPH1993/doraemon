@@ -52,6 +52,11 @@ except Exception:
     Image = None
 
 try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
     import boto3
     from botocore.client import Config as BotoConfig
 except Exception:
@@ -12078,7 +12083,8 @@ async def admin_curriculum_draft_upload(
     check_admin(password)
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400,'Vui lòng chọn file PDF.')
-    if not gemini:
+    # Bài tập không cần GenAI. Các loại curriculum khác vẫn dùng Gemini.
+    if str(content_type or '').strip() != 'Bài tập' and not gemini:
         raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
     if not b2_ready():
         raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
@@ -12278,7 +12284,10 @@ async def admin_curriculum_draft_upload(
                     normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
                 print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s course_master=1 grammar_reference=%s' % (ct,len(normalized_steps),bool(grammar_reference)))
 
-            if course_id:
+            # Exercise drafts are source-only OCR and have no vocabulary/grammar
+            # master mapping requirement. Skipping this also keeps exercise upload
+            # completely independent from optional curriculum mapping helpers.
+            if course_id and ct != 'Bài tập':
                 try:
                     normalized_steps=_map_curriculum_steps_to_master(course_id, None, ls, normalized_steps)
                 except Exception as exc:
@@ -14339,75 +14348,103 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
         doc.close()
     return stored
 
-def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """OCR + Vision ONLY the explicitly configured exercise/answer pages.
+def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
+    """OCR a configured exercise/answer page locally with Tesseract.
 
-    Every selected page is sent through Gemini page OCR so text is authoritative
-    and every meaningful image can be converted into a persisted knowledge image.
-    No page outside question_pages/answer_pages is rendered, OCRed, or sent to
-    Vision. Exercise page handling intentionally avoids the generic table pipeline
-    because the user wants the original exercise and original answer verbatim.
+    No Gemini/GenAI call is made. For native text PDFs the caller prefers the
+    PDF text layer; this is only a fallback for scanned/image-only pages.
+    """
+    if not pytesseract or Image is None:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(png))
+        # Preserve Japanese vertical text and English/Vietnamese mixed material.
+        # Tesseract chooses the useful script; the output is still raw OCR text.
+        text = pytesseract.image_to_string(im, lang='jpn+eng+vie', config='--psm 6')
+        text = str(text or '').replace('\x0c', '').strip()
+        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file}')
+        return text
+    except Exception as exc:
+        print(f'[EXERCISE LOCAL OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return ""
+
+
+def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
+    """Persist the original configured page as a single source image.
+
+    This is storage only. No Vision analysis or GenAI is performed.
+    """
+    try:
+        key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/source_{scope}.jpg"
+        image_bytes=png
+        if Image is not None:
+            try:
+                im=Image.open(io.BytesIO(png)).convert('RGB')
+                out=io.BytesIO(); im.save(out,format='JPEG',quality=88,optimize=True)
+                image_bytes=out.getvalue()
+                width,height=im.size
+            except Exception:
+                width=height=None
+        else:
+            width=height=None
+        b2_put_bytes(key,image_bytes,'image/jpeg')
+        conn=db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO knowledge_images
+                    (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,associated_text,width,height)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),f'Original {scope} exercise page',ocr_text,width,height))
+            conn.commit()
+        finally:
+            conn.close()
+        return {'key':key,'description':f'Original {scope} exercise page','associated_text':ocr_text,'page':page_no,'image_url':b2_url(key),'vision':{}}
+    except Exception as exc:
+        print(f'[EXERCISE SOURCE PAGE STORE] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return None
+
+
+def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
+    """Extract ONLY configured exercise/answer pages, with zero GenAI.
+
+    Fast path: use the PDF text layer directly. Fallback: local Tesseract OCR for
+    scanned/image-only pages. The original selected page is stored as one source
+    image for traceability/UI, but NO Vision analysis is performed.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
     selected=sorted(set(q_pages)|set(a_pages))
     qset=set(q_pages)
-    aset=set(a_pages)
     if not selected:
         raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
 
     page_texts={}; page_images={}; page_units={}
     for page_no in selected:
         tag='question' if page_no in qset else 'answer'
-        png=render_pdf_page(pdf_source,page_no,dpi=140)
-        ocr_text, detected=gemini_ocr_page(png,page_no,source_file=source_file)
-        ocr_text=str(ocr_text or '').strip()
+        page_obj=reader.pages[page_no-1]
+        extracted=(page_obj.extract_text() or '').strip()
+        text_len=len(re.sub(r'\s+','',extracted))
+        png=None
+        if text_len >= 20:
+            ocr_text=extracted
+            print(f'[EXERCISE TEXT LAYER] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
+        else:
+            png=render_pdf_page(pdf_source,page_no,dpi=180)
+            ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
+        if not ocr_text:
+            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}).')
         page_texts[page_no]=ocr_text
-        units=[]
-        if ocr_text:
-            units.append({
-                'type':'normal',
-                'unit_id':f'exercise:{tag}:page:{page_no}:text',
-                'text':ocr_text,
-                'image_keys':[],
-            })
-        stored=[]
-        for img_idx,item in enumerate(detected or [],1):
-            if not isinstance(item,dict):
-                continue
-            cropped=crop_image_from_page(png,item.get('box'))
-            if not cropped:
-                continue
-            image_bytes,(width,height)=cropped
-            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{img_idx:02d}.jpg"
-            b2_put_bytes(key,image_bytes,'image/jpeg')
-            description=str(item.get('description') or '').strip()
-            term=str(item.get('term') or '').strip()
-            reading=str(item.get('reading') or '').strip()
-            meaning=str(item.get('meaning') or '').strip()
-            associated_text=str(item.get('associated_text') or '').strip()
-            bbox=json.dumps(item.get('box'),ensure_ascii=False) if isinstance(item.get('box'),(list,tuple)) else ''
-            conn=db()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("""INSERT INTO knowledge_images
-                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                        (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),description,term,reading,meaning,associated_text,bbox,width,height))
-                conn.commit()
-            finally:
-                conn.close()
-            stored.append({
-                'key':key,'description':description,'term':term,'reading':reading,
-                'meaning':meaning,'associated_text':associated_text,'bbox':bbox,'page':page_no,
-                'vision':dict(item),
-            })
+        units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
+        stored=None
+        # Storage of the configured source page is optional UI provenance, not Vision.
+        if png is None:
+            png=render_pdf_page(pdf_source,page_no,dpi=150)
+        stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
         if stored:
-            page_images[page_no]=stored
-            if units:
-                units[0]['image_keys']=[str(x.get('key')) for x in stored if x.get('key')]
+            page_images[page_no]=[stored]
+            units[0]['image_keys']=[stored['key']]
         page_units[page_no]=units
-        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} detected_images={len(stored)} text_chars={len(ocr_text)}')
+        print(f'[EXERCISE OCR ONLY] page={page_no} scope={tag} chars={len(ocr_text)} genai_calls=0 vision_calls=0')
         try: del png
         except Exception: pass
         gc.collect()
