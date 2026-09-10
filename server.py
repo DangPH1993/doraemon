@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -89,6 +90,20 @@ B2_PRESIGN_SECONDS = int(os.getenv("B2_PRESIGN_SECONDS", "86400"))
 b2 = None
 
 app = FastAPI(title="Doraemon SaaS Server")
+
+# The desktop client talks directly to Render. The Web client is a separate
+# static origin, so explicitly allow browser CORS for the configured frontend.
+# WEB_ORIGINS may be a comma-separated list, e.g.
+# https://doraemon-web.onrender.com,https://doraemon.vn
+_WEB_ORIGINS_RAW = os.getenv("WEB_ORIGINS", "*")
+_WEB_ORIGINS = [x.strip() for x in _WEB_ORIGINS_RAW.split(",") if x.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_WEB_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 print("[DORAEMON SERVER FINGERPRINT] 19.127-followup-one-history-gated-context")
 SERVER_VERSION = "2026-09-07-v19_127_followup_one_history_gated_context"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -230,7 +245,9 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_progress_user_course ON learning_progress(user_id,course_id,content_type,lesson,topic,last_studied_at DESC);")
             cur.execute("ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_user_course ON subscriptions(user_id,course_id,status,expires_at DESC);")
+            cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_documents_course ON knowledge_documents(course_id,content_type,lesson,topic);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_course ON curriculum_lessons(course_id,content_type,lesson,status);")
             cur.execute("""UPDATE knowledge_documents kd SET course_id=c.id
                            FROM courses c
                            WHERE kd.course_id IS NULL
@@ -335,6 +352,21 @@ def init_db():
             cur.execute("""ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS parent_plan_id BIGINT REFERENCES study_plans(id) ON DELETE SET NULL;""")
             cur.execute("ALTER TABLE study_plans ADD COLUMN IF NOT EXISTS course_id BIGINT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_study_plans_user_course_status ON study_plans(user_id,course_id,status,start_date,id);")
+            cur.execute("""UPDATE study_plans p SET course_id=x.course_id
+                FROM (
+                    SELECT p2.id, MIN(src.course_id) AS course_id
+                    FROM study_plans p2
+                    JOIN study_plan_items i ON i.study_plan_id=p2.id
+                    JOIN (
+                        SELECT DISTINCT course_id,content_type,lesson FROM knowledge_documents WHERE course_id IS NOT NULL
+                        UNION
+                        SELECT DISTINCT course_id,content_type,lesson FROM curriculum_lessons WHERE course_id IS NOT NULL AND status='PUBLISHED'
+                    ) src ON lower(trim(coalesce(src.content_type,'')))=lower(trim(coalesce(p2.content_type,'')))
+                         AND lower(trim(src.lesson))=lower(trim(i.lesson))
+                    WHERE p2.course_id IS NULL
+                    GROUP BY p2.id
+                    HAVING COUNT(DISTINCT src.course_id)=1
+                ) x WHERE p.id=x.id AND p.course_id IS NULL;""")
             cur.execute("""CREATE TABLE IF NOT EXISTS study_plan_items (
                 id BIGSERIAL PRIMARY KEY, study_plan_id BIGINT NOT NULL REFERENCES study_plans(id) ON DELETE CASCADE,
                 plan_date DATE NOT NULL, unit_index INTEGER NOT NULL, lesson VARCHAR(255) NOT NULL,
@@ -5319,22 +5351,12 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
             parts.append('✅ Hôm nay cậu chưa có bài ôn tập nào đến lịch.')
 
     choices=[]
+    # Với nhiều nội dung đến lịch trong Study Plan, KHÔNG render từng bài thành
+    # button. Chatbox thu nhỏ có chiều rộng/chiều cao hạn chế, nhiều button sẽ
+    # tràn hoặc bị che mất. Chỉ liệt kê tên bài bằng text để người dùng gõ tên
+    # bài muốn học; router hiện tại sẽ xử lý lesson/content_type từ câu nhập đó.
     if intent=='LEARN_RECOMMENDATION' and today_plan_items:
-        for item in today_plan_items[:12]:
-            lesson=str(item.get('lesson') or '').strip()
-            if not lesson:
-                continue
-            ct=str(item.get('content_type') or 'Giáo trình')
-            token=urllib.parse.quote(json.dumps({
-                'plan_id':int(item.get('plan_id')),
-                'item_id':int(item.get('item_id')),
-                'content_type':ct,
-                'lesson':lesson,
-            },ensure_ascii=False,separators=(',',':')))
-            label=f'Học {lesson}'
-            if ct=='Từ vựng' and item.get('target'):
-                label += f' ({str(item.get("target"))})'
-            choices.append({'label':label,'action':f'plan_start_item:{token}'})
+        parts.append('👉 Cậu chỉ cần **gõ tên bài muốn học** (ví dụ: `dã ngoại` hoặc `danh từ`), Doraemon sẽ mở đúng nội dung theo lộ trình.')
     for r in scheduled[:10]:
         lesson=str(r.get('lesson') or '').strip()
         if not lesson:
@@ -5347,11 +5369,15 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     if choices:
         if today_plan_items:
-            parts.append('Cậu muốn bắt đầu nội dung nào trước?')
+            parts.append('Cậu muốn ôn tập phần nào trước?')
         elif scheduled or next_plan:
             parts.append('Cậu muốn ôn tập phần nào trước?')
         else:
             parts.append('Cậu muốn làm lại phần sai trước chứ?')
+    elif intent=='LEARN_RECOMMENDATION' and today_plan_items:
+        # Không tạo choice block cho các bài học theo lộ trình; giữ toàn bộ danh
+        # sách ở dạng text để thao tác được ổn định cả ở chatbox thu nhỏ.
+        pass
 
     blocks=[{'type':'text','text':'\n\n'.join(parts)}]
     if choices:
@@ -5592,11 +5618,9 @@ def proxy_chat(
     # transitions and do not need conversational follow-up detection.
     plan_recent_history = _normalize_chat_history(data.chat_history, max_messages=20)
     chat_followup_detected = None
-    if not data.action and data.text and not data.proactive:
+    if not data.action and data.text:
         chat_followup_detected = _classify_chat_followup(data.text, plan_recent_history)
         print(f'[CHAT FOLLOW-UP ROUTER] request={request_id} follow_up={int(bool(chat_followup_detected))}')
-    elif data.proactive:
-        print(f'[CHAT FOLLOW-UP ROUTER] request={request_id} skipped=proactive')
 
     # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
     # Standalone greetings are onboarding actions and do not consume a question.
@@ -6401,61 +6425,10 @@ def proxy_chat(
 
     namespace = data.knowledge_namespace or "__default__"
     query_text = data.text
-
-    # PROACTIVE CHAT IS TERMINAL.
-    # The desktop pet sends a short instruction as `data.text`; the server may use
-    # the current Study Plan state to make that one sentence natural, but must NEVER
-    # feed the generated sentence back into lesson/intent routing. Previously the
-    # generated greeting was treated only as a temporary hint and the request then
-    # fell through into lesson routing, causing a mismatch between the GPT output in
-    # the log and the text shown to the learner.
     if data.proactive:
-        proactive_hint = _study_plan_brief_for_auto_chat(user["id"], selected_course_id)
-        if proactive_hint:
-            proactive_prompt = (
-                "Bạn là Doraemon, một người bạn đồng hành học tập thân thiện.\n"
-                "Dựa đúng vào trạng thái học tập bên dưới, hãy viết đúng MỘT câu bắt chuyện tự nhiên bằng tiếng Việt.\n"
-                "Có thể hỏi han, động viên, chúc mừng hoặc nhắc nhẹ về tiến độ.\n"
-                "Không được mở bài học, không hỏi người dùng muốn học gì, không yêu cầu xác nhận bài, không tạo bài tập.\n"
-                "Không nhắc đến Study Plan, database hay trạng thái hệ thống.\n"
-                "Câu phải giống lời một người bạn nói tự nhiên, không máy móc.\n\n"
-                f"TRẠNG THÁI HỌC TẬP: {proactive_hint}"
-            )
-        else:
-            proactive_prompt = (
-                "Bạn là Doraemon, một người bạn thân thiện. Hãy nói đúng MỘT câu ngắn bằng tiếng Việt để bắt chuyện tự nhiên với người học. "
-                "Chỉ hỏi han nhẹ nhàng, không mở bài học, không hỏi menu học gì, không tạo bài tập và không đưa đáp án. "
-                "Câu nói phải tự nhiên như một người bạn, không máy móc."
-            )
-        gen_started = time.perf_counter()
-        proactive_reply, proactive_model, _ = _generate_chat_reply(
-            proactive_prompt,
-            content_type=None,
-            request_id=request_id,
-            gen_started=gen_started,
-            user_text="",
-            reasoning_profile='low'
-        )
-        proactive_reply = str(proactive_reply or "").strip()
-        # Defensive cleanup: proactive output must remain a single short sentence.
-        if not proactive_reply:
-            proactive_reply = "Hôm nay cậu thấy việc học của mình thế nào rồi? 😊"
-        else:
-            proactive_reply = re.sub(r"\s+", " ", proactive_reply).strip()
-            proactive_reply = proactive_reply.split("\n", 1)[0].strip()
-        print(
-            f"[PROACTIVE DIRECT] request={request_id} model={proactive_model!r} "
-            f"reply={proactive_reply!r} routing=terminal rag=0 embedding=0 pinecone=0"
-        )
-        return {
-            "reply": proactive_reply,
-            "model": proactive_model,
-            "sources": [],
-            "images": [],
-            "content_blocks": [{"type": "text", "text": proactive_reply}],
-            "learning_progress": None,
-            "proactive": True,
-        }
+        plan_hint = _study_plan_brief_for_auto_chat(user["id"], selected_course_id)
+        if plan_hint:
+            query_text = plan_hint
 
     # Keep enough history for continuity, but do not send 100 rows to Gemini.
     # The full learning state remains in PostgreSQL; this is only the prompt view.
@@ -11318,24 +11291,6 @@ def init_curriculum_db():
                            WHERE cl.course_id IS NULL
                              AND lower(trim(cl.subject))=lower(trim(c.name))""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_steps_lesson ON curriculum_steps(lesson_id, step_order);")
-            # study_plans and study_plan_items are committed by init_db() before this function runs.
-            # Keep curriculum-dependent backfill here so a brand-new database can bootstrap
-            # without referencing curriculum_lessons before that table exists.
-            cur.execute("""UPDATE study_plans p SET course_id=x.course_id
-                FROM (
-                    SELECT p2.id, MIN(src.course_id) AS course_id
-                    FROM study_plans p2
-                    JOIN study_plan_items i ON i.study_plan_id=p2.id
-                    JOIN (
-                        SELECT DISTINCT course_id,content_type,lesson FROM knowledge_documents WHERE course_id IS NOT NULL
-                        UNION
-                        SELECT DISTINCT course_id,content_type,lesson FROM curriculum_lessons WHERE course_id IS NOT NULL AND status='PUBLISHED'
-                    ) src ON lower(trim(coalesce(src.content_type,'')))=lower(trim(coalesce(p2.content_type,'')))
-                         AND lower(trim(src.lesson))=lower(trim(i.lesson))
-                    WHERE p2.course_id IS NULL
-                    GROUP BY p2.id
-                    HAVING COUNT(DISTINCT src.course_id)=1
-                ) x WHERE p.id=x.id AND p.course_id IS NULL;""")
         conn.commit()
     finally:
         conn.close()
