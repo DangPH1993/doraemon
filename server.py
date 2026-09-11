@@ -5239,22 +5239,11 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
         except Exception as exc:
             print(f"[WELCOME COURSE NAME] resolve skipped: {type(exc).__name__}: {exc}")
 
-    curriculum = (
-        "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
-        "1. Giáo trình\n"
-        "2. Ngữ pháp\n"
-        "3. Bài tập\n"
-        "4. Từ vựng\n"
-        "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
-        "5. Truyện đọc"
-    )
-
     if is_new:
         message = (
-            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
-            f"{curriculum}\n\n"
-            "Cậu muốn bắt đầu học phần nào? Nếu chưa biết nên bắt đầu từ đâu, "
-            "tớ có thể gợi ý lộ trình cho cậu nhé! 😊"
+            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư đồng hành cùng bạn chinh phục khóa học này. 🤖\n\n"
+            "Tớ sẽ đồng hành cùng bạn trong từng bài học, giải thích nội dung, đặt câu hỏi và hỗ trợ bạn luyện tập theo đúng khóa học đang chọn.\n\n"
+            "Cậu muốn bắt đầu học phần nào? Nếu chưa biết nên bắt đầu từ đâu, tớ có thể gợi ý lộ trình cho cậu nhé! 😊"
         )
         return {
             "success": True,
@@ -7295,13 +7284,9 @@ Tin nhắn hiện tại:
         print("[CHAT ROUTING] recommendation-only request: ignore current thread/active lesson")
     if recommendation_only_request and not ambiguous_study_request:
         msg = (
-            "📚 Doraemon có thể đồng hành cùng cậu ở 5 loại nội dung:\n\n"
-            "1. **Giáo trình** – học bài theo đúng giáo trình, giải thích từng phần.\n"
-            "2. **Ngữ pháp** – học các mẫu câu và điểm ngữ pháp.\n"
-            "3. **Bài tập** – làm bài, Doraemon ra đề, gợi ý, chấm và giải chi tiết.\n"
-            "4. **Từ vựng** – học từ vựng theo chủ đề, bao gồm **Kanji** và **Bộ thủ**.\n"
-            "5. **Truyện đọc** – luyện đọc hiểu qua các bài/truyện tiếng Nhật.\n\n"
-            "Cậu muốn học loại nào? Có thể nói luôn tên bài, ví dụ: **Bài 3 giáo trình** hoặc **Bài 3 bài tập** nhé. 😊"
+            "🤖 Tớ là Doraemon, gia sư đồng hành cùng bạn chinh phục khóa học này.\n\n"
+            "Tớ có thể hướng dẫn bạn học đúng nội dung của khóa học, giải thích bài, luyện tập và phản hồi theo tiến độ học của bạn.\n\n"
+            "Cậu muốn bắt đầu từ bài nào? Có thể nói luôn tên bài hoặc nội dung cậu muốn học nhé! 😊"
         )
         print("[CHAT ROUTING] recommendation-only request: no RAG/images")
         return {
