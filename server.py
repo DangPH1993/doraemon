@@ -14588,8 +14588,40 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
             png=render_pdf_page(pdf_source,page_no,dpi=180)
             ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
             print(f'[EXERCISE LOCAL OCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
+
+            # Some PDFs have a damaged/unsupported text layer (pypdf emits
+            # "Ignoring wrong pointing object ...") while the page is still
+            # visually readable. Try PyMuPDF text extraction before invoking
+            # Vision. This is local/non-GenAI and keeps the exercise source
+            # grounded in the original PDF.
+            if not ocr_text and fitz is not None:
+                try:
+                    doc_fitz=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
+                    try:
+                        fpage=doc_fitz.load_page(page_no-1)
+                        fitz_text=(fpage.get_text('text') or '').strip()
+                    finally:
+                        doc_fitz.close()
+                    if fitz_text:
+                        ocr_text=fitz_text
+                        print(f'[EXERCISE FITZ TEXT FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
+                except Exception as exc:
+                    print(f'[EXERCISE FITZ TEXT FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
+
+            # Do not fail just because local OCR is empty. A configured exercise
+            # page may be a scanned/image-only/table page, in which case Vision
+            # must be allowed to OCR/extract the page itself.
+            if not ocr_text and gemini:
+                try:
+                    vision_text,detected=gemini_ocr_page(png,page_no,source_file=source_file)
+                    if vision_text:
+                        ocr_text=str(vision_text).strip()
+                    print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=1 detected_images={len(detected or [])}')
+                except Exception as exc:
+                    print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} failed: {type(exc).__name__}: {exc}')
+
         if not ocr_text:
-            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}).')
+            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}) ngay cả sau PDF text/PyMuPDF/Tesseract/Vision.')
         page_texts[page_no]=ocr_text
         units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
 
