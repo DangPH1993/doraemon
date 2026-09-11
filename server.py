@@ -1362,18 +1362,33 @@ def record_learning_event(user_id, event):
                            ORDER BY id DESC LIMIT 1""",
                         (user_id, content_type, course_id, content_id))
             old = cur.fetchone()
-            if not old and course_id is not None:
-                cur.execute(
-                    """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
-                       WHERE user_id=%s AND content_type=%s AND course_id IS NULL
-                         AND lower(coalesce(lesson,''))=lower(%s)
-                         AND lower(coalesce(topic,''))=lower(%s)
-                       ORDER BY id DESC LIMIT 1""",
-                    (user_id, content_type, lesson or "", topic or ""),
-                )
-                old = cur.fetchone()
-                if old:
-                    cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
+            if not old:
+                # Exercise finish/re-open must update the same learning row even when
+                # an older event used a different content_id. Prefer the exact course,
+                # then fall back to legacy rows that have no course_id.
+                if course_id is not None:
+                    cur.execute(
+                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                           WHERE user_id=%s AND content_type=%s
+                             AND course_id=%s
+                             AND lower(coalesce(lesson,''))=lower(%s)
+                             AND lower(coalesce(topic,''))=lower(%s)
+                           ORDER BY id DESC LIMIT 1""",
+                        (user_id, content_type, course_id, lesson or "", topic or ""),
+                    )
+                    old = cur.fetchone()
+                if not old:
+                    cur.execute(
+                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                           WHERE user_id=%s AND content_type=%s AND course_id IS NULL
+                             AND lower(coalesce(lesson,''))=lower(%s)
+                             AND lower(coalesce(topic,''))=lower(%s)
+                           ORDER BY id DESC LIMIT 1""",
+                        (user_id, content_type, lesson or "", topic or ""),
+                    )
+                    old = cur.fetchone()
+                    if old and course_id is not None:
+                        cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
             if old:
                 if content_type == "Bài tập":
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
@@ -1395,7 +1410,7 @@ def record_learning_event(user_id, event):
                     (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempt_count,correct_count,wrong_count,
                      last_studied_at,next_review_at,completed_at)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                     RETURNING *""",
                     (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
@@ -6117,6 +6132,7 @@ def proxy_chat(
             # Fail closed: the dedicated exercise completion action must never mark another content type.
             return {"reply":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ."}],"learning_progress":None}
         target_status = "completed" if ui_action == "exercise_finish_yes" else "in_progress"
+        print(f"[EXERCISE FINISH] persist target_status={target_status} lesson={lesson_label!r} course_id={(study_session or {}).get('course_id')}")
         try:
             progress_row = record_learning_event(
                 user["id"],
