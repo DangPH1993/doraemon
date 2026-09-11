@@ -1,10 +1,10 @@
 # VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v9-exercise-ocr-only"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v8-edited-content-only"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-only"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct"
 import os
 import ast
 import io
@@ -14459,20 +14459,44 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
     return stored
 
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """OCR a configured exercise/answer page locally with Tesseract.
+    """OCR a configured exercise/answer page locally exactly ONCE.
 
-    No Gemini/GenAI call is made. For native text PDFs the caller prefers the
-    PDF text layer; this is only a fallback for scanned/image-only pages.
+    Exercise ingestion intentionally uses OCR only: no Gemini Vision and no
+    repeated OCR passes.  The image is lightly preprocessed before the single
+    Tesseract invocation so scanned pages are more likely to produce text.
     """
     if not pytesseract or Image is None:
         return ""
     try:
-        im = Image.open(io.BytesIO(png))
-        # Preserve Japanese vertical text and English/Vietnamese mixed material.
-        # Tesseract chooses the useful script; the output is still raw OCR text.
-        text = pytesseract.image_to_string(im, lang='jpn+eng+vie', config='--psm 6')
+        im = Image.open(io.BytesIO(png)).convert('L')
+        # One-time local preprocessing: upscale + autocontrast. This does not
+        # constitute another OCR pass and materially helps scanned worksheets.
+        scale = 2
+        im = im.resize((max(1, im.width * scale), max(1, im.height * scale)))
+        try:
+            from PIL import ImageOps
+            im = ImageOps.autocontrast(im)
+        except Exception:
+            pass
+
+        # Use only languages actually installed in the Render image. Falling
+        # back to a single installed language avoids an empty result caused by
+        # a missing Tesseract language pack while keeping exactly one OCR call.
+        langs = []
+        try:
+            installed = set(pytesseract.get_languages(config=''))
+            for code in ('jpn', 'eng', 'vie'):
+                if code in installed:
+                    langs.append(code)
+        except Exception:
+            installed = set()
+        lang = '+'.join(langs) if langs else 'eng'
+
+        # PSM 3 is safer for full exercise pages containing multiple lines,
+        # columns and question blocks than forcing a single uniform block.
+        text = pytesseract.image_to_string(im, lang=lang, config='--oem 1 --psm 3')
         text = str(text or '').replace('\x0c', '').strip()
-        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file}')
+        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file} lang={lang} single_pass=1')
         return text
     except Exception as exc:
         print(f'[EXERCISE LOCAL OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
@@ -14561,15 +14585,10 @@ def _exercise_store_vision_image_records(png, detected, source_file, subject, le
 
 
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """Extract ONLY configured exercise/answer pages using text/OCR once per page.
+    """Extract ONLY configured exercise/answer pages.
 
-    Bài tập deliberately does NOT use Gemini Vision or image/table interpretation.
-    The page is read exactly once for curriculum extraction:
-      1) native PDF text layer when it has usable text;
-      2) otherwise render the page and run local Tesseract OCR once.
-
-    The resulting text is reused for draft generation and all later processing;
-    there is no second OCR/Vision pass for tables/images/chunks.
+    Native PDF text extraction first, then one local OCR pass for scanned pages.
+    Exercise ingestion never uses Gemini Vision or repeated OCR passes.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -14582,24 +14601,22 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
     for page_no in selected:
         tag='question' if page_no in qset else 'answer'
         page_obj=reader.pages[page_no-1]
-
-        # First and only extraction attempt for a native-text page.
         extracted=(page_obj.extract_text() or '').strip()
         text_len=len(re.sub(r'\s+','',extracted))
         png=None
-
         if text_len >= 20:
             ocr_text=extracted
-            print(f'[EXERCISE TEXT/OCR] page={page_no} scope={tag} chars={len(ocr_text)} method=pdf_text ocr_calls=0 genai=0')
+            print(f'[EXERCISE TEXT LAYER] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
         else:
-            # Scanned/image-only page: render once, OCR once. No Vision fallback.
-            png=render_pdf_page(pdf_source,page_no,dpi=180)
+            png=render_pdf_page(pdf_source,page_no,dpi=300)
             ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-            print(f'[EXERCISE TEXT/OCR] page={page_no} scope={tag} chars={len(ocr_text or "")} method=tesseract ocr_calls=1 genai=0')
+            print(f'[EXERCISE LOCAL OCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
 
-            # Some PDFs have a damaged pypdf text layer while PyMuPDF can still
-            # read the underlying text layer. This is local text extraction, not OCR
-            # and not an additional AI/Vision pass.
+            # Some PDFs have a damaged/unsupported text layer (pypdf emits
+            # "Ignoring wrong pointing object ...") while the page is still
+            # visually readable. Try PyMuPDF text extraction before invoking
+            # Vision. This is local/non-GenAI and keeps the exercise source
+            # grounded in the original PDF.
             if not ocr_text and fitz is not None:
                 try:
                     doc_fitz=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
@@ -14614,32 +14631,62 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 except Exception as exc:
                     print(f'[EXERCISE FITZ TEXT FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
 
+            # Exercise content is OCR-only by design. Never call Gemini Vision
+            # for question/answer pages. If neither the PDF text layer, PyMuPDF
+            # text extraction nor the single local OCR pass yields text, fail
+            # clearly so the source PDF can be fixed.
+
         if not ocr_text:
             raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}). Bài tập chỉ hỗ trợ OCR chữ, không dùng Vision.')
-
-        # IMPORTANT: this is the canonical text for this page. It is reused as-is
-        # for draft generation; no second OCR/Vision pass is allowed downstream.
         page_texts[page_no]=ocr_text
         units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
 
-        # Keep only the configured page as a provenance image. This is storage/UI
-        # only and does not invoke Vision or OCR again.
+        # Render once only when needed for table/image detection or source storage.
         if png is None:
             png=render_pdf_page(pdf_source,page_no,dpi=150)
+        table_page=_page_has_table_grid(page_obj,png,ocr_text)
+        embedded_image=_exercise_page_has_embedded_images(pdf_source,page_no)
         stored=[]
-        base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
-        if base_stored:
-            stored.append(base_stored)
+
+        # Table: one compact Vision call that creates semantic table facts and stores
+        # the original table image as traceable knowledge.
+        if table_page and gemini:
+            try:
+                table_data=gemini_explain_table_page(png,page_no,extracted_text=ocr_text,source_file=source_file)
+                page_texts[page_no]=(ocr_text+'\n\n[TABLE VISION KNOWLEDGE]\n'+json.dumps(table_data,ensure_ascii=False)).strip()
+                print(f'[EXERCISE VISION/TABLE] page={page_no} scope={tag} genai=1 tables={len(table_data.get("tables") or [])}')
+            except Exception as exc:
+                print(f'[EXERCISE VISION/TABLE] page={page_no} skipped: {type(exc).__name__}: {exc}')
+
+        # Embedded illustration/image: one Vision call for this page to identify the
+        # educational image and its local label. Do not run on text-only pages.
+        if embedded_image and gemini and not table_page:
+            try:
+                vision_text,detected=gemini_ocr_page(png,page_no,source_file=source_file)
+                if vision_text:
+                    # Keep the original PDF text authoritative; add a separate knowledge
+                    # block rather than replacing OCR/text-layer content.
+                    page_texts[page_no]=(page_texts[page_no]+'\n\n[IMAGE VISION KNOWLEDGE]\n'+vision_text).strip()
+                stored.extend(_exercise_store_vision_image_records(png,detected,source_file,subject,lesson,page_no,page_texts[page_no]))
+                print(f'[EXERCISE VISION/IMAGE] page={page_no} scope={tag} genai=1 detected_images={len(detected or [])}')
+            except Exception as exc:
+                print(f'[EXERCISE VISION/IMAGE] page={page_no} skipped: {type(exc).__name__}: {exc}')
+
+        # Always retain the original configured page image for provenance/UI when there
+        # was no detected crop. This does not consume AI tokens.
+        if not stored:
+            base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
+            if base_stored:
+                stored.append(base_stored)
         page_images[page_no]=stored
         units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
         page_units[page_no]=units
-
-        print(f'[EXERCISE OCR ONLY] page={page_no} scope={tag} text_chars={len(ocr_text)} vision_calls=0 ocr_passes=1_or_pdf_text')
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} vision_calls={1 if (table_page and gemini) or (embedded_image and gemini and not table_page) else 0}')
         try: del png
         except Exception: pass
         gc.collect()
-
     return page_texts,page_images,page_units
+
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
