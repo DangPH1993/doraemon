@@ -14461,47 +14461,47 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
     """OCR a configured exercise/answer page locally exactly ONCE.
 
-    Exercise ingestion intentionally uses OCR only: no Gemini Vision and no
-    repeated OCR passes.  The image is lightly preprocessed before the single
-    Tesseract invocation so scanned pages are more likely to produce text.
+    Exercise ingestion uses OCR only: no Gemini Vision and no repeated OCR passes.
     """
-    if not pytesseract or Image is None:
+    if Image is None:
+        print(f'[EXERCISE LOCAL OCR] page={page_no} failed: PIL unavailable')
         return ""
     try:
+        from PIL import ImageOps, ImageFilter
         im = Image.open(io.BytesIO(png)).convert('L')
-        # One-time local preprocessing: upscale + autocontrast. This does not
-        # constitute another OCR pass and materially helps scanned worksheets.
-        scale = 2
-        im = im.resize((max(1, im.width * scale), max(1, im.height * scale)))
+
+        # One preprocessing pipeline, then exactly ONE Tesseract invocation.
+        target_w = max(im.width * 3, 2400)
+        if im.width < target_w:
+            ratio = target_w / float(im.width)
+            im = im.resize((int(im.width * ratio), int(im.height * ratio)), Image.Resampling.LANCZOS)
+        im = ImageOps.autocontrast(im)
+        im = im.filter(ImageFilter.SHARPEN)
+
+        installed = set()
         try:
-            from PIL import ImageOps
-            im = ImageOps.autocontrast(im)
+            installed = set(pytesseract.get_languages(config='')) if pytesseract else set()
         except Exception:
             pass
-
-        # Use only languages actually installed in the Render image. Falling
-        # back to a single installed language avoids an empty result caused by
-        # a missing Tesseract language pack while keeping exactly one OCR call.
-        langs = []
-        try:
-            installed = set(pytesseract.get_languages(config=''))
-            for code in ('jpn', 'eng', 'vie'):
-                if code in installed:
-                    langs.append(code)
-        except Exception:
-            installed = set()
+        langs = [c for c in ('eng', 'vie', 'jpn') if c in installed]
         lang = '+'.join(langs) if langs else 'eng'
 
-        # PSM 3 is safer for full exercise pages containing multiple lines,
-        # columns and question blocks than forcing a single uniform block.
-        text = pytesseract.image_to_string(im, lang=lang, config='--oem 1 --psm 3')
+        if not pytesseract:
+            print(f'[EXERCISE LOCAL OCR] page={page_no} failed: pytesseract unavailable')
+            return ""
+
+        text = pytesseract.image_to_string(
+            im,
+            lang=lang,
+            config='--oem 1 --psm 6',
+            timeout=90,
+        )
         text = str(text or '').replace('\x0c', '').strip()
-        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file} lang={lang} single_pass=1')
+        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file} lang={lang} single_pass=1 psm=6')
         return text
     except Exception as exc:
         print(f'[EXERCISE LOCAL OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
         return ""
-
 
 def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
     """Persist the original configured page as a single source image.
