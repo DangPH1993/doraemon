@@ -7353,22 +7353,26 @@ Tin nhắn hiện tại:
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
                 exercise_text=str((question_step or {}).get('text') or '').strip()
                 official_answer=str((answer_step or {}).get('text') or '').strip()
-                q_prompt=f"""Bạn là Doraemon, chấm bài tập thật ngắn gọn.
+                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu.
 
-ĐỀ BÀI (nguồn):
+ĐỀ BÀI (chỉ để đối chiếu, KHÔNG nhắc lại trong câu trả lời):
 {exercise_text}
 
-ĐÁP ÁN CHÍNH THỨC (nguồn):
+ĐÁP ÁN CHÍNH THỨC (chỉ để đối chiếu):
 {official_answer}
 
 BÀI LÀM CỦA HỌC SINH:
 {query_text.strip()}
 
-Chấm đúng theo đáp án chính thức. Trả tối đa 3 mục, tổng cộng không quá 350 ký tự:
-**Điểm: x/10**
-**Nhận xét:** đúng/sai chính và lỗi quan trọng nhất.
-**Cần cải thiện:** 1 câu ngắn về điểm cần sửa.
-Không chép lại đề, không chép lại đáp án, không lặp lại bài làm, không giải thích dài."""
+YÊU CẦU BẮT BUỘC:
+- Chấm TỪNG CÂU theo đáp án chính thức.
+- Mỗi câu chỉ 1 dòng: `Câu N: ✅/❌ — giải thích rất ngắn vì sao.`
+- Nếu sai, nói ngắn gọn điểm cần sửa; nếu đúng, chỉ cần xác nhận ngắn.
+- Cuối cùng thêm `Điểm: x/y`.
+- KHÔNG chép lại đề bài.
+- KHÔNG chép lại toàn bộ đáp án.
+- KHÔNG lặp lại bài làm của học sinh.
+- Không giải thích dài; tối đa khoảng 25 từ cho mỗi câu và 1 dòng điểm."""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
@@ -7378,7 +7382,7 @@ Không chép lại đề, không chép lại đáp án, không lặp lại bài 
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=220,
+                    max_output_tokens=320,
                 )
                 answered=True
                 waiting="continue"
@@ -7388,13 +7392,11 @@ Không chép lại đề, không chép lại đáp án, không lặp lại bài 
                 study_session["curriculum_step"]=current_step
                 study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
-                blocks=[{"type":"text","text":evaluation or ""}]
-                answer_step_for_ui=_published_curriculum_step(runtime_lesson_cache,current_step)
-                blocks.extend(_published_curriculum_non_giao_trinh_blocks(
-                    answer_step_for_ui, runtime_lesson_cache, requested_content_type,
-                    answered=True, course_id=selected_course_id, user_id=user["id"]
-                ))
-                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2")
+                blocks=[{"type":"text","text":(evaluation or "") + "\n\n📘 Cậu xem đáp án chính thức ở bước tiếp theo nhé."}]
+                # Do not paste the full answer immediately after grading. The next
+                # deterministic curriculum step (B2) will display the edited official
+                # answer only after the learner presses Tiếp theo.
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2 answer_render=deferred")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Cheap DB-only factual vocabulary questions must never spend LLM tokens.
