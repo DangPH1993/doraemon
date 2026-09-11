@@ -1,4 +1,5 @@
 # VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v8-edited-content-only"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -3202,191 +3203,23 @@ def _published_curriculum_images(content, pages=None):
 
 
 def _exercise_source_step_rows_from_runtime(lesson_row, step_rows):
-    """Repair/normalize published exercise runtime steps from authoritative OCR source.
+    """Return the published curriculum steps exactly as stored after Admin edit.
 
-    The runtime must never invent the exercise statement or answer. For legacy lessons
-    that were published with only one step or with malformed/nested content_json, recover
-    B1/B2 from raw_source_json first, then from knowledge_images + knowledge_documents.
+    Exercise OCR is transient during upload. After publish, runtime must use only
+    curriculum_steps.content_json saved from the Admin editor. It must never
+    reconstruct B1/B2 from raw OCR/source pages.
     """
-    if str(lesson_row.get('content_type') or '').strip() != 'Bài tập':
-        return list(step_rows or [])
-
-    rows=[dict(r) for r in (step_rows or [])]
-    raw_source=lesson_row.get('raw_source_json') or {}
-    if not isinstance(raw_source,dict):
-        raw_source={}
-    pages=raw_source.get('pages') if isinstance(raw_source.get('pages'),list) else []
-    q_label=str(raw_source.get('question_pages') or '').strip()
-    a_label=str(raw_source.get('answer_pages') or '').strip()
-
-    # Recover page metadata from knowledge_documents when the published lesson was
-    # created before question/answer page ranges were persisted in raw_source_json.
-    meta=None
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT question_pages,answer_pages,source_file
-                FROM knowledge_documents
-                WHERE course_id=%s
-                  AND lower(trim(content_type))=lower(trim(%s))
-                  AND lower(trim(lesson))=lower(trim(%s))
-                  AND source_file=%s
-                ORDER BY id DESC
-                LIMIT 1
-            """, (lesson_row.get('course_id'), 'Bài tập', lesson_row.get('lesson'), lesson_row.get('source_file')))
-            meta=cur.fetchone()
-    except Exception as exc:
-        print(f"[CURRICULUM EXERCISE LEGACY] metadata lookup failed: {type(exc).__name__}: {exc}")
-    finally:
-        try: conn.close()
-        except Exception: pass
-    if meta:
-        q_label=q_label or str(meta.get('question_pages') or '').strip()
-        a_label=a_label or str(meta.get('answer_pages') or '').strip()
-
-    # If raw_source pages are missing (common for very old published rows), rebuild
-    # the configured pages from knowledge_images, whose associated_text is the OCR
-    # of the original configured page stored during exercise upload.
-    if (not pages) and q_label and a_label:
-        all_page_labels=[]
-        try:
-            all_page_labels=_parse_curriculum_page_ranges(q_label, 1000000) + _parse_curriculum_page_ranges(a_label, 1000000)
-        except Exception:
-            all_page_labels=[]
-        wanted=sorted(set(int(x) for x in all_page_labels if int(x)>0))
-        if wanted:
-            conn=db()
-            try:
-                with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("""
-                        SELECT page,image_key,image_url,description,associated_text
-                        FROM knowledge_images
-                        WHERE source_file=%s
-                          AND lower(trim(content_type))=lower(trim(%s))
-                          AND lower(trim(lesson))=lower(trim(%s))
-                          AND page = ANY(%s)
-                        ORDER BY page,id
-                    """, (lesson_row.get('source_file'),'Bài tập',lesson_row.get('lesson'),wanted))
-                    image_rows=cur.fetchall() or []
-            except Exception as exc:
-                print(f"[CURRICULUM EXERCISE LEGACY] knowledge_images lookup failed: {type(exc).__name__}: {exc}")
-                image_rows=[]
-            finally:
-                try: conn.close()
-                except Exception: pass
-            by_page={}
-            for r in image_rows:
-                p=int(r.get('page')) if str(r.get('page')).isdigit() else None
-                if p is None: continue
-                by_page[p]={
-                    'page':p,
-                    'text':str(r.get('associated_text') or '').strip(),
-                    'images':[{
-                        'image_key':str(r.get('image_key') or '').strip(),
-                        'image_url':str(r.get('image_url') or '').strip(),
-                        'vision':{
-                            'description':str(r.get('description') or '').strip(),
-                        },
-                    }] if str(r.get('image_key') or '').strip() else [],
-                }
-            pages=[by_page[p] for p in wanted if p in by_page]
-            if pages:
-                print(f"[CURRICULUM EXERCISE LEGACY] recovered_pages_from_knowledge_images pages={[p.get('page') for p in pages]}")
-
-    page_numbers=[int(pg.get('page')) for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()]
-    if not page_numbers or not q_label or not a_label:
-        return _normalize_exercise_existing_rows(rows)
-
-    max_page=max(page_numbers)
-    try:
-        # The page labels may contain pages that are outside the small page inventory
-        # reconstructed above. Validate against the PDF/source inventory rather than a
-        # fake huge limit, then intersect with available pages.
-        q_pages=_parse_curriculum_page_ranges(q_label, max_page)
-        a_pages=_parse_curriculum_page_ranges(a_label, max_page)
-    except Exception as exc:
-        print(f"[CURRICULUM EXERCISE LEGACY] page-range recovery failed: {type(exc).__name__}: {exc}")
-        return _normalize_exercise_existing_rows(rows)
-
-    by_page={int(pg.get('page')):pg for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()}
-
-    def build(code,title,step_type,page_list,reason,order):
-        selected=[by_page[p] for p in page_list if p in by_page]
-        text='\n\n'.join(str(pg.get('text') or '').strip() for pg in selected if str(pg.get('text') or '').strip()).strip()
-        images=[]; refs=[]
-        for pg in selected:
-            if str(pg.get('text') or '').strip():
-                refs.append({'page':pg.get('page'),'reason':reason})
-            for im in pg.get('images') or []:
-                key=str(im.get('image_key') or im.get('key') or '').strip()
-                if key:
-                    vision=im.get('vision') or {}
-                    images.append({
-                        'image_key':key,
-                        'image_url':im.get('image_url') or im.get('url'),
-                        'page':pg.get('page'),
-                        'caption':str(vision.get('description') or vision.get('caption') or '').strip(),
-                    })
-        return {
-            'id':None,
-            'lesson_id':lesson_row.get('id'),
-            'step_code':code,
-            'step_order':order,
-            'title':title,
-            'step_type':step_type,
-            'content_json':{
-                'title':title,
-                'content':text,
-                'source_refs':refs,
-                'images':images,
-                'items':[],
-                'vocabulary_refs':[],
-                'grammar_refs':[],
-            },
-        }
-
-    b1=build('B1','Bài tập · Làm bài','exercise_intro',q_pages,'OCR nguyên văn trang bài tập',1)
-    b2=build('B2','Đáp án · Chấm và nhận xét','answer',a_pages,'OCR nguyên văn trang đáp án',2)
-    if b1['content_json']['content'] or b2['content_json']['content']:
-        print(f"[CURRICULUM EXERCISE LEGACY] repaired lesson_id={lesson_row.get('id')} -> B1/B2 source-only q_chars={len(b1['content_json']['content'])} a_chars={len(b2['content_json']['content'])}")
-        return [b1,b2]
-
-    return _normalize_exercise_existing_rows(rows)
-
-
-def _normalize_exercise_existing_rows(rows):
-    """Normalize legacy exercise content_json shapes without changing source text."""
-    out=[]
-    for r in rows or []:
-        x=dict(r)
-        code=str(x.get('step_code') or '').upper()
-        content=x.get('content_json')
-        if not isinstance(content,dict):
-            content={}
-        # Flatten one accidental nesting layer such as content.content={content: "..."}.
-        inner=content.get('content')
-        if isinstance(inner,dict) and isinstance(inner.get('content'),str):
-            merged=dict(inner)
-            for k,v in content.items():
-                if k!='content' and k not in merged:
-                    merged[k]=v
-            content=merged
-        if isinstance(content.get('content'),str) and content.get('content').strip():
-            x['content_json']=content
-        else:
-            # Keep original row untouched if there is no authoritative source text.
-            x['content_json']=content
-        x['step_code']=code or x.get('step_code')
-        out.append(x)
-    return out
+    return [dict(r) for r in (step_rows or [])]
 
 
 def _published_curriculum_runtime_payload(lesson_row, step_rows):
     step_rows=_exercise_source_step_rows_from_runtime(lesson_row, step_rows)
-    raw_source=lesson_row.get("raw_source_json") or {}
-    pages=raw_source.get("pages") if isinstance(raw_source,dict) else []
-    pages=pages if isinstance(pages,list) else []
+    if str(lesson_row.get('content_type') or '').strip() == 'Bài tập':
+        pages=[]
+    else:
+        raw_source=lesson_row.get('raw_source_json') or {}
+        pages=raw_source.get('pages') if isinstance(raw_source,dict) else []
+        pages=pages if isinstance(pages,list) else []
     sections=[]; images=[]
     for order,row in enumerate(step_rows):
         content=row.get("content_json") or {}
@@ -5708,6 +5541,7 @@ def _generate_chat_reply(
     gen_started: float,
     user_text: str = "",
     reasoning_profile: str = "low",
+    max_output_tokens: Optional[int] = None,
 ):
     """
     Provider-neutral chat adapter.
@@ -5748,13 +5582,14 @@ def _generate_chat_reply(
         }
         if model.startswith("gpt-5"):
             # GPT-5-family models require a supported reasoning effort.
-            # Ordinary chat uses minimal; only explicit evaluation uses medium.
             reasoning_effort = (
                 OPENAI_REASONING_MEDIUM
                 if effective_profile == "medium"
                 else OPENAI_REASONING_LOW
             )
             kwargs["reasoning"] = {"effort": reasoning_effort}
+        if max_output_tokens is not None:
+            kwargs["max_output_tokens"] = max(64, int(max_output_tokens))
         response = openai_client.responses.create(**kwargs)
         _log_openai_usage(response, operation="chat_generation", request_id=request_id)
         reply = getattr(response, "output_text", "") or ""
@@ -5779,12 +5614,15 @@ def _generate_chat_reply(
         f"[CHAT THINKING] request={request_id} provider='gemini' "
         f"content_type={content_type!r} level={thinking_level!r}"
     )
+    gen_cfg_kwargs={
+        "thinking_config": types.ThinkingConfig(thinking_level=thinking_level)
+    }
+    if max_output_tokens is not None:
+        gen_cfg_kwargs["max_output_tokens"] = max(64, int(max_output_tokens))
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
-        ),
+        config=types.GenerateContentConfig(**gen_cfg_kwargs),
     )
     _log_gemini_usage(response, operation="chat_generation", request_id=request_id)
     reply = response.text or ""
@@ -7515,39 +7353,32 @@ Tin nhắn hiện tại:
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
                 exercise_text=str((question_step or {}).get('text') or '').strip()
                 official_answer=str((answer_step or {}).get('text') or '').strip()
-                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Hãy chấm bài làm của học sinh dựa HOÀN TOÀN vào nội dung bài tập và đáp án OCR dưới đây.
+                q_prompt=f"""Bạn là Doraemon, chấm bài tập thật ngắn gọn.
 
-=== B1 · ĐỀ BÀI NGUYÊN VĂN (OCR) ===
+ĐỀ BÀI (nguồn):
 {exercise_text}
 
-=== B2 · ĐÁP ÁN CHÍNH THỨC (OCR) ===
+ĐÁP ÁN CHÍNH THỨC (nguồn):
 {official_answer}
 
-=== BÀI LÀM CỦA HỌC SINH ===
+BÀI LÀM CỦA HỌC SINH:
 {query_text.strip()}
 
-YÊU CẦU CHẤM:
-- So sánh bài làm với B2. Không được tự tạo đáp án khác hoặc thay đổi đáp án chính thức.
-- Cho điểm từ 0 đến 10; nếu bài có nhiều ý/câu, chấm theo mức độ hoàn thành chung.
-- Nêu rõ phần đúng.
-- Nêu rõ lỗi/sai ở đâu và cách sửa.
-- Nêu 1-3 điểm người học cần cải thiện dựa trên lỗi thực tế.
-- Nếu bài làm chưa đủ thông tin để chấm toàn bộ, nói rõ phần nào còn thiếu và chấm theo phần đã có.
-- Trả lời bằng tiếng Việt, dễ hiểu, có cấu trúc rõ ràng:
-  **Điểm: x/10**
-  **Nhận xét:** ...
-  **Điểm cần cải thiện:** ...
-
-ĐÁP ÁN CHÍNH THỨC PHẢI ĐƯỢC GIỮ NGUYÊN KHI HIỂN THỊ Ở PHẦN SAU."""
+Chấm đúng theo đáp án chính thức. Trả tối đa 3 mục, tổng cộng không quá 350 ký tự:
+**Điểm: x/10**
+**Nhận xét:** đúng/sai chính và lỗi quan trọng nhất.
+**Cần cải thiện:** 1 câu ngắn về điểm cần sửa.
+Không chép lại đề, không chép lại đáp án, không lặp lại bài làm, không giải thích dài."""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
                     q_prompt,
-                    content_type=requested_content_type,
+                    content_type=None,
                     request_id=request_id,
                     gen_started=gen_started,
                     user_text=query_text.strip(),
-                    reasoning_profile="medium",
+                    reasoning_profile="low",
+                    max_output_tokens=220,
                 )
                 answered=True
                 waiting="continue"
@@ -12502,13 +12333,16 @@ async def admin_curriculum_draft_upload(
                 'content_type':ct,
                 'lesson':ls,
                 'page_ranges':cfg['pages_label'],
-                'selected_pages':selected_pages,
                 'question_pages':cfg.get('question_pages_label',''),
                 'answer_pages':cfg.get('answer_pages_label',''),
-                'page_count':len(pages),
-                'pages':pages,
                 'steps':normalized_steps,
             }
+            if ct == 'Bài tập':
+                payload['selected_page_count']=len(selected_pages)
+            else:
+                payload['selected_pages']=selected_pages
+                payload['page_count']=len(pages)
+                payload['pages']=pages
             conn=db()
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -12519,14 +12353,18 @@ async def admin_curriculum_draft_upload(
                 conn.commit()
             finally:
                 conn.close()
-            results.append({
+            result_item={
                 'draft_id':draft_id,'status':'AI_DRAFT','version':version,
                 'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
-                'page_ranges':cfg['pages_label'],'selected_pages':selected_pages,
-                'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
+                'page_ranges':cfg['pages_label'],'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
                 'selected_page_count':len(selected_pages),
-                'steps':normalized_steps,'pages':pages,'page_count':len(pages),
-            })
+                'steps':normalized_steps,
+            }
+            if ct != 'Bài tập':
+                result_item['selected_pages']=selected_pages
+                result_item['pages']=pages
+                result_item['page_count']=len(pages)
+            results.append(result_item)
 
         return {
             'success':True,
@@ -12647,7 +12485,10 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 }
 
             raw_source=lesson.get('raw_source_json') if isinstance(lesson.get('raw_source_json'),dict) else {}
-            pages=raw_source.get('pages') if isinstance(raw_source,dict) else []
+            is_exercise_edit=str(lesson.get('content_type') or '').strip() == 'Bài tập'
+            # For exercises, do not hydrate an edit Draft with original OCR/source pages.
+            # For other content types retain the existing source-page editor behavior.
+            pages=[] if is_exercise_edit else (raw_source.get('pages') if isinstance(raw_source,dict) else [])
             pages=pages if isinstance(pages,list) else []
             steps=[]
             cur.execute("""
@@ -12667,12 +12508,14 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
             if not steps:
                 raise HTTPException(409,'Bài học đã publish nhưng chưa có các bước để chỉnh sửa.')
 
-            selected_pages=[]
-            if isinstance(raw_source,dict):
-                selected_pages=raw_source.get('selected_pages') or []
-            if not selected_pages:
-                selected_pages=sorted({int(pg.get('page')) for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()})
-            page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
+            selected_pages=raw_source.get('selected_pages') or [] if isinstance(raw_source,dict) else []
+            if is_exercise_edit:
+                q_edit=str(raw_source.get('question_pages') or '').strip()
+                a_edit=str(raw_source.get('answer_pages') or '').strip()
+                page_ranges=', '.join([x for x in (q_edit,a_edit) if x])
+            else:
+                page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
+
 
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",
                         (lesson['source_file'], lesson['content_type'], lesson['lesson']))
@@ -12684,11 +12527,8 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 'content_type':str(lesson['content_type'] or ''),
                 'lesson':str(lesson['lesson'] or ''),
                 'page_ranges':page_ranges,
-                'selected_pages':selected_pages,
                 'question_pages':raw_source.get('question_pages') if isinstance(raw_source,dict) else '',
                 'answer_pages':raw_source.get('answer_pages') if isinstance(raw_source,dict) else '',
-                'page_count':len(pages),
-                'pages':pages,
                 'steps':steps,
                 'edit_of_lesson_id':int(lesson_id),
                 'edit_of_version':int(lesson.get('version') or 1),
@@ -12806,6 +12646,8 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
         if not row: raise HTTPException(404,'Draft không tồn tại.')
         draft=dict(row['draft_json'] or {}); step=next((s for s in draft.get('steps',[]) if str(s.get('code'))==step_code),None)
         if not step: raise HTTPException(404,'Step không tồn tại.')
+        if str(draft.get('content_type') or '').strip() == 'Bài tập':
+            raise HTTPException(400,'Bài tập dùng nội dung nguồn + chỉnh sửa trực tiếp. Không lưu OCR gốc nên không hỗ trợ Regenerate Step sau khi Draft đã tạo.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
         _, grammar_reference = _get_course_curriculum_knowledge(draft.get('course_id'), digest)
         new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=grammar_reference)
@@ -12839,7 +12681,7 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             ct = str(draft.get('content_type') or dr.get('content_type') or '').strip()
             steps = draft.get('steps') or []
             draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
-            print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]}")
+            print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]} raw_source_persisted={'0' if ct == 'Bài tập' else '1'}")
             source_file=str(draft.get('source_file') or dr['source_file']).strip()
             lesson=str(draft.get('lesson') or dr['lesson']).strip()
             subject=str(draft.get('subject') or dr['subject']).strip()
@@ -12888,7 +12730,22 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
             cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id'),'course_name':course_name,'question_pages':draft.get('question_pages',''),'answer_pages':draft.get('answer_pages','')},ensure_ascii=False)))
+            if ct == 'Bài tập':
+                publish_meta={
+                    'course_id':draft.get('course_id'),
+                    'course_name':course_name,
+                    'question_pages':draft.get('question_pages',''),
+                    'answer_pages':draft.get('answer_pages',''),
+                }
+            else:
+                publish_meta={
+                    'pages':draft.get('pages') or [],
+                    'course_id':draft.get('course_id'),
+                    'course_name':course_name,
+                    'question_pages':draft.get('question_pages',''),
+                    'answer_pages':draft.get('answer_pages',''),
+                }
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps(publish_meta,ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
