@@ -7353,26 +7353,33 @@ Tin nhắn hiện tại:
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
                 exercise_text=str((question_step or {}).get('text') or '').strip()
                 official_answer=str((answer_step or {}).get('text') or '').strip()
-                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu.
+                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu dựa CHỈ trên nội dung đề và đáp án được cung cấp.
 
-ĐỀ BÀI (chỉ để đối chiếu, KHÔNG nhắc lại trong câu trả lời):
+ĐỀ BÀI / NGUỒN BÀI TẬP (chỉ để đối chiếu bằng chứng, KHÔNG chép lại toàn bộ):
 {exercise_text}
 
-ĐÁP ÁN CHÍNH THỨC (chỉ để đối chiếu):
+ĐÁP ÁN CHÍNH THỨC TRONG DB (phải trích nguyên văn đáp án tương ứng cho từng câu):
 {official_answer}
 
 BÀI LÀM CỦA HỌC SINH:
 {query_text.strip()}
 
 YÊU CẦU BẮT BUỘC:
-- Chấm TỪNG CÂU theo đáp án chính thức.
-- Mỗi câu chỉ 1 dòng: `Câu N: ✅/❌ — giải thích rất ngắn vì sao.`
-- Nếu sai, nói ngắn gọn điểm cần sửa; nếu đúng, chỉ cần xác nhận ngắn.
-- Cuối cùng thêm `Điểm: x/y`.
-- KHÔNG chép lại đề bài.
-- KHÔNG chép lại toàn bộ đáp án.
-- KHÔNG lặp lại bài làm của học sinh.
-- Không giải thích dài; tối đa khoảng 25 từ cho mỗi câu và 1 dòng điểm."""
+- Chấm TỪNG CÂU theo đáp án chính thức trong DB.
+- Với MỖI câu, trả đúng 3 dòng ngắn:
+  1) `Câu N: ✅` hoặc `Câu N: ❌`
+  2) `Đáp án DB: "<trích nguyên văn đáp án tương ứng>"`
+  3) `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: "<trích nguyên văn đoạn/câu trong đề chứng minh kết luận>"`
+- Nếu đáp án là NOT GIVEN hoặc nguồn không có bằng chứng trực tiếp, phải ghi rõ `Bằng chứng trong bài: Không có thông tin trực tiếp.` Không được tự suy luận thành thông tin mới.
+- Nếu không xác định được đoạn bằng chứng từ ĐỀ BÀI được cung cấp, ghi `Bằng chứng trong bài: Không xác định từ nguồn đã cung cấp.`
+- Diễn giải tối đa 20 từ/câu. Phần trích dẫn chỉ lấy đúng nguyên văn từ nguồn; không viết lại câu trích dẫn.
+- Không chép lại toàn bộ đề bài.
+- Không chép lại toàn bộ đáp án; chỉ trích đúng đáp án của từng câu.
+- Không lặp lại toàn bộ bài làm của học sinh.
+- Cuối cùng chỉ thêm `Điểm: x/y`.
+- KHÔNG thêm lời nhắn kiểu "xem đáp án ở bước tiếp theo" hoặc lời chốt khác.
+- Nếu số câu trong bài làm không khớp đề, chấm những câu xác định được và nêu ngắn gọn câu nào thiếu/dư.
+"""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
@@ -7382,7 +7389,7 @@ YÊU CẦU BẮT BUỘC:
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=320,
+                    max_output_tokens=520,
                 )
                 answered=True
                 waiting="continue"
@@ -7392,10 +7399,9 @@ YÊU CẦU BẮT BUỘC:
                 study_session["curriculum_step"]=current_step
                 study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
-                blocks=[{"type":"text","text":(evaluation or "") + "\n\n📘 Cậu xem đáp án chính thức ở bước tiếp theo nhé."}]
-                # Do not paste the full answer immediately after grading. The next
-                # deterministic curriculum step (B2) will display the edited official
-                # answer only after the learner presses Tiếp theo.
+                blocks=[{"type":"text","text":evaluation or ""}]
+                # Do not paste the full B2 answer block. The evaluation already quotes
+                # only the per-question official answer text requested for feedback.
                 print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2 answer_render=deferred")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
