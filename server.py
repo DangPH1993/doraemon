@@ -123,7 +123,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.127-followup-one-history-gated-context")
-SERVER_VERSION = "2026-09-11-v27-exercise-finish-and-catalog-all-content"
+SERVER_VERSION = "2026-09-11-v30-welcome-nameerror-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5238,6 +5238,12 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             _, selected_course_name, _ = _resolve_request_course(user["id"], selected_course_id)
         except Exception as exc:
             print(f"[WELCOME COURSE NAME] resolve skipped: {type(exc).__name__}: {exc}")
+
+    course_display = selected_course_name or "khóa học này"
+    curriculum = (
+        f"🤖 Doraemon là gia sư đồng hành cùng cậu trong **{course_display}**. "
+        "Tớ sẽ giúp cậu học nội dung, giải thích bài, luyện tập và theo dõi tiến độ theo đúng khóa học đang chọn."
+    )
 
     if is_new:
         message = (
