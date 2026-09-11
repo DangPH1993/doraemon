@@ -1,5 +1,5 @@
-# VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v11-curriculum-richtext"
+# VERSION: v19_107 — rich-text entity decode + paragraph/newline preservation
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v12-curriculum-richtext-newline-decode"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -19,6 +19,7 @@ import json
 import base64
 import calendar
 import urllib.parse
+import html
 import hashlib
 import tempfile
 from html.parser import HTMLParser
@@ -11500,10 +11501,18 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         self.out.append(data)
 
 def sanitize_curriculum_rich_text(value):
-    """Store safe rich text while keeping existing plain text unchanged."""
+    """Store safe rich text, decoding one HTML-entity layer before sanitizing.
+
+    This fixes content that was previously persisted as ``&lt;b&gt;...`` /
+    ``&lt;p&gt;...`` and therefore appeared literally in the Admin editor and
+    could lose paragraph structure in the learner UI.
+    """
     text=str(value or '')
     if not text:
         return ''
+    # Decode one entity layer first. The HTMLParser then decides which tags are
+    # actually allowed, so encoded <script> etc. cannot bypass sanitization.
+    text=html.unescape(text)
     if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span)\b', text, flags=re.I):
         return text
     try:
