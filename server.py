@@ -479,6 +479,10 @@ def init_db():
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_intro_history TEXT NOT NULL DEFAULT '';",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_intro_b0b1_history TEXT NOT NULL DEFAULT '';",
                 "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_global_exercise_result TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_writing_suggestion_shown BOOLEAN NOT NULL DEFAULT FALSE;",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_writing_vision TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_writing_prompt TEXT NOT NULL DEFAULT '';",
+                "ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_writing_result TEXT NOT NULL DEFAULT '';",
             ]:
                 cur.execute(sql)
             cur.execute("ALTER TABLE user_learning_state ALTER COLUMN curriculum_waiting TYPE VARCHAR(50)")
@@ -14017,7 +14021,7 @@ function _sanitizeCurriculumRichHtml(value){
   const src=String(value??'');
   if(!src)return '';
   const box=document.createElement('div');
-  if(/<\s*(?:b|strong|i|em|u|br|p|div|span)\b/i.test(src)){ box.innerHTML=src; }
+  if(/<\\s*(?:b|strong|i|em|u|br|p|div|span)\\b/i.test(src)){ box.innerHTML=src; }
   else { box.textContent=src; }
   box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
   box.querySelectorAll('*').forEach(el=>{
