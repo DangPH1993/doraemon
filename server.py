@@ -1,10 +1,10 @@
 # VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v8-edited-content-only"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v18-edited-content-only-rapidocr-array"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v18"
 import os
 import ast
 import io
@@ -51,6 +51,11 @@ try:
     from PIL import Image
 except Exception:
     Image = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 try:
     import pytesseract
@@ -14474,25 +14479,35 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
     return stored
 
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """Single-pass OCR for exercise/answer pages using RapidOCR only."""
+    """Single-pass local OCR for an exercise/answer page using RapidOCR.
+
+    RapidOCR is fed a real image array (not encoded PNG bytes) because different
+    rapidocr_onnxruntime releases handle byte input inconsistently. The page is
+    rendered once and OCR is called exactly once. No Vision/GenAI fallback.
+    """
     global rapid_ocr
-    if not png or Image is None or rapid_ocr is None:
-        print(f'[EXERCISE OCR] page={page_no} failed: RapidOCR unavailable')
+    if not png or Image is None or np is None or rapid_ocr is None:
+        print(f'[EXERCISE OCR] page={page_no} failed: OCR engine unavailable')
         return ""
     try:
-        from PIL import ImageOps, ImageFilter
-        im=Image.open(io.BytesIO(png)).convert('RGB')
-        im=im.resize((max(1,int(im.width*1.5)), max(1,int(im.height*1.5))))
-        im=ImageOps.autocontrast(ImageOps.grayscale(im)).filter(ImageFilter.SHARPEN)
-        buf=io.BytesIO(); im.save(buf,format='PNG')
-        result,_=rapid_ocr(buf.getvalue())
-        texts=[]
-        for item in (result or []):
-            try: txt=str(item[1] or '').strip()
-            except Exception: txt=''
-            if txt: texts.append(txt)
-        text='\n'.join(texts).strip()
-        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} single_pass=1')
+        im = Image.open(io.BytesIO(png)).convert('RGB')
+        # Keep the source page intact for OCR. Only enlarge modestly; do not
+        # threshold aggressively because anti-aliased IELTS text can disappear.
+        im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
+        arr = np.asarray(im)
+
+        result, _ = rapid_ocr(arr)
+        texts = []
+        if isinstance(result, (list, tuple)):
+            for item in result:
+                # rapidocr_onnxruntime commonly returns [box, text, score].
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    txt = str(item[1] or '').strip()
+                    if txt:
+                        texts.append(txt)
+
+        text = '\n'.join(texts).strip()
+        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
         return text
     except Exception as exc:
         print(f'[EXERCISE OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
