@@ -3444,6 +3444,26 @@ def _vocab_direct_answer_from_cache(cache, current_step, question_text):
             return ans
     return None
 
+def _exercise_answer_map_from_text(text):
+    """Parse numbered answers from published B2 text so question N cannot take another question's answer."""
+    raw=str(text or '').replace('\r\n','\n').replace('\r','\n')
+    lines=[re.sub(r"[ \t]+"," ",x).strip() for x in raw.split('\n') if x.strip()]
+    mapping={}
+    for line in lines:
+        m=re.match(r"^(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(.+?)\s*$", line, flags=re.I)
+        if not m:
+            m=re.match(r"^(\d+)\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        try:
+            n=int(m.group(1))
+        except Exception:
+            continue
+        ans=m.group(2).strip()
+        if ans:
+            mapping[n]=ans
+    return mapping
+
 def _published_curriculum_answer_step(cache):
     sections=list((cache or {}).get("sections") or [])
     for idx,sec in enumerate(sections):
@@ -7351,34 +7371,33 @@ Tin nhắn hiện tại:
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
                 question_step=step if str(step.get('code') or '').upper() == 'B1' else None
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
-                exercise_text=str((question_step or {}).get('text') or '').strip()
-                official_answer=str((answer_step or {}).get('text') or '').strip()
-                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu dựa CHỈ trên nội dung đề và đáp án được cung cấp.
+                official_answer=str((answer_step or {}).get("text") or "").strip()
+                answer_map=_exercise_answer_map_from_text(official_answer)
+                answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
+                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu. Chỉ dùng đề bài và đáp án đã cung cấp.
 
-ĐỀ BÀI / NGUỒN BÀI TẬP (chỉ để đối chiếu bằng chứng, KHÔNG chép lại toàn bộ):
+ĐỀ BÀI (chỉ dùng để tìm bằng chứng, KHÔNG chép lại):
 {exercise_text}
 
-ĐÁP ÁN CHÍNH THỨC TRONG DB (phải trích nguyên văn đáp án tương ứng cho từng câu):
-{official_answer}
+ĐÁP ÁN THEO TỪNG CÂU, lấy nguyên văn từ bước đáp án đã edit/publish:
+{answer_map_text or official_answer}
+
+QUAN TRỌNG: Với câu N, bắt buộc dùng đúng đáp án của Câu N ở phần trên. Không lấy đáp án của câu khác, không tự sửa và không tự đoán đáp án.
 
 BÀI LÀM CỦA HỌC SINH:
 {query_text.strip()}
 
-YÊU CẦU BẮT BUỘC:
-- Chấm TỪNG CÂU theo đáp án chính thức trong DB.
-- Với MỖI câu, trả đúng 3 dòng ngắn:
-  1) `Câu N: ✅` hoặc `Câu N: ❌`
-  2) `Đáp án DB: "<trích nguyên văn đáp án tương ứng>"`
-  3) `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: "<trích nguyên văn đoạn/câu trong đề chứng minh kết luận>"`
-- Nếu đáp án là NOT GIVEN hoặc nguồn không có bằng chứng trực tiếp, phải ghi rõ `Bằng chứng trong bài: Không có thông tin trực tiếp.` Không được tự suy luận thành thông tin mới.
-- Nếu không xác định được đoạn bằng chứng từ ĐỀ BÀI được cung cấp, ghi `Bằng chứng trong bài: Không xác định từ nguồn đã cung cấp.`
-- Diễn giải tối đa 20 từ/câu. Phần trích dẫn chỉ lấy đúng nguyên văn từ nguồn; không viết lại câu trích dẫn.
-- Không chép lại toàn bộ đề bài.
-- Không chép lại toàn bộ đáp án; chỉ trích đúng đáp án của từng câu.
-- Không lặp lại toàn bộ bài làm của học sinh.
-- Cuối cùng chỉ thêm `Điểm: x/y`.
-- KHÔNG thêm lời nhắn kiểu "xem đáp án ở bước tiếp theo" hoặc lời chốt khác.
-- Nếu số câu trong bài làm không khớp đề, chấm những câu xác định được và nêu ngắn gọn câu nào thiếu/dư.
+YÊU CẦU:
+- Chấm TỪNG CÂU.
+- Với mỗi câu, đúng 3 dòng:
+  `Câu N: ✅` hoặc `Câu N: ❌`
+  `Đáp án: <trích nguyên văn đáp án của đúng Câu N>`
+  `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: "<trích nguyên văn câu/đoạn chứng minh>"`
+- Nếu NOT GIVEN hoặc không có bằng chứng trực tiếp: `Bằng chứng trong bài: Không có thông tin trực tiếp.`
+- Không dùng kiến thức ngoài đề.
+- Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
+- Diễn giải tối đa 20 từ/câu.
+- Cuối cùng chỉ có `Điểm: x/y`.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
@@ -7389,7 +7408,7 @@ YÊU CẦU BẮT BUỘC:
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=520,
+                    max_output_tokens=560,
                 )
                 answered=True
                 waiting="continue"
