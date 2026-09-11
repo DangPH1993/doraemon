@@ -58,6 +58,11 @@ except Exception:
     pytesseract = None
 
 try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
+
+try:
     import boto3
     from botocore.client import Config as BotoConfig
 except Exception:
@@ -117,6 +122,7 @@ pc = None
 index = None
 gemini = None
 openai_client = None
+rapid_ocr = None
 connected_users = {}
 admin_connections = set()
 
@@ -508,7 +514,7 @@ def init_db():
 
 @app.on_event("startup")
 def startup():
-    global pc, index, gemini, openai_client, b2
+    global pc, index, gemini, openai_client, b2, rapid_ocr
     if PINECONE_API_KEY:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX)
@@ -516,6 +522,15 @@ def startup():
         gemini = genai.Client(api_key=GEMINI_API_KEY)
     if OPENAI_API_KEY and OpenAI is not None:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    if RapidOCR is not None:
+        try:
+            rapid_ocr = RapidOCR()
+            print("RapidOCR: OK")
+        except Exception as exc:
+            rapid_ocr = None
+            print("WARNING: RapidOCR init failed:", type(exc).__name__, str(exc))
+    else:
+        print("WARNING: rapidocr_onnxruntime chưa được cài; exercise OCR fallback unavailable.")
     if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
         b2 = boto3.client(
             "s3",
@@ -14459,48 +14474,28 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
     return stored
 
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """OCR a configured exercise/answer page locally exactly ONCE.
-
-    Exercise ingestion uses OCR only: no Gemini Vision and no repeated OCR passes.
-    """
-    if Image is None:
-        print(f'[EXERCISE LOCAL OCR] page={page_no} failed: PIL unavailable')
+    """Single-pass OCR for exercise/answer pages using RapidOCR only."""
+    global rapid_ocr
+    if not png or Image is None or rapid_ocr is None:
+        print(f'[EXERCISE OCR] page={page_no} failed: RapidOCR unavailable')
         return ""
     try:
         from PIL import ImageOps, ImageFilter
-        im = Image.open(io.BytesIO(png)).convert('L')
-
-        # One preprocessing pipeline, then exactly ONE Tesseract invocation.
-        target_w = max(im.width * 3, 2400)
-        if im.width < target_w:
-            ratio = target_w / float(im.width)
-            im = im.resize((int(im.width * ratio), int(im.height * ratio)), Image.Resampling.LANCZOS)
-        im = ImageOps.autocontrast(im)
-        im = im.filter(ImageFilter.SHARPEN)
-
-        installed = set()
-        try:
-            installed = set(pytesseract.get_languages(config='')) if pytesseract else set()
-        except Exception:
-            pass
-        langs = [c for c in ('eng', 'vie', 'jpn') if c in installed]
-        lang = '+'.join(langs) if langs else 'eng'
-
-        if not pytesseract:
-            print(f'[EXERCISE LOCAL OCR] page={page_no} failed: pytesseract unavailable')
-            return ""
-
-        text = pytesseract.image_to_string(
-            im,
-            lang=lang,
-            config='--oem 1 --psm 6',
-            timeout=90,
-        )
-        text = str(text or '').replace('\x0c', '').strip()
-        print(f'[EXERCISE LOCAL OCR] page={page_no} chars={len(text)} source={source_file} lang={lang} single_pass=1 psm=6')
+        im=Image.open(io.BytesIO(png)).convert('RGB')
+        im=im.resize((max(1,int(im.width*1.5)), max(1,int(im.height*1.5))))
+        im=ImageOps.autocontrast(ImageOps.grayscale(im)).filter(ImageFilter.SHARPEN)
+        buf=io.BytesIO(); im.save(buf,format='PNG')
+        result,_=rapid_ocr(buf.getvalue())
+        texts=[]
+        for item in (result or []):
+            try: txt=str(item[1] or '').strip()
+            except Exception: txt=''
+            if txt: texts.append(txt)
+        text='\n'.join(texts).strip()
+        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} single_pass=1')
         return text
     except Exception as exc:
-        print(f'[EXERCISE LOCAL OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
+        print(f'[EXERCISE OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
         return ""
 
 def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
@@ -14585,10 +14580,10 @@ def _exercise_store_vision_image_records(png, detected, source_file, subject, le
 
 
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """Extract ONLY configured exercise/answer pages.
+    """Extract only configured exercise/answer pages.
 
-    Native PDF text extraction first, then one local OCR pass for scanned pages.
-    Exercise ingestion never uses Gemini Vision or repeated OCR passes.
+    Exercise uses native local text extraction first, then exactly one RapidOCR
+    pass for pages without usable text. No Gemini Vision and no repeated OCR.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -14596,97 +14591,62 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
     qset=set(q_pages)
     if not selected:
         raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
-
     page_texts={}; page_images={}; page_units={}
-    for page_no in selected:
-        tag='question' if page_no in qset else 'answer'
-        page_obj=reader.pages[page_no-1]
-        extracted=(page_obj.extract_text() or '').strip()
-        text_len=len(re.sub(r'\s+','',extracted))
-        png=None
-        if text_len >= 20:
-            ocr_text=extracted
-            print(f'[EXERCISE TEXT LAYER] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
-        else:
-            png=render_pdf_page(pdf_source,page_no,dpi=300)
-            ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-            print(f'[EXERCISE LOCAL OCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
-
-            # Some PDFs have a damaged/unsupported text layer (pypdf emits
-            # "Ignoring wrong pointing object ...") while the page is still
-            # visually readable. Try PyMuPDF text extraction before invoking
-            # Vision. This is local/non-GenAI and keeps the exercise source
-            # grounded in the original PDF.
-            if not ocr_text and fitz is not None:
+    fitz_doc=None
+    if fitz is not None:
+        try:
+            fitz_doc=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
+        except Exception as exc:
+            print(f'[EXERCISE FITZ OPEN] failed: {type(exc).__name__}: {exc}')
+    try:
+        for page_no in selected:
+            tag='question' if page_no in qset else 'answer'
+            extracted=''
+            page_obj=None
+            # Prefer PyMuPDF; avoids pypdf broken-object warnings for damaged PDFs.
+            if fitz_doc is not None:
                 try:
-                    doc_fitz=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
-                    try:
-                        fpage=doc_fitz.load_page(page_no-1)
-                        fitz_text=(fpage.get_text('text') or '').strip()
-                    finally:
-                        doc_fitz.close()
-                    if fitz_text:
-                        ocr_text=fitz_text
-                        print(f'[EXERCISE FITZ TEXT FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
+                    extracted=(fitz_doc.load_page(page_no-1).get_text('text') or '').strip()
                 except Exception as exc:
-                    print(f'[EXERCISE FITZ TEXT FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
-
-            # Exercise content is OCR-only by design. Never call Gemini Vision
-            # for question/answer pages. If neither the PDF text layer, PyMuPDF
-            # text extraction nor the single local OCR pass yields text, fail
-            # clearly so the source PDF can be fixed.
-
-        if not ocr_text:
-            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}). Bài tập chỉ hỗ trợ OCR chữ, không dùng Vision.')
-        page_texts[page_no]=ocr_text
-        units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
-
-        # Render once only when needed for table/image detection or source storage.
-        if png is None:
-            png=render_pdf_page(pdf_source,page_no,dpi=150)
-        table_page=_page_has_table_grid(page_obj,png,ocr_text)
-        embedded_image=_exercise_page_has_embedded_images(pdf_source,page_no)
-        stored=[]
-
-        # Table: one compact Vision call that creates semantic table facts and stores
-        # the original table image as traceable knowledge.
-        if table_page and gemini:
-            try:
-                table_data=gemini_explain_table_page(png,page_no,extracted_text=ocr_text,source_file=source_file)
-                page_texts[page_no]=(ocr_text+'\n\n[TABLE VISION KNOWLEDGE]\n'+json.dumps(table_data,ensure_ascii=False)).strip()
-                print(f'[EXERCISE VISION/TABLE] page={page_no} scope={tag} genai=1 tables={len(table_data.get("tables") or [])}')
-            except Exception as exc:
-                print(f'[EXERCISE VISION/TABLE] page={page_no} skipped: {type(exc).__name__}: {exc}')
-
-        # Embedded illustration/image: one Vision call for this page to identify the
-        # educational image and its local label. Do not run on text-only pages.
-        if embedded_image and gemini and not table_page:
-            try:
-                vision_text,detected=gemini_ocr_page(png,page_no,source_file=source_file)
-                if vision_text:
-                    # Keep the original PDF text authoritative; add a separate knowledge
-                    # block rather than replacing OCR/text-layer content.
-                    page_texts[page_no]=(page_texts[page_no]+'\n\n[IMAGE VISION KNOWLEDGE]\n'+vision_text).strip()
-                stored.extend(_exercise_store_vision_image_records(png,detected,source_file,subject,lesson,page_no,page_texts[page_no]))
-                print(f'[EXERCISE VISION/IMAGE] page={page_no} scope={tag} genai=1 detected_images={len(detected or [])}')
-            except Exception as exc:
-                print(f'[EXERCISE VISION/IMAGE] page={page_no} skipped: {type(exc).__name__}: {exc}')
-
-        # Always retain the original configured page image for provenance/UI when there
-        # was no detected crop. This does not consume AI tokens.
-        if not stored:
+                    print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
+            # Secondary native text path. Still zero tokens.
+            if len(re.sub(r'\s+','',extracted)) < 20:
+                try:
+                    page_obj=reader.pages[page_no-1]
+                    pypdf_text=(page_obj.extract_text() or '').strip()
+                    if len(re.sub(r'\s+','',pypdf_text)) >= 20:
+                        extracted=pypdf_text
+                except Exception as exc:
+                    print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
+            text_len=len(re.sub(r'\s+','',extracted))
+            png=None
+            if text_len >= 20:
+                ocr_text=extracted
+                print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
+            else:
+                png=render_pdf_page(pdf_source,page_no,dpi=300)
+                ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
+                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
+            if not ocr_text:
+                raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}). RapidOCR không lấy được chữ từ trang PDF.')
+            page_texts[page_no]=ocr_text
+            units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
+            if png is None:
+                png=render_pdf_page(pdf_source,page_no,dpi=150)
+            # Storage only; never Vision-analyze exercise images/tables.
+            stored=[]
             base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
             if base_stored:
                 stored.append(base_stored)
-        page_images[page_no]=stored
-        units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
-        page_units[page_no]=units
-        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} vision_calls={1 if (table_page and gemini) or (embedded_image and gemini and not table_page) else 0}')
-        try: del png
-        except Exception: pass
-        gc.collect()
+            page_images[page_no]=stored
+            units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
+            page_units[page_no]=units
+            print(f'[EXERCISE OCR ONLY] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} genai=0 ocr_passes=1')
+    finally:
+        if fitz_doc is not None:
+            try: fitz_doc.close()
+            except Exception: pass
     return page_texts,page_images,page_units
-
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
