@@ -3201,7 +3201,91 @@ def _published_curriculum_images(content, pages=None):
     return out
 
 
+def _exercise_source_step_rows_from_runtime(lesson_row, step_rows):
+    """Repair legacy published exercise lessons that have only one stored step.
+
+    New exercise drafts publish B1/B2 directly from OCR. Older published lessons
+    may only have B1; recover the configured question/answer page ranges from
+    knowledge_documents and rebuild both steps from raw_source_json, with no GenAI.
+    """
+    if str(lesson_row.get("content_type") or "").strip() != "Bài tập":
+        return list(step_rows or [])
+    rows=[dict(r) for r in (step_rows or [])]
+    codes={str(r.get("step_code") or "").upper() for r in rows}
+    if "B1" in codes and "B2" in codes:
+        return rows
+    raw_source=lesson_row.get("raw_source_json") or {}
+    pages=raw_source.get("pages") if isinstance(raw_source,dict) else []
+    pages=pages if isinstance(pages,list) else []
+    if not pages:
+        return rows
+
+    q_label=str(raw_source.get("question_pages") or "").strip() if isinstance(raw_source,dict) else ""
+    a_label=str(raw_source.get("answer_pages") or "").strip() if isinstance(raw_source,dict) else ""
+    if not q_label or not a_label:
+        conn=db()
+        meta=None
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT question_pages,answer_pages
+                    FROM knowledge_documents
+                    WHERE course_id=%s
+                      AND lower(trim(content_type))=lower(trim(%s))
+                      AND lower(trim(lesson))=lower(trim(%s))
+                      AND source_file=%s
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (lesson_row.get("course_id"), "Bài tập", lesson_row.get("lesson"), lesson_row.get("source_file")))
+                meta=cur.fetchone()
+        except Exception as exc:
+            print(f"[CURRICULUM EXERCISE LEGACY] metadata lookup failed: {type(exc).__name__}: {exc}")
+        finally:
+            try: conn.close()
+            except Exception: pass
+        if meta:
+            q_label=q_label or str(meta.get("question_pages") or "").strip()
+            a_label=a_label or str(meta.get("answer_pages") or "").strip()
+
+    page_numbers=[int(pg.get("page")) for pg in pages if str(pg.get("page")).isdigit()]
+    if not page_numbers or not q_label or not a_label:
+        return rows
+    max_page=max(page_numbers)
+    try:
+        q_pages=_parse_curriculum_page_ranges(q_label,max_page)
+        a_pages=_parse_curriculum_page_ranges(a_label,max_page)
+    except Exception as exc:
+        print(f"[CURRICULUM EXERCISE LEGACY] page-range recovery failed: {type(exc).__name__}: {exc}")
+        return rows
+
+    by_page={int(pg.get("page")):pg for pg in pages if str(pg.get("page")).isdigit()}
+    def build(code,title,step_type,page_list,reason,order):
+        selected=[by_page[p] for p in page_list if p in by_page]
+        text="\n\n".join(str(pg.get("text") or "").strip() for pg in selected if str(pg.get("text") or "").strip()).strip()
+        images=[]; refs=[]
+        for pg in selected:
+            if str(pg.get("text") or "").strip():
+                refs.append({"page":pg.get("page"),"reason":reason})
+            for im in pg.get("images") or []:
+                key=str(im.get("image_key") or "").strip()
+                if key:
+                    vision=im.get("vision") or {}
+                    images.append({"image_key":key,"image_url":im.get("image_url"),"page":pg.get("page"),"caption":str(vision.get("description") or vision.get("caption") or "").strip()})
+        return {
+            "id":None,"lesson_id":lesson_row.get("id"),"step_code":code,"step_order":order,
+            "title":title,"step_type":step_type,
+            "content_json":{"title":title,"content":text,"source_refs":refs,"images":images,"items":[],"vocabulary_refs":[],"grammar_refs":[]}
+        }
+    b1=build("B1","Bài tập · Làm bài","exercise_intro",q_pages,"OCR nguyên văn trang bài tập",1)
+    b2=build("B2","Đáp án · Chấm và nhận xét","answer",a_pages,"OCR nguyên văn trang đáp án",2)
+    if b1["content_json"]["content"] and b2["content_json"]["content"]:
+        print(f"[CURRICULUM EXERCISE LEGACY] repaired lesson_id={lesson_row.get('id')} -> B1/B2 source-only")
+        return [b1,b2]
+    return rows
+
+
 def _published_curriculum_runtime_payload(lesson_row, step_rows):
+    step_rows=_exercise_source_step_rows_from_runtime(lesson_row, step_rows)
     raw_source=lesson_row.get("raw_source_json") or {}
     pages=raw_source.get("pages") if isinstance(raw_source,dict) else []
     pages=pages if isinstance(pages,list) else []
@@ -3588,7 +3672,8 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
 
     if step.get("is_final"):
         blocks.extend(_curriculum_final_blocks())
-    else:
+    elif not (is_exercise and is_question_step and not answered):
+        # B1 must wait for the learner's answer; do not offer "Tiếp theo" yet.
         blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
         blocks.extend(_curriculum_continue_blocks(int(step.get("index") or 0)))
     return blocks
@@ -3650,7 +3735,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, course_id=No
                 step_rows=cur.fetchall() or []
                 if step_rows:
                     payload=_published_curriculum_runtime_payload(curriculum_row,step_rows)
-                    print(f"[CURRICULUM DB RUNTIME HIT] request={request_id} lesson={ls!r} lesson_id={curriculum_row['id']} steps={len(step_rows)}")
+                    print(f"[CURRICULUM DB RUNTIME HIT] request={request_id} lesson={ls!r} lesson_id={curriculum_row['id']} steps={len(payload.get('sections') or [])}")
                     return payload
 
             cur.execute(
@@ -5021,6 +5106,13 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             {"label":"Học tự do","action":"onboarding_free"}
         ]}]
         return {"success":True,"mode":"plan_choice","message":msg,"content_blocks":blocks,"learning_history":unfinished_rows,"course_guides":[]}
+
+    selected_course_name = None
+    if selected_course_id is not None:
+        try:
+            _, selected_course_name, _ = _resolve_request_course(user["id"], selected_course_id)
+        except Exception as exc:
+            print(f"[WELCOME COURSE NAME] resolve skipped: {type(exc).__name__}: {exc}")
 
     curriculum = (
         "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
@@ -7281,7 +7373,10 @@ Tin nhắn hiện tại:
                     print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} advance={current_step}")
 
             # Text 'tiếp' is also a pure DB navigation turn.
-            elif not data.action and _is_continue_confirmation(query_text) and current_step < len(sections)-1:
+            elif (not data.action
+                  and not (requested_content_type == "Bài tập" and waiting == "exercise_answer")
+                  and _is_continue_confirmation(query_text)
+                  and current_step < len(sections)-1):
                 current_step += 1
                 answered=False
                 waiting="continue"
@@ -7353,14 +7448,19 @@ YÊU CẦU CHẤM:
                 )
                 answered=True
                 waiting="continue"
+                answer_index=int((answer_step or {}).get("index") if (answer_step or {}).get("index") is not None else current_step)
+                current_step=answer_index
                 _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=True)
+                study_session["curriculum_step"]=current_step
+                study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
                 blocks=[{"type":"text","text":evaluation or ""}]
-                if official_answer:
-                    blocks.append({"type":"text","text":"📘 **Đáp án chính thức trong DB:**\n\n"+official_answer})
-                blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
-                blocks.extend(_curriculum_continue_blocks(current_step))
-                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1")
+                answer_step_for_ui=_published_curriculum_step(runtime_lesson_cache,current_step)
+                blocks.extend(_published_curriculum_non_giao_trinh_blocks(
+                    answer_step_for_ui, runtime_lesson_cache, requested_content_type,
+                    answered=True, course_id=selected_course_id, user_id=user["id"]
+                ))
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Cheap DB-only factual vocabulary questions must never spend LLM tokens.
@@ -12685,7 +12785,7 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
             cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id'),'course_name':course_name},ensure_ascii=False)))
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id'),'course_name':course_name,'question_pages':draft.get('question_pages',''),'answer_pages':draft.get('answer_pages','')},ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
