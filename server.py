@@ -1302,19 +1302,10 @@ def _normalize_content_type(value):
 
 
 def _review_days(content_type, score=None, status="in_progress"):
-    """Review schedule: exercises use score; non-scored learning uses a gentle revisit schedule."""
+    """Review schedule: exercises do not use a total score; other learning keeps the existing schedule."""
     if content_type == "Truyện đọc":
         return None
-    if content_type == "Bài tập" and score is not None:
-        try:
-            sc = float(score)
-        except Exception:
-            sc = None
-        if sc is not None:
-            if sc < 60: return 1
-            if sc < 80: return 3
-            if sc < 90: return 7
-            return 14
+    # Bài tập intentionally has no score-based review schedule.
     if status == "completed":
         return 7 if content_type in {"Từ vựng", "Ngữ pháp"} else None
     return 3 if content_type in {"Từ vựng", "Ngữ pháp"} else None
@@ -1351,12 +1342,10 @@ def record_learning_event(user_id, event):
     correct_count = max(0, int(event.get("correct_count") or 0))
     wrong_count = max(0, int(event.get("wrong_count") or 0))
 
-    # Exercise scoring: correct+wrong is the source of truth when supplied.
-    total = correct_count + wrong_count
-    if content_type == "Bài tập" and total > 0 and score is None:
-        score = round(correct_count * 100 / total)
-    if content_type == "Bài tập" and total > 0 and status == "in_progress":
-        status = "completed" if wrong_count == 0 else "needs_review"
+    # Bài tập không chấm điểm tổng. Keep legacy score columns for compatibility,
+    # but never calculate or persist a new total score from correct/wrong counts.
+    if content_type == "Bài tập":
+        score = None
     if content_type != "Bài tập" and event.get("completed") is True:
         status = "completed"
 
@@ -4280,10 +4269,54 @@ def _is_study_followup(text):
 
 
 
+
+def _is_exercise_no_answer(text):
+    q = re.sub(r"\s+", " ", str(text or "").strip().casefold())
+    if not q:
+        return False
+    markers = (
+        "mình không biết", "tôi không biết", "tớ không biết", "không biết",
+        "chưa biết", "không làm được", "mình chịu", "chịu rồi", "bó tay",
+    )
+    return any(m in q for m in markers)
+
+
+def _exercise_question_numbers_from_text(text):
+    """Extract the full numbered question set from B1, including ranges such as 1–7 and 8–13."""
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    nums = set()
+    for m in re.finditer(r"\b(?:questions?|câu)\s*(\d+)\s*[–—-]\s*(\d+)\b", raw, flags=re.I):
+        a, b = int(m.group(1)), int(m.group(2))
+        if b >= a and b - a <= 100:
+            nums.update(range(a, b + 1))
+    # Also catch standalone numbered questions such as "1 People..." or "8 ...."
+    for line in raw.split("\n"):
+        m = re.match(r"^\s*(\d{1,3})\s+(?!19\d\d\b|20\d\d\b)(?=\S)", line)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 100:
+                nums.add(n)
+    return sorted(nums)
+
+
+def _exercise_strip_total_score(text):
+    """Remove legacy total-score lines from exercise feedback."""
+    raw = str(text or "")
+    lines = []
+    for line in raw.splitlines():
+        if re.match(r"^\s*(?:Điểm|Tổng điểm|Score|Total score)\s*[:：]", line, flags=re.I):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
 def _exercise_simple_direct_answer(query_text, step, cache=None, current_step=None):
     """Deterministic no-LLM handling for casual/simple exercise-session turns."""
     q=str(query_text or '').strip().casefold()
     if not q or not isinstance(step, dict):
+        return None
+    # "Mình không biết" is an exercise submission, not casual chat.
+    if _is_exercise_no_answer(q):
         return None
 
     # Off-topic/casual chat while the learner is inside an exercise session.
@@ -7388,7 +7421,7 @@ Tin nhắn hiện tại:
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
 
             # Deterministic simple/casual exercise turns must not invoke GenAI.
-            if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip():
+            if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip() and not _is_exercise_no_answer(query_text):
                 direct_ex = _exercise_simple_direct_answer(query_text.strip(), step, runtime_lesson_cache, current_step)
                 if direct_ex:
                     mode, msg = direct_ex
@@ -7418,22 +7451,34 @@ Tin nhắn hiện tại:
                     msg="⚠️ Bài tập này chưa có bước đáp án B2 đã publish nên chưa thể chấm bài. Hãy kiểm tra và publish lại bước đáp án."
                     return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
                 answer_map=_exercise_answer_map_from_text(official_answer)
+                question_numbers=_exercise_question_numbers_from_text(exercise_text)
+                expected_numbers=sorted(set(question_numbers) | set(answer_map.keys()))
+                expected_text=", ".join(str(n) for n in expected_numbers)
+                no_answer=_is_exercise_no_answer(query_text)
                 answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
-                q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu. Chỉ dùng đề bài và đáp án đã cung cấp.
+                student_submission = "Học sinh không biết / không trả lời. Hãy giải đủ toàn bộ các câu." if no_answer else query_text.strip()
+                q_prompt=f"""Bạn là Doraemon, giải và nhận xét bài tập theo TỪNG CÂU. Chỉ dùng đề bài và đáp án đã cung cấp.
 
-ĐỀ BÀI (chỉ dùng để tìm bằng chứng, KHÔNG chép lại):
+ĐỀ BÀI (chỉ dùng để tìm đáp án và bằng chứng, KHÔNG chép lại toàn bộ):
 {exercise_text}
 
-ĐÁP ÁN THEO TỪNG CÂU, lấy nguyên văn từ bước đáp án đã edit/publish:
+ĐÁP ÁN THEO TỪNG CÂU, lấy nguyên văn từ bước B2 đã edit/publish:
 {answer_map_text or official_answer}
 
-QUAN TRỌNG: Với câu N, bắt buộc dùng đúng đáp án của Câu N ở phần trên. Không lấy đáp án của câu khác, không tự sửa và không tự đoán đáp án.
+DANH SÁCH CÂU BẮT BUỘC PHẢI XỬ LÝ ĐẦY ĐỦ:
+{expected_text or '(không xác định được; hãy xử lý toàn bộ câu có đánh số trong đề)'}
+
+QUAN TRỌNG:
+- Mỗi câu trong danh sách bắt buộc phải xuất hiện đúng 1 lần. Không được bỏ sót câu nào, không được gộp nhiều câu.
+- Với câu N, bắt buộc dùng đúng đáp án của Câu N ở phần B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán đáp án.
+- Nếu học sinh nói "mình không biết" hoặc không trả lời một câu, vẫn phải giải câu đó đầy đủ và đánh dấu `Câu N: ❌`.
+- Bài tập KHÔNG chấm điểm tổng. TUYỆT ĐỐI không tạo dòng điểm, tỷ lệ %, x/y hoặc tổng số câu đúng.
 
 BÀI LÀM CỦA HỌC SINH:
-{query_text.strip()}
+{student_submission}
 
-YÊU CẦU:
-- Chấm TỪNG CÂU.
+YÊU CẦU OUTPUT:
+- Giải đủ TẤT CẢ các câu bắt buộc, theo đúng thứ tự tăng dần.
 - Với mỗi câu, đúng 3 dòng:
   `Câu N: ✅` hoặc `Câu N: ❌`
   `Đáp án: <trích nguyên văn đáp án của đúng Câu N>`
@@ -7442,8 +7487,7 @@ YÊU CẦU:
 - Không dùng kiến thức ngoài đề.
 - Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
 - Diễn giải tối đa 20 từ/câu.
-- Phải chấm đủ TẤT CẢ các câu mà học sinh đã trả lời; không được dừng giữa chừng vì giới hạn độ dài.
-- Cuối cùng chỉ có `Điểm: x/y`.
+- Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
@@ -7454,8 +7498,9 @@ YÊU CẦU:
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=2000,
+                    max_output_tokens=4000,
                 )
+                evaluation=_exercise_strip_total_score(evaluation)
                 answered=True
                 waiting="continue"
                 answer_index=int((answer_step or {}).get("index") if (answer_step or {}).get("index") is not None else current_step)
