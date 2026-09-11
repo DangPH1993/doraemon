@@ -1,5 +1,5 @@
 # VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v18-edited-content-only-rapidocr-array"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v10-exercise-output-2000"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -7440,6 +7440,7 @@ YÊU CẦU:
 - Không dùng kiến thức ngoài đề.
 - Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
 - Diễn giải tối đa 20 từ/câu.
+- Phải chấm đủ TẤT CẢ các câu mà học sinh đã trả lời; không được dừng giữa chừng vì giới hạn độ dài.
 - Cuối cùng chỉ có `Điểm: x/y`.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
@@ -7451,7 +7452,7 @@ YÊU CẦU:
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=560,
+                    max_output_tokens=2000,
                 )
                 answered=True
                 waiting="continue"
