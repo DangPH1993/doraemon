@@ -12644,10 +12644,37 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute('SELECT content_type FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+            cur.execute('SELECT content_type,draft_json FROM curriculum_drafts WHERE id=%s FOR UPDATE',(draft_id,)); row=cur.fetchone()
             if not row: raise HTTPException(404,'Draft không tồn tại.')
             ct=str(draft.get('content_type') or row.get('content_type') or '').strip()
-            draft['steps']=reindex_curriculum_draft_steps_safe(ct,draft.get('steps') or [])
+
+            # Bài tập MUST always keep both B1 (exercise) and B2 (answer).
+            # Some Admin editor save requests only send the currently visible step;
+            # never let such a partial payload erase the already-persisted B2 answer.
+            if ct == 'Bài tập':
+                incoming=[dict(x) for x in (draft.get('steps') or []) if isinstance(x,dict)]
+                existing_obj=row.get('draft_json') if isinstance(row.get('draft_json'),dict) else {}
+                existing=[dict(x) for x in (existing_obj.get('steps') or []) if isinstance(x,dict)]
+                by_code={str(x.get('code') or '').strip().upper(): x for x in existing}
+                incoming_by_code={str(x.get('code') or '').strip().upper(): x for x in incoming}
+                # Preserve a previously saved answer step when the client omits it.
+                if 'B2' not in incoming_by_code and 'ANSWER' not in incoming_by_code:
+                    saved_b2=by_code.get('B2') or by_code.get('ANSWER')
+                    if saved_b2 is not None:
+                        incoming.append(saved_b2)
+                        print(f'[CURRICULUM DRAFT SAVE] preserved_missing_B2 draft_id={draft_id}')
+                # Likewise preserve B1 if a partial editor payload only contains the answer.
+                if 'B1' not in incoming_by_code and 'B0' not in incoming_by_code:
+                    saved_b1=by_code.get('B1') or by_code.get('B0')
+                    if saved_b1 is not None:
+                        incoming.insert(0,saved_b1)
+                        print(f'[CURRICULUM DRAFT SAVE] preserved_missing_B1 draft_id={draft_id}')
+                draft['steps']=reindex_curriculum_draft_steps_safe(ct,incoming)
+                codes=[str(x.get('code') or '') for x in draft.get('steps') or []]
+                if 'B1' not in codes or 'B2' not in codes:
+                    raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
+            else:
+                draft['steps']=reindex_curriculum_draft_steps_safe(ct,draft.get('steps') or [])
             draft_json_text=json.dumps(draft,ensure_ascii=False)
             print(f"[CURRICULUM DRAFT SAVE] draft_id={draft_id} steps={len(draft.get('steps') or [])} chars={len(draft_json_text)} content_fields={[str((st.get('content') or {}).get('content') or '')[:80] for st in (draft.get('steps') or [])]}")
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(draft_json_text,draft_id))
@@ -12698,6 +12725,8 @@ def admin_curriculum_delete_step(draft_id:int,payload:dict):
             if target is None: raise HTTPException(404,f'Không tìm thấy bước {step_code}.')
             if ct == 'Giáo trình' and step_code in {'B0','B1','FINAL','SUMMARY'}:
                 raise HTTPException(400,f'{step_code} là bước cấu trúc bắt buộc của Giáo trình, không thể xóa.')
+            if ct == 'Bài tập' and step_code in {'B1','B2','ANSWER','B0'}:
+                raise HTTPException(400,'Bài tập phải luôn giữ đủ B1 (Bài tập) và B2 (Đáp án), không thể xóa bước này.')
             steps=[x for x in steps if str(x.get('code') or '').strip().upper()!=step_code]
             draft['steps']=reindex_curriculum_draft_steps_safe(ct,steps)
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
@@ -12750,7 +12779,28 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             draft = dict(client_draft) if isinstance(client_draft, dict) else dict(dr.get('draft_json') or {})
             ct = str(draft.get('content_type') or dr.get('content_type') or '').strip()
             steps = draft.get('steps') or []
-            draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
+            if ct == 'Bài tập':
+                incoming=[dict(x) for x in steps if isinstance(x,dict)]
+                stored_obj=dr.get('draft_json') if isinstance(dr.get('draft_json'),dict) else {}
+                stored=[dict(x) for x in (stored_obj.get('steps') or []) if isinstance(x,dict)]
+                incoming_codes={str(x.get('code') or '').strip().upper() for x in incoming}
+                stored_by_code={str(x.get('code') or '').strip().upper(): x for x in stored}
+                if 'B2' not in incoming_codes and 'ANSWER' not in incoming_codes:
+                    saved_b2=stored_by_code.get('B2') or stored_by_code.get('ANSWER')
+                    if saved_b2 is not None:
+                        incoming.append(saved_b2)
+                        print(f'[CURRICULUM PUBLISH] preserved_missing_B2 draft_id={draft_id}')
+                if 'B1' not in incoming_codes and 'B0' not in incoming_codes:
+                    saved_b1=stored_by_code.get('B1') or stored_by_code.get('B0')
+                    if saved_b1 is not None:
+                        incoming.insert(0,saved_b1)
+                        print(f'[CURRICULUM PUBLISH] preserved_missing_B1 draft_id={draft_id}')
+                draft['steps'] = reindex_curriculum_draft_steps_safe(ct, incoming)
+                codes=[str(x.get('code') or '') for x in draft.get('steps') or []]
+                if 'B1' not in codes or 'B2' not in codes:
+                    raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
+            else:
+                draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
             print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]} raw_source_persisted={'0' if ct == 'Bài tập' else '1'}")
             source_file=str(draft.get('source_file') or dr['source_file']).strip()
             lesson=str(draft.get('lesson') or dr['lesson']).strip()
