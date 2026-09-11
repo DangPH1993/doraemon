@@ -1,5 +1,5 @@
 # VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v10-exercise-output-2000"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v11-curriculum-richtext"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -21,6 +21,7 @@ import calendar
 import urllib.parse
 import hashlib
 import tempfile
+from html.parser import HTMLParser
 import gc
 from zoneinfo import ZoneInfo
 
@@ -11465,6 +11466,54 @@ def _normalize_curriculum_steps(content_type, steps, source_digest):
         found['code']=code; found.setdefault('title',rule['title']); found.setdefault('type',rule['type']); out.append(found)
     return out
 
+_ALLOWED_CURRICULUM_RICH_TAGS = {"b", "strong", "i", "em", "u", "br", "p", "div", "span"}
+_RICH_TAG_NORMALIZE = {"strong":"b", "em":"i"}
+
+class _CurriculumRichTextSanitizer(HTMLParser):
+    """Allow only harmless inline formatting tags used by the Admin editor."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out=[]
+    def handle_starttag(self, tag, attrs):
+        tag=str(tag or '').lower()
+        if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
+            return
+        norm=_RICH_TAG_NORMALIZE.get(tag, tag)
+        if norm == 'br':
+            self.out.append('<br>')
+            return
+        if norm in ('p','div'):
+            if self.out and not str(self.out[-1]).endswith(('\n','<br>')):
+                self.out.append('\n')
+        self.out.append(f'<{norm}>')
+    def handle_endtag(self, tag):
+        tag=str(tag or '').lower()
+        if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
+            return
+        norm=_RICH_TAG_NORMALIZE.get(tag, tag)
+        if norm == 'br':
+            return
+        self.out.append(f'</{norm}>')
+        if norm in ('p','div'):
+            self.out.append('\n')
+    def handle_data(self, data):
+        self.out.append(data)
+
+def sanitize_curriculum_rich_text(value):
+    """Store safe rich text while keeping existing plain text unchanged."""
+    text=str(value or '')
+    if not text:
+        return ''
+    if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span)\b', text, flags=re.I):
+        return text
+    try:
+        parser=_CurriculumRichTextSanitizer()
+        parser.feed(text)
+        parser.close()
+        return ''.join(parser.out)
+    except Exception:
+        return re.sub(r'<[^>]+>', '', text)
+
 def reindex_curriculum_draft_steps_safe(content_type, steps):
     """Reindex draft step codes without touching any published lesson.
 
@@ -12406,6 +12455,10 @@ async def admin_curriculum_draft_upload(
                 if not str(b2_content.get('content') or '').strip():
                     raise HTTPException(500, f'Bài tập {ls}: bước B2 chưa có nội dung đáp án.')
                 print(f'[CURRICULUM EXERCISE DRAFT VALIDATE] lesson={ls!r} B1=1 B2=1 B2_chars={len(str(b2_content.get("content") or ""))}')
+            for _st in normalized_steps:
+                _ctn=_st.get('content') if isinstance(_st,dict) else None
+                if isinstance(_ctn,dict) and 'content' in _ctn:
+                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
             payload={
                 'source_file':source_file,
                 'course_id':course_id,
@@ -12703,6 +12756,11 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
                     raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
             else:
                 draft['steps']=reindex_curriculum_draft_steps_safe(ct,draft.get('steps') or [])
+            # Persist only the supported rich-text marks from the Admin editor.
+            for _st in draft.get('steps') or []:
+                _ctn=_st.get('content') if isinstance(_st,dict) else None
+                if isinstance(_ctn,dict) and 'content' in _ctn:
+                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
             draft_json_text=json.dumps(draft,ensure_ascii=False)
             print(f"[CURRICULUM DRAFT SAVE] draft_id={draft_id} steps={len(draft.get('steps') or [])} chars={len(draft_json_text)} content_fields={[str((st.get('content') or {}).get('content') or '')[:80] for st in (draft.get('steps') or [])]}")
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(draft_json_text,draft_id))
@@ -12840,6 +12898,11 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
                     raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
             else:
                 draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
+            # Publish the sanitized rich-text exactly as entered in the Admin editor.
+            for _st in draft.get('steps') or []:
+                _ctn=_st.get('content') if isinstance(_st,dict) else None
+                if isinstance(_ctn,dict) and 'content' in _ctn:
+                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
             print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]} raw_source_persisted={'0' if ct == 'Bài tập' else '1'}")
             source_file=str(draft.get('source_file') or dr['source_file']).strip()
             lesson=str(draft.get('lesson') or dr['lesson']).strip()
@@ -13514,8 +13577,44 @@ function curriculumImageGallery(step,pages){
   return `<div id="cur-gallery-${encodeURIComponent(code)}" style="margin-top:10px"><b>🖼️ Ảnh của bước</b>${selectedHtml?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${selectedHtml}</div>`:`<div class="small" style="margin-top:6px;color:#b76b00">⚠️ Chưa chọn ảnh</div>`}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">＋ Thêm ảnh từ nguồn (${remaining.length})</summary>${remaining.length?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${remaining.map((im,i)=>card(im,i,false)).join('')}</div>`:`<div class="small" style="padding:7px">Không còn ảnh nguồn khác.</div>`}</details></div>`;
 }
 function _findCurriculumJsonTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-json'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
-function _findCurriculumTextTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-text'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
+function _findCurriculumTextTextarea(code){const wanted=String(code||'');for(const el of document.querySelectorAll('#curSteps .cur-rich'))if(String(el.getAttribute('data-code')||'')===wanted)return el;return null;}
 function _findCurriculumTextarea(code){return _findCurriculumJsonTextarea(code);}
+function _sanitizeCurriculumRichHtml(value){
+  const src=String(value??'');
+  if(!src)return '';
+  const box=document.createElement('div');
+  if(/<\s*(?:b|strong|i|em|u|br|p|div|span)\b/i.test(src)){ box.innerHTML=src; }
+  else { box.textContent=src; }
+  box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
+  box.querySelectorAll('*').forEach(el=>{
+    const tag=el.tagName.toLowerCase();
+    if(!['b','strong','i','em','u','br','p','div','span'].includes(tag)){
+      const frag=document.createDocumentFragment(); while(el.firstChild)frag.appendChild(el.firstChild); el.replaceWith(frag); return;
+    }
+    [...el.attributes].forEach(a=>el.removeAttribute(a.name));
+    if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); el.replaceWith(b);}
+    else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); el.replaceWith(i);}
+  });
+  return box.innerHTML;
+}
+function _curriculumRichEditor(code, value){
+  const safe=_sanitizeCurriculumRichHtml(value);
+  return `<div class="cur-rich-wrap" style="margin-top:5px;border:1px solid #cfd8e3;border-radius:9px;background:#fff;overflow:hidden">`+
+    `<div class="cur-rich-toolbar" style="display:flex;gap:4px;align-items:center;padding:6px 7px;border-bottom:1px solid #e5e7eb;background:#f8fafc;flex-wrap:wrap">`+
+      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('bold',this)"><b>B</b></button>`+
+      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('italic',this)"><i>I</i></button>`+
+      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('underline',this)"><u>U</u></button>`+
+      `<span class="small" style="margin-left:5px;color:#64748b">Bôi đen chữ rồi chọn B / I / U</span>`+
+    `</div>`+
+    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:pre-wrap;line-height:1.55">${safe}</div>`+
+  `</div>`;
+}
+function formatCurriculumText(command){
+  const sel=window.getSelection(); const anchor=sel?.anchorNode;
+  const editor=anchor?.nodeType===3?anchor.parentElement?.closest('.cur-rich'):anchor?.closest?.('.cur-rich');
+  if(!editor)return; editor.focus();
+  document.execCommand(command,false,null);
+}
 function changeCurriculumImage(code,key,add){
   const wanted=String(code||'').trim(), k=String(key||'').trim(); if(!wanted||!k)return false;
   let c=_curriculumGetStepState(wanted,{}); const ta=_findCurriculumTextarea(wanted);
@@ -13545,12 +13644,12 @@ function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
-  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label><textarea class="cur-text" data-code="${esc(code)}" style="width:100%;min-height:150px;margin-top:5px">${esc((s.content&&typeof s.content==='object')?String(s.content.content||''):'')}</textarea><details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
+  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
 function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
-async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:String(textTa.value||'')};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:_sanitizeCurriculumRichHtml(String(textTa.innerHTML||''))};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
-async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.value=String((d.step.content||{}).content||'');_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
+async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.innerHTML=_sanitizeCurriculumRichHtml(String((d.step.content||{}).content||''));_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
 async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;const draft=await collectCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw,draft})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
