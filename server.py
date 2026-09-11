@@ -1,5 +1,5 @@
-# VERSION: v19_107 — rich-text entity decode + paragraph/newline preservation
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v12-curriculum-richtext-newline-decode"
+# VERSION: v19_108 — exercise answer syntax deterministic + B2 editor persistence fix
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v13-exercise-answer-syntax-b2-editor-persist"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -3490,6 +3490,60 @@ def _exercise_answer_map_from_text(text):
         if ans and n not in mapping:
             mapping[n]=ans
     return mapping
+
+def _exercise_student_answer_map_from_text(text):
+    """Parse a learner's numbered answers for deterministic display/comparison.
+
+    Supports common forms such as:
+      1. TRUE
+      2 - FALSE
+      3: NOT GIVEN
+      4 A
+      5-F
+    Also accepts comma/semicolon/pipe separated compact answers.
+    """
+    raw=str(text or '').replace('\r\n','\n').replace('\r','\n').strip()
+    if not raw:
+        return {}
+    mapping={}
+    compact_pat=re.compile(
+        r"(?:^|[;,|\n])\s*(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(NOT\s+GIVEN|[A-Za-z]+(?:\s+[A-Za-z]+){0,3})\s*(?=,|;|\||\n|$)",
+        flags=re.I
+    )
+    for m in compact_pat.finditer(raw):
+        try:
+            n=int(m.group(1))
+        except Exception:
+            continue
+        ans=re.sub(r"\s+"," ",m.group(2)).strip()
+        if ans:
+            mapping[n]=ans
+    for line in raw.split('\n'):
+        line=re.sub(r"[ \t]+"," ",line).strip()
+        if not line:
+            continue
+        m=re.match(r"^(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(.+?)\s*$", line, flags=re.I)
+        if not m:
+            m=re.match(r"^(\d+)\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        try:
+            n=int(m.group(1))
+        except Exception:
+            continue
+        ans=re.sub(r"\s+"," ",m.group(2)).strip()
+        if ans and n not in mapping:
+            mapping[n]=ans
+    return mapping
+
+
+def _normalize_exercise_answer(value):
+    """Normalize an answer only for deterministic learner-vs-DB comparison/display."""
+    s=str(value or '').strip().casefold()
+    s=re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", s)
+    s=re.sub(r"\s+", " ", s)
+    return s
+
 
 def _published_curriculum_answer_step(cache):
     sections=list((cache or {}).get("sections") or [])
@@ -7457,32 +7511,39 @@ Tin nhắn hiện tại:
                 no_answer=_is_exercise_no_answer(query_text)
                 answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
                 student_submission = "Học sinh không biết / không trả lời. Hãy giải đủ toàn bộ các câu." if no_answer else query_text.strip()
+                student_answer_map=_exercise_student_answer_map_from_text(query_text if not no_answer else '')
+                student_answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(student_answer_map.items()))
                 q_prompt=f"""Bạn là Doraemon, giải và nhận xét bài tập theo TỪNG CÂU. Chỉ dùng đề bài và đáp án đã cung cấp.
 
 ĐỀ BÀI (chỉ dùng để tìm đáp án và bằng chứng, KHÔNG chép lại toàn bộ):
 {exercise_text}
 
-ĐÁP ÁN THEO TỪNG CÂU, lấy nguyên văn từ bước B2 đã edit/publish:
+ĐÁP ÁN ĐÚNG THEO TỪNG CÂU, lấy nguyên văn từ bước B2 đã edit/publish:
 {answer_map_text or official_answer}
 
-DANH SÁCH CÂU BẮT BUỘC PHẢI XỬ LÝ ĐẦY ĐỦ:
+CÂU BẮT BUỘC PHẢI XỬ LÝ ĐẦY ĐỦ:
 {expected_text or '(không xác định được; hãy xử lý toàn bộ câu có đánh số trong đề)'}
+
+ĐÁP ÁN HỌC SINH ĐÃ NHẬP (nếu không có thì coi là chưa trả lời):
+{student_answer_map_text or '(không có đáp án; học sinh nói mình không biết)'}
 
 QUAN TRỌNG:
 - Mỗi câu trong danh sách bắt buộc phải xuất hiện đúng 1 lần. Không được bỏ sót câu nào, không được gộp nhiều câu.
-- Với câu N, bắt buộc dùng đúng đáp án của Câu N ở phần B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán đáp án.
-- Nếu học sinh nói "mình không biết" hoặc không trả lời một câu, vẫn phải giải câu đó đầy đủ và đánh dấu `Câu N: ❌`.
-- Bài tập KHÔNG chấm điểm tổng. TUYỆT ĐỐI không tạo dòng điểm, tỷ lệ %, x/y hoặc tổng số câu đúng.
+- Với Câu N, đáp án đúng bắt buộc lấy từ đúng Câu N trong B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán.
+- "Đáp án của bạn" phải lấy nguyên văn từ phần ĐÁP ÁN HỌC SINH ĐÃ NHẬP; nếu không có thì ghi `Không trả lời`.
+- KHÔNG dùng dấu ✅ hoặc ❌ để đánh giá đúng/sai.
+- BÀI TẬP KHÔNG CHẤM ĐIỂM TỔNG. Tuyệt đối không tạo điểm, tỷ lệ %, x/y hoặc tổng số câu đúng.
 
-BÀI LÀM CỦA HỌC SINH:
+BÀI LÀM GỐC CỦA HỌC SINH:
 {student_submission}
 
-YÊU CẦU OUTPUT:
+YÊU CẦU OUTPUT BẮT BUỘC:
 - Giải đủ TẤT CẢ các câu bắt buộc, theo đúng thứ tự tăng dần.
-- Với mỗi câu, đúng 3 dòng:
-  `Câu N: ✅` hoặc `Câu N: ❌`
-  `Đáp án: <trích nguyên văn đáp án của đúng Câu N>`
-  `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: "<trích nguyên văn câu/đoạn chứng minh>"`
+- Với mỗi câu, đúng cấu trúc 4 dòng:
+  `Câu N:`
+  `Đáp án của bạn: <đáp án học sinh>; nếu không có: Không trả lời`
+  `Đáp án đúng: <trích nguyên văn đáp án của đúng Câu N>`
+  `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: <trích nguyên văn câu/đoạn chứng minh>`
 - Nếu NOT GIVEN hoặc không có bằng chứng trực tiếp: `Bằng chứng trong bài: Không có thông tin trực tiếp.`
 - Không dùng kiến thức ngoài đề.
 - Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
@@ -7501,6 +7562,10 @@ YÊU CẦU OUTPUT:
                     max_output_tokens=4000,
                 )
                 evaluation=_exercise_strip_total_score(evaluation)
+                # Never expose legacy correctness icons or score totals in Bài tập.
+                evaluation=re.sub(r'(^|\n)\s*Câu\s+(\d+)\s*:\s*(?:✅|❌)\s*', r'\1Câu \2:\n', evaluation, flags=re.I)
+                evaluation=re.sub(r'(?im)^\s*(?:Điểm|Score|Tổng điểm|Kết quả)\s*:\s*.*$', '', evaluation)
+                evaluation=re.sub(r'(?im)^\s*[-•]?\s*(?:Đáp án)\s*:\s*', 'Đáp án đúng: ', evaluation)
                 answered=True
                 waiting="continue"
                 answer_index=int((answer_step or {}).get("index") if (answer_step or {}).get("index") is not None else current_step)
@@ -13700,7 +13765,7 @@ function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
   box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
-function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
+function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}if(ct==='Bài tập'){const b1=raw.find(x=>['B1','B0'].includes(String(x.code||'').toUpperCase()));const b2=raw.find(x=>['B2','ANSWER'].includes(String(x.code||'').toUpperCase()));const out=[];if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
 async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:_sanitizeCurriculumRichHtml(String(textTa.innerHTML||''))};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.innerHTML=_sanitizeCurriculumRichHtml(String((d.step.content||{}).content||''));_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
