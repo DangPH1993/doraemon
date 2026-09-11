@@ -14597,8 +14597,15 @@ def _exercise_store_vision_image_records(png, detected, source_file, subject, le
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
     """Extract only configured exercise/answer pages.
 
-    Exercise uses native local text extraction first, then exactly one RapidOCR
-    pass for pages without usable text. No Gemini Vision and no repeated OCR.
+    Flow per configured page:
+      1) local PDF text extraction (zero token);
+      2) if needed, one RapidOCR pass;
+      3) only when local OCR returns no text, one Gemini Vision OCR fallback.
+
+    The winning extracted text is cached in page_texts and reused for the whole
+    draft pipeline. A page is never OCR'd twice and Vision is never called when
+    local OCR already returned usable text. Vision is OCR/extraction only; it is
+    not asked to invent or rewrite exercise content.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -14642,8 +14649,22 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 png=render_pdf_page(pdf_source,page_no,dpi=300)
                 ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
                 print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
+
+                # Only when local OCR truly returns no text, use ONE Gemini Vision
+                # call as an OCR fallback for scanned/complex pages. This is not
+                # content generation: the Vision prompt returns the page text only.
+                if not ocr_text and gemini is not None:
+                    try:
+                        vision_text, _detected = gemini_ocr_page(png, page_no, source_file=source_file)
+                        ocr_text=str(vision_text or '').strip()
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
+                    except Exception as exc:
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
+
             if not ocr_text:
-                raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}). RapidOCR không lấy được chữ từ trang PDF.')
+                raise ValueError(
+                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
+                )
             page_texts[page_no]=ocr_text
             units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
             if png is None:
@@ -14656,7 +14677,7 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
             page_images[page_no]=stored
             units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
             page_units[page_no]=units
-            print(f'[EXERCISE OCR ONLY] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} genai=0 ocr_passes=1')
+            print(f'[EXERCISE OCR CACHE] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} source_cached=1')
     finally:
         if fitz_doc is not None:
             try: fitz_doc.close()
