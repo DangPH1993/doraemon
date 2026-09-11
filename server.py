@@ -3202,86 +3202,184 @@ def _published_curriculum_images(content, pages=None):
 
 
 def _exercise_source_step_rows_from_runtime(lesson_row, step_rows):
-    """Repair legacy published exercise lessons that have only one stored step.
+    """Repair/normalize published exercise runtime steps from authoritative OCR source.
 
-    New exercise drafts publish B1/B2 directly from OCR. Older published lessons
-    may only have B1; recover the configured question/answer page ranges from
-    knowledge_documents and rebuild both steps from raw_source_json, with no GenAI.
+    The runtime must never invent the exercise statement or answer. For legacy lessons
+    that were published with only one step or with malformed/nested content_json, recover
+    B1/B2 from raw_source_json first, then from knowledge_images + knowledge_documents.
     """
-    if str(lesson_row.get("content_type") or "").strip() != "Bài tập":
+    if str(lesson_row.get('content_type') or '').strip() != 'Bài tập':
         return list(step_rows or [])
+
     rows=[dict(r) for r in (step_rows or [])]
-    codes={str(r.get("step_code") or "").upper() for r in rows}
-    if "B1" in codes and "B2" in codes:
-        return rows
-    raw_source=lesson_row.get("raw_source_json") or {}
-    pages=raw_source.get("pages") if isinstance(raw_source,dict) else []
-    pages=pages if isinstance(pages,list) else []
-    if not pages:
-        return rows
+    raw_source=lesson_row.get('raw_source_json') or {}
+    if not isinstance(raw_source,dict):
+        raw_source={}
+    pages=raw_source.get('pages') if isinstance(raw_source.get('pages'),list) else []
+    q_label=str(raw_source.get('question_pages') or '').strip()
+    a_label=str(raw_source.get('answer_pages') or '').strip()
 
-    q_label=str(raw_source.get("question_pages") or "").strip() if isinstance(raw_source,dict) else ""
-    a_label=str(raw_source.get("answer_pages") or "").strip() if isinstance(raw_source,dict) else ""
-    if not q_label or not a_label:
-        conn=db()
-        meta=None
+    # Recover page metadata from knowledge_documents when the published lesson was
+    # created before question/answer page ranges were persisted in raw_source_json.
+    meta=None
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT question_pages,answer_pages,source_file
+                FROM knowledge_documents
+                WHERE course_id=%s
+                  AND lower(trim(content_type))=lower(trim(%s))
+                  AND lower(trim(lesson))=lower(trim(%s))
+                  AND source_file=%s
+                ORDER BY id DESC
+                LIMIT 1
+            """, (lesson_row.get('course_id'), 'Bài tập', lesson_row.get('lesson'), lesson_row.get('source_file')))
+            meta=cur.fetchone()
+    except Exception as exc:
+        print(f"[CURRICULUM EXERCISE LEGACY] metadata lookup failed: {type(exc).__name__}: {exc}")
+    finally:
+        try: conn.close()
+        except Exception: pass
+    if meta:
+        q_label=q_label or str(meta.get('question_pages') or '').strip()
+        a_label=a_label or str(meta.get('answer_pages') or '').strip()
+
+    # If raw_source pages are missing (common for very old published rows), rebuild
+    # the configured pages from knowledge_images, whose associated_text is the OCR
+    # of the original configured page stored during exercise upload.
+    if (not pages) and q_label and a_label:
+        all_page_labels=[]
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT question_pages,answer_pages
-                    FROM knowledge_documents
-                    WHERE course_id=%s
-                      AND lower(trim(content_type))=lower(trim(%s))
-                      AND lower(trim(lesson))=lower(trim(%s))
-                      AND source_file=%s
-                    ORDER BY id DESC
-                    LIMIT 1
-                """, (lesson_row.get("course_id"), "Bài tập", lesson_row.get("lesson"), lesson_row.get("source_file")))
-                meta=cur.fetchone()
-        except Exception as exc:
-            print(f"[CURRICULUM EXERCISE LEGACY] metadata lookup failed: {type(exc).__name__}: {exc}")
-        finally:
-            try: conn.close()
-            except Exception: pass
-        if meta:
-            q_label=q_label or str(meta.get("question_pages") or "").strip()
-            a_label=a_label or str(meta.get("answer_pages") or "").strip()
+            all_page_labels=_parse_curriculum_page_ranges(q_label, 1000000) + _parse_curriculum_page_ranges(a_label, 1000000)
+        except Exception:
+            all_page_labels=[]
+        wanted=sorted(set(int(x) for x in all_page_labels if int(x)>0))
+        if wanted:
+            conn=db()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT page,image_key,image_url,description,associated_text
+                        FROM knowledge_images
+                        WHERE source_file=%s
+                          AND lower(trim(content_type))=lower(trim(%s))
+                          AND lower(trim(lesson))=lower(trim(%s))
+                          AND page = ANY(%s)
+                        ORDER BY page,id
+                    """, (lesson_row.get('source_file'),'Bài tập',lesson_row.get('lesson'),wanted))
+                    image_rows=cur.fetchall() or []
+            except Exception as exc:
+                print(f"[CURRICULUM EXERCISE LEGACY] knowledge_images lookup failed: {type(exc).__name__}: {exc}")
+                image_rows=[]
+            finally:
+                try: conn.close()
+                except Exception: pass
+            by_page={}
+            for r in image_rows:
+                p=int(r.get('page')) if str(r.get('page')).isdigit() else None
+                if p is None: continue
+                by_page[p]={
+                    'page':p,
+                    'text':str(r.get('associated_text') or '').strip(),
+                    'images':[{
+                        'image_key':str(r.get('image_key') or '').strip(),
+                        'image_url':str(r.get('image_url') or '').strip(),
+                        'vision':{
+                            'description':str(r.get('description') or '').strip(),
+                        },
+                    }] if str(r.get('image_key') or '').strip() else [],
+                }
+            pages=[by_page[p] for p in wanted if p in by_page]
+            if pages:
+                print(f"[CURRICULUM EXERCISE LEGACY] recovered_pages_from_knowledge_images pages={[p.get('page') for p in pages]}")
 
-    page_numbers=[int(pg.get("page")) for pg in pages if str(pg.get("page")).isdigit()]
+    page_numbers=[int(pg.get('page')) for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()]
     if not page_numbers or not q_label or not a_label:
-        return rows
+        return _normalize_exercise_existing_rows(rows)
+
     max_page=max(page_numbers)
     try:
-        q_pages=_parse_curriculum_page_ranges(q_label,max_page)
-        a_pages=_parse_curriculum_page_ranges(a_label,max_page)
+        # The page labels may contain pages that are outside the small page inventory
+        # reconstructed above. Validate against the PDF/source inventory rather than a
+        # fake huge limit, then intersect with available pages.
+        q_pages=_parse_curriculum_page_ranges(q_label, max_page)
+        a_pages=_parse_curriculum_page_ranges(a_label, max_page)
     except Exception as exc:
         print(f"[CURRICULUM EXERCISE LEGACY] page-range recovery failed: {type(exc).__name__}: {exc}")
-        return rows
+        return _normalize_exercise_existing_rows(rows)
 
-    by_page={int(pg.get("page")):pg for pg in pages if str(pg.get("page")).isdigit()}
+    by_page={int(pg.get('page')):pg for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()}
+
     def build(code,title,step_type,page_list,reason,order):
         selected=[by_page[p] for p in page_list if p in by_page]
-        text="\n\n".join(str(pg.get("text") or "").strip() for pg in selected if str(pg.get("text") or "").strip()).strip()
+        text='\n\n'.join(str(pg.get('text') or '').strip() for pg in selected if str(pg.get('text') or '').strip()).strip()
         images=[]; refs=[]
         for pg in selected:
-            if str(pg.get("text") or "").strip():
-                refs.append({"page":pg.get("page"),"reason":reason})
-            for im in pg.get("images") or []:
-                key=str(im.get("image_key") or "").strip()
+            if str(pg.get('text') or '').strip():
+                refs.append({'page':pg.get('page'),'reason':reason})
+            for im in pg.get('images') or []:
+                key=str(im.get('image_key') or im.get('key') or '').strip()
                 if key:
-                    vision=im.get("vision") or {}
-                    images.append({"image_key":key,"image_url":im.get("image_url"),"page":pg.get("page"),"caption":str(vision.get("description") or vision.get("caption") or "").strip()})
+                    vision=im.get('vision') or {}
+                    images.append({
+                        'image_key':key,
+                        'image_url':im.get('image_url') or im.get('url'),
+                        'page':pg.get('page'),
+                        'caption':str(vision.get('description') or vision.get('caption') or '').strip(),
+                    })
         return {
-            "id":None,"lesson_id":lesson_row.get("id"),"step_code":code,"step_order":order,
-            "title":title,"step_type":step_type,
-            "content_json":{"title":title,"content":text,"source_refs":refs,"images":images,"items":[],"vocabulary_refs":[],"grammar_refs":[]}
+            'id':None,
+            'lesson_id':lesson_row.get('id'),
+            'step_code':code,
+            'step_order':order,
+            'title':title,
+            'step_type':step_type,
+            'content_json':{
+                'title':title,
+                'content':text,
+                'source_refs':refs,
+                'images':images,
+                'items':[],
+                'vocabulary_refs':[],
+                'grammar_refs':[],
+            },
         }
-    b1=build("B1","Bài tập · Làm bài","exercise_intro",q_pages,"OCR nguyên văn trang bài tập",1)
-    b2=build("B2","Đáp án · Chấm và nhận xét","answer",a_pages,"OCR nguyên văn trang đáp án",2)
-    if b1["content_json"]["content"] and b2["content_json"]["content"]:
-        print(f"[CURRICULUM EXERCISE LEGACY] repaired lesson_id={lesson_row.get('id')} -> B1/B2 source-only")
+
+    b1=build('B1','Bài tập · Làm bài','exercise_intro',q_pages,'OCR nguyên văn trang bài tập',1)
+    b2=build('B2','Đáp án · Chấm và nhận xét','answer',a_pages,'OCR nguyên văn trang đáp án',2)
+    if b1['content_json']['content'] or b2['content_json']['content']:
+        print(f"[CURRICULUM EXERCISE LEGACY] repaired lesson_id={lesson_row.get('id')} -> B1/B2 source-only q_chars={len(b1['content_json']['content'])} a_chars={len(b2['content_json']['content'])}")
         return [b1,b2]
-    return rows
+
+    return _normalize_exercise_existing_rows(rows)
+
+
+def _normalize_exercise_existing_rows(rows):
+    """Normalize legacy exercise content_json shapes without changing source text."""
+    out=[]
+    for r in rows or []:
+        x=dict(r)
+        code=str(x.get('step_code') or '').upper()
+        content=x.get('content_json')
+        if not isinstance(content,dict):
+            content={}
+        # Flatten one accidental nesting layer such as content.content={content: "..."}.
+        inner=content.get('content')
+        if isinstance(inner,dict) and isinstance(inner.get('content'),str):
+            merged=dict(inner)
+            for k,v in content.items():
+                if k!='content' and k not in merged:
+                    merged[k]=v
+            content=merged
+        if isinstance(content.get('content'),str) and content.get('content').strip():
+            x['content_json']=content
+        else:
+            # Keep original row untouched if there is no authoritative source text.
+            x['content_json']=content
+        x['step_code']=code or x.get('step_code')
+        out.append(x)
+    return out
 
 
 def _published_curriculum_runtime_payload(lesson_row, step_rows):
@@ -3303,14 +3401,19 @@ def _published_curriculum_runtime_payload(lesson_row, step_rows):
         if isinstance(refs,list) and refs and isinstance(refs[0],dict): page=refs[0].get("page")
         code=str(row.get("step_code") or "").upper()
         stype=str(row.get("step_type") or "").strip().casefold()
-        if code == "B1" or stype == "vocabulary":
-            text=_published_curriculum_vocabulary_text({"content":content}) or str(row.get("title") or "").strip()
-        elif code == "B2" or stype == "grammar":
-            text=_published_curriculum_grammar_text({"content":content}) or str(row.get("title") or "").strip()
+        ct_norm=str(lesson_row.get("content_type") or "").strip()
+        if ct_norm == "Từ vựng" and (code == "B0" or stype == "vocabulary"):
+            text=_published_curriculum_vocabulary_text({"content":content}) or _published_curriculum_step_text(content) or str(row.get("title") or "").strip()
+        elif ct_norm == "Ngữ pháp" and (code == "B0" or stype == "grammar"):
+            text=_published_curriculum_grammar_text({"content":content}) or _published_curriculum_step_text(content) or str(row.get("title") or "").strip()
         else:
             text=_published_curriculum_step_text(content) or str(row.get("title") or "").strip()
         sections.append({"chunk_index":order,"page":page or order+1,"content_unit_id":f"curriculum:{row.get('step_code')}","step_code":str(row.get("step_code") or ""),"step_title":str(row.get("title") or ""),"step_type":str(row.get("step_type") or "lesson"),"text":text,"content":content,"image_keys":keys})
-    return {"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
+    payload={"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
+    if str(lesson_row.get("content_type") or "").strip()=="Bài tập":
+        audit=[(str(x.get("step_code") or ""),len(str(x.get("text") or ""))) for x in sections]
+        print(f"[CURRICULUM EXERCISE RUNTIME PAYLOAD] lesson_id={lesson_row.get('id')} steps={audit}")
+    return payload
 
 
 def _published_curriculum_step(cache,index):
@@ -14504,12 +14607,58 @@ def _store_exercise_source_page(png: bytes, source_file: str, subject: str, less
         return None
 
 
-def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """Extract ONLY configured exercise/answer pages, with zero GenAI.
+def _exercise_page_has_embedded_images(pdf_path, page_no):
+    """Cheap structural image check; no AI and no OCR."""
+    try:
+        if fitz is None:
+            return False
+        doc=fitz.open(pdf_path)
+        try:
+            page=doc.load_page(int(page_no)-1)
+            return bool(page.get_images(full=True))
+        finally:
+            doc.close()
+    except Exception:
+        return False
 
-    Fast path: use the PDF text layer directly. Fallback: local Tesseract OCR for
-    scanned/image-only pages. The original selected page is stored as one source
-    image for traceability/UI, but NO Vision analysis is performed.
+
+def _exercise_store_vision_image_records(png, detected, source_file, subject, lesson, page_no, ocr_text):
+    """Store detected image knowledge from one exercise Vision call."""
+    results=[]
+    for idx,item in enumerate(detected or [],1):
+        cropped=crop_image_from_page(png,item.get('box'))
+        if not cropped:
+            continue
+        image_bytes,(width,height)=cropped
+        safe_source=re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)
+        key=f"images/{safe_source}/exercise_page_{page_no:04d}/img_{idx:02d}.jpg"
+        b2_put_bytes(key,image_bytes,'image/jpeg')
+        description=str(item.get('description') or '').strip()
+        term=str(item.get('term') or '').strip()
+        reading=str(item.get('reading') or '').strip()
+        meaning=str(item.get('meaning') or '').strip()
+        associated_text=str(item.get('associated_text') or '').strip()
+        bbox=json.dumps(item.get('box'),ensure_ascii=False) if isinstance(item.get('box'),(list,tuple)) else ''
+        conn=db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO knowledge_images
+                    (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),description,term,reading,meaning,associated_text,bbox,width,height))
+            conn.commit()
+        finally:
+            conn.close()
+        results.append({'key':key,'description':description,'term':term,'reading':reading,'meaning':meaning,'associated_text':associated_text,'page':page_no,'image_url':b2_url(key),'vision':item})
+    return results
+
+
+def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
+    """Extract ONLY configured exercise/answer pages.
+
+    Text-only pages are zero-token: native PDF text extraction first, local OCR as
+    fallback. If a configured page contains a real image/illustration or table,
+    one compact Gemini Vision call creates image/table knowledge for that page.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -14531,20 +14680,53 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
         else:
             png=render_pdf_page(pdf_source,page_no,dpi=180)
             ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
+            print(f'[EXERCISE LOCAL OCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
         if not ocr_text:
             raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}).')
         page_texts[page_no]=ocr_text
         units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
-        stored=None
-        # Storage of the configured source page is optional UI provenance, not Vision.
+
+        # Render once only when needed for table/image detection or source storage.
         if png is None:
             png=render_pdf_page(pdf_source,page_no,dpi=150)
-        stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
-        if stored:
-            page_images[page_no]=[stored]
-            units[0]['image_keys']=[stored['key']]
+        table_page=_page_has_table_grid(page_obj,png,ocr_text)
+        embedded_image=_exercise_page_has_embedded_images(pdf_source,page_no)
+        stored=[]
+
+        # Table: one compact Vision call that creates semantic table facts and stores
+        # the original table image as traceable knowledge.
+        if table_page and gemini:
+            try:
+                table_data=gemini_explain_table_page(png,page_no,extracted_text=ocr_text,source_file=source_file)
+                page_texts[page_no]=(ocr_text+'\n\n[TABLE VISION KNOWLEDGE]\n'+json.dumps(table_data,ensure_ascii=False)).strip()
+                print(f'[EXERCISE VISION/TABLE] page={page_no} scope={tag} genai=1 tables={len(table_data.get("tables") or [])}')
+            except Exception as exc:
+                print(f'[EXERCISE VISION/TABLE] page={page_no} skipped: {type(exc).__name__}: {exc}')
+
+        # Embedded illustration/image: one Vision call for this page to identify the
+        # educational image and its local label. Do not run on text-only pages.
+        if embedded_image and gemini and not table_page:
+            try:
+                vision_text,detected=gemini_ocr_page(png,page_no,source_file=source_file)
+                if vision_text:
+                    # Keep the original PDF text authoritative; add a separate knowledge
+                    # block rather than replacing OCR/text-layer content.
+                    page_texts[page_no]=(page_texts[page_no]+'\n\n[IMAGE VISION KNOWLEDGE]\n'+vision_text).strip()
+                stored.extend(_exercise_store_vision_image_records(png,detected,source_file,subject,lesson,page_no,page_texts[page_no]))
+                print(f'[EXERCISE VISION/IMAGE] page={page_no} scope={tag} genai=1 detected_images={len(detected or [])}')
+            except Exception as exc:
+                print(f'[EXERCISE VISION/IMAGE] page={page_no} skipped: {type(exc).__name__}: {exc}')
+
+        # Always retain the original configured page image for provenance/UI when there
+        # was no detected crop. This does not consume AI tokens.
+        if not stored:
+            base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
+            if base_stored:
+                stored.append(base_stored)
+        page_images[page_no]=stored
+        units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
         page_units[page_no]=units
-        print(f'[EXERCISE OCR ONLY] page={page_no} scope={tag} chars={len(ocr_text)} genai_calls=0 vision_calls=0')
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} vision_calls={1 if (table_page and gemini) or (embedded_image and gemini and not table_page) else 0}')
         try: del png
         except Exception: pass
         gc.collect()
