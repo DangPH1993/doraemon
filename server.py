@@ -3445,11 +3445,27 @@ def _vocab_direct_answer_from_cache(cache, current_step, question_text):
     return None
 
 def _exercise_answer_map_from_text(text):
-    """Parse numbered answers from published B2 text so question N cannot take another question's answer."""
-    raw=str(text or '').replace('\r\n','\n').replace('\r','\n')
-    lines=[re.sub(r"[ \t]+"," ",x).strip() for x in raw.split('\n') if x.strip()]
+    """Parse numbered answers from published B2 text deterministically."""
+    raw=str(text or '').replace('\r\n','\n').replace('\r','\n').strip()
+    if not raw:
+        return {}
     mapping={}
-    for line in lines:
+    compact_pat=re.compile(
+        r"(?:^|[;,|\n])\s*(?:C(?:â|a|ă)u\s*)?(\d+)\s*[.)\-:]\s*(NOT\s+GIVEN|[A-Za-z]+(?:\s+[A-Za-z]+){0,3})\s*(?=,|;|\||\n|$)",
+        flags=re.I
+    )
+    for m in compact_pat.finditer(raw):
+        try:
+            n=int(m.group(1))
+        except Exception:
+            continue
+        ans=re.sub(r"\s+"," ",m.group(2)).strip()
+        if ans:
+            mapping[n]=ans
+    for line in raw.split('\n'):
+        line=re.sub(r"[ \t]+"," ",line).strip()
+        if not line:
+            continue
         m=re.match(r"^(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(.+?)\s*$", line, flags=re.I)
         if not m:
             m=re.match(r"^(\d+)\s+(.+?)\s*$", line)
@@ -3460,7 +3476,7 @@ def _exercise_answer_map_from_text(text):
         except Exception:
             continue
         ans=m.group(2).strip()
-        if ans:
+        if ans and n not in mapping:
             mapping[n]=ans
     return mapping
 
@@ -7370,8 +7386,15 @@ Tin nhắn hiện tại:
             # official answer shown to the learner always comes verbatim from DB.
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
                 question_step=step if str(step.get('code') or '').upper() == 'B1' else None
+                exercise_text=str((question_step or {}).get("text") or step.get("text") or "").strip()
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
                 official_answer=str((answer_step or {}).get("text") or "").strip()
+                if not exercise_text:
+                    msg="⚠️ Chưa tìm thấy nội dung bài tập đã publish ở bước B1. Vui lòng kiểm tra lại nội dung B1 trong CMS."
+                    return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+                if not answer_step or not official_answer:
+                    msg="⚠️ Bài tập này chưa có bước đáp án B2 đã publish nên chưa thể chấm bài. Hãy kiểm tra và publish lại bước đáp án."
+                    return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
                 answer_map=_exercise_answer_map_from_text(official_answer)
                 answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
                 q_prompt=f"""Bạn là Doraemon, chấm bài tập theo từng câu. Chỉ dùng đề bài và đáp án đã cung cấp.
