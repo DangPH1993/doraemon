@@ -4,7 +4,7 @@ SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v18-edited-content-only-rapidocr-a
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v18"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19"
 import os
 import ast
 import io
@@ -12396,6 +12396,15 @@ async def admin_curriculum_draft_upload(
                     normalized_steps=_map_curriculum_steps_to_master(course_id, None, ls, normalized_steps)
                 except Exception as exc:
                     print(f'[CURRICULUM ITEM MAP] pre-publish draft mapping warning: {type(exc).__name__}: {exc}')
+            if ct == 'Bài tập':
+                draft_codes=[str(st.get('code') or '').strip().upper() for st in normalized_steps]
+                if draft_codes != ['B1','B2']:
+                    raise HTTPException(500, f'Bài tập {ls}: Draft phải tạo đủ B1 và B2, hiện có {draft_codes}.')
+                b2_payload=next((st for st in normalized_steps if str(st.get('code') or '').strip().upper()=='B2'), None)
+                b2_content=((b2_payload or {}).get('content') or {}) if isinstance((b2_payload or {}).get('content'),dict) else {}
+                if not str(b2_content.get('content') or '').strip():
+                    raise HTTPException(500, f'Bài tập {ls}: bước B2 chưa có nội dung đáp án.')
+                print(f'[CURRICULUM EXERCISE DRAFT VALIDATE] lesson={ls!r} B1=1 B2=1 B2_chars={len(str(b2_content.get("content") or ""))}')
             payload={
                 'source_file':source_file,
                 'course_id':course_id,
@@ -12657,12 +12666,30 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
                 existing=[dict(x) for x in (existing_obj.get('steps') or []) if isinstance(x,dict)]
                 by_code={str(x.get('code') or '').strip().upper(): x for x in existing}
                 incoming_by_code={str(x.get('code') or '').strip().upper(): x for x in incoming}
-                # Preserve a previously saved answer step when the client omits it.
-                if 'B2' not in incoming_by_code and 'ANSWER' not in incoming_by_code:
-                    saved_b2=by_code.get('B2') or by_code.get('ANSWER')
-                    if saved_b2 is not None:
-                        incoming.append(saved_b2)
-                        print(f'[CURRICULUM DRAFT SAVE] preserved_missing_B2 draft_id={draft_id}')
+                # Preserve a previously saved answer step when the client omits it
+                # OR sends an empty/placeholder B2. This prevents the Admin editor from
+                # accidentally erasing the official answer when it only saves the
+                # currently visible B1 fields.
+                saved_b2=by_code.get('B2') or by_code.get('ANSWER')
+                incoming_b2=incoming_by_code.get('B2') or incoming_by_code.get('ANSWER')
+                incoming_b2_content = ''
+                if isinstance(incoming_b2, dict):
+                    c=incoming_b2.get('content')
+                    if isinstance(c, dict):
+                        incoming_b2_content=str(c.get('content') or '').strip()
+                    else:
+                        incoming_b2_content=str(c or '').strip()
+                saved_b2_content = ''
+                if isinstance(saved_b2, dict):
+                    c=saved_b2.get('content')
+                    if isinstance(c, dict):
+                        saved_b2_content=str(c.get('content') or '').strip()
+                    else:
+                        saved_b2_content=str(c or '').strip()
+                if saved_b2 is not None and (incoming_b2 is None or (not incoming_b2_content and saved_b2_content)):
+                    incoming=[x for x in incoming if str(x.get('code') or '').strip().upper() not in {'B2','ANSWER'}]
+                    incoming.append(saved_b2)
+                    print(f'[CURRICULUM DRAFT SAVE] preserved_B2_content draft_id={draft_id} reason=missing_or_empty')
                 # Likewise preserve B1 if a partial editor payload only contains the answer.
                 if 'B1' not in incoming_by_code and 'B0' not in incoming_by_code:
                     saved_b1=by_code.get('B1') or by_code.get('B0')
@@ -12785,11 +12812,22 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
                 stored=[dict(x) for x in (stored_obj.get('steps') or []) if isinstance(x,dict)]
                 incoming_codes={str(x.get('code') or '').strip().upper() for x in incoming}
                 stored_by_code={str(x.get('code') or '').strip().upper(): x for x in stored}
-                if 'B2' not in incoming_codes and 'ANSWER' not in incoming_codes:
-                    saved_b2=stored_by_code.get('B2') or stored_by_code.get('ANSWER')
-                    if saved_b2 is not None:
-                        incoming.append(saved_b2)
-                        print(f'[CURRICULUM PUBLISH] preserved_missing_B2 draft_id={draft_id}')
+                # Never allow Publish to erase the official answer because the client
+                # omitted B2 or sent an empty B2 placeholder. Prefer the last saved B2.
+                saved_b2=stored_by_code.get('B2') or stored_by_code.get('ANSWER')
+                incoming_b2=next((x for x in incoming if str(x.get('code') or '').strip().upper() in {'B2','ANSWER'}), None)
+                incoming_b2_content=''
+                if isinstance(incoming_b2,dict):
+                    c=incoming_b2.get('content')
+                    incoming_b2_content=str((c.get('content') if isinstance(c,dict) else c) or '').strip()
+                saved_b2_content=''
+                if isinstance(saved_b2,dict):
+                    c=saved_b2.get('content')
+                    saved_b2_content=str((c.get('content') if isinstance(c,dict) else c) or '').strip()
+                if saved_b2 is not None and (incoming_b2 is None or (not incoming_b2_content and saved_b2_content)):
+                    incoming=[x for x in incoming if str(x.get('code') or '').strip().upper() not in {'B2','ANSWER'}]
+                    incoming.append(saved_b2)
+                    print(f'[CURRICULUM PUBLISH] preserved_B2_content draft_id={draft_id} reason=missing_or_empty')
                 if 'B1' not in incoming_codes and 'B0' not in incoming_codes:
                     saved_b1=stored_by_code.get('B1') or stored_by_code.get('B0')
                     if saved_b1 is not None:
@@ -14644,6 +14682,37 @@ def _exercise_store_vision_image_records(png, detected, source_file, subject, le
     return results
 
 
+def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = ""):
+    """One-shot OCR-only Vision fallback for Exercise pages.
+
+    This path is intentionally minimal: no image detection, no table analysis, no
+    solving, no summarization, no function calling, and minimal thinking. It returns
+    only the visible text because the exercise pipeline already stores the source page
+    and does not need any Vision-derived image knowledge.
+    """
+    if not gemini:
+        raise RuntimeError("Gemini chưa được khởi tạo.")
+    prompt = (
+        f"Đây là trang {page_no} của đề bài/đáp án. "
+        "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
+        "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
+        "không suy luận, không giải bài, không mô tả hình ảnh. "
+        "Chỉ trả về phần văn bản đã đọc; nếu có bảng, giữ thứ tự đọc của chữ trong bảng. "
+        "Không trả JSON và không gọi công cụ."
+    )
+    part=types.Part.from_bytes(data=page_png,mime_type='image/png')
+    response=gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[part,prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            thinking_config=types.ThinkingConfig(thinking_level='minimal'),
+        ),
+    )
+    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}")
+    return str(response.text or '').strip()
+
+
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
     """Extract only configured exercise/answer pages.
 
@@ -14705,7 +14774,7 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 # content generation: the Vision prompt returns the page text only.
                 if not ocr_text and gemini is not None:
                     try:
-                        vision_text, _detected = gemini_ocr_page(png, page_no, source_file=source_file)
+                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
                         ocr_text=str(vision_text or '').strip()
                         print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
                     except Exception as exc:
