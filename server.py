@@ -1,5 +1,5 @@
-# VERSION: v19_108 — exercise answer syntax deterministic + B2 editor persistence fix
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v13-exercise-answer-syntax-b2-editor-persist"
+# VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -123,7 +123,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.127-followup-one-history-gated-context")
-SERVER_VERSION = "2026-09-07-v19_127_followup_one_history_gated_context"
+SERVER_VERSION = "2026-09-11-v27-exercise-finish-and-catalog-all-content"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3168,19 +3168,36 @@ def _canonical_lesson_key(value: str) -> str:
     return s
 
 
+def _decode_curriculum_html_entities(value, max_rounds=4):
+    """Decode repeatedly-escaped HTML entities without altering ordinary plain text."""
+    text=str(value or "")
+    if not text:
+        return ""
+    # Older Admin/client versions could escape rich text more than once, producing
+    # strings such as &amp;amp;lt;b&amp;amp;gt;... . Decode a bounded number of
+    # entity layers until stable so runtime receives the intended rich-text markup.
+    for _ in range(max(1, int(max_rounds))):
+        decoded=html.unescape(text)
+        if decoded == text:
+            break
+        text=decoded
+    return text
+
+
 def _published_curriculum_step_text(content):
     content = content if isinstance(content, dict) else {}
     parts=[]
     main=content.get("content")
-    if isinstance(main,str) and main.strip(): parts.append(main.strip())
+    if isinstance(main,str) and main.strip():
+        parts.append(_decode_curriculum_html_entities(main).strip())
     elif main not in (None,"",[],{}): parts.append(json.dumps(main,ensure_ascii=False,indent=2))
     items=content.get("items")
     if isinstance(items,list) and items:
         lines=[]
         for i,item in enumerate(items,1):
             if isinstance(item,dict):
-                title=str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or item.get("structure") or item.get("grammar") or "").strip()
-                body=str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("explanation") or item.get("example") or "").strip()
+                title=_decode_curriculum_html_entities(str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or item.get("structure") or item.get("grammar") or "")).strip()
+                body=_decode_curriculum_html_entities(str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("explanation") or item.get("example") or "")).strip()
                 if title and body: lines.append(f"{i}. {title}\n{body}")
                 elif title: lines.append(f"{i}. {title}")
                 elif body: lines.append(f"{i}. {body}")
@@ -3256,7 +3273,8 @@ def _published_curriculum_runtime_payload(lesson_row, step_rows):
     payload={"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
     if str(lesson_row.get("content_type") or "").strip()=="Bài tập":
         audit=[(str(x.get("step_code") or ""),len(str(x.get("text") or ""))) for x in sections]
-        print(f"[CURRICULUM EXERCISE RUNTIME PAYLOAD] lesson_id={lesson_row.get('id')} steps={audit}")
+        entity_hits=sum(str(x.get("text") or "").count("&amp;") for x in sections)
+        print(f"[CURRICULUM EXERCISE RUNTIME PAYLOAD] lesson_id={lesson_row.get('id')} steps={audit} richtext_entity_hits={entity_hits}")
     return payload
 
 
@@ -3457,7 +3475,7 @@ def _vocab_direct_answer_from_cache(cache, current_step, question_text):
 
 def _exercise_answer_map_from_text(text):
     """Parse numbered answers from published B2 text deterministically."""
-    raw=str(text or '').replace('\r\n','\n').replace('\r','\n').strip()
+    raw=_decode_curriculum_html_entities(str(text or '')).replace('\r\n','\n').replace('\r','\n').strip()
     if not raw:
         return {}
     mapping={}
@@ -4293,6 +4311,17 @@ def _curriculum_final_blocks():
         {"label":"Có — mình nắm rồi","action":"curriculum_finish_yes"},
         {"label":"Chưa — mình muốn ôn lại","action":"curriculum_finish_no"},
     ]}]
+
+
+def _exercise_finish_blocks():
+    """Ask explicitly whether the learner has finished the exercise lesson."""
+    return [
+        {"type":"text","text":"Bạn đã hoàn thành bài học này?"},
+        {"type":"choice","id":"exercise_finish","options":[
+            {"label":"Có","display_label":"Có — hoàn thành bài học","action":"exercise_finish_yes"},
+            {"label":"Chưa","display_label":"Chưa — học lại sau","action":"exercise_finish_no"},
+        ]}
+    ]
 
 
 def _is_study_followup(text):
@@ -6080,6 +6109,46 @@ def proxy_chat(
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
 
+    # Exercise completion is decided explicitly after the full B1/B2 grading result.
+    if ui_action in {"exercise_finish_yes", "exercise_finish_no"} and study_session:
+        lesson_label=(study_session or {}).get("lesson") or "bài học này"
+        content_type=_normalize_content_type((study_session or {}).get("content_type"))
+        if content_type != "Bài tập":
+            # Fail closed: the dedicated exercise completion action must never mark another content type.
+            return {"reply":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ."}],"learning_progress":None}
+        target_status = "completed" if ui_action == "exercise_finish_yes" else "in_progress"
+        try:
+            progress_row = record_learning_event(
+                user["id"],
+                {
+                    "content_type": "Bài tập",
+                    "course_id": (study_session or {}).get("course_id"),
+                    "subject": str((study_session or {}).get("course") or (study_session or {}).get("subject") or "Tiếng Anh IELTS"),
+                    "lesson": lesson_label,
+                    "topic": (study_session or {}).get("topic") or "",
+                    "item_key": lesson_label,
+                    "content_id": (study_session or {}).get("content_id") or "",
+                    "status": target_status,
+                    "completed": ui_action == "exercise_finish_yes",
+                    "current_position": int((study_session or {}).get("curriculum_step") or 0),
+                },
+            )
+            print(f"[EXERCISE FINISH] status={target_status} lesson={lesson_label!r} progress_id={progress_row.get('id') if progress_row else None}")
+        except Exception as exc:
+            print(f"[EXERCISE FINISH] progress save failed: {type(exc).__name__}: {exc}")
+            progress_row = None
+        if ui_action == "exercise_finish_yes":
+            try:
+                _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":"Bài tập"})
+            except Exception as exc:
+                print(f"[EXERCISE FINISH] plan completion sync skipped: {type(exc).__name__}: {exc}")
+            _finish_study_session(user["id"])
+            msg=f"✅ Tuyệt vời! Doraemon đã ghi nhận cậu **hoàn thành bài học {lesson_label}**. Hẹn gặp cậu ở bài tiếp theo nhé! 🤖"
+        else:
+            _finish_study_session(user["id"])
+            msg=f"Được nhé! 🤖 Vậy mình học lại **{lesson_label}** sau nhé. Trạng thái bài hiện tại là **Đang học**."
+        return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":target_status,"lesson":lesson_label,"content_type":"Bài tập"}}
+
     # Curriculum finish actions apply to ALL structured curriculum content types.
     if ui_action in {"curriculum_finish_yes", "curriculum_finish_no"} and study_session:
         lesson_label=(study_session or {}).get("lesson") or "bài học này"
@@ -7575,9 +7644,10 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                 study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
                 blocks=[{"type":"text","text":evaluation or ""}]
+                blocks.extend(_exercise_finish_blocks())
                 # Do not paste the full B2 answer block. The evaluation already quotes
                 # only the per-question official answer text requested for feedback.
-                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2 answer_render=deferred")
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2 answer_render=deferred finish_prompt=1")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Cheap DB-only factual vocabulary questions must never spend LLM tokens.
@@ -11620,9 +11690,9 @@ def sanitize_curriculum_rich_text(value):
     text=str(value or '')
     if not text:
         return ''
-    # Decode one entity layer first. The HTMLParser then decides which tags are
-    # actually allowed, so encoded <script> etc. cannot bypass sanitization.
-    text=html.unescape(text)
+    # Decode all legacy entity layers first. The HTMLParser then decides which tags
+    # are actually allowed, so encoded <script> etc. cannot bypass sanitization.
+    text=_decode_curriculum_html_entities(text)
     if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span)\b', text, flags=re.I):
         return text
     try:
