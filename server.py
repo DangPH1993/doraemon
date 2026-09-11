@@ -1293,7 +1293,7 @@ def search(data: ChatRequest, authorization: Optional[str] = Header(default=None
     return {"matches":matches}
 
 
-CONTENT_TYPES = {"Giáo trình", "Từ vựng", "Ngữ pháp", "Bài tập", "Truyện đọc"}
+CONTENT_TYPES = {"Giáo trình", "Từ vựng", "Ngữ pháp", "Bài tập", "Luyện viết", "Truyện đọc"}
 
 
 def _normalize_content_type(value):
@@ -1344,7 +1344,7 @@ def record_learning_event(user_id, event):
 
     # Bài tập không chấm điểm tổng. Keep legacy score columns for compatibility,
     # but never calculate or persist a new total score from correct/wrong counts.
-    if content_type == "Bài tập":
+    if content_type in {"Bài tập", "Luyện viết"}:
         score = None
     if content_type != "Bài tập" and event.get("completed") is True:
         status = "completed"
@@ -1390,7 +1390,7 @@ def record_learning_event(user_id, event):
                     if old and course_id is not None:
                         cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
             if old:
-                if content_type == "Bài tập":
+                if content_type in {"Bài tập", "Luyện viết"}:
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
                 else:
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count)
@@ -4021,7 +4021,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 SELECT study_session_active,study_session_content_type,study_session_course,study_session_course_id,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending,study_session_chatbox_id,
-                       curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result
+                       curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,curriculum_writing_suggestion_shown,curriculum_writing_vision,curriculum_writing_prompt,curriculum_writing_result
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
@@ -4050,6 +4050,10 @@ def _get_study_session(user_id, chatbox_id=None):
                 "curriculum_intro_history": str(row.get("curriculum_intro_history") or ""),
                 "curriculum_intro_b0b1_history": str(row.get("curriculum_intro_b0b1_history") or ""),
                 "curriculum_global_exercise_result": str(row.get("curriculum_global_exercise_result") or ""),
+                "curriculum_writing_suggestion_shown": bool(row.get("curriculum_writing_suggestion_shown")),
+                "curriculum_writing_vision": str(row.get("curriculum_writing_vision") or ""),
+                "curriculum_writing_prompt": str(row.get("curriculum_writing_prompt") or ""),
+                "curriculum_writing_result": str(row.get("curriculum_writing_result") or ""),
             }
     finally:
         conn.close()
@@ -4074,8 +4078,8 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     user_id,welcome_seen,reset_count,learning_mode,onboarding_completed,
                     study_session_active,study_session_content_type,study_session_course,study_session_course_id,
                     study_session_lesson,study_session_topic,study_session_chatbox_id,study_session_started_at,
-                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,updated_at
-                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','','','',NOW())
+                    study_end_prompt_pending,curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_global_exercise_question,curriculum_global_exercise_evidence,curriculum_summary_notes,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,curriculum_writing_suggestion_shown,curriculum_writing_vision,curriculum_writing_prompt,curriculum_writing_result,updated_at
+                ) VALUES(%s,TRUE,0,NULL,TRUE,TRUE,%s,%s,%s,%s,%s,%s,NOW(),FALSE,0,'continue',FALSE,'','','','',FALSE,'','','',NOW())
                 ON CONFLICT(user_id) DO UPDATE SET
                     study_session_active=TRUE,
                     study_session_content_type=%s,
@@ -4095,6 +4099,10 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     curriculum_intro_history='',
                     curriculum_intro_b0b1_history='',
                     curriculum_global_exercise_result='',
+                    curriculum_writing_suggestion_shown=FALSE,
+                    curriculum_writing_vision='',
+                    curriculum_writing_prompt='',
+                    curriculum_writing_result='',
                     updated_at=NOW()
             """, (
                 user_id,content_type,course,course_id,lesson,topic,chatbox,
@@ -4155,6 +4163,10 @@ def _finish_study_session(user_id):
                     curriculum_intro_history='',
                     curriculum_intro_b0b1_history='',
                     curriculum_global_exercise_result='',
+                    curriculum_writing_suggestion_shown=FALSE,
+                    curriculum_writing_vision='',
+                    curriculum_writing_prompt='',
+                    curriculum_writing_result='',
                     updated_at=NOW()
                 WHERE user_id=%s
             """, (user_id,))
@@ -4172,6 +4184,28 @@ def _active_session_scope(session):
         "lesson": session.get("lesson"),
         "topic": session.get("topic"),
     }
+
+
+def _set_curriculum_writing_state(user_id, *, suggestion_shown=None, vision=None, prompt=None, result=None):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            sets=[]; vals=[]
+            if suggestion_shown is not None:
+                sets.append("curriculum_writing_suggestion_shown=%s"); vals.append(bool(suggestion_shown))
+            if vision is not None:
+                sets.append("curriculum_writing_vision=%s"); vals.append(str(vision or '')[:12000])
+            if prompt is not None:
+                sets.append("curriculum_writing_prompt=%s"); vals.append(str(prompt or '')[:12000])
+            if result is not None:
+                sets.append("curriculum_writing_result=%s"); vals.append(str(result or '')[:16000])
+            if sets:
+                sets.append("updated_at=NOW()")
+                vals.append(user_id)
+                cur.execute("UPDATE user_learning_state SET " + ",".join(sets) + " WHERE user_id=%s", tuple(vals))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _set_curriculum_compact_state(user_id, *, global_question=None, global_evidence=None, summary_notes=None):
@@ -6123,16 +6157,15 @@ def proxy_chat(
     if ui_action in {"exercise_finish_yes", "exercise_finish_no"} and study_session:
         lesson_label=(study_session or {}).get("lesson") or "bài học này"
         content_type=_normalize_content_type((study_session or {}).get("content_type"))
-        if content_type != "Bài tập":
-            # Fail closed: the dedicated exercise completion action must never mark another content type.
-            return {"reply":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ."}],"learning_progress":None}
+        if content_type not in {"Bài tập","Luyện viết"}:
+            return {"reply":"⚠️ Trạng thái hoàn thành bài học dạng bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài học dạng bài tập không hợp lệ."}],"learning_progress":None}
         target_status = "completed" if ui_action == "exercise_finish_yes" else "in_progress"
         print(f"[EXERCISE FINISH] persist target_status={target_status} lesson={lesson_label!r} course_id={(study_session or {}).get('course_id')}")
         try:
             progress_row = record_learning_event(
                 user["id"],
                 {
-                    "content_type": "Bài tập",
+                    "content_type": content_type,
                     "course_id": (study_session or {}).get("course_id"),
                     "subject": str((study_session or {}).get("course") or (study_session or {}).get("subject") or "Tiếng Anh IELTS"),
                     "lesson": lesson_label,
@@ -6150,7 +6183,7 @@ def proxy_chat(
             progress_row = None
         if ui_action == "exercise_finish_yes":
             try:
-                _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":"Bài tập"})
+                _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":content_type})
             except Exception as exc:
                 print(f"[EXERCISE FINISH] plan completion sync skipped: {type(exc).__name__}: {exc}")
             _finish_study_session(user["id"])
@@ -6158,7 +6191,7 @@ def proxy_chat(
         else:
             _finish_study_session(user["id"])
             msg=f"Được nhé! 🤖 Vậy mình học lại **{lesson_label}** sau nhé. Trạng thái bài hiện tại là **Đang học**."
-        return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":target_status,"lesson":lesson_label,"content_type":"Bài tập"}}
+        return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":target_status,"lesson":lesson_label,"content_type":content_type}}
 
     # Curriculum finish actions apply to ALL structured curriculum content types.
     if ui_action in {"curriculum_finish_yes", "curriculum_finish_no"} and study_session:
@@ -7511,7 +7544,7 @@ Tin nhắn hiện tại:
     # lesson-step navigation. Gemini is reserved for genuine learner questions,
     # and those turns receive only one prior chat exchange as context.
     if (runtime_cache_hit and (runtime_lesson_cache or {}).get("published_curriculum")
-            and requested_content_type in {"Từ vựng", "Bài tập", "Ngữ pháp", "Truyện đọc"} and study_session):
+            and requested_content_type in {"Từ vựng", "Bài tập", "Luyện viết", "Ngữ pháp", "Truyện đọc"} and study_session):
         sections=list((runtime_lesson_cache or {}).get("sections") or [])
         if sections:
             current_step=max(0,min(int((study_session or {}).get("curriculum_step") or 0),len(sections)-1))
@@ -7549,6 +7582,107 @@ Tin nhắn hiện tại:
                 print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} text_advance={current_step}")
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
+
+            # Luyện viết: show B0 prompt + optional hint, then grade the learner's essay with hidden B0 Vision knowledge.
+            if requested_content_type == "Luyện viết":
+                code=str(step.get('code') or '').upper()
+                content=step.get('content') if isinstance(step.get('content'),dict) else {}
+                if ui_action in {"writing_hint_yes","writing_hint_no"}:
+                    if ui_action == "writing_hint_yes":
+                        hint_step=next((dict(x) for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
+                        hint_text=str((hint_step or {}).get('text') or '').strip()
+                        hblocks=[]
+                        if hint_text:
+                            hblocks.append({"type":"text","text":"**Gợi ý làm bài**\n\n"+hint_text})
+                        hblocks.append({"type":"text","text":"✍️ Giờ cậu hãy viết bài essay của mình và gửi cho Doraemon nhé."})
+                        _set_curriculum_flow(user["id"],step=current_step,waiting="writing_essay",exercise_answered=False)
+                        _set_curriculum_writing_state(user["id"],suggestion_shown=True)
+                    else:
+                        hblocks=[{"type":"text","text":"Được nhé! 🤖 Cậu không cần xem gợi ý. Hãy viết bài essay của mình và gửi cho Doraemon nhé."}]
+                        _set_curriculum_flow(user["id"],step=current_step,waiting="writing_essay",exercise_answered=False)
+                        _set_curriculum_writing_state(user["id"],suggestion_shown=False)
+                    return {"reply":"\n\n".join(str(b.get('text') or '') for b in hblocks if b.get('type')=='text'),"model":"db-direct","sources":[],"images":[],"content_blocks":hblocks,"learning_progress":None}
+
+                if code == 'B0' and not data.action and waiting not in {"writing_essay","writing_grade_done"}:
+                    prompt_text=str(step.get('text') or '').strip()
+                    b1=next((x for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
+                    hint_text=str((b1 or {}).get('text') or '').strip()
+                    blocks=[]
+                    if prompt_text:
+                        blocks.append({"type":"text","text":("**Đề bài · Luyện viết**\n\n"+prompt_text).strip()})
+                    for im in step.get('images') or []:
+                        if im.get('url'): blocks.append({"type":"image","key":im.get('key'),"url":im.get('url'),"page":im.get('page'),"caption":im.get('caption','')})
+                    if hint_text:
+                        blocks.append({"type":"text","text":"💡 Cậu có muốn Doraemon gợi ý cách làm bài không?"})
+                        blocks.append({"type":"choice","id":"writing_hint","options":[
+                            {"label":"Có","action":"writing_hint_yes"},{"label":"Không","action":"writing_hint_no"}
+                        ]})
+                        _set_curriculum_flow(user["id"],step=current_step,waiting="writing_hint",exercise_answered=False)
+                    else:
+                        blocks.append({"type":"text","text":"✍️ Cậu hãy viết bài essay của mình và gửi cho Doraemon nhé."})
+                        _set_curriculum_flow(user["id"],step=current_step,waiting="writing_essay",exercise_answered=False)
+                    return {"reply":"\n\n".join(str(b.get('text') or '') for b in blocks if b.get('type')=='text'),"model":"db-direct","sources":[],"images":[{"key":b.get('key'),"url":b.get('url')} for b in blocks if b.get('type')=='image'],"content_blocks":blocks,"learning_progress":None}
+
+                if waiting in {"writing_hint","writing_essay"} and not data.action and str(query_text or '').strip():
+                    if waiting == 'writing_hint':
+                        qlow=str(query_text).strip().casefold()
+                        if qlow in {'có','co','yes','y','ok','oke','được','được nhé'}:
+                            hint_step=next((dict(x) for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
+                            hint_text=str((hint_step or {}).get('text') or '').strip()
+                            hblocks=[{"type":"text","text":"**Gợi ý làm bài**\n\n"+hint_text if hint_text else "Doraemon không có gợi ý riêng cho bài này."},{"type":"text","text":"✍️ Giờ cậu hãy viết bài essay của mình và gửi cho Doraemon nhé."}]
+                            _set_curriculum_flow(user["id"],step=current_step,waiting='writing_essay',exercise_answered=False)
+                            _set_curriculum_writing_state(user["id"],suggestion_shown=True)
+                            return {"reply":"\n\n".join(str(b.get('text') or '') for b in hblocks),"model":"db-direct","sources":[],"images":[],"content_blocks":hblocks,"learning_progress":None}
+                        if qlow in {'không','khong','no','n','chưa','chua'}:
+                            msg='Được nhé! 🤖 Cậu không cần xem gợi ý. Hãy viết bài essay của mình và gửi cho Doraemon nhé.'
+                            _set_curriculum_flow(user["id"],step=current_step,waiting='writing_essay',exercise_answered=False)
+                            _set_curriculum_writing_state(user["id"],suggestion_shown=False)
+                            return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+                    b0_content=content if isinstance(content,dict) else {}
+                    grading_vision=str(b0_content.get('grading_vision') or '').strip()
+                    prompt_text=str(b0_content.get('content') or step.get('text') or '').strip()
+                    hint_step=next((dict(x) for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
+                    hint_text=str((hint_step or {}).get('text') or '').strip()
+                    q_prompt=f"""Bạn là giáo viên dạy viết. Hãy chấm bài essay của học sinh dựa CHỈ trên đề bài và Knowledge Vision được cung cấp nếu có.
+
+ĐỀ BÀI:
+{prompt_text}
+
+KNOWLEDGE VISION ẨN CỦA B0 (chỉ dùng để kiểm tra mức độ bám đúng nội dung/ý trong đề; không nhắc rằng đây là Vision):
+{grading_vision or '(Không có)'}
+
+GỢI Ý ĐƯỢC CUNG CẤP (nếu có):
+{hint_text or '(Không có)'}
+
+BÀI ESSAY HỌC SINH:
+{query_text.strip()}
+
+ĐÁNH GIÁ THEO 6 TIÊU CHÍ:
+1. Đúng đề
+2. Ý rõ
+3. Phát triển tốt
+4. Bố cục logic
+5. Từ vựng tự nhiên
+6. Ngữ pháp đa dạng và tương đối chính xác
+
+YÊU CẦU OUTPUT:
+- Đóng vai giáo viên, nhận xét cụ thể nhưng dễ hiểu.
+- Với từng tiêu chí, nêu: Tốt ở đâu; Cần cải thiện ở đâu.
+- Sau 6 tiêu chí, đưa ra 3-5 điểm cần cải thiện quan trọng nhất.
+- Có thể trích dẫn ngắn các đoạn trong bài làm để minh họa lỗi/điểm mạnh.
+- Không chấm điểm tổng bằng số và không biến đây thành bài IELTS score report.
+- Không bịa yêu cầu không có trong đề.
+- Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
+"""
+                    gen_started=time.perf_counter()
+                    evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
+                    _set_curriculum_writing_state(user["id"],result=evaluation)
+                    _set_curriculum_flow(user["id"],step=current_step,waiting='writing_grade_done',exercise_answered=True)
+                    blocks=[{"type":"text","text":evaluation or ''}]
+                    blocks.extend(_exercise_finish_blocks())
+                    print(f'[CURRICULUM WRITING GRADE] request={request_id} vision_used={int(bool(grading_vision))} genai=1')
+                    return {"reply":evaluation or '',"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
             # Deterministic simple/casual exercise turns must not invoke GenAI.
             if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip() and not _is_exercise_no_answer(query_text):
@@ -11626,6 +11760,10 @@ CURRICULUM_STEP_RULES = {
         {'code':'B1','title':'Bài tập · Làm bài','type':'exercise_intro'},
         {'code':'B2','title':'Đáp án · Chấm và nhận xét','type':'answer'},
     ],
+    'Luyện viết': [
+        {'code':'B0','title':'Đề bài · Luyện viết','type':'writing_prompt'},
+        {'code':'B1','title':'Gợi ý làm bài','type':'writing_hint'},
+    ],
     'Truyện đọc': [
         {'code':'B0','title':'Nội dung truyện','type':'story'},
         {'code':'B1','title':'Bản dịch tiếng Việt','type':'translation'},
@@ -12235,6 +12373,64 @@ def _exercise_source_digest(label, pages):
     return f"[{label}]\n{body}" if body else f"[{label}]\n(Không có OCR text.)"
 
 
+def _writing_vision_for_page(page_png, page_no, source_file=''):
+    if gemini is None or not page_png:
+        return ''
+    prompt = f"""You are creating hidden grading knowledge for a writing exercise, not a student-facing answer.
+Page {page_no} of source file {source_file}.
+Describe ONLY the meaningful visual information contained in images/diagrams/charts on this page that could be relevant when grading a student's essay.
+Do not solve the essay, do not write an essay, do not invent requirements, and do not repeat ordinary page text unless it is part of an image/diagram and necessary to understand that visual.
+If there are no meaningful visuals, return an empty string.
+Return concise factual prose."""
+    try:
+        part=types.Part.from_bytes(data=page_png,mime_type='image/png')
+        response=gemini.models.generate_content(
+            model=GEMINI_MODEL, contents=[part,prompt],
+            config=types.GenerateContentConfig(temperature=0.0, thinking_config=types.ThinkingConfig(thinking_level='minimal'))
+        )
+        _log_gemini_usage(response, operation=f'writing_vision_b0:page_{page_no}')
+        return str(getattr(response,'text','') or '').strip()[:6000]
+    except Exception as exc:
+        print(f'[WRITING VISION] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return ''
+
+
+def _writing_generate_deterministic_steps(lesson, prompt_pages, suggestion_pages, page_source=None, source_file=''):
+    prompt_text='\n\n'.join(str(pg.get('text') or '').strip() for pg in (prompt_pages or []) if str(pg.get('text') or '').strip()).strip()
+    suggestion_text='\n\n'.join(str(pg.get('text') or '').strip() for pg in (suggestion_pages or []) if str(pg.get('text') or '').strip()).strip()
+    if not prompt_text:
+        raise HTTPException(400,f'Luyện viết {lesson}: không OCR được nội dung đề bài.')
+    prompt_refs=[{'page':pg.get('page'),'reason':'OCR nguyên văn nội dung đề bài'} for pg in prompt_pages or [] if str(pg.get('text') or '').strip()]
+    suggestion_refs=[{'page':pg.get('page'),'reason':'OCR nguyên văn gợi ý làm bài'} for pg in suggestion_pages or [] if str(pg.get('text') or '').strip()]
+    prompt_images=[]
+    vision_parts=[]
+    for pg in prompt_pages or []:
+        for im in pg.get('images') or []:
+            key=str(im.get('image_key') or '').strip()
+            if key:
+                prompt_images.append({'image_key':key,'image_url':im.get('image_url'),'page':pg.get('page'),'caption':str((im.get('vision') or {}).get('caption') or (im.get('vision') or {}).get('description') or '').strip()})
+        if page_source is not None and (pg.get('images') or []):
+            try:
+                png=render_pdf_page(page_source, int(pg.get('page')), dpi=120)
+                if png:
+                    v=_writing_vision_for_page(png,int(pg.get('page')),source_file=source_file)
+                    if v:
+                        vision_parts.append(f'[TRANG {pg.get("page")}]\n{v}')
+            except Exception as exc:
+                print(f'[WRITING VISION] render page={pg.get("page")} failed: {type(exc).__name__}: {exc}')
+    b0_content={
+        'content':prompt_text, 'source_refs':prompt_refs, 'images':prompt_images, 'items':[],
+        'grading_vision':'\n\n'.join(vision_parts).strip(), 'grading_vision_pages':[x.get('page') for x in prompt_pages if x.get('page')],
+    }
+    b1_content={
+        'content':suggestion_text, 'source_refs':suggestion_refs, 'images':[], 'items':[],
+    }
+    return [
+        {'code':'B0','title':'Đề bài · Luyện viết','type':'writing_prompt','content':b0_content},
+        {'code':'B1','title':'Gợi ý làm bài','type':'writing_hint','content':b1_content},
+    ]
+
+
 def _exercise_generate_deterministic_steps(lesson, question_pages, answer_pages):
     """Build exercise curriculum steps directly from OCR/Vision source.
 
@@ -12476,7 +12672,8 @@ async def admin_curriculum_draft_upload(
                 raise HTTPException(400,f'Bài #{idx}: Tên bài học là bắt buộc.')
             qpg=str(cfg.get('question_pages') or '').strip()
             apg=str(cfg.get('answer_pages') or '').strip()
-            normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg})
+            spg=str(cfg.get('suggestion_pages') or '').strip()
+            normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg,'suggestion_pages':spg})
         configs=normalized
 
     source_file=os.path.basename(file.filename)
@@ -12518,6 +12715,22 @@ async def admin_curriculum_draft_upload(
                 cfg['question_pages_label']=_curriculum_page_range_label(cfg['question_selected_pages'])
                 cfg['answer_pages_label']=_curriculum_page_range_label(cfg['answer_selected_pages'])
                 cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+            elif ct == 'Luyện viết':
+                praw=str(cfg.get('pages') or '').strip()
+                sraw=str(cfg.get('suggestion_pages') or '').strip()
+                if not praw:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Luyện viết cần nhập Trang đề bài, ví dụ 1-2.')
+                try:
+                    cfg['prompt_selected_pages']=_parse_curriculum_page_ranges(praw,total_pages)
+                    cfg['suggestion_selected_pages']=_parse_curriculum_page_ranges(sraw,total_pages) if sraw else []
+                except ValueError as exc:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): {exc}')
+                overlap=sorted(set(cfg['prompt_selected_pages']) & set(cfg['suggestion_selected_pages']))
+                if overlap:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Trang đề bài và Trang gợi ý bị chồng lấn: {", ".join(map(str,overlap))}.')
+                cfg['selected_pages']=sorted(set(cfg['prompt_selected_pages']) | set(cfg['suggestion_selected_pages']))
+                cfg['pages_label']=_curriculum_page_range_label(cfg['prompt_selected_pages'])
+                cfg['suggestion_pages_label']=_curriculum_page_range_label(cfg['suggestion_selected_pages'])
             else:
                 if not str(cfg.get('pages') or '').strip():
                     raise HTTPException(400,f'Bài #{idx} ({lesson_name}): phải nhập số trang, ví dụ 7-8.')
@@ -12552,6 +12765,15 @@ async def admin_curriculum_draft_upload(
                     question_pages=cfg.get('question_selected_pages'),
                     answer_pages=cfg.get('answer_selected_pages'),
                 )
+            elif ct == 'Luyện viết':
+                # Writing prompt/suggestion pages use OCR-only extraction.
+                # Vision interpretation is kept hidden in B0 grading_vision and is
+                # never appended to the student-facing prompt text.
+                page_texts,page_images,page_units=process_exercise_pdf_pages(
+                    temp_pdf_path, reader, source_file, subject, ls,
+                    question_pages=cfg.get('prompt_selected_pages'),
+                    answer_pages=cfg.get('suggestion_selected_pages'),
+                )
             else:
                 page_texts,page_images,page_units=process_pdf_pages(
                     temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
@@ -12574,7 +12796,18 @@ async def admin_curriculum_draft_upload(
             digest=_curriculum_source_digest(pages)
             normalized_steps=[]
             _, grammar_reference = _get_course_curriculum_knowledge(course_id, digest)
-            if ct == 'Bài tập':
+            if ct == 'Luyện viết':
+                selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
+                prompt_pages=[selected_by_page[p] for p in cfg.get('prompt_selected_pages',[]) if p in selected_by_page]
+                suggestion_pages=[selected_by_page[p] for p in cfg.get('suggestion_selected_pages',[]) if p in selected_by_page]
+                generated=_writing_generate_deterministic_steps(ls,prompt_pages,suggestion_pages,page_source=temp_pdf_path,source_file=source_file)
+                for st in generated:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content, pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print(f'[CURRICULUM WRITING DRAFT] lesson={ls!r} prompt_pages={cfg.get("pages_label","")} suggestion_pages={cfg.get("suggestion_pages_label","")} vision_b0=1')
+            elif ct == 'Bài tập':
                 selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
                 question_pages=[selected_by_page[p] for p in cfg.get('question_selected_pages',[]) if p in selected_by_page]
                 answer_pages=[selected_by_page[p] for p in cfg.get('answer_selected_pages',[]) if p in selected_by_page]
@@ -12664,6 +12897,7 @@ async def admin_curriculum_draft_upload(
                 'page_ranges':cfg['pages_label'],
                 'question_pages':cfg.get('question_pages_label',''),
                 'answer_pages':cfg.get('answer_pages_label',''),
+                'suggestion_pages':cfg.get('suggestion_pages_label',''),
                 'steps':normalized_steps,
             }
             if ct == 'Bài tập':
@@ -12685,7 +12919,7 @@ async def admin_curriculum_draft_upload(
             result_item={
                 'draft_id':draft_id,'status':'AI_DRAFT','version':version,
                 'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
-                'page_ranges':cfg['pages_label'],'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
+                'page_ranges':cfg['pages_label'],'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),'suggestion_pages':cfg.get('suggestion_pages_label',''),
                 'selected_page_count':len(selected_pages),
                 'steps':normalized_steps,
             }
@@ -12814,7 +13048,7 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 }
 
             raw_source=lesson.get('raw_source_json') if isinstance(lesson.get('raw_source_json'),dict) else {}
-            is_exercise_edit=str(lesson.get('content_type') or '').strip() == 'Bài tập'
+            is_exercise_edit=str(lesson.get('content_type') or '').strip() in {'Bài tập','Luyện viết'}
             # For exercises, do not hydrate an edit Draft with original OCR/source pages.
             # For other content types retain the existing source-page editor behavior.
             pages=[] if is_exercise_edit else (raw_source.get('pages') if isinstance(raw_source,dict) else [])
@@ -13586,6 +13820,7 @@ function addMetaRow(values={}){
       <option value="Từ vựng" ${values.content_type==="Từ vựng"?"selected":""}>Từ vựng</option>
       <option value="Ngữ pháp" ${values.content_type==="Ngữ pháp"?"selected":""}>Ngữ pháp</option>
       <option value="Bài tập" ${values.content_type==="Bài tập"?"selected":""}>Bài tập</option>
+      <option value="Luyện viết" ${values.content_type==="Luyện viết"?"selected":""}>Luyện viết</option>
       <option value="Truyện đọc" ${values.content_type==="Truyện đọc"?"selected":""}>Truyện đọc</option>
     </select>
     <input class="m-lesson" placeholder="Bài học" value="${esc(values.lesson||"")}">
@@ -13639,7 +13874,7 @@ async function uploadKnowledge(event){
 
 
 function curriculumTypeOptions(selected){
-  const types=['Giáo trình','Từ vựng','Ngữ pháp','Bài tập','Truyện đọc'];
+  const types=['Giáo trình','Bài tập','Luyện viết','Từ vựng','Ngữ pháp','Truyện đọc'];
   return types.map(t=>`<option value="${esc(t)}" ${t===selected?'selected':''}>${esc(t)}</option>`).join('');
 }
 function addCurriculumArticleRow(values={}){
@@ -13652,12 +13887,14 @@ function addCurriculumArticleRow(values={}){
   <input class="cur-a-pages" placeholder="Trang bài: 7-8" value="${esc(values.pages||'')}">
   <input class="cur-a-question-pages" placeholder="Trang bài tập: 8-10" value="${esc(values.question_pages||'')}" style="display:${ct==='Bài tập'?'block':'none'}">
   <input class="cur-a-answer-pages" placeholder="Trang đáp án: 20-21" value="${esc(values.answer_pages||'')}" style="display:${ct==='Bài tập'?'block':'none'}">
+  <input class="cur-a-suggestion-pages" placeholder="Trang gợi ý: 3-4" value="${esc(values.suggestion_pages||'')}" style="display:${ct==='Luyện viết'?'block':'none'}">
   <button type="button" class="red" title="Xóa dòng" onclick="this.parentElement.remove()">✕</button>`;
   const typeSel=row.querySelector('.cur-a-type');
   const pages=row.querySelector('.cur-a-pages');
   const qpages=row.querySelector('.cur-a-question-pages');
   const apages=row.querySelector('.cur-a-answer-pages');
-  function sync(){const isEx=typeSel.value==='Bài tập'; pages.style.display=isEx?'none':'block'; qpages.style.display=isEx?'block':'none'; apages.style.display=isEx?'block':'none';}
+  const spages=row.querySelector('.cur-a-suggestion-pages');
+  function sync(){const isEx=typeSel.value==='Bài tập'; const isWriting=typeSel.value==='Luyện viết'; pages.style.display=(isEx?'none':'block'); qpages.style.display=isEx?'block':'none'; apages.style.display=isEx?'block':'none'; spages.style.display=isWriting?'block':'none';}
   typeSel.addEventListener('change',sync); sync();
   wrap.appendChild(row);
 }
@@ -13671,7 +13908,8 @@ function getCurriculumArticleRows(){
     lesson:(row.querySelector('.cur-a-lesson')?.value||'').trim(),
     pages:(row.querySelector('.cur-a-pages')?.value||'').trim(),
     question_pages:(row.querySelector('.cur-a-question-pages')?.value||'').trim(),
-    answer_pages:(row.querySelector('.cur-a-answer-pages')?.value||'').trim()
+    answer_pages:(row.querySelector('.cur-a-answer-pages')?.value||'').trim(),
+    suggestion_pages:(row.querySelector('.cur-a-suggestion-pages')?.value||'').trim()
   }));
 }
 addCurriculumArticleRow();
@@ -13680,8 +13918,8 @@ async function createCurriculumDraft(event){
  event.preventDefault(); const btn=document.getElementById('curGenBtn'); const st=document.getElementById('curStatus'); const file=document.getElementById('curPdf').files[0]; if(!file)return;
  const rows=getCurriculumArticleRows().filter(x=>x.lesson||x.pages);
  if(!rows.length){st.textContent='❌ Hãy thêm ít nhất 1 bài và nhập đủ thông tin trang.';return;}
- for(const r of rows){if(!r.lesson){st.textContent=`❌ Bài #${r.index}: cần nhập tên bài.`;return;} if(r.content_type==='Bài tập'){if(!r.question_pages||!r.answer_pages){st.textContent=`❌ Bài #${r.index}: Bài tập cần đủ Trang bài tập + Trang đáp án.`;return;}} else if(!r.pages){st.textContent=`❌ Bài #${r.index}: cần nhập số trang.`;return;}}
- btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài. Bài tập sẽ OCR/Vision riêng Trang bài tập + Trang đáp án, không đụng các trang khác...`;
+ for(const r of rows){if(!r.lesson){st.textContent=`❌ Bài #${r.index}: cần nhập tên bài.`;return;} if(r.content_type==='Bài tập'){if(!r.question_pages||!r.answer_pages){st.textContent=`❌ Bài #${r.index}: Bài tập cần đủ Trang bài tập + Trang đáp án.`;return;}} else if(r.content_type==='Luyện viết'){if(!r.pages){st.textContent=`❌ Bài #${r.index}: Luyện viết cần Trang đề bài.`;return;}} else if(!r.pages){st.textContent=`❌ Bài #${r.index}: cần nhập số trang.`;return;}}
+ btn.disabled=true; st.textContent=`⏳ Đang xử lý ${rows.length} bài. Bài tập và Luyện viết sẽ dùng phạm vi trang riêng; Luyện viết có thêm Vision ẩn cho khâu chấm bài...`;
  try{
    const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('course_id',document.getElementById('curCourse').value); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
    const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
