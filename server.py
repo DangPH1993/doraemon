@@ -7556,7 +7556,7 @@ Tin nhắn hiện tại:
             answered=bool((study_session or {}).get("curriculum_exercise_answered"))
 
             # Button navigation is deterministic and costs 0 Gemini/embedding/Pinecone.
-            if ui_action == "curriculum_next":
+            if ui_action == "curriculum_next" and requested_content_type != "Luyện viết":
                 try:
                     expected=int(action_plan_id or -1)
                 except Exception:
@@ -7572,7 +7572,8 @@ Tin nhắn hiện tại:
                     print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} advance={current_step}")
 
             # Text 'tiếp' is also a pure DB navigation turn.
-            elif (not data.action
+            elif (requested_content_type != "Luyện viết"
+                  and not data.action
                   and not (requested_content_type == "Bài tập" and waiting == "exercise_answer")
                   and _is_continue_confirmation(query_text)
                   and current_step < len(sections)-1):
@@ -7607,24 +7608,32 @@ Tin nhắn hiện tại:
                         _set_curriculum_writing_state(user["id"],suggestion_shown=False)
                     return {"reply":"\n\n".join(str(b.get('text') or '') for b in hblocks if b.get('type')=='text'),"model":"db-direct","sources":[],"images":[],"content_blocks":hblocks,"learning_progress":None}
 
-                if code == 'B0' and not data.action and waiting not in {"writing_essay","writing_grade_done"}:
+                if code == 'B0' and (
+                    ui_action == "lesson_confirm_yes"
+                    or (not data.action and waiting not in {"writing_essay","writing_grade_done"})
+                ):
                     prompt_text=str(step.get('text') or '').strip()
                     b1=next((x for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
                     hint_text=str((b1 or {}).get('text') or '').strip()
+                    if not hint_text and isinstance((b1 or {}).get('content'),dict):
+                        hint_text=_published_curriculum_step_text((b1 or {}).get('content') or '').strip()
                     blocks=[]
                     if prompt_text:
                         blocks.append({"type":"text","text":("**Đề bài · Luyện viết**\n\n"+prompt_text).strip()})
                     for im in step.get('images') or []:
-                        if im.get('url'): blocks.append({"type":"image","key":im.get('key'),"url":im.get('url'),"page":im.get('page'),"caption":im.get('caption','')})
+                        if im.get('url'):
+                            blocks.append({"type":"image","key":im.get('key'),"url":im.get('url'),"page":im.get('page'),"caption":im.get('caption','')})
                     if hint_text:
                         blocks.append({"type":"text","text":"💡 Cậu có muốn Doraemon gợi ý cách làm bài không?"})
                         blocks.append({"type":"choice","id":"writing_hint","options":[
-                            {"label":"Có","action":"writing_hint_yes"},{"label":"Không","action":"writing_hint_no"}
+                            {"label":"Có","action":"writing_hint_yes"},
+                            {"label":"Không","action":"writing_hint_no"}
                         ]})
                         _set_curriculum_flow(user["id"],step=current_step,waiting="writing_hint",exercise_answered=False)
                     else:
                         blocks.append({"type":"text","text":"✍️ Cậu hãy viết bài essay của mình và gửi cho Doraemon nhé."})
                         _set_curriculum_flow(user["id"],step=current_step,waiting="writing_essay",exercise_answered=False)
+                    _set_curriculum_writing_state(user["id"],suggestion_shown=False)
                     return {"reply":"\n\n".join(str(b.get('text') or '') for b in blocks if b.get('type')=='text'),"model":"db-direct","sources":[],"images":[{"key":b.get('key'),"url":b.get('url')} for b in blocks if b.get('type')=='image'],"content_blocks":blocks,"learning_progress":None}
 
                 if waiting in {"writing_hint","writing_essay"} and not data.action and str(query_text or '').strip():
@@ -7633,6 +7642,8 @@ Tin nhắn hiện tại:
                         if qlow in {'có','co','yes','y','ok','oke','được','được nhé'}:
                             hint_step=next((dict(x) for x in sections if str(x.get('step_code') or '').upper()=='B1'),None)
                             hint_text=str((hint_step or {}).get('text') or '').strip()
+                            if not hint_text and isinstance((hint_step or {}).get('content'),dict):
+                                hint_text=_published_curriculum_step_text((hint_step or {}).get('content') or '').strip()
                             hblocks=[{"type":"text","text":"**Gợi ý làm bài**\n\n"+hint_text if hint_text else "Doraemon không có gợi ý riêng cho bài này."},{"type":"text","text":"✍️ Giờ cậu hãy viết bài essay của mình và gửi cho Doraemon nhé."}]
                             _set_curriculum_flow(user["id"],step=current_step,waiting='writing_essay',exercise_answered=False)
                             _set_curriculum_writing_state(user["id"],suggestion_shown=True)
@@ -7673,9 +7684,11 @@ BÀI ESSAY HỌC SINH:
 YÊU CẦU OUTPUT:
 - Đóng vai giáo viên, nhận xét cụ thể nhưng dễ hiểu.
 - Với từng tiêu chí, nêu: Tốt ở đâu; Cần cải thiện ở đâu.
+- Ngay dòng đầu tiên phải ghi đúng dạng: **Điểm ước lượng: X.X/9.0** (thang điểm IELTS Writing, có thể dùng .5).
+- Điểm tổng phải phản ánh chất lượng bài viết dựa trên toàn bộ 6 tiêu chí; đây là điểm ước lượng của giáo viên, không phải điểm thi chính thức.
+- Sau dòng điểm, lần lượt nhận xét cả 6 tiêu chí và nêu rõ: Tốt ở đâu; Cần cải thiện ở đâu.
 - Sau 6 tiêu chí, đưa ra 3-5 điểm cần cải thiện quan trọng nhất.
 - Có thể trích dẫn ngắn các đoạn trong bài làm để minh họa lỗi/điểm mạnh.
-- Không chấm điểm tổng bằng số và không biến đây thành bài IELTS score report.
 - Không bịa yêu cầu không có trong đề.
 - Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
 """
@@ -7683,7 +7696,8 @@ YÊU CẦU OUTPUT:
                     evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
                     _set_curriculum_writing_state(user["id"],result=evaluation)
                     _set_curriculum_flow(user["id"],step=current_step,waiting='writing_grade_done',exercise_answered=True)
-                    blocks=[{"type":"text","text":evaluation or ''}]
+                    evaluation_text=(evaluation or '').strip()
+                    blocks=[{"type":"text","text":evaluation_text or "Doraemon chưa nhận được kết quả chấm bài."}]
                     blocks.extend(_exercise_finish_blocks())
                     print(f'[CURRICULUM WRITING GRADE] request={request_id} vision_used={int(bool(grading_vision))} genai=1')
                     return {"reply":evaluation or '',"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
