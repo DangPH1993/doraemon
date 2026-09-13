@@ -11427,21 +11427,39 @@ def _collocation_row(row):
 
 
 @app.get("/admin/api/collocations")
-def admin_collocations(password: str, course_id: Optional[int] = None):
+def admin_collocations(password: str, course_id: Optional[int] = None, q: str = "", limit: int = 50):
+    """Return only a small search result set plus the total count.
+
+    The admin UI intentionally does NOT list the entire Collocation catalogue.
+    It shows the current count and loads individual rows only after a search.
+    """
     check_admin(password)
+    query=str(q or "").strip()
+    safe_limit=max(1,min(int(limit or 50),100))
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if course_id is None:
-                cur.execute("""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,x.collocation,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
-                              FROM collocations x LEFT JOIN courses c ON c.id=x.course_id
-                              ORDER BY c.name,x.id""")
-            else:
-                cur.execute("""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,x.collocation,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
-                              FROM collocations x LEFT JOIN courses c ON c.id=x.course_id
-                              WHERE x.course_id=%s ORDER BY x.id""", (int(course_id),))
-            rows=[_collocation_row(r) for r in cur.fetchall()]
-        return {"success":True,"collocations":rows}
+            where=[]; params=[]
+            if course_id is not None:
+                where.append("x.course_id=%s"); params.append(int(course_id))
+            if query:
+                where.append("(x.collocation ILIKE %s OR x.meaning ILIKE %s OR x.example ILIKE %s)")
+                like=f"%{query}%"
+                params.extend([like,like,like])
+            where_sql=(" WHERE "+" AND ".join(where)) if where else ""
+            cur.execute(f"SELECT COUNT(*) AS total FROM collocations x{where_sql}", tuple(params))
+            count=int((cur.fetchone() or {}).get("total") or 0)
+
+            rows=[]
+            if query:
+                cur.execute(f"""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,
+                                      x.collocation,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
+                                   FROM collocations x LEFT JOIN courses c ON c.id=x.course_id
+                                   {where_sql}
+                                   ORDER BY x.collocation
+                                   LIMIT %s""", tuple(params+[safe_limit]))
+                rows=[_collocation_row(r) for r in cur.fetchall()]
+        return {"success":True,"collocations":rows,"count":count,"query":query,"limited":len(rows)>=safe_limit}
     finally:
         conn.close()
 
@@ -11522,6 +11540,35 @@ def admin_collocation_update(collocation_id:int, payload:dict):
         conn.rollback(); raise
     finally:
         conn.close()
+
+
+@app.delete("/admin/api/collocations/all")
+def admin_collocations_delete_all(password:str, course_id:int):
+    """Delete every Collocation in the selected course, including stored images."""
+    check_admin(password)
+    cid=int(course_id)
+    conn=db(); image_keys=[]
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,image_key FROM collocations WHERE course_id=%s", (cid,))
+            rows=cur.fetchall() or []
+            if rows:
+                image_keys=[str(r.get("image_key") or "") for r in rows if str(r.get("image_key") or "").strip()]
+                cur.execute("DELETE FROM collocations WHERE course_id=%s", (cid,))
+                deleted=int(cur.rowcount or 0)
+            else:
+                deleted=0
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    for key in image_keys:
+        try:
+            b2_delete_key(key)
+        except Exception as exc:
+            print(f"[COLLOCATION DELETE ALL] image delete skipped key={key!r}: {type(exc).__name__}: {exc}")
+    return {"success":True,"course_id":cid,"deleted":deleted}
 
 
 @app.delete("/admin/api/collocations/{collocation_id}")
@@ -14039,21 +14086,47 @@ function ensureCollocationAdminSection(){
       <button type="button" class="gray" onclick="loadCollocationsAdmin()">🔄 Làm mới</button>
     </div>
     <div id="collocationStatus" class="small" style="margin:6px 0 10px"></div>
+    <div id="collocationCountBox" style="display:none;margin-bottom:10px;padding:10px 12px;border:1px solid #ddd;border-radius:8px;background:#fafafa">
+      <span id="collocationCountText" style="font-weight:700"></span>
+      <button type="button" class="red" style="float:right" onclick="deleteAllCollocations()">🗑️ Xóa tất cả Collocation</button>
+    </div>
+    <div id="collocationSearchRow" style="display:none;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <input id="collocationSearch" type="search" placeholder="Tìm Collocation..." style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')searchCollocations()">
+      <button type="button" onclick="searchCollocations()">🔎 Tìm kiếm</button>
+    </div>
     <div id="collocationAdminList"></div>
   </div>`);
   const sel=document.getElementById("collocationCourse");
   sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('');
-  sel.addEventListener('change',()=>loadCollocationsAdmin());
+  sel.addEventListener('change',()=>{document.getElementById('collocationSearch').value='';loadCollocationsAdmin();});
 }
 async function loadCollocationsAdmin(){
   ensureCollocationAdminSection();
   const cid=document.getElementById('collocationCourse')?.value||'';
-  const box=document.getElementById('collocationAdminList'); if(!box)return;
+  const box=document.getElementById('collocationAdminList');
+  const countBox=document.getElementById('collocationCountBox');
+  const searchRow=document.getElementById('collocationSearchRow');
+  if(!box)return;
+  if(!cid){countBox.style.display='none';searchRow.style.display='none';box.innerHTML='<div class="small">Hãy chọn khóa học để xem số lượng Collocation.</div>';return;}
   try{
-    const d=await api('/admin/api/collocations?password='+encodeURIComponent(pw)+(cid?'&course_id='+encodeURIComponent(cid):''));
+    const d=await api('/admin/api/collocations?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid));
+    const count=Number(d.count||0);
+    countBox.style.display='block';
+    searchRow.style.display='flex';
+    document.getElementById('collocationCountText').textContent=`Hiện có ${count} Collocation trong khóa học này`;
+    box.innerHTML='<div class="small">Nhập từ khóa và bấm 🔎 Tìm kiếm để sửa hoặc xóa Collocation cụ thể.</div>';
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function searchCollocations(){
+  const cid=document.getElementById('collocationCourse')?.value||'';
+  const q=(document.getElementById('collocationSearch')?.value||'').trim();
+  const box=document.getElementById('collocationAdminList'); if(!box||!cid)return;
+  if(!q){box.innerHTML='<div class="small">Nhập Collocation cần tìm.</div>';return;}
+  try{
+    const d=await api('/admin/api/collocations?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid)+'&q='+encodeURIComponent(q));
     const rows=d.collocations||[];
-    if(!rows.length){box.innerHTML='<div class="small">Chưa có Collocation. Hãy upload file DOCX.</div>';return;}
-    box.innerHTML=`<div style="font-weight:700;margin-bottom:8px">Danh sách (${rows.length})</div>`+rows.map(r=>`<div style="display:grid;grid-template-columns:190px 1.1fr 1.5fr 190px auto;gap:8px;align-items:start;padding:10px 0;border-top:1px solid #eee">
+    if(!rows.length){box.innerHTML='<div class="small">Không tìm thấy Collocation phù hợp.</div>';return;}
+    box.innerHTML=`<div style="font-weight:700;margin-bottom:8px">Kết quả tìm kiếm: ${rows.length}${d.count>rows.length?' / '+d.count:''}</div>`+rows.map(r=>`<div style="display:grid;grid-template-columns:190px 1.1fr 1.5fr 190px auto;gap:8px;align-items:start;padding:10px 0;border-top:1px solid #eee">
       <div><input id="col-collocation-${Number(r.id)}" value="${esc(r.collocation||'')}" style="width:100%;font-weight:700"><div class="small">${esc(r.course_name||'')}</div></div>
       <textarea id="col-meaning-${Number(r.id)}" rows="2" placeholder="Nghĩa">${esc(r.meaning||'')}</textarea>
       <textarea id="col-example-${Number(r.id)}" rows="3" placeholder="Ví dụ">${esc(r.example||'')}</textarea>
@@ -14069,15 +14142,27 @@ async function uploadCollocations(){
   const cid=document.getElementById('collocationCourse')?.value||''; const file=document.getElementById('collocationDocx')?.files?.[0]; const st=document.getElementById('collocationStatus');
   if(!cid){st.textContent='❌ Hãy chọn khóa học.';return;} if(!file){st.textContent='❌ Hãy chọn file .docx.';return;}
   const fd=new FormData(); fd.append('password',pw); fd.append('course_id',cid); fd.append('file',file);
-  try{st.textContent='⏳ Đang bóc tách DOCX và lưu ảnh...'; const r=await fetch('/admin/api/collocations/upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Đã đọc ${d.parsed} Collocation · mới ${d.created} · cập nhật ${d.updated}.`; document.getElementById('collocationDocx').value=''; await loadCollocationsAdmin();}catch(e){st.textContent='❌ '+e.message;}
+  try{st.textContent='⏳ Đang bóc tách DOCX và lưu ảnh...'; const r=await fetch('/admin/api/collocations/upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Đã đọc ${d.parsed} Collocation · mới ${d.created} · cập nhật ${d.updated}.`; document.getElementById('collocationDocx').value=''; document.getElementById('collocationSearch').value=''; await loadCollocationsAdmin();}catch(e){st.textContent='❌ '+e.message;}
 }
 async function saveCollocation(id){
   const meaning=document.getElementById('col-meaning-'+id)?.value||''; const example=document.getElementById('col-example-'+id)?.value||'';
-  try{await api('/admin/api/collocations/'+id,{method:'PATCH',body:JSON.stringify({password:pw,meaning,example,collocation:(document.getElementById('col-collocation-'+id)?.value||'')})}); await loadCollocationsAdmin();}catch(e){alert('❌ '+e.message)}
+  try{await api('/admin/api/collocations/'+id,{method:'PATCH',body:JSON.stringify({password:pw,meaning,example,collocation:(document.getElementById('col-collocation-'+id)?.value||'')})}); await searchCollocations();}catch(e){alert('❌ '+e.message)}
 }
 async function deleteCollocation(id,name){
   if(!confirm(`Xóa Collocation "${name}"?`))return;
   try{await api('/admin/api/collocations/'+id+'?password='+encodeURIComponent(pw),{method:'DELETE'}); await loadCollocationsAdmin();}catch(e){alert('❌ '+e.message)}
+}
+async function deleteAllCollocations(){
+  const cid=document.getElementById('collocationCourse')?.value||''; if(!cid)return;
+  const count=Number((document.getElementById('collocationCountText')?.textContent||'').match(/[0-9]+/)?.[0]||0);
+  if(!count){alert('Khóa học này hiện không có Collocation để xóa.');return;}
+  if(!confirm(`Xóa toàn bộ ${count} Collocation của khóa học này?\n\nThao tác này không thể hoàn tác.`))return;
+  try{
+    const d=await api('/admin/api/collocations/all?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid),{method:'DELETE'});
+    document.getElementById('collocationStatus').textContent=`✅ Đã xóa ${Number(d.deleted||0)} Collocation.`;
+    document.getElementById('collocationSearch').value='';
+    await loadCollocationsAdmin();
+  }catch(e){alert('❌ '+e.message)}
 }
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
