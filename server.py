@@ -22,6 +22,9 @@ import urllib.parse
 import html
 import hashlib
 import tempfile
+from pathlib import Path
+import zipfile
+import mimetypes
 from html.parser import HTMLParser
 import gc
 from zoneinfo import ZoneInfo
@@ -122,7 +125,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.127-followup-one-history-gated-context")
+print("[DORAEMON SERVER FINGERPRINT] 19.130-collocation-daily-docx-admin-writing-flow")
 SERVER_VERSION = "2026-09-11-v30-welcome-nameerror-fix"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -11337,6 +11340,264 @@ def admin_course_delete(course_id:int,payload:dict):
     finally:
         conn.close()
 
+def _docx_collocation_entries(file_bytes: bytes):
+    """Parse the user's collocation DOCX deterministically; no GenAI required."""
+    NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+    import xml.etree.ElementTree as ET
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
+        doc = ET.fromstring(zf.read("word/document.xml"))
+        rels = ET.fromstring(zf.read("word/_rels/document.xml.rels"))
+        rel_map = {}
+        for rel in rels.findall(f"{{{NS_REL}}}Relationship"):
+            rid = rel.attrib.get("Id")
+            target = rel.attrib.get("Target", "")
+            if rid and target:
+                target = target.lstrip("/")
+                if not target.startswith("word/"):
+                    target = "word/" + target
+                rel_map[rid] = target
+
+        def para_text(p):
+            parts=[]
+            for t in p.iter(f"{{{NS_W}}}t"):
+                parts.append(t.text or "")
+            return "".join(parts).strip()
+
+        def para_images(p):
+            out=[]
+            for blip in p.iter(f"{{{NS_A}}}blip"):
+                rid = blip.attrib.get(f"{{{NS_R}}}embed")
+                target = rel_map.get(rid)
+                if not target or target not in zf.namelist():
+                    continue
+                raw=zf.read(target)
+                ext=Path(target).suffix.lower()
+                content_type=mimetypes.types_map.get(ext, "application/octet-stream")
+                out.append((Path(target).name, raw, content_type))
+            return out
+
+        entries=[]
+        current=None
+        def commit_current():
+            nonlocal current
+            if not current:
+                return
+            coll=str(current.get("collocation") or "").strip()
+            if not coll:
+                current=None
+                return
+            current["collocation"]=coll
+            current["meaning"]=str(current.get("meaning") or "").strip()
+            current["example"]=str(current.get("example") or "").strip()
+            current["image"]=(current.get("images") or [None])[0]
+            current.pop("images", None)
+            entries.append(current)
+            current=None
+
+        for p_el in doc.iter(f"{{{NS_W}}}p"):
+            text=para_text(p_el)
+            imgs=para_images(p_el)
+            # Entry title, e.g. '41. sustainable tourism'. Field lines also begin
+            # with a number, but always contain the field labels below.
+            m=re.match(r"^(\d+)\.\s+(.+)$", text)
+            if m and not re.match(r"^\d+\.\s*(Collocation|Nghĩa|Ví dụ|Ảnh)", text, re.I):
+                commit_current()
+                current={"number":int(m.group(1)),"collocation":m.group(2).strip(),"meaning":"","example":"","images":[]}
+            elif current:
+                low=text.casefold()
+                if low.startswith("1. collocation:"):
+                    current["collocation"]=text.split(":",1)[1].strip()
+                elif low.startswith("2. nghĩa:"):
+                    current["meaning"]=text.split(":",1)[1].strip()
+                elif low.startswith("3. ví dụ:"):
+                    current["example"]=text.split(":",1)[1].strip()
+            if current and imgs:
+                current["images"].extend(imgs)
+        commit_current()
+        return entries
+
+
+def _collocation_row(row):
+    d=dict(row)
+    d["image_url"]=b2_url(d.get("image_key")) if d.get("image_key") else None
+    return d
+
+
+@app.get("/admin/api/collocations")
+def admin_collocations(password: str, course_id: Optional[int] = None):
+    check_admin(password)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if course_id is None:
+                cur.execute("""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,x.collocation,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
+                              FROM collocations x LEFT JOIN courses c ON c.id=x.course_id
+                              ORDER BY c.name,x.id""")
+            else:
+                cur.execute("""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,x.collocation,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
+                              FROM collocations x LEFT JOIN courses c ON c.id=x.course_id
+                              WHERE x.course_id=%s ORDER BY x.id""", (int(course_id),))
+            rows=[_collocation_row(r) for r in cur.fetchall()]
+        return {"success":True,"collocations":rows}
+    finally:
+        conn.close()
+
+
+@app.post("/admin/api/collocations/upload")
+async def admin_collocations_upload(password: str = Form(""), course_id: int = Form(...), file: UploadFile = File(...)):
+    check_admin(password)
+    filename=str(file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(400,"Chỉ hỗ trợ file .docx cho danh sách Collocation.")
+    data=await file.read()
+    if not data:
+        raise HTTPException(400,"File DOCX rỗng.")
+    entries=_docx_collocation_entries(data)
+    if not entries:
+        raise HTTPException(400,"Không bóc tách được Collocation nào từ file DOCX.")
+    conn=db()
+    created=updated=0
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name FROM courses WHERE id=%s", (int(course_id),))
+            course=cur.fetchone()
+            if not course:
+                raise HTTPException(404,"Không tìm thấy khóa học.")
+            for idx,e in enumerate(entries,1):
+                image_key=""
+                image=e.get("image")
+                if image:
+                    image_name, raw, content_type=image
+                    safe_source=re.sub(r"[^A-Za-z0-9._-]+","_",Path(filename).stem)[:80]
+                    image_key=f"collocations/{int(course_id)}/{safe_source}/{idx:04d}_{re.sub(r'[^A-Za-z0-9._-]+','_',image_name)[:80]}"
+                    if b2_ready():
+                        b2_put_bytes(image_key,raw,content_type)
+                    else:
+                        print(f"[COLLOCATION UPLOAD] B2 unavailable; image skipped collocation={e['collocation']!r}")
+                        image_key=""
+                cur.execute("""INSERT INTO collocations(course_id,collocation,meaning,example,image_key,source_file,is_active,updated_at)
+                               VALUES(%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                               ON CONFLICT(course_id,collocation) DO UPDATE SET
+                                   meaning=EXCLUDED.meaning,
+                                   example=EXCLUDED.example,
+                                   image_key=CASE WHEN EXCLUDED.image_key<>'' THEN EXCLUDED.image_key ELSE collocations.image_key END,
+                                   source_file=EXCLUDED.source_file,
+                                   is_active=TRUE,
+                                   updated_at=NOW()
+                               RETURNING id, (xmax=0) AS inserted""",(int(course_id),e["collocation"],e["meaning"],e["example"],image_key,filename))
+                row=cur.fetchone()
+                if row and row.get("inserted"): created+=1
+                else: updated+=1
+        conn.commit()
+        return {"success":True,"filename":filename,"course_id":int(course_id),"parsed":len(entries),"created":created,"updated":updated}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+@app.patch("/admin/api/collocations/{collocation_id}")
+def admin_collocation_update(collocation_id:int, payload:dict):
+    check_admin(str(payload.get("password") or ""))
+    collocation=str(payload.get("collocation") or "").strip()
+    meaning=str(payload.get("meaning") or "").strip()
+    example=str(payload.get("example") or "").strip()
+    if not collocation:
+        raise HTTPException(400,"Collocation không được để trống.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""UPDATE collocations SET collocation=%s,meaning=%s,example=%s,updated_at=NOW()
+                           WHERE id=%s RETURNING id,course_id,collocation,meaning,example,image_key,source_file,is_active,updated_at""",(collocation,meaning,example,int(collocation_id)))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"Không tìm thấy Collocation.")
+        conn.commit()
+        return {"success":True,"collocation":_collocation_row(row)}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+@app.delete("/admin/api/collocations/{collocation_id}")
+def admin_collocation_delete(collocation_id:int, password:str):
+    check_admin(password)
+    conn=db()
+    image_key=""
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("DELETE FROM collocations WHERE id=%s RETURNING id,image_key",(int(collocation_id),))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"Không tìm thấy Collocation.")
+            image_key=str(row.get("image_key") or "")
+        conn.commit()
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+    if image_key:
+        b2_delete_key(image_key)
+    return {"success":True,"collocation_id":int(collocation_id)}
+
+
+@app.get("/learning/collocation/daily")
+def learning_collocation_daily(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization)
+    authorized=_authorized_courses(user["id"])
+    ids=[int(x["course_id"]) for x in authorized if x.get("course_id") is not None]
+    if course_id is not None:
+        if int(course_id) not in ids:
+            raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
+        target=int(course_id)
+    elif len(ids)==1:
+        target=ids[0]
+    else:
+        return {"success":True,"show":False,"requires_course_selection":len(ids)>1,"courses":authorized}
+    today=_now_local().date()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT ucd.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
+                          FROM user_collocation_daily ucd
+                          JOIN collocations c ON c.id=ucd.collocation_id
+                          WHERE ucd.user_id=%s AND ucd.course_id=%s AND ucd.shown_date=%s""",(user["id"],target,today))
+            row=cur.fetchone()
+            if row:
+                row=dict(row); row["image_url"]=b2_url(row.get("image_key")) if row.get("image_key") else None
+                return {"success":True,"show":False,"collocation":row}
+            cur.execute("""SELECT c.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
+                          FROM collocations c
+                          WHERE c.course_id=%s AND c.is_active=TRUE
+                            AND NOT EXISTS (SELECT 1 FROM user_collocation_daily u
+                                            WHERE u.user_id=%s AND u.course_id=%s AND u.collocation_id=c.id)
+                          ORDER BY random() LIMIT 1""",(target,user["id"],target))
+            row=cur.fetchone()
+            if not row:
+                cur.execute("""SELECT c.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
+                              FROM collocations c WHERE c.course_id=%s AND c.is_active=TRUE ORDER BY random() LIMIT 1""",(target,))
+                row=cur.fetchone()
+            if not row:
+                return {"success":True,"show":False,"collocation":None}
+            cur.execute("""INSERT INTO user_collocation_daily(user_id,course_id,collocation_id,shown_date)
+                          VALUES(%s,%s,%s,%s) ON CONFLICT(user_id,course_id,shown_date) DO NOTHING""",(user["id"],target,int(row["id"]),today))
+            # If another request won the race, reuse the already stored row.
+            cur.execute("""SELECT ucd.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
+                          FROM user_collocation_daily ucd JOIN collocations c ON c.id=ucd.collocation_id
+                          WHERE ucd.user_id=%s AND ucd.course_id=%s AND ucd.shown_date=%s""",(user["id"],target,today))
+            final=cur.fetchone()
+        conn.commit()
+        result=dict(final or row)
+        result["image_url"]=b2_url(result.get("image_key")) if result.get("image_key") else None
+        return {"success":True,"show":True,"collocation":result}
+    finally:
+        conn.close()
+
+
 @app.get("/admin/api/knowledge/catalog")
 def admin_knowledge_catalog(password: str):
     check_admin(password)
@@ -11699,6 +11960,30 @@ def init_curriculum_db():
     conn = db()
     try:
         with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS collocations (
+                id BIGSERIAL PRIMARY KEY,
+                course_id BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                collocation TEXT NOT NULL,
+                meaning TEXT NOT NULL DEFAULT '',
+                example TEXT NOT NULL DEFAULT '',
+                image_key TEXT NOT NULL DEFAULT '',
+                source_file VARCHAR(500) NOT NULL DEFAULT '',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(course_id, collocation)
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS user_collocation_daily (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                course_id BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                collocation_id BIGINT NOT NULL REFERENCES collocations(id) ON DELETE CASCADE,
+                shown_date DATE NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(user_id, course_id, shown_date)
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_collocations_course_active ON collocations(course_id,is_active,id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_user_collocation_daily_user_course ON user_collocation_daily(user_id,course_id,shown_date);")
             cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_drafts (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
                 content_type VARCHAR(30) NOT NULL, lesson VARCHAR(255) NOT NULL, status VARCHAR(30) NOT NULL DEFAULT 'AI_DRAFT',
@@ -13742,6 +14027,59 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 <script>
 let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0, adminCourses=[];
 
+function ensureCollocationAdminSection(){
+  const panel=document.getElementById("panel"); if(!panel || document.getElementById("collocationAdminCard")) return;
+  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="collocationAdminCard">
+    <h3>💡 Collocation</h3>
+    <div class="small" style="margin-bottom:10px">Upload .docx danh sách Collocation → bóc tách trực tiếp bằng DOCX, không dùng GenAI. Mỗi Collocation gồm cụm từ, nghĩa, ví dụ và ảnh minh họa.</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <select id="collocationCourse" style="min-width:240px"><option value="">-- Chọn khóa học --</option></select>
+      <input id="collocationDocx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="flex:1;min-width:260px">
+      <button type="button" onclick="uploadCollocations()">⬆️ Upload DOCX</button>
+      <button type="button" class="gray" onclick="loadCollocationsAdmin()">🔄 Làm mới</button>
+    </div>
+    <div id="collocationStatus" class="small" style="margin:6px 0 10px"></div>
+    <div id="collocationAdminList"></div>
+  </div>`);
+  const sel=document.getElementById("collocationCourse");
+  sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('');
+  sel.addEventListener('change',()=>loadCollocationsAdmin());
+}
+async function loadCollocationsAdmin(){
+  ensureCollocationAdminSection();
+  const cid=document.getElementById('collocationCourse')?.value||'';
+  const box=document.getElementById('collocationAdminList'); if(!box)return;
+  try{
+    const d=await api('/admin/api/collocations?password='+encodeURIComponent(pw)+(cid?'&course_id='+encodeURIComponent(cid):''));
+    const rows=d.collocations||[];
+    if(!rows.length){box.innerHTML='<div class="small">Chưa có Collocation. Hãy upload file DOCX.</div>';return;}
+    box.innerHTML=`<div style="font-weight:700;margin-bottom:8px">Danh sách (${rows.length})</div>`+rows.map(r=>`<div style="display:grid;grid-template-columns:190px 1.1fr 1.5fr 190px auto;gap:8px;align-items:start;padding:10px 0;border-top:1px solid #eee">
+      <div><input id="col-collocation-${Number(r.id)}" value="${esc(r.collocation||'')}" style="width:100%;font-weight:700"><div class="small">${esc(r.course_name||'')}</div></div>
+      <textarea id="col-meaning-${Number(r.id)}" rows="2" placeholder="Nghĩa">${esc(r.meaning||'')}</textarea>
+      <textarea id="col-example-${Number(r.id)}" rows="3" placeholder="Ví dụ">${esc(r.example||'')}</textarea>
+      <div>${r.image_url?`<img src="${esc(r.image_url)}" alt="" style="width:180px;max-height:90px;object-fit:cover;border-radius:8px;border:1px solid #ddd">`:'<span class="small">Không có ảnh</span>'}</div>
+      <div style="display:flex;gap:5px;flex-direction:column">
+        <button type="button" onclick="saveCollocation(${Number(r.id)})">💾 Lưu</button>
+        <button type="button" class="red" onclick="deleteCollocation(${Number(r.id)},${JSON.stringify(String(r.collocation||''))})">🗑️ Xóa</button>
+      </div>
+    </div>`).join('');
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function uploadCollocations(){
+  const cid=document.getElementById('collocationCourse')?.value||''; const file=document.getElementById('collocationDocx')?.files?.[0]; const st=document.getElementById('collocationStatus');
+  if(!cid){st.textContent='❌ Hãy chọn khóa học.';return;} if(!file){st.textContent='❌ Hãy chọn file .docx.';return;}
+  const fd=new FormData(); fd.append('password',pw); fd.append('course_id',cid); fd.append('file',file);
+  try{st.textContent='⏳ Đang bóc tách DOCX và lưu ảnh...'; const r=await fetch('/admin/api/collocations/upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Đã đọc ${d.parsed} Collocation · mới ${d.created} · cập nhật ${d.updated}.`; document.getElementById('collocationDocx').value=''; await loadCollocationsAdmin();}catch(e){st.textContent='❌ '+e.message;}
+}
+async function saveCollocation(id){
+  const meaning=document.getElementById('col-meaning-'+id)?.value||''; const example=document.getElementById('col-example-'+id)?.value||'';
+  try{await api('/admin/api/collocations/'+id,{method:'PATCH',body:JSON.stringify({password:pw,meaning,example,collocation:(document.getElementById('col-collocation-'+id)?.value||'')})}); await loadCollocationsAdmin();}catch(e){alert('❌ '+e.message)}
+}
+async function deleteCollocation(id,name){
+  if(!confirm(`Xóa Collocation "${name}"?`))return;
+  try{await api('/admin/api/collocations/'+id+'?password='+encodeURIComponent(pw),{method:'DELETE'}); await loadCollocationsAdmin();}catch(e){alert('❌ '+e.message)}
+}
+
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
   o.headers={"Content-Type":"application/json",...(o.headers||{})};
@@ -13758,6 +14096,8 @@ async function login(){
     document.getElementById("panel").style.display="block";
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadCourses();
+    ensureCollocationAdminSection();
+    await loadCollocationsAdmin();
     await loadUsers();
     await loadPaymentPackages();
     await loadKnowledgeCatalog();
