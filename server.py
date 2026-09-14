@@ -125,8 +125,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.130-collocation-daily-docx-admin-writing-flow")
-SERVER_VERSION = "2026-09-11-v30-welcome-nameerror-fix"
+print("[DORAEMON SERVER FINGERPRINT] 19.131-collocation-login-random-shuffle")
+SERVER_VERSION = "2026-09-14-v31_9-collocation-login-random-shuffle"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -11659,57 +11659,67 @@ def admin_collocation_delete(collocation_id:int, password:str):
     return {"success":True,"collocation_id":int(collocation_id)}
 
 
-@app.get("/learning/collocation/daily")
-def learning_collocation_daily(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
-    user=require_active_user(authorization)
-    authorized=_authorized_courses(user["id"])
+def _resolve_collocation_course(user_id: int, course_id: Optional[int] = None):
+    authorized=_authorized_courses(user_id)
     ids=[int(x["course_id"]) for x in authorized if x.get("course_id") is not None]
     if course_id is not None:
         if int(course_id) not in ids:
             raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
-        target=int(course_id)
-    elif len(ids)==1:
-        target=ids[0]
-    else:
-        return {"success":True,"show":False,"requires_course_selection":len(ids)>1,"courses":authorized}
-    today=_now_local().date()
+        return int(course_id), authorized
+    if len(ids)==1:
+        return ids[0], authorized
+    return None, authorized
+
+
+def _pick_collocation_for_user(user_id: int, course_id: Optional[int] = None, exclude_id: Optional[int] = None):
+    target, authorized = _resolve_collocation_course(user_id, course_id)
+    if target is None:
+        return {"success":True,"show":False,"requires_course_selection":len(authorized)>1,"courses":authorized}
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT ucd.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
-                          FROM user_collocation_daily ucd
-                          JOIN collocations c ON c.id=ucd.collocation_id
-                          WHERE ucd.user_id=%s AND ucd.course_id=%s AND ucd.shown_date=%s""",(user["id"],target,today))
-            row=cur.fetchone()
-            if row:
-                row=dict(row); row["image_url"]=b2_url(row.get("image_key")) if row.get("image_key") else None
-                return {"success":True,"show":False,"collocation":row}
-            cur.execute("""SELECT c.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
+            params=[target]
+            extra=""
+            if exclude_id is not None:
+                extra=" AND c.id<>%s"
+                params.append(int(exclude_id))
+            cur.execute(f"""SELECT c.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
                           FROM collocations c
-                          WHERE c.course_id=%s AND c.is_active=TRUE
-                            AND NOT EXISTS (SELECT 1 FROM user_collocation_daily u
-                                            WHERE u.user_id=%s AND u.course_id=%s AND u.collocation_id=c.id)
-                          ORDER BY random() LIMIT 1""",(target,user["id"],target))
+                          WHERE c.course_id=%s AND c.is_active=TRUE{extra}
+                          ORDER BY random() LIMIT 1""", tuple(params))
             row=cur.fetchone()
-            if not row:
+            # If the course has only one item, allow returning it even when excluded.
+            if not row and exclude_id is not None:
                 cur.execute("""SELECT c.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
-                              FROM collocations c WHERE c.course_id=%s AND c.is_active=TRUE ORDER BY random() LIMIT 1""",(target,))
+                              FROM collocations c WHERE c.course_id=%s AND c.is_active=TRUE
+                              ORDER BY random() LIMIT 1""", (target,))
                 row=cur.fetchone()
             if not row:
-                return {"success":True,"show":False,"collocation":None}
-            cur.execute("""INSERT INTO user_collocation_daily(user_id,course_id,collocation_id,shown_date)
-                          VALUES(%s,%s,%s,%s) ON CONFLICT(user_id,course_id,shown_date) DO NOTHING""",(user["id"],target,int(row["id"]),today))
-            # If another request won the race, reuse the already stored row.
-            cur.execute("""SELECT ucd.id,c.course_id,c.collocation,c.meaning,c.example,c.image_key,c.source_file
-                          FROM user_collocation_daily ucd JOIN collocations c ON c.id=ucd.collocation_id
-                          WHERE ucd.user_id=%s AND ucd.course_id=%s AND ucd.shown_date=%s""",(user["id"],target,today))
-            final=cur.fetchone()
-        conn.commit()
-        result=dict(final or row)
-        result["image_url"]=b2_url(result.get("image_key")) if result.get("image_key") else None
-        return {"success":True,"show":True,"collocation":result}
+                return {"success":True,"show":False,"collocation":None,"course_id":target}
+            result=dict(row)
+            result["image_url"]=b2_url(result.get("image_key")) if result.get("image_key") else None
+            return {"success":True,"show":True,"collocation":result,"course_id":target}
     finally:
         conn.close()
+
+
+@app.get("/learning/collocation/daily")
+def learning_collocation_daily(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
+    """Show one random Collocation whenever a new web learning session is opened/logged in.
+
+    This endpoint intentionally does NOT cache one item per day; the learner can see a
+    different Collocation on the next login/session. Use /shuffle to rotate immediately.
+    """
+    user=require_active_user(authorization)
+    return _pick_collocation_for_user(user["id"], course_id)
+
+
+@app.get("/learning/collocation/shuffle")
+def learning_collocation_shuffle(course_id: Optional[int] = None, exclude_id: Optional[int] = None,
+                                 authorization: Optional[str] = Header(default=None)):
+    """Return another random Collocation for the active course."""
+    user=require_active_user(authorization)
+    return _pick_collocation_for_user(user["id"], course_id, exclude_id=exclude_id)
 
 
 @app.get("/admin/api/knowledge/catalog")
