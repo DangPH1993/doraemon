@@ -1,10 +1,10 @@
 # VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.3"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.10-free-tutor-weakness"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.3"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.10-free-tutor-weakness"
 import os
 import ast
 import io
@@ -416,6 +416,28 @@ def init_db():
                 question_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(user_id, usage_date)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS learner_weakness_notes (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                course_id BIGINT NULL,
+                lesson_id TEXT NULL,
+                lesson TEXT NOT NULL DEFAULT '',
+                content_type TEXT NOT NULL DEFAULT '',
+                weakness_note TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_learner_weakness_notes_user_course_created
+                ON learner_weakness_notes(user_id, course_id, created_at DESC);""")
+            cur.execute("""ALTER TABLE learner_weakness_notes ADD COLUMN IF NOT EXISTS lesson_id TEXT NULL;""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS free_chat_tutor_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                chatbox_id TEXT NOT NULL,
+                course_id BIGINT NULL,
+                weakness_note_id BIGINT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(user_id, chatbox_id)
+            );""")
             cur.execute("""CREATE TABLE IF NOT EXISTS payment_packages (
                 months INTEGER PRIMARY KEY,
                 plan_name VARCHAR(50) NOT NULL,
@@ -613,6 +635,7 @@ class ChatRequest(BaseModel):
     proactive: bool = False
     action: str | None = None
     course_id: int | None = None
+    free_chat_tutor: bool = False
 
     @property
     def text(self) -> str:
@@ -4670,6 +4693,98 @@ def _is_lightweight_casual_message(message: str) -> bool:
     return any(x in s for x in phrases)
 
 
+def _extract_weakness_note(raw_text: str) -> tuple[str, str]:
+    text = str(raw_text or '').strip()
+    marker = '###WEAKNESS_NOTE###'
+    if marker not in text:
+        return text, ''
+    before, after = text.split(marker, 1)
+    note = re.split(r'###END_WEAKNESS_NOTE###', after.strip(), maxsplit=1, flags=re.I)[0].strip()
+    lines = [re.sub(r'^\s*[-•]\s*', '', x).strip() for x in note.splitlines()]
+    lines = [x for x in lines if x]
+    return before.rstrip(), '\n'.join(lines[:5]).strip()
+
+
+def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, note):
+    note = str(note or '').strip()
+    if not note:
+        return None
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO learner_weakness_notes
+                (user_id, course_id, lesson_id, lesson, content_type, weakness_note)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                RETURNING id, created_at""",
+                (int(user_id), course_id, lesson_id, str(lesson or ''), str(content_type or ''), note[:3000]))
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row or {})
+    finally:
+        conn.close()
+
+
+def _get_free_chat_tutor_note(user_id, course_id, chatbox_id):
+    chatbox_id = str(chatbox_id or '').strip()
+    if not chatbox_id:
+        return None
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT s.weakness_note_id, n.id, n.lesson, n.content_type, n.weakness_note, n.created_at
+                FROM free_chat_tutor_sessions s
+                LEFT JOIN learner_weakness_notes n ON n.id=s.weakness_note_id
+                WHERE s.user_id=%s AND s.chatbox_id=%s LIMIT 1""", (int(user_id), chatbox_id))
+            existing = cur.fetchone()
+            if existing and existing.get('weakness_note'):
+                return dict(existing)
+            params=[int(user_id)]; where=['user_id=%s']
+            if course_id is not None:
+                where.append('course_id=%s'); params.append(int(course_id))
+            cur.execute("SELECT id, lesson, content_type, weakness_note, created_at FROM learner_weakness_notes WHERE " + ' AND '.join(where) + " ORDER BY created_at DESC, id DESC LIMIT 5", tuple(params))
+            notes=[dict(r) for r in (cur.fetchall() or []) if str(r.get('weakness_note') or '').strip()]
+            chosen=random.choice(notes) if notes else None
+            cur.execute("""INSERT INTO free_chat_tutor_sessions(user_id,chatbox_id,course_id,weakness_note_id)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT(user_id,chatbox_id) DO UPDATE SET
+                course_id=EXCLUDED.course_id,
+                weakness_note_id=COALESCE(free_chat_tutor_sessions.weakness_note_id,EXCLUDED.weakness_note_id)""",
+                (int(user_id), chatbox_id, int(course_id) if course_id is not None else None, chosen.get('id') if chosen else None))
+            conn.commit()
+            return chosen
+    finally:
+        conn.close()
+
+
+def _free_chat_tutor_prompt(note, history_text, query_text):
+    note_text=str((note or {}).get('weakness_note') or '').strip()
+    note_lesson=str((note or {}).get('lesson') or '').strip()
+    note_type=str((note or {}).get('content_type') or '').strip()
+    meta=f"Bài được chọn cho phiên này: {note_lesson} ({note_type})." if note_lesson else ''
+    return f"""Bạn là Doraemon trong chế độ Free Chat Tutor.
+Bạn đóng vai một giáo viên nước ngoài thân thiện, tự nhiên, biết hỏi han, động viên và hướng dẫn cải thiện. Mục tiêu là giúp người học tiến bộ nhưng không được biến mọi cuộc trò chuyện thành buổi học bắt buộc.
+
+QUY TẮC:
+- Có thể trò chuyện tự do về mọi chủ đề nếu user muốn.
+- Khi phù hợp, chủ động bắt chuyện dựa trên weakness note và biến nó thành một cuộc luyện tập nhẹ nhàng.
+- Không nói về database, log, weakness note hay cơ chế nội bộ.
+- Có thể nghĩ ra bài tập nhỏ, mini challenge, ví dụ hoặc hội thoại để luyện điểm yếu; chờ user trả lời rồi sửa.
+- Nếu user đang nói chuyện ngoài lề, hãy theo mạch trò chuyện. Có thể gợi ý hóm hỉnh để mở rộng chủ đề nhưng không ép học.
+- Nếu user dùng tiếng Anh, ưu tiên tiếng Anh; nếu user dùng tiếng Việt, ưu tiên tiếng Việt trừ khi user yêu cầu ngôn ngữ khác.
+
+{meta}
+ĐIỂM CẦN CẢI THIỆN TỪ MỘT BÀI CỤ THỂ:
+{note_text or '(Chưa có dữ liệu; trò chuyện tự nhiên và chỉ dạy khi user muốn.)'}
+
+LỊCH SỬ PHIÊN HIỆN TẠI, tối đa 10 lượt user/model:
+{history_text or '(chưa có lịch sử)'}
+
+TIN NHẮN HIỆN TẠI:
+{query_text}
+
+Hãy trả lời tự nhiên như một tutor thật."""
+
+
 def _normalize_chat_history(chat_history, max_messages=20):
     """Normalize the current chatbox history into at most max_messages messages.
 
@@ -6120,6 +6235,16 @@ def proxy_chat(
         print(f"[CHATBOX CONTEXT] existing_chatbox history_messages={len(plan_recent_history)} bounded=10_exchanges")
     if plan_recent_history:
         print(f"[CHAT HISTORY PLAN] messages={len(plan_recent_history)}")
+
+    if data.free_chat_tutor and not data.action:
+        tutor_note=_get_free_chat_tutor_note(user["id"], selected_course_id, data.chatbox_id)
+        tutor_history=plan_recent_history[-20:]
+        tutor_history_text="\n".join(f"{h.get('role')}: {str(h.get('text') or '')[-1200:]}" for h in tutor_history)
+        tutor_prompt=_free_chat_tutor_prompt(tutor_note, tutor_history_text, query_text)
+        gen_started=time.perf_counter()
+        reply,model_used,_=_generate_chat_reply(tutor_prompt,content_type=None,request_id=request_id,gen_started=gen_started,user_text=query_text,reasoning_profile="low",max_output_tokens=1800)
+        print(f"[FREE CHAT TUTOR] user={user['id']} chatbox_id={data.chatbox_id!r} note_id={(tutor_note or {}).get('id')} history_messages={len(tutor_history)}")
+        return {"reply":reply,"model":model_used,"sources":[],"images":[],"content_blocks":[{"type":"text","text":reply or ""}],"learning_progress":None,"free_chat_tutor":True,"weakness_note":tutor_note or None}
 
     # Once a chatbox has started a review session, normal user text is an answer
     # to the current question. This keeps the review state authoritative without
@@ -7694,13 +7819,22 @@ YÊU CẦU OUTPUT:
 - Có thể trích dẫn ngắn các đoạn trong bài làm để minh họa lỗi/điểm mạnh.
 - Không bịa yêu cầu không có trong đề.
 - Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
+- SAU phần nhận xét 6 tiêu chí và 3-5 điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết weakness của bài.
+- Nếu có từ vựng hoặc grammar/cấu trúc cần lưu ý liên quan trực tiếp tới lỗi trong bài, ghi rõ chúng. Không suy đoán yếu tố không có bằng chứng.
 """
                     gen_started=time.perf_counter()
                     evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
+                    evaluation, weakness_note = _extract_weakness_note(evaluation)
                     _set_curriculum_writing_state(user["id"],result=evaluation)
+                    if weakness_note:
+                        lesson_id=(study_session or {}).get("lesson_id") or (study_session or {}).get("content_id") or None
+                        note_row=_save_weakness_note(user["id"], selected_course_id, lesson_id, (study_session or {}).get("lesson") or requested_lesson or "", "Luyện viết", weakness_note)
+                        print(f"[WEAKNESS NOTE] saved type=Luyện viết user={user['id']} note_id={(note_row or {}).get('id')} chars={len(weakness_note)}")
                     _set_curriculum_flow(user["id"],step=current_step,waiting='writing_grade_done',exercise_answered=True)
                     evaluation_text=(evaluation or '').strip()
                     blocks=[{"type":"text","text":evaluation_text or "Doraemon chưa nhận được kết quả chấm bài."}]
+                    if weakness_note:
+                        blocks.append({"type":"text","text":"🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
                     blocks.extend(_exercise_finish_blocks())
                     print(f'[CURRICULUM WRITING GRADE] request={request_id} vision_used={int(bool(grading_vision))} genai=1')
                     return {"reply":evaluation or '',"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
@@ -7779,7 +7913,9 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Không dùng kiến thức ngoài đề.
 - Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
 - Diễn giải tối đa 20 từ/câu.
-- Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối.
+- Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối phần chấm câu.
+- SAU toàn bộ phần chấm câu, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết những điểm yếu nổi bật dựa CHỈ vào các câu sai và bằng chứng/diễn giải.
+- Nếu có từ vựng hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, phải ghi rõ mục cần lưu ý. Chỉ ghi khi có bằng chứng; không suy đoán.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
@@ -7792,7 +7928,12 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                     reasoning_profile="low",
                     max_output_tokens=4000,
                 )
+                evaluation, weakness_note = _extract_weakness_note(evaluation)
                 evaluation=_exercise_strip_total_score(evaluation)
+                if weakness_note:
+                    lesson_id=(study_session or {}).get("lesson_id") or (study_session or {}).get("content_id") or None
+                    note_row=_save_weakness_note(user["id"], selected_course_id, lesson_id, (study_session or {}).get("lesson") or requested_lesson or "", "Bài tập", weakness_note)
+                    print(f"[WEAKNESS NOTE] saved type=Bài tập user={user['id']} note_id={(note_row or {}).get('id')} chars={len(weakness_note)}")
                 # Never expose legacy correctness icons or score totals in Bài tập.
                 evaluation=re.sub(r'(^|\n)\s*Câu\s+(\d+)\s*:\s*(?:✅|❌)\s*', r'\1Câu \2:\n', evaluation, flags=re.I)
                 evaluation=re.sub(r'(?im)^\s*(?:Điểm|Score|Tổng điểm|Kết quả)\s*:\s*.*$', '', evaluation)
@@ -7806,6 +7947,8 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                 study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
                 blocks=[{"type":"text","text":evaluation or ""}]
+                if weakness_note:
+                    blocks.append({"type":"text","text":"🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
                 blocks.extend(_exercise_finish_blocks())
                 # Do not paste the full B2 answer block. The evaluation already quotes
                 # only the per-question official answer text requested for feedback.
