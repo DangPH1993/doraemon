@@ -1,4 +1,5 @@
 # VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v2-query-order-and-router-bypass"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.10-free-tutor-weakness"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -6118,7 +6119,7 @@ def proxy_chat(
     explicit_plan_request = explicit_plan_phrase and bool(
         plan_target.get('target_date') or plan_target.get('units_per_day') or plan_target.get('days_per_unit')
     )
-    if (not data.action and selected_course_id is not None and data.text
+    if (not data.free_chat_tutor and not data.action and selected_course_id is not None and data.text
             and not _is_short_acknowledgement(data.text)
             and _is_learning_intent_candidate(data.text)
             and not explicit_plan_request):
@@ -6219,6 +6220,10 @@ def proxy_chat(
                 lesson_label = scope.get("lesson") or "bài này"
                 msg = f"Được nhé! 🤖 Mình vẫn giữ bài **{lesson_label}** đang mở. Cậu cứ hỏi tiếp phần đang học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
+
+    # Resolve the current user text before any Free Chat Tutor branch.
+    # Free Chat must not depend on the later generic-chat routing section.
+    query_text = data.text
 
     # The current open chatbox supplies the authoritative conversational context.
     # Keep the latest 20 messages (= up to 10 user/model exchanges) available
@@ -6852,7 +6857,6 @@ def proxy_chat(
         }
 
     namespace = data.knowledge_namespace or "__default__"
-    query_text = data.text
     if data.proactive:
         plan_hint = _study_plan_brief_for_auto_chat(user["id"], selected_course_id)
         if plan_hint:
