@@ -11341,15 +11341,23 @@ def admin_course_delete(course_id:int,payload:dict):
         conn.close()
 
 def _docx_collocation_entries(file_bytes: bytes):
-    """Parse the user's collocation DOCX deterministically; no GenAI required."""
+    """Parse generic Collocation blocks from DOCX without GenAI.
+
+    The parser deliberately ignores any document title/header before the first
+    `Collocation:` line. Each entry begins at `Collocation:` (optionally preceded
+    by a number such as `21.` / `1.`), then consumes its Nghĩa, Ví dụ and image
+    until the next `Collocation:` marker.
+    """
     NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
     NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
     NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
     import xml.etree.ElementTree as ET
+
     with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
         doc = ET.fromstring(zf.read("word/document.xml"))
         rels = ET.fromstring(zf.read("word/_rels/document.xml.rels"))
+
         rel_map = {}
         for rel in rels.findall(f"{{{NS_REL}}}Relationship"):
             rid = rel.attrib.get("Id")
@@ -11361,63 +11369,122 @@ def _docx_collocation_entries(file_bytes: bytes):
                 rel_map[rid] = target
 
         def para_text(p):
-            parts=[]
-            for t in p.iter(f"{{{NS_W}}}t"):
-                parts.append(t.text or "")
-            return "".join(parts).strip()
+            return "".join(t.text or "" for t in p.iter(f"{{{NS_W}}}t")).strip()
 
         def para_images(p):
-            out=[]
+            out = []
             for blip in p.iter(f"{{{NS_A}}}blip"):
                 rid = blip.attrib.get(f"{{{NS_R}}}embed")
                 target = rel_map.get(rid)
                 if not target or target not in zf.namelist():
                     continue
-                raw=zf.read(target)
-                ext=Path(target).suffix.lower()
-                content_type=mimetypes.types_map.get(ext, "application/octet-stream")
+                raw = zf.read(target)
+                ext = Path(target).suffix.lower()
+                content_type = mimetypes.types_map.get(ext, "application/octet-stream")
                 out.append((Path(target).name, raw, content_type))
             return out
 
-        entries=[]
-        current=None
+        # A Collocation block starts whenever a paragraph contains the field
+        # label `Collocation:`. Everything before the first such marker is
+        # treated as document title/header and ignored.
+        collocation_re = re.compile(
+            r"^(?:(?:\d+)\s*[.)]\s*)?(?:\d+\s*[.)]\s*)?(?:1\s*[.)]\s*)?collocation\s*:\s*(.+?)\s*$",
+            re.IGNORECASE,
+        )
+        meaning_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?nghĩa\s*:\s*(.*)$", re.IGNORECASE)
+        example_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?ví dụ\s*:\s*(.*)$", re.IGNORECASE)
+        usage_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?mức độ sử dụng\s*:\s*(.*)$", re.IGNORECASE)
+        image_label_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?ảnh\s+minh\s+họa\s+ví\s+dụ\s*:??\s*$", re.IGNORECASE)
+
+        entries = []
+        current = None
+        awaiting_image = False
+
         def commit_current():
-            nonlocal current
+            nonlocal current, awaiting_image
             if not current:
+                awaiting_image = False
                 return
-            coll=str(current.get("collocation") or "").strip()
+            coll = str(current.get("collocation") or "").strip()
             if not coll:
-                current=None
+                current = None
+                awaiting_image = False
                 return
-            current["collocation"]=coll
-            current["meaning"]=str(current.get("meaning") or "").strip()
-            current["example"]=str(current.get("example") or "").strip()
-            current["image"]=(current.get("images") or [None])[0]
-            current.pop("images", None)
+            current["collocation"] = coll
+            current["meaning"] = str(current.get("meaning") or "").strip()
+            current["example"] = str(current.get("example") or "").strip()
+            current["usage"] = str(current.get("usage") or "").strip()
+            imgs = current.pop("images", []) or []
+            current["image"] = imgs[0] if imgs else None
             entries.append(current)
-            current=None
+            current = None
+            awaiting_image = False
 
         for p_el in doc.iter(f"{{{NS_W}}}p"):
-            text=para_text(p_el)
-            imgs=para_images(p_el)
-            # Entry title, e.g. '41. sustainable tourism'. Field lines also begin
-            # with a number, but always contain the field labels below.
-            m=re.match(r"^(\d+)\.\s+(.+)$", text)
-            if m and not re.match(r"^\d+\.\s*(Collocation|Nghĩa|Ví dụ|Ảnh)", text, re.I):
+            text = para_text(p_el)
+            imgs = para_images(p_el)
+
+            # 1) Entry start. The document title can be arbitrary because only
+            # the Collocation: label starts a record.
+            m = collocation_re.match(text)
+            if m:
                 commit_current()
-                current={"number":int(m.group(1)),"collocation":m.group(2).strip(),"meaning":"","example":"","images":[]}
-            elif current:
-                low=text.casefold()
-                if low.startswith("1. collocation:"):
-                    current["collocation"]=text.split(":",1)[1].strip()
-                elif low.startswith("2. nghĩa:"):
-                    current["meaning"]=text.split(":",1)[1].strip()
-                elif low.startswith("3. ví dụ:"):
-                    current["example"]=text.split(":",1)[1].strip()
-            if current and imgs:
+                current = {
+                    "collocation": m.group(1).strip(),
+                    "meaning": "",
+                    "example": "",
+                    "usage": "",
+                    "images": [],
+                }
+                awaiting_image = False
+                if imgs:
+                    current["images"].extend(imgs)
+                continue
+
+            # Ignore anything before the first Collocation marker.
+            if current is None:
+                continue
+
+            # 2) Fields inside the current block. Numbering is optional.
+            m = meaning_re.match(text)
+            if m:
+                current["meaning"] = m.group(1).strip()
+                awaiting_image = False
+                continue
+
+            m = example_re.match(text)
+            if m:
+                current["example"] = m.group(1).strip()
+                awaiting_image = False
+                continue
+
+            m = usage_re.match(text)
+            if m:
+                current["usage"] = m.group(1).strip()
+                awaiting_image = False
+                continue
+
+            if image_label_re.match(text):
+                awaiting_image = True
+                if imgs:
+                    current["images"].extend(imgs)
+                    awaiting_image = False
+                continue
+
+            # 3) The image may be in the paragraph immediately following the
+            # "Ảnh minh họa ví dụ:" label.
+            if imgs:
                 current["images"].extend(imgs)
+                awaiting_image = False
+
         commit_current()
-        return entries
+        # Only valid records with the minimum required fields are imported.
+        return [
+            e for e in entries
+            if str(e.get("collocation") or "").strip()
+            and str(e.get("meaning") or "").strip()
+            and str(e.get("example") or "").strip()
+        ]
 
 
 def _collocation_row(row):
