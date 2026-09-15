@@ -34,7 +34,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -12404,7 +12404,7 @@ class _CurriculumRichTextSanitizer(HTMLParser):
             attr_map={str(k or '').lower():str(v or '').strip() for k,v in attrs}
             src=attr_map.get('src','')
             alt=attr_map.get('alt','')
-            if not re.match(r'^https?://', src, flags=re.I):
+            if not re.match(r'^(?:https?://|/)', src, flags=re.I):
                 return
             self.out.append(f'<img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}">')
             return
@@ -13750,6 +13750,25 @@ def admin_curriculum_draft_get(draft_id:int,password:str):
             return dict(row)
     finally: conn.close()
 
+@app.get('/media/curriculum-draft/{draft_id}/{filename}')
+def curriculum_draft_media(draft_id:int, filename:str):
+    """Serve Draft editor images through the app, so B2_PUBLIC_BASE_URL is not required."""
+    raw_name=str(filename or '')
+    safe_name=os.path.basename(raw_name)
+    if safe_name != raw_name or not re.match(r'^[A-Za-z0-9_.-]+\.(?:png|jpe?g|webp|gif)$', safe_name, flags=re.I):
+        raise HTTPException(400,'Tên ảnh không hợp lệ.')
+    if not b2_ready():
+        raise HTTPException(503,'B2 chưa sẵn sàng.')
+    key=f'curriculum-drafts/{int(draft_id)}/content-images/{safe_name}'
+    try:
+        obj=b2.get_object(Bucket=B2_BUCKET, Key=key)
+        body=obj['Body']
+        media_type=str(obj.get('ContentType') or 'application/octet-stream')
+        return StreamingResponse(body, media_type=media_type)
+    except Exception as exc:
+        print(f'[CURRICULUM DRAFT IMAGE SERVE] draft_id={draft_id} key={key!r} error={type(exc).__name__}: {exc}')
+        raise HTTPException(404,'Không tìm thấy ảnh Draft.')
+
 @app.post('/admin/api/curriculum/drafts/{draft_id}/content-image')
 async def admin_curriculum_draft_content_image(draft_id:int, password:str=Form(''), file:UploadFile=File(...)):
     """Upload an Admin-authored image for the current Curriculum Draft editor."""
@@ -13781,10 +13800,9 @@ async def admin_curriculum_draft_content_image(draft_id:int, password:str=Form('
         url=b2_put_bytes(key,data,content_type)
     except Exception as exc:
         raise HTTPException(500,f'Không lưu được ảnh vào B2: {type(exc).__name__}: {exc}')
-    if not url:
-        raise HTTPException(500,'B2 chưa có public URL để hiển thị ảnh trong Draft.')
-    print(f"[CURRICULUM DRAFT IMAGE] draft_id={draft_id} key={key} bytes={len(data)}")
-    return {'success':True,'draft_id':draft_id,'image_key':key,'image_url':url,'filename':safe_name}
+    stable_url=f'/media/curriculum-draft/{draft_id}/{urllib.parse.quote(digest + ext)}'
+    print(f"[CURRICULUM DRAFT IMAGE] draft_id={draft_id} key={key} bytes={len(data)} url={stable_url}")
+    return {'success':True,'draft_id':draft_id,'image_key':key,'image_url':stable_url,'filename':safe_name}
 
 @app.post('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_save(draft_id:int,payload:dict):
@@ -14773,7 +14791,7 @@ function _sanitizeCurriculumRichHtml(value){
     const tag=el.tagName.toLowerCase();
     if(tag==='img'){
       const src=String(el.getAttribute('src')||'').trim();
-      if(!/^https?:\/\//i.test(src)){ el.remove(); return; }
+      if(!/^(?:https?:\/\/|\/)/i.test(src)){ el.remove(); return; }
       const alt=String(el.getAttribute('alt')||'').trim();
       [...el.attributes].forEach(a=>el.removeAttribute(a.name));
       el.setAttribute('src',src); if(alt)el.setAttribute('alt',alt);
