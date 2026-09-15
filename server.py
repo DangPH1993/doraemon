@@ -15606,6 +15606,91 @@ Chỉ trả JSON đúng schema:
         out.append({"box": vals, "explanation": explanation, "facts": facts})
     return out
 
+def gemini_detect_exercise_visuals(page_png: bytes, page_no: int, extracted_text: str = "", source_file: str = ""):
+    """Detect large self-contained visual content blocks inside exercise pages.
+
+    Examples include email/forms, posters/notices, tables/schedules, charts,
+    screenshots and other bordered information panels. These crops are kept as
+    source images so Admin can attach the exact visual block to an exercise.
+    """
+    if not gemini:
+        return []
+    prompt = f"""Đây là trang {page_no} của tài liệu Bài tập.
+
+Hãy nhìn TRỰC TIẾP vào ảnh và tìm các KHỐI NỘI DUNG LỚN, TỰ THÂN chứa thông tin mà người học cần nhìn để làm bài. Ví dụ:
+- email/form có khung
+- poster/thông báo/quảng cáo
+- bảng biểu/lịch
+- biểu mẫu, phiếu, notice, menu, chart
+- screenshot hoặc panel có nhiều nội dung bên trong
+
+Mục tiêu: CẮT RIÊNG từng khối như vậy thành ảnh để Admin có thể gắn vào bài tập.
+
+KHÔNG lấy đoạn văn bình thường, toàn bộ trang, header/footer, icon hoặc ảnh minh họa nhỏ.
+
+Mỗi khối trả về:
+- box: [ymin, xmin, ymax, xmax] chuẩn hóa 0-1000
+- kind: email/form/poster/table/chart/screenshot/notice/other
+- description: mô tả ngắn
+- associated_text: vài chữ/tiêu đề chính nhìn thấy trong khối
+- confidence: 0..1
+
+Quy tắc:
+1. Chỉ lấy vùng nội dung độc lập, thường có khung/biên/bố cục riêng.
+2. Box phải bao phủ gần sát toàn bộ khối và không cắt mất nội dung.
+3. Không đoán phần không nhìn rõ.
+4. Có thể trả nhiều khối. Nếu không có, trả [].
+
+TEXT OCR (chỉ hỗ trợ đối chiếu, ảnh là nguồn sự thật):
+{extracted_text[:5000]}
+
+Chỉ trả JSON:
+{{"visuals":[{{"box":[0,0,1000,1000],"kind":"email","description":"...","associated_text":"...","confidence":0.95}}]}}"""
+    try:
+        part = types.Part.from_bytes(data=page_png, mime_type="image/png")
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[part, prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
+                response_mime_type="application/json",
+            )
+        )
+        _log_gemini_usage(response, operation=f"vision_exercise_visual_blocks:{source_file}:page_{page_no}")
+        data = _parse_gemini_json(response.text or "{}")
+    except Exception as exc:
+        print(f"[EXERCISE VISUAL DETECTOR] page={page_no} failed:", type(exc).__name__, str(exc))
+        return []
+    visuals = data.get("visuals") if isinstance(data, dict) and isinstance(data.get("visuals"), list) else []
+    out=[]
+    for item in visuals:
+        if not isinstance(item, dict): continue
+        box=item.get("box")
+        if not isinstance(box,(list,tuple)) or len(box)!=4: continue
+        try: vals=[max(0,min(1000,int(float(x)))) for x in box]
+        except Exception: continue
+        if vals[2] <= vals[0] or vals[3] <= vals[1]: continue
+        area=(vals[2]-vals[0])*(vals[3]-vals[1])
+        if area < 10000: continue
+        try: confidence=float(item.get("confidence") or 0)
+        except Exception: confidence=0.0
+        if confidence < 0.65: continue
+        kind=str(item.get("kind") or "other").strip().lower()
+        desc=str(item.get("description") or "").strip()
+        associated=str(item.get("associated_text") or "").strip()
+        if not desc and not associated: continue
+        out.append({"box":vals,"kind":kind,"description":desc or "Khối nội dung trực quan của bài tập","associated_text":associated,"confidence":confidence})
+    final=[]
+    for item in sorted(out,key=lambda x: ((x["box"][2]-x["box"][0])*(x["box"][3]-x["box"][1])), reverse=True):
+        y1,x1,y2,x2=item["box"]; area=max(1,(y2-y1)*(x2-x1)); duplicate=False
+        for prev in final:
+            py1,px1,py2,px2=prev["box"]; iw=max(0,min(x2,px2)-max(x1,px1)); ih=max(0,min(y2,py2)-max(y1,py1)); inter=iw*ih
+            parea=max(1,(py2-py1)*(px2-px1))
+            if inter/min(area,parea) > 0.82: duplicate=True; break
+        if not duplicate: final.append(item)
+    return final[:8]
+
 def _store_table_source_image(source_file: str, subject: str, page_meta, page_no: int, table_index: int, image_bytes: bytes, size):
     """Store ONE original table image as an independent knowledge image."""
     if not b2_ready():
@@ -16065,15 +16150,20 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
         page_meta = metadata_for_page(records_meta, page_no)
         extracted = (page.extract_text() or "").strip()
         text_len = len(re.sub(r"\s+", "", extracted))
+        is_exercise_page = any(
+            str(m.get("content_type") or "").strip().casefold() == "bài tập"
+            for m in (page_meta or []) if isinstance(m, dict)
+        )
 
-        # Keep the original V16 fast path for ordinary text pages.
+        # Keep the original V16 fast path for ordinary non-exercise text pages.
+        # Exercise pages also pass through the visual-block detector.
         if text_len >= 30:
             # A low-cost local visual check is used only to detect whether an
             # actual table is present. It does NOT perform OCR. PdfReader's
             # PageObject has no drawing API, so use a tiny rendered preview.
             preview = render_pdf_page(pdf_source, page_no, dpi=72)
             table_page = _page_has_table_grid(page, preview, extracted)
-            if not table_page:
+            if not table_page and not is_exercise_page:
                 page_texts[page_no] = extracted
                 lesson_images = extract_lesson_images(pdf_source, page_no, source_file, subject, page_meta)
                 if lesson_images:
@@ -16089,6 +16179,7 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
 
         stored = []
+        detected = []
         if text_len < 30:
             ocr_text, detected = gemini_ocr_page(png, page_no, source_file=source_file)
             for idx, item in enumerate(detected, 1):
@@ -16118,6 +16209,56 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
                     conn.close()
                 stored.append({"key": key, "description": description, "term": term, "reading": reading,
                                "meaning": meaning, "associated_text": associated_text, "bbox": bbox, "page": page_no})
+
+        # Exercise-specific visual extraction: large self-contained regions such as
+        # emails/forms/posters/notices/charts/screenshots. Tables are handled by
+        # the existing table crop pipeline below.
+        if is_exercise_page and not table_page:
+            visual_items = gemini_detect_exercise_visuals(
+                png, page_no, extracted_text=ocr_text or extracted, source_file=source_file
+            )
+            existing_boxes=[]
+            for prior in detected or []:
+                b=prior.get("box") if isinstance(prior,dict) else None
+                if isinstance(b,(list,tuple)) and len(b)==4:
+                    try: existing_boxes.append([float(x) for x in b])
+                    except Exception: pass
+            visual_idx=0
+            for item in visual_items:
+                box=item.get("box") if isinstance(item,dict) else None
+                if not isinstance(box,(list,tuple)) or len(box)!=4: continue
+                try: y1,x1,y2,x2=[float(x) for x in box]
+                except Exception: continue
+                area=max(1.0,(y2-y1)*(x2-x1)); overlap_existing=False
+                for eb in existing_boxes:
+                    ey1,ex1,ey2,ex2=eb; iw=max(0.0,min(x2,ex2)-max(x1,ex1)); ih=max(0.0,min(y2,ey2)-max(y1,ey1)); inter=iw*ih; earea=max(1.0,(ey2-ey1)*(ex2-ex1))
+                    if inter/min(area,earea) >= 0.78: overlap_existing=True; break
+                if overlap_existing: continue
+                cropped=crop_image_from_page(png,box)
+                if not cropped: continue
+                image_bytes,(width,height)=cropped
+                visual_idx += 1
+                safe_source=re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)
+                key=f"images/{safe_source}/page_{page_no:04d}/exercise_visual_{visual_idx:02d}.jpg"
+                b2_put_bytes(key,image_bytes,"image/jpeg")
+                primary=page_meta[0] if page_meta else {}
+                kind=str(item.get("kind") or "other").strip().lower()
+                description=str(item.get("description") or f"Khối {kind} của bài tập").strip()
+                associated_text=str(item.get("associated_text") or "").strip()
+                bbox=json.dumps(box,ensure_ascii=False)
+                conn=db()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""INSERT INTO knowledge_images
+                            (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,associated_text,bbox,width,height)
+                            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (source_file,subject,primary.get("content_type","Bài tập"),primary.get("lesson"),primary.get("topic"),page_no,key,b2_url(key),f"Exercise visual [{kind}]: {description}",associated_text,bbox,width,height))
+                    conn.commit()
+                finally:
+                    conn.close()
+                stored.append({"key":key,"description":f"Exercise visual [{kind}]: {description}","associated_text":associated_text,"bbox":bbox,"page":page_no,"kind":"exercise_visual","image_scope":"chunk","exercise_visual_kind":kind,"unit_id":f"page:{page_no}:exercise_visual:{visual_idx}"})
+            if visual_idx:
+                print(f"[EXERCISE VISUAL] page={page_no} detected={len(visual_items)} stored={visual_idx}")
 
         # For table pages, keep EACH ORIGINAL TABLE as its own image and add
         # one semantic Vision explanation per table to the text that is embedded in the RAG chunk.
