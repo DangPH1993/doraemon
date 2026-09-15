@@ -1,11 +1,11 @@
 # VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v2-query-order-and-router-bypass"
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.10-free-tutor-weakness"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.10-free-tutor-weakness"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 import os
 import ast
 import io
@@ -7824,7 +7824,8 @@ YÊU CẦU OUTPUT:
 - Không bịa yêu cầu không có trong đề.
 - Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
 - SAU phần nhận xét 6 tiêu chí và 3-5 điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết weakness của bài.
-- Nếu có từ vựng hoặc grammar/cấu trúc cần lưu ý liên quan trực tiếp tới lỗi trong bài, ghi rõ chúng. Không suy đoán yếu tố không có bằng chứng.
+- NẾU bài essay có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc, BẮT BUỘC ghi rõ các lỗi tiêu biểu trong weakness note. Không được chỉ nói chung chung. Phải ưu tiên ghi cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, có thể trích ngắn câu chứa lỗi.
+- Ưu tiên lưu những lỗi xuất hiện thật trong bài làm của học sinh; không tự suy đoán điểm yếu từ phong cách viết nếu không có ví dụ/bằng chứng cụ thể.
 """
                     gen_started=time.perf_counter()
                     evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
@@ -7919,7 +7920,8 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Diễn giải tối đa 20 từ/câu.
 - Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối phần chấm câu.
 - SAU toàn bộ phần chấm câu, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết những điểm yếu nổi bật dựa CHỈ vào các câu sai và bằng chứng/diễn giải.
-- Nếu có từ vựng hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, phải ghi rõ mục cần lưu ý. Chỉ ghi khi có bằng chứng; không suy đoán.
+- NẾU đáp án/ phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong weakness note. Không được chỉ viết chung chung như "cần cải thiện từ vựng/grammar". Phải nêu cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, kèm ngữ cảnh ngắn nếu cần.
+- Chỉ ghi lỗi từ vựng/grammar khi nhìn thấy bằng chứng trực tiếp trong câu trả lời của học sinh hoặc khi diễn giải cho thấy lỗi đó; tuyệt đối không suy đoán. Nếu không có lỗi từ vựng/grammar thì không cần tạo mục này.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
