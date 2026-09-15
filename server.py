@@ -3747,9 +3747,17 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
         text=str(step.get("text") or "").strip()
     if text:
         blocks.append({"type":"text","text":(title+"\n\n"+text).strip()})
+    image_urls=[]; seen_img=set()
     for im in step.get("images") or []:
         if im.get("url"):
-            blocks.append({"type":"image","key":im.get("key"),"url":im.get("url"),"page":im.get("page"),"caption":im.get("caption","")})
+            u=str(im.get("url") or '').strip()
+            if u and u not in seen_img:
+                seen_img.add(u); image_urls.append((im.get("key"),u,im.get("page"),im.get("caption",'')))
+    for u in _inline_curriculum_image_urls(step.get('content') if isinstance(step.get('content'),dict) else {}):
+        if u not in seen_img:
+            seen_img.add(u); image_urls.append((None,u,None,'Hình minh họa'))
+    for key,u,page,caption in image_urls:
+        blocks.append({"type":"image","key":key,"url":u,"page":page,"caption":caption})
 
     sections=list((cache or {}).get("sections") or [])
     is_exercise = ct == "Bài tập"
@@ -12448,6 +12456,27 @@ def sanitize_curriculum_rich_text(value):
     except Exception:
         return re.sub(r'<[^>]+>', '', text)
 
+
+def _normalize_curriculum_content_for_admin(content):
+    """Normalize legacy rich-text so edit Drafts receive real <img> tags, not literal markup."""
+    out=dict(content) if isinstance(content,dict) else {}
+    if "content" in out:
+        out["content"]=sanitize_curriculum_rich_text(out.get("content"))
+    return out
+
+
+def _inline_curriculum_image_urls(content):
+    """Extract inline image src URLs stored inside rich-text HTML."""
+    content=content if isinstance(content,dict) else {}
+    raw=_decode_curriculum_html_entities(str(content.get("content") or ""))
+    urls=[]
+    seen=set()
+    for m in re.finditer(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', raw, flags=re.I):
+        u=str(m.group(1) or '').strip()
+        if u and u not in seen and re.match(r'^(?:https?://|/)',u,re.I):
+            seen.add(u); urls.append(u)
+    return urls
+
 def reindex_curriculum_draft_steps_safe(content_type, steps):
     """Reindex draft step codes without touching any published lesson.
 
@@ -13682,6 +13711,7 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
             """, (int(lesson_id),))
             for r in cur.fetchall() or []:
                 content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+                content=_normalize_curriculum_content_for_admin(content)
                 steps.append({
                     'code':str(r.get('step_code') or ''),
                     'title':str(r.get('title') or ''),
@@ -13747,7 +13777,15 @@ def admin_curriculum_draft_get(draft_id:int,password:str):
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
             if not row: raise HTTPException(404,'Draft không tồn tại.')
-            return dict(row)
+            result=dict(row)
+            draft=result.get('draft_json') if isinstance(result.get('draft_json'),dict) else {}
+            steps=[]
+            for st in (draft.get('steps') or []):
+                st=dict(st)
+                st['content']=_normalize_curriculum_content_for_admin(st.get('content') if isinstance(st.get('content'),dict) else {})
+                steps.append(st)
+            draft=dict(draft); draft['steps']=steps; result['draft_json']=draft
+            return result
     finally: conn.close()
 
 @app.get('/media/curriculum-draft/{draft_id}/{filename}')
@@ -14797,6 +14835,29 @@ function _sanitizeCurriculumRichHtml(value){
   const box=document.createElement('div');
   if(/<\s*(?:b|strong|i|em|u|br|p|div|span|img)\b/i.test(src)){ box.innerHTML=src; }
   else { box.textContent=src; }
+
+  // Legacy/paste-safe fallback: older saves may contain literal IMG markup as
+  // plain text nodes. Convert every literal <img ...> occurrence into a real
+  // DOM image before the final allow-list pass.
+  const literalImgRe=/<img\s+[^>]*src=[\"']([^\"']+)[\"'][^>]*>/ig;
+  const walker=document.createTreeWalker(box,NodeFilter.SHOW_TEXT);
+  const textNodes=[]; let n;
+  while((n=walker.nextNode())){ if(literalImgRe.test(n.nodeValue||'')){ literalImgRe.lastIndex=0; textNodes.push(n); } }
+  textNodes.forEach(node=>{
+    const text=String(node.nodeValue||'');
+    let last=0; let match; const frag=document.createDocumentFragment(); literalImgRe.lastIndex=0;
+    while((match=literalImgRe.exec(text))){
+      if(match.index>last)frag.appendChild(document.createTextNode(text.slice(last,match.index)));
+      const rawSrc=String(match[1]||'').trim();
+      if(/^(?:https?:\/\/|\/)/i.test(rawSrc)){
+        const img=document.createElement('img'); img.setAttribute('src',rawSrc); img.setAttribute('alt','Hình minh họa'); frag.appendChild(img);
+      }else{ frag.appendChild(document.createTextNode(match[0])); }
+      last=match.index+match[0].length;
+    }
+    if(last<text.length)frag.appendChild(document.createTextNode(text.slice(last)));
+    node.replaceWith(frag);
+  });
+
   box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
   box.querySelectorAll('*').forEach(el=>{
     const tag=el.tagName.toLowerCase();
