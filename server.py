@@ -12438,7 +12438,7 @@ def sanitize_curriculum_rich_text(value):
     # Decode all legacy entity layers first. The HTMLParser then decides which tags
     # are actually allowed, so encoded <script> etc. cannot bypass sanitization.
     text=_decode_curriculum_html_entities(text)
-    if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span)\b', text, flags=re.I):
+    if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span|img)\b', text, flags=re.I):
         return text
     try:
         parser=_CurriculumRichTextSanitizer()
@@ -14780,8 +14780,19 @@ function curriculumImageGallery(step,pages){
 function _findCurriculumJsonTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-json'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
 function _findCurriculumTextTextarea(code){const wanted=String(code||'');for(const el of document.querySelectorAll('#curSteps .cur-rich'))if(String(el.getAttribute('data-code')||'')===wanted)return el;return null;}
 function _findCurriculumTextarea(code){return _findCurriculumJsonTextarea(code);}
+function _decodeCurriculumRichEntities(value){
+  let out=String(value??'');
+  for(let i=0;i<6;i++){
+    const ta=document.createElement('textarea');
+    ta.innerHTML=out;
+    const next=ta.value;
+    if(next===out)break;
+    out=next;
+  }
+  return out;
+}
 function _sanitizeCurriculumRichHtml(value){
-  const src=String(value??'');
+  let src=_decodeCurriculumRichEntities(value);
   if(!src)return '';
   const box=document.createElement('div');
   if(/<\s*(?:b|strong|i|em|u|br|p|div|span|img)\b/i.test(src)){ box.innerHTML=src; }
