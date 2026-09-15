@@ -3259,6 +3259,19 @@ def _published_curriculum_images(content, pages=None):
         for im in page.get("images") or []:
             key=str(im.get("image_key") or "").strip()
             if key: inventory[key]=im
+    # Inline images embedded inside the rich-text `content` must remain inline.
+    # They are NOT emitted again as trailing image blocks, otherwise the learner
+    # sees the same image twice and the image appears at the end of the lesson.
+    inline_urls=set(_inline_curriculum_image_urls(content))
+    normalized_inline=set()
+    for u in inline_urls:
+        u0=str(u or '').strip()
+        if u0:
+            normalized_inline.add(u0)
+            try:
+                normalized_inline.add(str(urllib.parse.unquote(u0)))
+            except Exception:
+                pass
     out=[]; seen=set()
     for item in content.get("images") or []:
         if not isinstance(item,dict): continue
@@ -3266,9 +3279,13 @@ def _published_curriculum_images(content, pages=None):
         if not key or key in seen: continue
         base=inventory.get(key,{})
         vision=item.get("vision") or base.get("vision") or {}
+        url=str(b2_url(key) or item.get("image_url") or base.get("image_url") or "").strip()
+        if url in normalized_inline or str(item.get("image_url") or '').strip() in normalized_inline:
+            seen.add(key)
+            continue
         out.append({
             "key":key,
-            "url":str(b2_url(key) or item.get("image_url") or base.get("image_url") or "").strip(),
+            "url":url,
             "page":item.get("page") or base.get("page"),
             "caption":str(item.get("caption") or vision.get("caption") or vision.get("description") or vision.get("explanation") or "").strip()
         })
@@ -3753,9 +3770,6 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
             u=str(im.get("url") or '').strip()
             if u and u not in seen_img:
                 seen_img.add(u); image_urls.append((im.get("key"),u,im.get("page"),im.get("caption",'')))
-    for u in _inline_curriculum_image_urls(step.get('content') if isinstance(step.get('content'),dict) else {}):
-        if u not in seen_img:
-            seen_img.add(u); image_urls.append((None,u,None,'Hình minh họa'))
     for key,u,page,caption in image_urls:
         blocks.append({"type":"image","key":key,"url":u,"page":page,"caption":caption})
 
