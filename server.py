@@ -64,6 +64,11 @@ except Exception:
     np = None
 
 try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
     import pytesseract
 except Exception:
     pytesseract = None
@@ -15622,6 +15627,87 @@ Chỉ trả JSON đúng schema:
         out.append({"box": vals, "explanation": explanation, "facts": facts})
     return out
 
+def _detect_exercise_visuals_cv(page_png: bytes, page_no: int):
+    """Fallback detector for large bordered content blocks on scanned exercise pages.
+
+    This is intentionally conservative and geometry-only: it finds large closed
+    rectangular regions (email/form/poster/panel/table-like blocks) so we still
+    produce a usable crop when Vision returns no box.
+    """
+    if cv2 is None or Image is None or not page_png:
+        return []
+    try:
+        arr = np.frombuffer(page_png, dtype=np.uint8) if np is not None else None
+        if arr is None:
+            return []
+        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return []
+        h, w = img.shape[:2]
+        if w < 300 or h < 200:
+            return []
+        # Strong enough edges for scanned borders without requiring OCR.
+        blur = cv2.GaussianBlur(img, (3, 3), 0)
+        edges = cv2.Canny(blur, 45, 140)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        candidates=[]
+        page_area=float(w*h)
+        for c in contours:
+            x,y,ww,hh=cv2.boundingRect(c)
+            if ww < 0.35*w or hh < 0.18*h:
+                continue
+            area=float(ww*hh)
+            frac=area/page_area
+            if frac < 0.08 or frac > 0.82:
+                continue
+            # Reject page-edge frames and nearly full-page borders.
+            if x < 0.015*w or y < 0.015*h or x+ww > 0.985*w or y+hh > 0.985*h:
+                continue
+            peri=cv2.arcLength(c, True)
+            if peri <= 0:
+                continue
+            approx=cv2.approxPolyDP(c, 0.02*peri, True)
+            if len(approx) != 4:
+                continue
+            rectangularity=area/max(1.0,float(cv2.contourArea(approx)))
+            if rectangularity < 0.82:
+                continue
+            # Prefer large standalone blocks with a healthy aspect ratio.
+            aspect=ww/float(max(1,hh))
+            if aspect < 0.75 or aspect > 5.5:
+                continue
+            box=[int(round(1000*y/h)), int(round(1000*x/w)), int(round(1000*(y+hh)/h)), int(round(1000*(x+ww)/w))]
+            candidates.append({
+                'box': box,
+                'kind':'form',
+                'description':'Khối nội dung lớn có khung viền (fallback hình học)',
+                'associated_text':'',
+                'confidence':0.86,
+                '_area':frac,
+            })
+        candidates.sort(key=lambda z: z['_area'], reverse=True)
+        final=[]
+        for cand in candidates:
+            y1,x1,y2,x2=cand['box']
+            area=max(1,(y2-y1)*(x2-x1))
+            dup=False
+            for prev in final:
+                py1,px1,py2,px2=prev['box']
+                iw=max(0,min(x2,px2)-max(x1,px1)); ih=max(0,min(y2,py2)-max(y1,py1)); inter=iw*ih
+                if inter/max(1,min(area,(py2-py1)*(px2-px1))) >= 0.84:
+                    dup=True; break
+            if not dup:
+                cand.pop('_area',None)
+                final.append(cand)
+            if len(final)>=4:
+                break
+        if final:
+            print(f'[EXERCISE VISUAL CV] page={page_no} detected={len(final)}')
+        return final
+    except Exception as exc:
+        print(f'[EXERCISE VISUAL CV] page={page_no} failed:', type(exc).__name__, str(exc))
+        return []
+
 def gemini_detect_exercise_visuals(page_png: bytes, page_no: int, extracted_text: str = "", source_file: str = ""):
     """Detect large self-contained visual content blocks inside exercise pages.
 
@@ -15691,12 +15777,13 @@ Chỉ trả JSON:
         if area < 10000: continue
         try: confidence=float(item.get("confidence") or 0)
         except Exception: confidence=0.0
-        if confidence < 0.65: continue
+        if confidence < 0.45: continue
         kind=str(item.get("kind") or "other").strip().lower()
         desc=str(item.get("description") or "").strip()
         associated=str(item.get("associated_text") or "").strip()
-        if not desc and not associated: continue
-        out.append({"box":vals,"kind":kind,"description":desc or "Khối nội dung trực quan của bài tập","associated_text":associated,"confidence":confidence})
+        if not desc and not associated:
+            desc = f"Khối {kind} trong bài tập"
+        out.append({"box":vals,"kind":kind,"description":desc,"associated_text":associated,"confidence":confidence})
     final=[]
     for item in sorted(out,key=lambda x: ((x["box"][2]-x["box"][0])*(x["box"][3]-x["box"][1])), reverse=True):
         y1,x1,y2,x2=item["box"]; area=max(1,(y2-y1)*(x2-x1)); duplicate=False
@@ -16142,6 +16229,9 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                     )
                 except Exception as exc:
                     print(f'[EXERCISE VISUAL DETECTOR] page={page_no} failed: {type(exc).__name__}: {exc}')
+                    visual_items=[]
+                if not visual_items:
+                    visual_items=_detect_exercise_visuals_cv(png, page_no)
 
             visual_idx=0
             for item in visual_items:
@@ -16292,9 +16382,15 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
         # emails/forms/posters/notices/charts/screenshots. Tables are handled by
         # the existing table crop pipeline below.
         if is_exercise_page and not table_page:
-            visual_items = gemini_detect_exercise_visuals(
-                png, page_no, extracted_text=ocr_text or extracted, source_file=source_file
-            )
+            try:
+                visual_items = gemini_detect_exercise_visuals(
+                    png, page_no, extracted_text=ocr_text or extracted, source_file=source_file
+                )
+            except Exception as exc:
+                print(f'[EXERCISE VISUAL DETECTOR] page={page_no} failed: {type(exc).__name__}: {exc}')
+                visual_items=[]
+            if not visual_items:
+                visual_items = _detect_exercise_visuals_cv(png, page_no)
             existing_boxes=[]
             for prior in detected or []:
                 b=prior.get("box") if isinstance(prior,dict) else None
