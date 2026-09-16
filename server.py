@@ -4769,7 +4769,7 @@ def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, not
             else:
                 where.append('course_id=%s'); params.append(int(course_id))
             if lesson_id is None or str(lesson_id).strip() == '':
-                where.append('(lesson_id IS NULL OR lesson_id='')')
+                where.append('(lesson_id IS NULL OR lesson_id=%s)'); params.append('')
             else:
                 where.append('lesson_id=%s'); params.append(str(lesson_id).strip())
 
