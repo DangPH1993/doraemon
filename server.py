@@ -127,7 +127,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.131-collocation-login-random-shuffle")
-SERVER_VERSION = "2026-09-14-v31_9-collocation-login-random-shuffle"
+SERVER_VERSION = "31.32"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -11787,6 +11787,286 @@ def _docx_collocation_entries(file_bytes: bytes):
         ]
 
 
+
+def _docx_phrasal_verb_entries(file_bytes: bytes):
+    """Parse generic Phrasal verb blocks from DOCX without GenAI.
+
+    Each entry starts at `Phrasal verb:` (optionally numbered) and consumes its
+    Nghĩa, Ví dụ and the following illustration until the next Phrasal verb marker.
+    """
+    NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
+        doc = ET.fromstring(zf.read("word/document.xml"))
+        rels = ET.fromstring(zf.read("word/_rels/document.xml.rels"))
+        rel_map = {}
+        for rel in rels.findall(f"{{{NS_REL}}}Relationship"):
+            rid = rel.attrib.get("Id")
+            target = rel.attrib.get("Target", "")
+            if rid and target:
+                target = target.lstrip("/")
+                if not target.startswith("word/"):
+                    target = "word/" + target
+                rel_map[rid] = target
+
+        def para_text(p):
+            return "".join(t.text or "" for t in p.iter(f"{{{NS_W}}}t")).strip()
+
+        def para_images(p):
+            out = []
+            for blip in p.iter(f"{{{NS_A}}}blip"):
+                rid = blip.attrib.get(f"{{{NS_R}}}embed")
+                target = rel_map.get(rid)
+                if not target or target not in zf.namelist():
+                    continue
+                raw = zf.read(target)
+                ext = Path(target).suffix.lower()
+                out.append((Path(target).name, raw, mimetypes.types_map.get(ext, "application/octet-stream")))
+            return out
+
+        pv_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?phrasal\s+verb\s*:\s*(.+?)\s*$", re.IGNORECASE)
+        meaning_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?nghĩa\s*:\s*(.*)$", re.IGNORECASE)
+        example_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?ví dụ\s*:\s*(.*)$", re.IGNORECASE)
+        image_label_re = re.compile(r"^(?:(?:\d+)\s*[.)]\s*)?ảnh\s+minh\s+họa\s+ví\s+dụ\s*:??\s*$", re.IGNORECASE)
+
+        entries = []
+        current = None
+        def commit_current():
+            nonlocal current
+            if not current:
+                return
+            pv = str(current.get("phrasal_verb") or "").strip()
+            if pv and str(current.get("meaning") or "").strip() and str(current.get("example") or "").strip():
+                imgs = current.pop("images", []) or []
+                current["image"] = imgs[0] if imgs else None
+                current["phrasal_verb"] = pv
+                current["meaning"] = str(current.get("meaning") or "").strip()
+                current["example"] = str(current.get("example") or "").strip()
+                entries.append(current)
+            current = None
+
+        for p_el in doc.iter(f"{{{NS_W}}}p"):
+            text = para_text(p_el)
+            imgs = para_images(p_el)
+            m = pv_re.match(text)
+            if m:
+                commit_current()
+                current = {"phrasal_verb":m.group(1).strip(), "meaning":"", "example":"", "images":[]}
+                if imgs:
+                    current["images"].extend(imgs)
+                continue
+            if current is None:
+                continue
+            m = meaning_re.match(text)
+            if m:
+                current["meaning"] = m.group(1).strip(); continue
+            m = example_re.match(text)
+            if m:
+                current["example"] = m.group(1).strip(); continue
+            if image_label_re.match(text):
+                if imgs:
+                    current["images"].extend(imgs)
+                continue
+            if imgs:
+                current["images"].extend(imgs)
+        commit_current()
+        return entries
+
+
+def _phrasal_verb_row(row):
+    d=dict(row)
+    d["image_url"]=b2_url(d.get("image_key")) if d.get("image_key") else None
+    return d
+
+
+@app.get("/admin/api/phrasal-verbs")
+def admin_phrasal_verbs(password: str, course_id: Optional[int] = None, q: str = "", limit: int = 50):
+    check_admin(password)
+    query=str(q or "").strip()
+    safe_limit=max(1,min(int(limit or 50),100))
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where=[]; params=[]
+            if course_id is not None:
+                where.append("x.course_id=%s"); params.append(int(course_id))
+            if query:
+                where.append("(x.phrasal_verb ILIKE %s OR x.meaning ILIKE %s OR x.example ILIKE %s)")
+                like=f"%{query}%"; params.extend([like,like,like])
+            where_sql=(" WHERE "+" AND ".join(where)) if where else ""
+            cur.execute(f"SELECT COUNT(*) AS total FROM phrasal_verbs x{where_sql}", tuple(params))
+            count=int((cur.fetchone() or {}).get("total") or 0)
+            rows=[]
+            if query:
+                cur.execute(f"""SELECT x.id,x.course_id,COALESCE(c.name,'') AS course_name,
+                                      x.phrasal_verb,x.meaning,x.example,x.image_key,x.source_file,x.is_active,x.updated_at
+                                   FROM phrasal_verbs x LEFT JOIN courses c ON c.id=x.course_id
+                                   {where_sql}
+                                   ORDER BY x.phrasal_verb LIMIT %s""", tuple(params+[safe_limit]))
+                rows=[_phrasal_verb_row(r) for r in cur.fetchall()]
+        return {"success":True,"phrasal_verbs":rows,"count":count,"query":query,"limited":len(rows)>=safe_limit}
+    finally:
+        conn.close()
+
+
+@app.post("/admin/api/phrasal-verbs/upload")
+async def admin_phrasal_verbs_upload(password: str = Form(""), course_id: int = Form(...), file: UploadFile = File(...)):
+    check_admin(password)
+    filename=str(file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(400,"Chỉ hỗ trợ file .docx cho danh sách Phrasal verb.")
+    data=await file.read()
+    if not data:
+        raise HTTPException(400,"File DOCX rỗng.")
+    entries=_docx_phrasal_verb_entries(data)
+    if not entries:
+        raise HTTPException(400,"Không bóc tách được Phrasal verb nào từ file DOCX.")
+    conn=db(); created=updated=0
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name FROM courses WHERE id=%s", (int(course_id),))
+            if not cur.fetchone():
+                raise HTTPException(404,"Không tìm thấy khóa học.")
+            for idx,e in enumerate(entries,1):
+                image_key=""
+                image=e.get("image")
+                if image:
+                    image_name, raw, content_type=image
+                    safe_source=re.sub(r"[^A-Za-z0-9._-]+","_",Path(filename).stem)[:80]
+                    image_key=f"phrasal_verbs/{int(course_id)}/{safe_source}/{idx:04d}_{re.sub(r'[^A-Za-z0-9._-]+','_',image_name)[:80]}"
+                    if b2_ready():
+                        b2_put_bytes(image_key, raw, content_type)
+                    else:
+                        print(f"[PHRASAL VERB UPLOAD] B2 unavailable; image skipped phrasal_verb={e['phrasal_verb']!r}")
+                        image_key=""
+                cur.execute("""INSERT INTO phrasal_verbs(course_id,phrasal_verb,meaning,example,image_key,source_file,is_active,updated_at)
+                               VALUES(%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                               ON CONFLICT(course_id,phrasal_verb) DO UPDATE SET
+                                   meaning=EXCLUDED.meaning,
+                                   example=EXCLUDED.example,
+                                   image_key=CASE WHEN EXCLUDED.image_key<>'' THEN EXCLUDED.image_key ELSE phrasal_verbs.image_key END,
+                                   source_file=EXCLUDED.source_file,
+                                   is_active=TRUE,
+                                   updated_at=NOW()
+                               RETURNING id,(xmax=0) AS inserted""", (int(course_id),e["phrasal_verb"],e["meaning"],e["example"],image_key,filename))
+                row=cur.fetchone()
+                if row and row.get("inserted"): created+=1
+                else: updated+=1
+        conn.commit()
+        return {"success":True,"filename":filename,"course_id":int(course_id),"parsed":len(entries),"created":created,"updated":updated}
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+@app.patch("/admin/api/phrasal-verbs/{phrasal_verb_id}")
+def admin_phrasal_verb_update(phrasal_verb_id:int, payload:dict):
+    check_admin(str(payload.get("password") or ""))
+    phrasal_verb=str(payload.get("phrasal_verb") or "").strip()
+    meaning=str(payload.get("meaning") or "").strip()
+    example=str(payload.get("example") or "").strip()
+    if not phrasal_verb:
+        raise HTTPException(400,"Phrasal verb không được để trống.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""UPDATE phrasal_verbs SET phrasal_verb=%s,meaning=%s,example=%s,updated_at=NOW()
+                           WHERE id=%s RETURNING id,course_id,phrasal_verb,meaning,example,image_key,source_file,is_active,updated_at""", (phrasal_verb,meaning,example,int(phrasal_verb_id)))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"Không tìm thấy Phrasal verb.")
+        conn.commit(); return {"success":True,"phrasal_verb":_phrasal_verb_row(row)}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+@app.delete("/admin/api/phrasal-verbs/all")
+def admin_phrasal_verbs_delete_all(password:str, course_id:int):
+    check_admin(password); cid=int(course_id); conn=db(); image_keys=[]
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT image_key FROM phrasal_verbs WHERE course_id=%s", (cid,))
+            image_keys=[str(r.get("image_key") or "") for r in cur.fetchall() if str(r.get("image_key") or "").strip()]
+            cur.execute("DELETE FROM phrasal_verbs WHERE course_id=%s", (cid,)); deleted=int(cur.rowcount or 0)
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+    for key in image_keys:
+        try: b2_delete_key(key)
+        except Exception as exc: print(f"[PHRASAL VERB DELETE ALL] image delete skipped key={key!r}: {type(exc).__name__}: {exc}")
+    return {"success":True,"course_id":cid,"deleted":deleted}
+
+
+@app.delete("/admin/api/phrasal-verbs/{phrasal_verb_id}")
+def admin_phrasal_verb_delete(phrasal_verb_id:int, password:str):
+    check_admin(password); conn=db(); image_key=""
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("DELETE FROM phrasal_verbs WHERE id=%s RETURNING id,image_key", (int(phrasal_verb_id),))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"Không tìm thấy Phrasal verb.")
+            image_key=str(row.get("image_key") or "")
+        conn.commit()
+    except HTTPException:
+        conn.rollback(); raise
+    finally: conn.close()
+    if image_key: b2_delete_key(image_key)
+    return {"success":True,"phrasal_verb_id":int(phrasal_verb_id)}
+
+
+def _resolve_phrasal_verb_course(user_id: int, course_id: Optional[int] = None):
+    authorized=_authorized_courses(user_id)
+    ids=[int(x["course_id"]) for x in authorized if x.get("course_id") is not None]
+    if course_id is not None:
+        if int(course_id) not in ids:
+            raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
+        return int(course_id), authorized
+    if len(ids)==1: return ids[0], authorized
+    return None, authorized
+
+
+def _pick_phrasal_verb_for_user(user_id: int, course_id: Optional[int] = None, exclude_id: Optional[int] = None):
+    target, authorized=_resolve_phrasal_verb_course(user_id, course_id)
+    if target is None:
+        return {"success":True,"show":False,"requires_course_selection":len(authorized)>1,"courses":authorized}
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params=[target]; extra=""
+            if exclude_id is not None:
+                extra=" AND p.id<>%s"; params.append(int(exclude_id))
+            cur.execute(f"""SELECT p.id,p.course_id,p.phrasal_verb,p.meaning,p.example,p.image_key,p.source_file
+                           FROM phrasal_verbs p WHERE p.course_id=%s AND p.is_active=TRUE{extra}
+                           ORDER BY random() LIMIT 1""", tuple(params))
+            row=cur.fetchone()
+            if not row and exclude_id is not None:
+                cur.execute("""SELECT p.id,p.course_id,p.phrasal_verb,p.meaning,p.example,p.image_key,p.source_file
+                               FROM phrasal_verbs p WHERE p.course_id=%s AND p.is_active=TRUE ORDER BY random() LIMIT 1""", (target,))
+                row=cur.fetchone()
+            if not row: return {"success":True,"show":False,"phrasal_verb":None,"course_id":target}
+            result=dict(row); result["image_url"]=b2_url(result.get("image_key")) if result.get("image_key") else None
+            return {"success":True,"show":True,"phrasal_verb":result,"course_id":target}
+    finally: conn.close()
+
+
+@app.get("/learning/phrasal-verb/daily")
+def learning_phrasal_verb_daily(course_id: Optional[int] = None, authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization); return _pick_phrasal_verb_for_user(user["id"], course_id)
+
+
+@app.get("/learning/phrasal-verb/shuffle")
+def learning_phrasal_verb_shuffle(course_id: Optional[int] = None, exclude_id: Optional[int] = None,
+                                  authorization: Optional[str] = Header(default=None)):
+    user=require_active_user(authorization); return _pick_phrasal_verb_for_user(user["id"], course_id, exclude_id=exclude_id)
+
+
 def _collocation_row(row):
     d=dict(row)
     d["image_url"]=b2_url(d.get("image_key")) if d.get("image_key") else None
@@ -12397,6 +12677,19 @@ def init_curriculum_db():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(course_id, collocation)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS phrasal_verbs (
+                id BIGSERIAL PRIMARY KEY,
+                course_id BIGINT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+                phrasal_verb TEXT NOT NULL,
+                meaning TEXT NOT NULL DEFAULT '',
+                example TEXT NOT NULL DEFAULT '',
+                image_key TEXT NOT NULL DEFAULT '',
+                source_file VARCHAR(500) NOT NULL DEFAULT '',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(course_id, phrasal_verb)
+            );""")
             cur.execute("""CREATE TABLE IF NOT EXISTS user_collocation_daily (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -12407,6 +12700,7 @@ def init_curriculum_db():
                 UNIQUE(user_id, course_id, shown_date)
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collocations_course_active ON collocations(course_id,is_active,id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phrasal_verbs_course_active ON phrasal_verbs(course_id,is_active,id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_collocation_daily_user_course ON user_collocation_daily(user_id,course_id,shown_date);")
             cur.execute("""CREATE TABLE IF NOT EXISTS curriculum_drafts (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, subject VARCHAR(255) NOT NULL,
@@ -14568,6 +14862,85 @@ function ensureCollocationAdminSection(){
   const sel=document.getElementById("collocationCourse");
   sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('');
   sel.addEventListener('change',()=>{document.getElementById('collocationSearch').value='';loadCollocationsAdmin();});
+  ensurePhrasalVerbAdminSection();
+}
+function ensurePhrasalVerbAdminSection(){
+  const panel=document.getElementById("panel"); if(!panel || document.getElementById("phrasalVerbAdminCard")) return;
+  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="phrasalVerbAdminCard">
+    <h3>🔗 Phrasal verb</h3>
+    <div class="small" style="margin-bottom:10px">Upload .docx danh sách Phrasal verb → bóc tách trực tiếp bằng DOCX, không dùng GenAI. Mỗi Phrasal verb gồm cụm động từ, nghĩa, ví dụ và ảnh minh họa.</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <select id="phrasalVerbCourse" style="min-width:240px"><option value="">-- Chọn khóa học --</option></select>
+      <input id="phrasalVerbDocx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="flex:1;min-width:260px">
+      <button type="button" onclick="uploadPhrasalVerbs()">⬆️ Upload DOCX</button>
+      <button type="button" class="gray" onclick="loadPhrasalVerbsAdmin()">🔄 Làm mới</button>
+    </div>
+    <div id="phrasalVerbStatus" class="small" style="margin:6px 0 10px"></div>
+    <div id="phrasalVerbCountBox" style="display:none;margin-bottom:10px;padding:10px 12px;border:1px solid #ddd;border-radius:8px;background:#fafafa">
+      <span id="phrasalVerbCountText" style="font-weight:700"></span>
+      <button type="button" class="red" style="float:right" onclick="deleteAllPhrasalVerbs()">🗑️ Xóa tất cả Phrasal verb</button>
+    </div>
+    <div id="phrasalVerbSearchRow" style="display:none;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <input id="phrasalVerbSearch" type="search" placeholder="Tìm Phrasal verb..." style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')searchPhrasalVerbs()">
+      <button type="button" onclick="searchPhrasalVerbs()">🔎 Tìm kiếm</button>
+    </div>
+    <div id="phrasalVerbAdminList"></div>
+  </div>`);
+  const sel=document.getElementById('phrasalVerbCourse');
+  sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('');
+  sel.addEventListener('change',()=>{document.getElementById('phrasalVerbSearch').value='';loadPhrasalVerbsAdmin();});
+}
+async function loadPhrasalVerbsAdmin(){
+  ensurePhrasalVerbAdminSection();
+  const cid=document.getElementById('phrasalVerbCourse')?.value||''; const box=document.getElementById('phrasalVerbAdminList');
+  const countBox=document.getElementById('phrasalVerbCountBox'); const searchRow=document.getElementById('phrasalVerbSearchRow');
+  if(!box)return;
+  if(!cid){countBox.style.display='none';searchRow.style.display='none';box.innerHTML='<div class="small">Hãy chọn khóa học để xem số lượng Phrasal verb.</div>';return;}
+  try{
+    const d=await api('/admin/api/phrasal-verbs?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid));
+    const count=Number(d.count||0); countBox.style.display='block'; searchRow.style.display='flex';
+    document.getElementById('phrasalVerbCountText').textContent=`Hiện có ${count} Phrasal verb trong khóa học này`;
+    box.innerHTML='<div class="small">Nhập từ khóa và bấm 🔎 Tìm kiếm để sửa hoặc xóa Phrasal verb cụ thể.</div>';
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function searchPhrasalVerbs(){
+  const cid=document.getElementById('phrasalVerbCourse')?.value||''; const q=(document.getElementById('phrasalVerbSearch')?.value||'').trim(); const box=document.getElementById('phrasalVerbAdminList'); if(!box||!cid)return;
+  if(!q){box.innerHTML='<div class="small">Nhập Phrasal verb cần tìm.</div>';return;}
+  try{
+    const d=await api('/admin/api/phrasal-verbs?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid)+'&q='+encodeURIComponent(q)); const rows=d.phrasal_verbs||[];
+    if(!rows.length){box.innerHTML='<div class="small">Không tìm thấy Phrasal verb phù hợp.</div>';return;}
+    box.innerHTML=`<div style="font-weight:700;margin-bottom:8px">Kết quả tìm kiếm: ${rows.length}${d.count>rows.length?' / '+d.count:''}</div>`+rows.map(r=>`<div style="display:grid;grid-template-columns:190px 1.1fr 1.5fr 190px auto;gap:8px;align-items:start;padding:10px 0;border-top:1px solid #eee">
+      <div><input id="pv-phrasal-${Number(r.id)}" value="${esc(r.phrasal_verb||'')}" style="width:100%;font-weight:700"><div class="small">${esc(r.course_name||'')}</div></div>
+      <textarea id="pv-meaning-${Number(r.id)}" rows="2" placeholder="Nghĩa">${esc(r.meaning||'')}</textarea>
+      <textarea id="pv-example-${Number(r.id)}" rows="3" placeholder="Ví dụ">${esc(r.example||'')}</textarea>
+      <div>${r.image_url?`<img src="${esc(r.image_url)}" alt="" style="width:180px;max-height:90px;object-fit:cover;border-radius:8px;border:1px solid #ddd">`:'<span class="small">Không có ảnh</span>'}</div>
+      <div style="display:flex;gap:5px;flex-direction:column">
+        <button type="button" onclick="savePhrasalVerb(${Number(r.id)})">💾 Lưu</button>
+        <button type="button" class="red" onclick="deletePhrasalVerb(${Number(r.id)},${JSON.stringify(String(r.phrasal_verb||''))})">🗑️ Xóa</button>
+      </div>
+    </div>`).join('');
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function uploadPhrasalVerbs(){
+  const cid=document.getElementById('phrasalVerbCourse')?.value||''; const file=document.getElementById('phrasalVerbDocx')?.files?.[0]; const st=document.getElementById('phrasalVerbStatus');
+  if(!cid){st.textContent='❌ Hãy chọn khóa học.';return;} if(!file){st.textContent='❌ Hãy chọn file .docx.';return;}
+  const fd=new FormData(); fd.append('password',pw); fd.append('course_id',cid); fd.append('file',file);
+  try{st.textContent='⏳ Đang bóc tách DOCX và lưu ảnh...'; const r=await fetch('/admin/api/phrasal-verbs/upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Đã đọc ${d.parsed} Phrasal verb · mới ${d.created} · cập nhật ${d.updated}.`; document.getElementById('phrasalVerbDocx').value=''; document.getElementById('phrasalVerbSearch').value=''; await loadPhrasalVerbsAdmin();}catch(e){st.textContent='❌ '+e.message;}
+}
+async function savePhrasalVerb(id){
+  const meaning=document.getElementById('pv-meaning-'+id)?.value||''; const example=document.getElementById('pv-example-'+id)?.value||''; const phrasal_verb=document.getElementById('pv-phrasal-'+id)?.value||'';
+  try{await api('/admin/api/phrasal-verbs/'+id,{method:'PATCH',body:JSON.stringify({password:pw,meaning,example,phrasal_verb})}); await searchPhrasalVerbs();}catch(e){alert('❌ '+e.message)}
+}
+async function deletePhrasalVerb(id,name){
+  if(!confirm(`Xóa Phrasal verb "${name}"?`))return;
+  try{await api('/admin/api/phrasal-verbs/'+id+'?password='+encodeURIComponent(pw),{method:'DELETE'}); await loadPhrasalVerbsAdmin();}catch(e){alert('❌ '+e.message)}
+}
+async function deleteAllPhrasalVerbs(){
+  const cid=document.getElementById('phrasalVerbCourse')?.value||''; if(!cid)return;
+  const count=Number((document.getElementById('phrasalVerbCountText')?.textContent||'').match(/[0-9]+/)?.[0]||0);
+  if(!count){alert('Khóa học này hiện không có Phrasal verb để xóa.');return;}
+  if(!confirm(`Xóa toàn bộ ${count} Phrasal verb của khóa học này?\n\nThao tác này không thể hoàn tác.`))return;
+  try{const d=await api('/admin/api/phrasal-verbs/all?password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid),{method:'DELETE'}); document.getElementById('phrasalVerbStatus').textContent=`✅ Đã xóa ${Number(d.deleted||0)} Phrasal verb.`; document.getElementById('phrasalVerbSearch').value=''; await loadPhrasalVerbsAdmin();}catch(e){alert('❌ '+e.message)}
 }
 async function loadCollocationsAdmin(){
   ensureCollocationAdminSection();
@@ -14652,6 +15025,8 @@ async function login(){
     await loadCourses();
     ensureCollocationAdminSection();
     await loadCollocationsAdmin();
+    ensurePhrasalVerbAdminSection();
+    await loadPhrasalVerbsAdmin();
     await loadUsers();
     await loadPaymentPackages();
     await loadKnowledgeCatalog();
