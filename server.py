@@ -4814,12 +4814,13 @@ NGÔN NGỮ KHÓA HỌC:
 """
     opening_rule = f"""
 ĐẶC BIỆT: ĐÂY LÀ TIN NHẮN MỞ ĐẦU PHIÊN TUTOR.
-- BẮT BUỘC mở đầu bằng việc gợi lại lỗi từ chính bài được chọn; không chào hỏi chung chung rồi bỏ qua lỗi.
-- Nếu đây là Bài tập đọc/Reading và weakness note có câu sai cụ thể, PHẢI ưu tiên gợi lại các câu sai đó trước: nêu số câu, đáp án user đã chọn, đáp án đúng (nếu note có), rồi nhắc lại diễn giải/bằng chứng đã lưu.
-- Sau khi gợi lại lỗi, giải thích ngắn cách tránh lặp lại; CHỈ SAU ĐÓ mới cân nhắc bài tập tương tự.
-- Chỉ ra bài tập tương tự khi weakness note có bằng chứng cụ thể đủ để làm lại. Nếu note không có câu sai/đáp án/diễn giải/bằng chứng đủ cụ thể, KHÔNG được tự suy diễn và KHÔNG tự tạo bài tương tự.
-- Nếu tạo bài tập tương tự Reading, phải NÂNG mức độ thinking: ưu tiên paraphrase, đối chiếu bằng chứng, loại trừ phương án, inference có căn cứ hoặc yêu cầu giải thích evidence; không copy nguyên mẫu câu cũ và không chỉ đổi tên/đổi số.
-- Nếu weakness note có lỗi từ vựng/grammar cụ thể, nhắc ít nhất 1 lỗi đúng theo note và giải thích ngắn.
+- BẮT BUỘC mở đầu bằng việc gợi lại ĐIỂM YẾU CỤ THỂ của chính bài được chọn; không chào hỏi chung chung rồi bỏ qua lỗi.
+- Với Reading, weakness note là BẢN TỔNG KẾT điểm yếu, không phải danh sách câu sai. Hãy ưu tiên gợi lại đúng điểm yếu, diễn giải vì sao user mắc lỗi và nhắc lại bằng chứng/đoạn trích đã lưu. Không đọc lại hàng loạt câu hỏi hoặc đánh số câu như một báo cáo.
+- Nếu note có một ví dụ/bằng chứng nguồn cụ thể, hãy dùng chính ví dụ đó để minh họa khi tutor bắt đầu cuộc trò chuyện.
+- Sau khi gợi lại điểm yếu và bằng chứng, hướng dẫn cách cải thiện; CHỈ SAU ĐÓ mới cân nhắc bài tập tương tự.
+- Chỉ ra bài tập tương tự khi weakness note có bằng chứng cụ thể đủ để hiểu bản chất lỗi. Nếu note chỉ chung chung, KHÔNG được tự suy diễn thành một dạng lỗi cụ thể và KHÔNG tự tạo bài tương tự.
+- Nếu tạo bài tập tương tự Reading, phải NÂNG mức độ thinking: ưu tiên paraphrase, đối chiếu bằng chứng, loại trừ phương án, inference có căn cứ hoặc yêu cầu giải thích evidence; không copy câu cũ và không chỉ đổi tên/đổi số.
+- Nếu weakness note có lỗi từ vựng/grammar cụ thể, nhắc đúng lỗi đã lưu và giải thích ngắn.
 - Không bịa thêm lỗi mới ngoài weakness note.
 """ if is_session_start else ''
     return f"""Bạn là Doraemon trong chế độ Free Chat Tutor.
@@ -4829,7 +4830,8 @@ QUY TẮC:
 - Có thể trò chuyện tự do về mọi chủ đề nếu user muốn.
 - Weakness note của phiên hiện tại là trọng tâm học tập khi user đang ở mạch học.
 - Không nói về database, log, weakness note hay cơ chế nội bộ.
-- Với Reading, ưu tiên nhớ lại lỗi sai cụ thể + diễn giải/bằng chứng trước khi hướng dẫn chiến lược.
+- Với Reading, ưu tiên nhớ lại ĐIỂM YẾU đã được tổng kết + diễn giải + bằng chứng nguồn trước khi hướng dẫn chiến lược. Không biến weakness note thành danh sách câu hỏi.
+- Nếu cần nhắc lại một lỗi sai cụ thể, chỉ suy ra từ bằng chứng đã được note lưu; không tự bịa số câu, đáp án hoặc nguyên nhân chưa có trong note.
 - Với từ vựng/grammar, chỉ dạy các lỗi cụ thể thực sự có trong note; không tự gán user yếu một lĩnh vực nếu note không có bằng chứng.
 - Nếu note không đủ cụ thể để xác định một lỗi/bài tập, chỉ trò chuyện, giải thích hoặc hỏi thêm; KHÔNG suy diễn thành một bài tập tương tự.
 - Nếu tạo bài tương tự Reading, phải khó hơn về mặt tư duy so với câu cũ, không chỉ đổi từ.
@@ -7989,8 +7991,11 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Diễn giải tối đa 20 từ/câu.
 - Nếu đây là bài đọc/Reading, SAU phần chấm câu phải có mục `📚 Từ vựng khó & cụm động từ cần lưu ý` gồm các từ/cụm thực sự xuất hiện trong bài đọc/đề, kèm giải thích ngắn gọn; không lấy từ ngoài nguồn. Chỉ chọn các từ/cụm đáng chú ý, không cần liệt kê toàn bộ.
 - Không thêm nhận xét chung ở cuối phần chấm câu ngoài mục từ vựng/cụm động từ nói trên và weakness note.
-- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn. Với Bài tập đọc, CÁC CÂU SAI PHẢI ĐƯỢC GHI RÕ trong weakness note theo dạng ngắn gọn: `Câu N: chọn X → đúng Y. Diễn giải: ...` và dùng đúng diễn giải/bằng chứng vừa chấm; nếu có nhiều câu sai thì ưu tiên các câu sai nổi bật trong 5 dòng.
-- Weakness note phải ưu tiên dữ liệu cụ thể của bài: số câu sai, đáp án user chọn, đáp án đúng, diễn giải/bằng chứng. Không được thay bằng nhận xét chung chung nếu đã có dữ liệu cụ thể.
+- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn TỔNG KẾT ĐIỂM YẾU CỦA USER. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
+- Với Bài tập đọc/Reading, weakness note phải có cấu trúc ý nghĩa: `Điểm yếu: ...` + `Diễn giải: ...` + `Bằng chứng: "..."` khi nguồn chấm có bằng chứng. Nội dung phải tổng quát hóa từ các lỗi sai để mô tả kỹ năng/khả năng hiểu mà user đang thiếu, nhưng chỉ kết luận những gì dữ liệu bài làm hỗ trợ.
+- Ví dụ: `Điểm yếu: Chưa nắm được ý rằng Murray từng được xem là một ngoại lệ chưa nổi bật trước đó.`; `Diễn giải: User chưa nối được mô tả về thành tích quá khứ với ý "outsider" và việc chưa từng thắng các giải lớn.`; `Bằng chứng: "he had been regarded as a talented outsider who entered but never won the major tournaments."`
+- Bằng chứng nên là câu/đoạn nguồn quan trọng nhất giúp chứng minh điểm yếu, không phải danh sách toàn bộ câu sai. Có thể dùng 1-2 bằng chứng nổi bật nếu cần.
+- Weakness note phải đủ cụ thể để Tutor hiểu bản chất lỗi; không biến thành nhận xét chung kiểu `cần đọc kỹ hơn` nếu dữ liệu cho phép mô tả rõ hơn.
 - NẾU đáp án/phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong weakness note. Phải nêu cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, kèm ngữ cảnh ngắn nếu cần.
 - Chỉ ghi lỗi từ vựng/grammar khi nhìn thấy bằng chứng trực tiếp trong câu trả lời của học sinh hoặc khi diễn giải cho thấy lỗi đó; tuyệt đối không suy đoán. Nếu không có lỗi từ vựng/grammar thì không cần tạo mục này.
 """
