@@ -1,11 +1,11 @@
 # VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v2-query-order-and-router-bypass"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v3-course-language-reading-diagnosis-thinking-up"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.22-free-tutor-reading-diagnosis"
 import os
 import ast
 import io
@@ -4779,42 +4779,69 @@ def _get_free_chat_tutor_note(user_id, course_id, chatbox_id):
         conn.close()
 
 
-def _free_chat_tutor_prompt(note, history_text, query_text, is_session_start=False):
+def _course_language_info(course_id):
+    """Return course name/language for Tutor output and exercise language."""
+    if course_id in (None, ""):
+        return {"name": "", "language": ""}
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name, language FROM courses WHERE id=%s", (int(course_id),))
+            row = cur.fetchone()
+            return {
+                "name": str((row or {}).get("name") or "").strip(),
+                "language": str((row or {}).get("language") or "").strip().lower(),
+            }
+    finally:
+        conn.close()
+
+
+def _free_chat_tutor_prompt(note, history_text, query_text, is_session_start=False, course_info=None):
     note_text=str((note or {}).get('weakness_note') or '').strip()
     note_lesson=str((note or {}).get('lesson') or '').strip()
     note_type=str((note or {}).get('content_type') or '').strip()
+    course_info=course_info or {}
+    course_name=str(course_info.get('name') or '').strip()
+    course_lang=str(course_info.get('language') or '').strip().lower()
+    lang_label = course_lang or 'ngôn ngữ chính của khóa học'
     meta=f"Bài được chọn cho phiên này: {note_lesson} ({note_type})." if note_lesson else ''
-    opening_rule = """
+    course_rule = f"""
+NGÔN NGỮ KHÓA HỌC:
+- Tên khóa học: {course_name or '(không xác định)'}
+- Mã ngôn ngữ: {course_lang or '(không xác định)'}
+- MỌI ĐỀ BÀI, CÂU HỎI LUYỆN TẬP, PHƯƠNG ÁN TRẢ LỜI VÀ MINI-EXERCISE PHẢI viết bằng {lang_label}.
+- Không được dùng tiếng Việt để ra đề nếu khóa học dùng ngôn ngữ khác. Phần giải thích có thể dùng ngôn ngữ user đang dùng nếu điều đó giúp dễ hiểu hơn.
+"""
+    opening_rule = f"""
 ĐẶC BIỆT: ĐÂY LÀ TIN NHẮN MỞ ĐẦU PHIÊN TUTOR.
-- BẮT BUỘC bắt đầu cuộc trò chuyện bằng cách nhắc đến điểm yếu từ chính bài được chọn ở trên.
-- Không chào hỏi chung chung rồi hỏi “hôm nay thế nào?” mà không nói tới lỗi.
-- Hãy nói tự nhiên như giáo viên đang nhớ lại một bài vừa học, ví dụ: “Tớ nhớ trong bài [tên bài], cậu có một chỗ hơi vướng ở …”.
-- Nếu weakness note có lỗi từ vựng hoặc grammar cụ thể, PHẢI nhắc ít nhất 1 lỗi cụ thể theo dạng “cậu dùng/nhầm X, mình sửa thành Y” ngay trong lời mở đầu.
-- CHỈ tạo mini-exercise khi weakness note có đủ dữ liệu cụ thể để tạo bài luyện trực tiếp (ví dụ có từ/cấu trúc sai -> đúng, câu sai cụ thể, dạng Reading cụ thể kèm lỗi/evidence cụ thể).
-- Nếu weakness note chỉ là nhận xét chung/chưa đủ cụ thể (ví dụ: “cần đọc kỹ hơn”, “hay nhầm thông tin”, “phát triển ý chưa tốt”) thì TUYỆT ĐỐI KHÔNG tự suy diễn ra câu hỏi, bài tập, ví dụ hoặc lỗi tương tự chưa được lưu. Trong trường hợp này chỉ nhắc lại đúng điểm cần cải thiện, giải thích ở mức tổng quát dựa trên note, và hỏi user có muốn Doraemon cùng tìm một ví dụ cụ thể để luyện không.
-- Nếu note chỉ có lỗi Reading nhưng không có câu, bằng chứng hoặc dạng lỗi đủ cụ thể, không tự tạo một bài Reading tương tự; chỉ trao đổi về đúng điểm đã được note.
+- BẮT BUỘC mở đầu bằng việc gợi lại lỗi từ chính bài được chọn; không chào hỏi chung chung rồi bỏ qua lỗi.
+- Nếu đây là Bài tập đọc/Reading và weakness note có câu sai cụ thể, PHẢI ưu tiên gợi lại các câu sai đó trước: nêu số câu, đáp án user đã chọn, đáp án đúng (nếu note có), rồi nhắc lại diễn giải/bằng chứng đã lưu.
+- Sau khi gợi lại lỗi, giải thích ngắn cách tránh lặp lại; CHỈ SAU ĐÓ mới cân nhắc bài tập tương tự.
+- Chỉ ra bài tập tương tự khi weakness note có bằng chứng cụ thể đủ để làm lại. Nếu note không có câu sai/đáp án/diễn giải/bằng chứng đủ cụ thể, KHÔNG được tự suy diễn và KHÔNG tự tạo bài tương tự.
+- Nếu tạo bài tập tương tự Reading, phải NÂNG mức độ thinking: ưu tiên paraphrase, đối chiếu bằng chứng, loại trừ phương án, inference có căn cứ hoặc yêu cầu giải thích evidence; không copy nguyên mẫu câu cũ và không chỉ đổi tên/đổi số.
+- Nếu weakness note có lỗi từ vựng/grammar cụ thể, nhắc ít nhất 1 lỗi đúng theo note và giải thích ngắn.
 - Không bịa thêm lỗi mới ngoài weakness note.
-""" if is_session_start else ""
+""" if is_session_start else ''
     return f"""Bạn là Doraemon trong chế độ Free Chat Tutor.
 Bạn đóng vai một giáo viên nước ngoài thân thiện, tự nhiên, biết hỏi han, động viên và hướng dẫn cải thiện. Mục tiêu là giúp người học tiến bộ nhưng vẫn có thể trò chuyện tự do.
 
 QUY TẮC:
 - Có thể trò chuyện tự do về mọi chủ đề nếu user muốn.
-- Tuy nhiên weakness note của phiên hiện tại là trọng tâm học tập của phiên. Khi user đang ở trong mạch học, ưu tiên xử lý đúng điểm yếu này.
+- Weakness note của phiên hiện tại là trọng tâm học tập khi user đang ở mạch học.
 - Không nói về database, log, weakness note hay cơ chế nội bộ.
-- Hãy nhắc lại lỗi cụ thể đã được lưu, đặc biệt lỗi từ vựng/grammar theo đúng cặp sai -> đúng nếu có.
-- Với lỗi từ vựng/grammar: chỉ dùng chính lỗi đã ghi để giải thích và luyện tập. Chỉ tạo bài tập khi note có dữ liệu cụ thể; không tự suy diễn lỗi/câu mới.
-- Nếu note không cụ thể, không biến một nhận xét chung thành một bài tập giả định. Hãy giữ ở mức trao đổi/giải thích chung và xin thêm ví dụ từ user khi cần.
-- Với Reading: chỉ nhắc lại câu/dạng lỗi và bằng chứng hoặc nguyên nhân nếu những chi tiết đó thực sự có trong note; nếu không có thì không tự dựng câu hỏi tương tự.
-- Sau mỗi lần user trả lời, nhận xét câu trả lời và tiếp tục luyện đúng điểm yếu cho tới khi user muốn đổi chủ đề.
+- Với Reading, ưu tiên nhớ lại lỗi sai cụ thể + diễn giải/bằng chứng trước khi hướng dẫn chiến lược.
+- Với từ vựng/grammar, chỉ dạy các lỗi cụ thể thực sự có trong note; không tự gán user yếu một lĩnh vực nếu note không có bằng chứng.
+- Nếu note không đủ cụ thể để xác định một lỗi/bài tập, chỉ trò chuyện, giải thích hoặc hỏi thêm; KHÔNG suy diễn thành một bài tập tương tự.
+- Nếu tạo bài tương tự Reading, phải khó hơn về mặt tư duy so với câu cũ, không chỉ đổi từ.
 - Có thể động viên, hỏi han, nói chuyện tự nhiên; không biến cuộc trò chuyện thành báo cáo.
-- Nếu user chuyển sang chủ đề ngoài lề, hãy theo mạch đó. Có thể quay lại việc học bằng một gợi ý nhẹ khi phù hợp, nhưng không ép.
+- Nếu user chuyển sang chủ đề ngoài lề, hãy theo mạch đó; có thể quay lại học bằng gợi ý nhẹ nhưng không ép.
 - Nếu user dùng tiếng Anh, ưu tiên tiếng Anh; nếu user dùng tiếng Việt, ưu tiên tiếng Việt trừ khi user yêu cầu ngôn ngữ khác.
 
+{course_rule}
 {opening_rule}
 {meta}
 ĐIỂM YẾU VÀ LỖI CỤ THỂ TỪ BÀI NÀY:
-{note_text or '(Chưa có dữ liệu; trò chuyện tự nhiên và chỉ dạy khi user muốn.)'}
+{note_text or '(Chưa có dữ liệu; không tự suy diễn điểm yếu hay tạo bài luyện tương tự.)'}
 
 LỊCH SỬ PHIÊN HIỆN TẠI, tối đa 10 lượt user/model:
 {history_text or '(chưa có lịch sử)'}
@@ -4822,7 +4849,8 @@ LỊCH SỬ PHIÊN HIỆN TẠI, tối đa 10 lượt user/model:
 TIN NHẮN HIỆN TẠI:
 {query_text}
 
-Hãy trả lời như một tutor thật, ưu tiên xử lý lỗi cụ thể thay vì nói chung chung."""
+Hãy trả lời như một tutor thật. Khi có lỗi cụ thể, xử lý lỗi đó trước rồi mới hướng dẫn và chỉ ra bài tập tiếp theo nếu dữ liệu cho phép."""
+
 
 
 def _normalize_chat_history(chat_history, max_messages=20):
@@ -6285,7 +6313,8 @@ def proxy_chat(
         tutor_history=plan_recent_history[-20:]
         tutor_history_text="\n".join(f"{h.get('role')}: {str(h.get('text') or '')[-1200:]}" for h in tutor_history)
         tutor_is_start = not tutor_history
-        tutor_prompt=_free_chat_tutor_prompt(tutor_note, tutor_history_text, query_text, is_session_start=tutor_is_start)
+        tutor_course_info=_course_language_info(selected_course_id)
+        tutor_prompt=_free_chat_tutor_prompt(tutor_note, tutor_history_text, query_text, is_session_start=tutor_is_start, course_info=tutor_course_info)
         gen_started=time.perf_counter()
         reply,model_used,_=_generate_chat_reply(tutor_prompt,content_type=None,request_id=request_id,gen_started=gen_started,user_text=query_text,reasoning_profile="low",max_output_tokens=1800)
         print(f"[FREE CHAT TUTOR] user={user['id']} chatbox_id={data.chatbox_id!r} note_id={(tutor_note or {}).get('id')} history_messages={len(tutor_history)}")
@@ -7958,9 +7987,11 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Không dùng kiến thức ngoài đề.
 - Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
 - Diễn giải tối đa 20 từ/câu.
-- Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối phần chấm câu.
-- SAU toàn bộ phần chấm câu, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết những điểm yếu nổi bật dựa CHỈ vào các câu sai và bằng chứng/diễn giải.
-- NẾU đáp án/ phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong weakness note. Không được chỉ viết chung chung như "cần cải thiện từ vựng/grammar". Phải nêu cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, kèm ngữ cảnh ngắn nếu cần.
+- Nếu đây là bài đọc/Reading, SAU phần chấm câu phải có mục `📚 Từ vựng khó & cụm động từ cần lưu ý` gồm các từ/cụm thực sự xuất hiện trong bài đọc/đề, kèm giải thích ngắn gọn; không lấy từ ngoài nguồn. Chỉ chọn các từ/cụm đáng chú ý, không cần liệt kê toàn bộ.
+- Không thêm nhận xét chung ở cuối phần chấm câu ngoài mục từ vựng/cụm động từ nói trên và weakness note.
+- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn. Với Bài tập đọc, CÁC CÂU SAI PHẢI ĐƯỢC GHI RÕ trong weakness note theo dạng ngắn gọn: `Câu N: chọn X → đúng Y. Diễn giải: ...` và dùng đúng diễn giải/bằng chứng vừa chấm; nếu có nhiều câu sai thì ưu tiên các câu sai nổi bật trong 5 dòng.
+- Weakness note phải ưu tiên dữ liệu cụ thể của bài: số câu sai, đáp án user chọn, đáp án đúng, diễn giải/bằng chứng. Không được thay bằng nhận xét chung chung nếu đã có dữ liệu cụ thể.
+- NẾU đáp án/phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong weakness note. Phải nêu cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, kèm ngữ cảnh ngắn nếu cần.
 - Chỉ ghi lỗi từ vựng/grammar khi nhìn thấy bằng chứng trực tiếp trong câu trả lời của học sinh hoặc khi diễn giải cho thấy lỗi đó; tuyệt đối không suy đoán. Nếu không có lỗi từ vựng/grammar thì không cần tạo mục này.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
