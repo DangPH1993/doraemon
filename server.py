@@ -126,8 +126,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.131-collocation-login-random-shuffle")
-SERVER_VERSION = "31.32"
+print("[DORAEMON SERVER FINGERPRINT] 19.132-grammar-ocr-two-stage")
+SERVER_VERSION = "31.34"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3775,8 +3775,22 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
 
     sections=list((cache or {}).get("sections") or [])
     is_exercise = ct == "Bài tập"
+    is_grammar = ct == "Ngữ pháp"
     is_answer_step = str(step.get("code") or "").upper() in {"B2","ANSWER"}
-    is_question_step = (ct == "Bài tập" and str(step.get("code") or "").upper() == "B1") or (ct == "Từ vựng" and str(step.get("code") or "").upper() == "B2")
+    is_question_step = (ct == "Bài tập" and str(step.get("code") or "").upper() == "B1") or (ct == "Từ vựng" and str(step.get("code") or "").upper() == "B2") or (is_grammar and str(step.get("code") or "").upper() == "B1")
+
+    if is_grammar and str(step.get("code") or "").upper() == "B2":
+        conn=db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT curriculum_global_exercise_result FROM user_learning_state WHERE user_id=%s", (user_id,))
+                rr=cur.fetchone()
+                dynamic_answer=str((rr[0] if rr else '') or '').strip()
+        finally:
+            conn.close()
+        if dynamic_answer:
+            return [{"type":"text","text":dynamic_answer}, *(_exercise_finish_blocks())]
+        return [{"type":"text","text":"⚠️ Chưa có đáp án B2. Cậu hãy làm bài ở B1 trước."}]
 
     if answered and is_exercise:
         answer_step=_published_curriculum_answer_step(cache)
@@ -3795,7 +3809,7 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
 
     if step.get("is_final"):
         blocks.extend(_curriculum_final_blocks())
-    elif not (is_exercise and is_question_step and not answered):
+    elif not ((is_exercise or is_grammar) and is_question_step and not answered):
         # B1 must wait for the learner's answer; do not offer "Tiếp theo" yet.
         blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
         blocks.extend(_curriculum_continue_blocks(int(step.get("index") or 0)))
@@ -7826,7 +7840,7 @@ Tin nhắn hiện tại:
             answered=bool((study_session or {}).get("curriculum_exercise_answered"))
 
             # Button navigation is deterministic and costs 0 Gemini/embedding/Pinecone.
-            if ui_action == "curriculum_next" and requested_content_type != "Luyện viết":
+            if ui_action == "curriculum_next" and requested_content_type != "Luyện viết" and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered):
                 try:
                     expected=int(action_plan_id or -1)
                 except Exception:
@@ -7845,6 +7859,7 @@ Tin nhắn hiện tại:
             elif (requested_content_type != "Luyện viết"
                   and not data.action
                   and not (requested_content_type == "Bài tập" and waiting == "exercise_answer")
+                  and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered)
                   and _is_continue_confirmation(query_text)
                   and current_step < len(sections)-1):
                 current_step += 1
@@ -7855,6 +7870,19 @@ Tin nhắn hiện tại:
                 study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=False
                 print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} text_advance={current_step}")
+
+            # Grammar B1 is a hard gate: the learner must submit the exercise before
+            # Doraemon can move to B2. Do not fall through to the generic LLM path when
+            # the user presses Continue or types a continuation confirmation early.
+            if requested_content_type == "Ngữ pháp" and current_step == 1 and not answered and (
+                ui_action == "curriculum_next" or (not data.action and _is_continue_confirmation(query_text))
+            ):
+                msg="✍️ Cậu hãy làm bài **B1** trước nhé. Gửi câu trả lời của cậu cho Doraemon, rồi tớ sẽ tạo **B2 · Đáp án**."
+                _set_curriculum_flow(user["id"],step=current_step,waiting="grammar_exercise_answer",exercise_answered=False)
+                study_session["curriculum_step"]=current_step
+                study_session["curriculum_waiting"]="grammar_exercise_answer"
+                study_session["curriculum_exercise_answered"]=False
+                return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
 
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
 
@@ -7982,6 +8010,44 @@ YÊU CẦU OUTPUT:
                     blocks.extend(_exercise_finish_blocks())
                     print(f'[CURRICULUM WRITING GRADE] request={request_id} vision_used={int(bool(grading_vision))} genai=1')
                     return {"reply":evaluation or '',"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
+
+            # Grammar B1 is a learner exercise. Generate B2 only after submission.
+            if requested_content_type == "Ngữ pháp" and str(step.get('code') or '').upper() == 'B1' and not data.action and str(query_text or '').strip():
+                grammar_b0=next((x for x in sections if str(x.get('step_code') or '').upper()=='B0'), None)
+                grammar_source=str((grammar_b0 or {}).get('text') or '').strip()
+                grammar_exercise=str(step.get('text') or '').strip()
+                grammar_prompt=f"""Bạn là Doraemon, giáo viên Ngữ pháp. Hãy tạo B2 — Đáp án sau khi học sinh đã làm bài.
+
+NGUỒN OCR:
+{grammar_source}
+
+ĐỀ BÀI B1:
+{grammar_exercise}
+
+BÀI LÀM CỦA HỌC SINH:
+{query_text.strip()}
+
+YÊU CẦU:
+- Chỉ dùng kiến thức có trong nguồn và đề bài.
+- Giải đủ tất cả câu.
+- Với mỗi câu: nêu đáp án đúng và giải thích ngắn gọn.
+- Nếu học sinh sai, chỉ ra lỗi và cách đúng.
+- Không chấm điểm tổng.
+- Không dùng ✅ hoặc ❌.
+- Không tạo thêm bài tập.
+- Bắt đầu bằng: **B2 · Đáp án**"""
+                gen_started=time.perf_counter()
+                answer,response_model,gen_elapsed=_generate_chat_reply(grammar_prompt,content_type='Ngữ pháp',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=3000)
+                answer=(answer or '').strip() or 'Doraemon chưa tạo được phần đáp án. Cậu thử gửi lại bài làm nhé.'
+                _set_curriculum_global_exercise_result(user['id'],answer)
+                _set_curriculum_flow(user['id'],step=current_step+1,waiting='continue',exercise_answered=True)
+                study_session['curriculum_step']=current_step+1
+                study_session['curriculum_waiting']='continue'
+                study_session['curriculum_exercise_answered']=True
+                blocks=[{"type":"text","text":answer}]
+                blocks.extend(_exercise_finish_blocks())
+                print(f'[CURRICULUM GRAMMAR ANSWER] request={request_id} B1_submission=1 B2=genai')
+                return {"reply":answer,"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
             # Deterministic simple/casual exercise turns must not invoke GenAI.
             if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip() and not _is_exercise_no_answer(query_text):
@@ -8180,6 +8246,9 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
             if requested_content_type == "Bài tập" and str(step.get("code") or "").upper() == "B1" and not answered:
                 _set_curriculum_flow(user["id"],step=current_step,waiting="exercise_answer",exercise_answered=False)
                 study_session["curriculum_waiting"]="exercise_answer"
+            elif requested_content_type == "Ngữ pháp" and str(step.get("code") or "").upper() == "B1" and not answered:
+                _set_curriculum_flow(user["id"],step=current_step,waiting="grammar_exercise_answer",exercise_answered=False)
+                study_session["curriculum_waiting"]="grammar_exercise_answer"
             elif not step.get("is_final") and waiting != "continue":
                 _set_curriculum_flow(user["id"],step=current_step,waiting="continue",exercise_answered=answered)
 
@@ -12776,9 +12845,9 @@ CURRICULUM_STEP_RULES = {
         {'code':'B2','title':'Một số bài tập','type':'exercise'},
     ],
     'Ngữ pháp': [
-        {'code':'B0','title':'Giới thiệu cấu trúc ngữ pháp','type':'grammar'},
-        {'code':'B1','title':'Một số ví dụ','type':'examples'},
-        {'code':'B2','title':'Một số bài tập','type':'exercise'},
+        {'code':'B0','title':'Nội dung nguyên văn từ tài liệu OCR','type':'original_text'},
+        {'code':'B1','title':'Bài tập · Làm bài','type':'exercise'},
+        {'code':'B2','title':'Đáp án · Được tạo sau khi làm bài','type':'answer'},
     ],
     'Bài tập': [
         {'code':'B1','title':'Bài tập · Làm bài','type':'exercise_intro'},
@@ -13534,12 +13603,67 @@ def _exercise_generate_deterministic_steps(lesson, question_pages, answer_pages)
     ]
 
 
+def _grammar_generate_draft_steps(lesson, pages, source_digest, grammar_reference=''):
+    """Grammar upload: B0=OCR nguyên văn, B1=GenAI exercise, B2=deferred."""
+    ocr_parts=[]; refs=[]; images=[]
+    for pg in pages or []:
+        text=str(pg.get('text') or '')
+        if text.strip():
+            ocr_parts.append(text)
+            refs.append({'page':pg.get('page'),'reason':'OCR nguyên văn tài liệu upload'})
+        for im in pg.get('images') or []:
+            key=str(im.get('image_key') or '').strip()
+            if key:
+                images.append({'image_key':key,'image_url':im.get('image_url'),'page':pg.get('page'),
+                               'caption':str((im.get('vision') or {}).get('caption') or (im.get('vision') or {}).get('description') or '').strip()})
+    b0_text='\n\n'.join(x for x in ocr_parts if x.strip()).strip()
+    if not b0_text:
+        raise HTTPException(400,f'Ngữ pháp {lesson}: không OCR được nội dung tài liệu upload.')
+    prompt=f"""Bạn là Doraemon, biên soạn MỘT BÀI TẬP NGỮ PHÁP dựa CHỈ trên tài liệu được OCR dưới đây.
+Bài học: {lesson}
+
+QUY TẮC:
+- Chỉ dùng kiến thức có trong nguồn OCR; không bịa cấu trúc ngoài tài liệu.
+- Tạo một bài tập để người học tự vận dụng cấu trúc/ngữ pháp có trong nguồn.
+- Bài tập phải rõ ràng; đánh số câu nếu có nhiều câu.
+- Không tạo đáp án trong B1 và không hé lộ đáp án.
+- Có thể dùng điền từ, chọn đáp án, biến đổi câu, sắp xếp câu hoặc dạng phù hợp với nguồn.
+- Ngôn ngữ của đề bài ưu tiên theo ngôn ngữ của tài liệu/khóa học.
+- Trả JSON duy nhất.
+
+CÁC CẤU TRÚC NGỮ PHÁP TRƯỚC ĐÂY NẾU CÓ:
+{grammar_reference or '(Không có ứng viên ngữ pháp cũ.)'}
+
+NGUỒN OCR:
+{source_digest}
+
+JSON:
+{{"step":{{"code":"B1","title":"Bài tập · Làm bài","type":"exercise","content":"...","source_refs":[],"images":[],"items":[]}}}}"""
+    data=_curriculum_ai_json(prompt,'grammar_exercise_generation')
+    if isinstance(data,list): data=data[0] if data and isinstance(data[0],dict) else {}
+    step=data.get('step') if isinstance(data,dict) and isinstance(data.get('step'),dict) else (data if isinstance(data,dict) else {})
+    exercise_text=str(step.get('content') or '').strip()
+    if not exercise_text:
+        raise HTTPException(500,'AI không tạo được nội dung bài tập Ngữ pháp.')
+    return [
+        {'code':'B0','title':'Nội dung nguyên văn từ tài liệu OCR','type':'original_text',
+         'content':{'content':b0_text,'source_refs':refs,'images':images,'items':[]}},
+        {'code':'B1','title':'Bài tập · Làm bài','type':'exercise',
+         'content':{'content':exercise_text,'source_refs':step.get('source_refs') if isinstance(step.get('source_refs'),list) else [],'images':[],'items':step.get('items') if isinstance(step.get('items'),list) else []}},
+        {'code':'B2','title':'Đáp án · Được tạo sau khi làm bài','type':'answer',
+         'content':{'content':'','source_refs':[],'images':[],'items':[],'deferred':True}},
+    ]
+
 def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference='', *, exercise_question_pages=None, exercise_answer_pages=None):
     """Generate all curriculum steps in exactly ONE GenAI call per lesson.
 
     OCR/Vision has already completed before this function runs.
     """
     ct=str(content_type or '').strip()
+    if ct == 'Ngữ pháp' and exercise_question_pages is not None:
+        steps=_grammar_generate_draft_steps(lesson, exercise_question_pages, source_digest, grammar_reference=grammar_reference)
+        print(f'[CURRICULUM GRAMMAR SOURCE-FIRST] lesson={lesson!r} B0=ocr B1=genai B2=deferred genai_calls=1 pages={len(exercise_question_pages or [])}')
+        return steps
     if ct == 'Bài tập' and exercise_question_pages is not None and exercise_answer_pages is not None:
         steps=_exercise_generate_deterministic_steps(lesson, exercise_question_pages, exercise_answer_pages)
         print(f'[CURRICULUM EXERCISE SOURCE-FIRST] lesson={lesson!r} genai_calls=0 steps=2 question_pages={len(exercise_question_pages or [])} answer_pages={len(exercise_answer_pages or [])}')
@@ -13860,7 +13984,8 @@ async def admin_curriculum_draft_upload(
                     key=str(img.get('key') or '')
                     if not key: continue
                     imgs.append({'image_key':key,'image_url':b2_url(key),'vision':vision})
-                pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
+                text_limit = 50000 if ct == 'Ngữ pháp' else 12000
+                pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:text_limit],'images':imgs})
             # Hard invariant: the AI Draft payload may contain ONLY configured pages.
             page_keys={int(pg.get('page')) for pg in pages if str(pg.get('page')).isdigit()}
             if page_keys != selected_set:
@@ -13869,7 +13994,17 @@ async def admin_curriculum_draft_upload(
             digest=_curriculum_source_digest(pages)
             normalized_steps=[]
             _, grammar_reference = _get_course_curriculum_knowledge(course_id, digest)
-            if ct == 'Luyện viết':
+            if ct == 'Ngữ pháp':
+                selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
+                grammar_pages=[selected_by_page[p] for p in cfg.get('selected_pages',[]) if p in selected_by_page]
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference,exercise_question_pages=grammar_pages)
+                for st in generated:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content, pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print(f'[CURRICULUM GRAMMAR DRAFT] lesson={ls!r} pages={cfg.get("pages_label","")} B0=ocr B1=genai B2=deferred')
+            elif ct == 'Luyện viết':
                 selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
                 prompt_pages=[selected_by_page[p] for p in cfg.get('prompt_selected_pages',[]) if p in selected_by_page]
                 suggestion_pages=[selected_by_page[p] for p in cfg.get('suggestion_selected_pages',[]) if p in selected_by_page]
@@ -14401,7 +14536,17 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
             raise HTTPException(400,'Bài tập dùng nội dung nguồn + chỉnh sửa trực tiếp. Không lưu OCR gốc nên không hỗ trợ Regenerate Step sau khi Draft đã tạo.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
         _, grammar_reference = _get_course_curriculum_knowledge(draft.get('course_id'), digest)
-        new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=grammar_reference)
+        if str(draft.get('content_type') or '').strip() == 'Ngữ pháp':
+            code=str(step.get('code') or '').strip().upper()
+            if code == 'B0':
+                raise HTTPException(400,'B0 Ngữ pháp lấy nguyên văn từ OCR và không dùng Regenerate.')
+            if code == 'B2':
+                raise HTTPException(400,'B2 Ngữ pháp được tạo bằng GenAI sau khi học viên làm bài, không regenerate trong Admin.')
+            generated=_grammar_generate_draft_steps(str(draft.get('lesson') or ''), draft.get('pages') or [], digest, grammar_reference=grammar_reference)
+            one=next((x for x in generated if str(x.get('code') or '').upper()=='B1'),None)
+            new_content=(one or {}).get('content') or {}
+        else:
+            new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=grammar_reference)
         if str(draft.get('content_type') or '').strip() == 'Giáo trình':
             one = _filter_generated_course_knowledge([{'code':str(step.get('code') or ''),'content':new_content}], draft.get('course_id'))
             new_content = (one[0].get('content') if one else new_content)
@@ -14431,7 +14576,28 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             draft = dict(client_draft) if isinstance(client_draft, dict) else dict(dr.get('draft_json') or {})
             ct = str(draft.get('content_type') or dr.get('content_type') or '').strip()
             steps = draft.get('steps') or []
-            if ct == 'Bài tập':
+            if ct == 'Ngữ pháp':
+                incoming=[dict(x) for x in steps if isinstance(x,dict)]
+                codes={str(x.get('code') or '').strip().upper() for x in incoming}
+                if not {'B0','B1','B2'}.issubset(codes):
+                    raise HTTPException(400,'Ngữ pháp phải có đủ B0 (OCR nguyên văn), B1 (Bài tập) và B2 (Đáp án deferred).')
+                b0=next(x for x in incoming if str(x.get('code') or '').strip().upper()=='B0')
+                b1=next(x for x in incoming if str(x.get('code') or '').strip().upper()=='B1')
+                b2=next(x for x in incoming if str(x.get('code') or '').strip().upper()=='B2')
+                def _step_content_text(x):
+                    c=x.get('content')
+                    return str((c.get('content') if isinstance(c,dict) else c) or '').strip()
+                if not _step_content_text(b0):
+                    raise HTTPException(400,'Ngữ pháp B0 phải có nội dung OCR nguyên văn.')
+                if not _step_content_text(b1):
+                    raise HTTPException(400,'Ngữ pháp B1 phải có đề bài do GenAI tạo.')
+                if not isinstance(b2.get('content'),dict):
+                    b2['content']={'content':'','source_refs':[],'images':[],'items':[],'deferred':True}
+                else:
+                    b2['content']['deferred']=True
+                draft['steps']=reindex_curriculum_draft_steps_safe(ct, incoming)
+                print(f'[CURRICULUM PUBLISH] grammar_two_stage draft_id={draft_id} B0=ocr B1=genai B2=deferred')
+            elif ct == 'Bài tập':
                 incoming=[dict(x) for x in steps if isinstance(x,dict)]
                 stored_obj=dr.get('draft_json') if isinstance(dr.get('draft_json'),dict) else {}
                 stored=[dict(x) for x in (stored_obj.get('steps') or []) if isinstance(x,dict)]
