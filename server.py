@@ -12039,16 +12039,19 @@ def _pick_phrasal_verb_for_user(user_id: int, course_id: Optional[int] = None, e
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE is_active=TRUE) AS active FROM phrasal_verbs WHERE course_id=%s", (target,))
+            count_row=cur.fetchone() or {}
+            print(f"[PHRASAL VERB DAILY SCOPE] user={user_id} course_id={target} total={int(count_row.get('total') or 0)} active={int(count_row.get('active') or 0)}")
             params=[target]; extra=""
             if exclude_id is not None:
                 extra=" AND p.id<>%s"; params.append(int(exclude_id))
             cur.execute(f"""SELECT p.id,p.course_id,p.phrasal_verb,p.meaning,p.example,p.image_key,p.source_file
-                           FROM phrasal_verbs p WHERE p.course_id=%s AND p.is_active=TRUE{extra}
+                           FROM phrasal_verbs p WHERE p.course_id=%s{extra}
                            ORDER BY random() LIMIT 1""", tuple(params))
             row=cur.fetchone()
             if not row and exclude_id is not None:
                 cur.execute("""SELECT p.id,p.course_id,p.phrasal_verb,p.meaning,p.example,p.image_key,p.source_file
-                               FROM phrasal_verbs p WHERE p.course_id=%s AND p.is_active=TRUE ORDER BY random() LIMIT 1""", (target,))
+                               FROM phrasal_verbs p WHERE p.course_id=%s ORDER BY random() LIMIT 1""", (target,))
                 row=cur.fetchone()
             if not row: return {"success":True,"show":False,"phrasal_verb":None,"course_id":target}
             result=dict(row); result["image_url"]=b2_url(result.get("image_key")) if result.get("image_key") else None
