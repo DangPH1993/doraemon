@@ -4484,6 +4484,27 @@ def _exercise_question_numbers_from_text(text):
     return sorted(nums)
 
 
+def _format_reading_feedback_headings(text):
+    """Normalize Reading feedback headings/spacing after model generation."""
+    raw = str(text or "")
+    lines = raw.splitlines()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if re.fullmatch(r"(?:\*\*)?📚\s*Từ vựng khó\s*&\s*cụm động từ cần lưu ý(?:\*\*)?", stripped, flags=re.I):
+            out.append("**📚 Từ vựng khó & cụm động từ cần lưu ý**")
+            continue
+        out.append(line)
+    # Ensure the vocabulary section heading has a blank line after it when there is content.
+    normalized=[]
+    for i,line in enumerate(out):
+        normalized.append(line)
+        if line.strip() == "**📚 Từ vựng khó & cụm động từ cần lưu ý**":
+            if i+1 < len(out) and out[i+1].strip():
+                normalized.append("")
+    return "\n".join(normalized).strip()
+
+
 def _exercise_strip_total_score(text):
     """Remove legacy total-score lines from exercise feedback."""
     raw = str(text or "")
@@ -7901,6 +7922,7 @@ YÊU CẦU OUTPUT:
                     gen_started=time.perf_counter()
                     evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
                     evaluation, weakness_note = _extract_weakness_note(evaluation)
+                    evaluation=_format_reading_feedback_headings(evaluation)
                     _set_curriculum_writing_state(user["id"],result=evaluation)
                     if weakness_note:
                         lesson_id=(study_session or {}).get("lesson_id") or (study_session or {}).get("content_id") or None
@@ -7910,7 +7932,7 @@ YÊU CẦU OUTPUT:
                     evaluation_text=(evaluation or '').strip()
                     blocks=[{"type":"text","text":evaluation_text or "Doraemon chưa nhận được kết quả chấm bài."}]
                     if weakness_note:
-                        blocks.append({"type":"text","text":"🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
+                        blocks.append({"type":"text","text":"\n🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
                     blocks.extend(_exercise_finish_blocks())
                     print(f'[CURRICULUM WRITING GRADE] request={request_id} vision_used={int(bool(grading_vision))} genai=1')
                     return {"reply":evaluation or '',"model":response_model,"sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
@@ -8011,6 +8033,7 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                     max_output_tokens=4000,
                 )
                 evaluation, weakness_note = _extract_weakness_note(evaluation)
+                evaluation=_format_reading_feedback_headings(evaluation)
                 evaluation=_exercise_strip_total_score(evaluation)
                 if weakness_note:
                     lesson_id=(study_session or {}).get("lesson_id") or (study_session or {}).get("content_id") or None
@@ -8030,7 +8053,7 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                 study_session["curriculum_exercise_answered"]=True
                 blocks=[{"type":"text","text":evaluation or ""}]
                 if weakness_note:
-                    blocks.append({"type":"text","text":"🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
+                    blocks.append({"type":"text","text":"\n🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
                 blocks.extend(_exercise_finish_blocks())
                 # Do not paste the full B2 answer block. The evaluation already quotes
                 # only the per-question official answer text requested for feedback.
