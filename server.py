@@ -1,11 +1,11 @@
 # VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v3-course-language-reading-diagnosis-thinking-up"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.22-free-tutor-reading-diagnosis"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.26-tutor-evidence-vocab-grammar"
 import os
 import ast
 import io
@@ -4746,7 +4746,7 @@ def _extract_weakness_note(raw_text: str) -> tuple[str, str]:
     note = re.split(r'###END_WEAKNESS_NOTE###', after.strip(), maxsplit=1, flags=re.I)[0].strip()
     lines = [re.sub(r'^\s*[-•]\s*', '', x).strip() for x in note.splitlines()]
     lines = [x for x in lines if x]
-    return before.rstrip(), '\n'.join(lines[:5]).strip()
+    return before.rstrip(), '\n'.join(lines[:15]).strip()
 
 
 def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, note):
@@ -4760,7 +4760,7 @@ def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, not
                 (user_id, course_id, lesson_id, lesson, content_type, weakness_note)
                 VALUES (%s,%s,%s,%s,%s,%s)
                 RETURNING id, created_at""",
-                (int(user_id), course_id, lesson_id, str(lesson or ''), str(content_type or ''), note[:3000]))
+                (int(user_id), course_id, lesson_id, str(lesson or ''), str(content_type or ''), note[:12000]))
             row = cur.fetchone()
         conn.commit()
         return dict(row or {})
@@ -4851,10 +4851,17 @@ QUY TẮC:
 - Có thể trò chuyện tự do về mọi chủ đề nếu user muốn.
 - Weakness note của phiên hiện tại là trọng tâm học tập khi user đang ở mạch học.
 - Không nói về database, log, weakness note hay cơ chế nội bộ.
-- Với Reading, ưu tiên nhớ lại ĐIỂM YẾU đã được tổng kết + diễn giải + bằng chứng nguồn trước khi hướng dẫn chiến lược. Không biến weakness note thành danh sách câu hỏi.
+- Với Reading, ưu tiên nhớ lại ĐIỂM YẾU đã được phân loại + diễn giải + bằng chứng nguồn trước khi hướng dẫn chiến lược.
+- Các nhóm weakness được hiểu như sau: `Từ vựng chưa nắm`, `Ngữ pháp chưa nắm`, `Chưa nắm được ý đoạn văn`. Chỉ dạy những nhóm thực sự có trong note.
+- Khi có bằng chứng, dùng chính câu/đoạn đó làm nguồn học chính của phiên. Không biến weakness note thành danh sách câu hỏi.
+- Nếu có nhóm `Từ vựng chưa nắm`, ưu tiên giải thích 1-3 từ/cụm quan trọng trong chính bằng chứng: nghĩa trong ngữ cảnh, cách dùng, collocation/phrasal verb nếu có.
+- Nếu có nhóm `Ngữ pháp chưa nắm`, ưu tiên giải thích 1-2 cấu trúc ngữ pháp xuất hiện trong chính bằng chứng và chỉ rõ cách cấu trúc đó ảnh hưởng tới việc hiểu câu.
+- Nếu có nhóm `Chưa nắm được ý đoạn văn`, giải thích cách nối các chi tiết/paraphrase/inference trong chính bằng chứng để hiểu đúng ý.
+- Ví dụ với "he had been regarded as a talented outsider...": giải thích **outsider** trong ngữ cảnh và **be regarded as + noun/adjective**, rồi liên hệ hai điểm này với cách hiểu toàn câu.
+- Không tự thêm từ/cấu trúc không xuất hiện trong bằng chứng nếu không cần thiết.- Sau khi giải thích từ vựng và cấu trúc trong bằng chứng, kiểm tra hiểu bằng một câu hỏi ngắn. Chỉ tạo mini-exercise mới sau bước giải thích/kiểm tra này.
 - Nếu cần nhắc lại một lỗi sai cụ thể, chỉ suy ra từ bằng chứng đã được note lưu; không tự bịa số câu, đáp án hoặc nguyên nhân chưa có trong note.
-- Với từ vựng/grammar, chỉ dạy các lỗi cụ thể thực sự có trong note; không tự gán user yếu một lĩnh vực nếu note không có bằng chứng.
-- Nếu note không đủ cụ thể để xác định một lỗi/bài tập, chỉ trò chuyện, giải thích hoặc hỏi thêm; KHÔNG suy diễn thành một bài tập tương tự.
+- Với từ vựng/grammar, chỉ dạy các lỗi cụ thể thực sự có trong note hoặc xuất hiện trực tiếp trong bằng chứng; không tự gán user yếu một lĩnh vực nếu note không có bằng chứng.
+- Nếu note không đủ cụ thể để xác định bằng chứng, từ vựng hoặc cấu trúc, chỉ trò chuyện, giải thích hoặc hỏi thêm; KHÔNG suy diễn thành một bài tập tương tự.
 - Nếu tạo bài tương tự Reading, phải khó hơn về mặt tư duy so với câu cũ, không chỉ đổi từ.
 - Có thể động viên, hỏi han, nói chuyện tự nhiên; không biến cuộc trò chuyện thành báo cáo.
 - Nếu user chuyển sang chủ đề ngoài lề, hãy theo mạch đó; có thể quay lại học bằng gợi ý nhẹ nhưng không ép.
@@ -4863,8 +4870,13 @@ QUY TẮC:
 {course_rule}
 {opening_rule}
 {meta}
-ĐIỂM YẾU VÀ LỖI CỤ THỂ TỪ BÀI NÀY:
+ĐIỂM YẾU VÀ BẰNG CHỨNG TỪ BÀI NÀY:
 {note_text or '(Chưa có dữ liệu; không tự suy diễn điểm yếu hay tạo bài luyện tương tự.)'}
+
+ƯU TIÊN PHÂN TÍCH BẰNG CHỨNG:
+- Nếu note có dòng "Bằng chứng:" thì hãy trích đúng câu đó trong tư duy nội bộ và dạy từ vựng/cụm từ + grammar/cấu trúc xuất hiện trong chính bằng chứng đó.
+- Không thay thế bằng một câu ví dụ do tutor tự nghĩ ra ở bước đầu.
+- Sau khi giải thích, mới tạo câu hỏi/mini-exercise kiểm tra hiểu hoặc bài tương tự nâng mức độ thinking nếu dữ liệu đủ.
 
 LỊCH SỬ PHIÊN HIỆN TẠI, tối đa 10 lượt user/model:
 {history_text or '(chưa có lịch sử)'}
@@ -7911,11 +7923,11 @@ YÊU CẦU OUTPUT:
 - Ngay dòng đầu tiên phải ghi đúng dạng: **Điểm ước lượng: X.X/9.0** (thang điểm IELTS Writing, có thể dùng .5).
 - Điểm tổng phải phản ánh chất lượng bài viết dựa trên toàn bộ 6 tiêu chí; đây là điểm ước lượng của giáo viên, không phải điểm thi chính thức.
 - Sau dòng điểm, lần lượt nhận xét cả 6 tiêu chí và nêu rõ: Tốt ở đâu; Cần cải thiện ở đâu.
-- Sau 6 tiêu chí, đưa ra 3-5 điểm cần cải thiện quan trọng nhất.
+- Sau 6 tiêu chí, đưa ra các điểm cần cải thiện quan trọng nhất.
 - Có thể trích dẫn ngắn các đoạn trong bài làm để minh họa lỗi/điểm mạnh.
 - Không bịa yêu cầu không có trong đề.
 - Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
-- SAU phần nhận xét 6 tiêu chí và 3-5 điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn tổng kết weakness của bài.
+- SAU phần nhận xét 6 tiêu chí và các điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi tổng hợp đầy đủ các weakness có bằng chứng. Không giới hạn số dòng; độ dài tùy số lượng và mức độ cụ thể của các điểm yếu thực tế.
 - NẾU bài essay có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc, BẮT BUỘC ghi rõ các lỗi tiêu biểu trong weakness note. Không được chỉ nói chung chung. Phải ưu tiên ghi cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, có thể trích ngắn câu chứa lỗi.
 - Ưu tiên lưu những lỗi xuất hiện thật trong bài làm của học sinh; không tự suy đoán điểm yếu từ phong cách viết nếu không có ví dụ/bằng chứng cụ thể.
 """
@@ -8013,13 +8025,19 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Diễn giải tối đa 20 từ/câu.
 - Nếu đây là bài đọc/Reading, SAU phần chấm câu phải có mục `📚 Từ vựng khó & cụm động từ cần lưu ý` gồm các từ/cụm thực sự xuất hiện trong bài đọc/đề, kèm giải thích ngắn gọn; không lấy từ ngoài nguồn. Chỉ chọn các từ/cụm đáng chú ý, không cần liệt kê toàn bộ.
 - Không thêm nhận xét chung ở cuối phần chấm câu ngoài mục từ vựng/cụm động từ nói trên và weakness note.
-- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết 3-5 dòng ngắn gọn TỔNG KẾT ĐIỂM YẾU CỦA USER. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
-- Với Bài tập đọc/Reading, weakness note phải có cấu trúc ý nghĩa: `Điểm yếu: ...` + `Diễn giải: ...` + `Bằng chứng: "..."` khi nguồn chấm có bằng chứng. Nội dung phải tổng quát hóa từ các lỗi sai để mô tả kỹ năng/khả năng hiểu mà user đang thiếu, nhưng chỉ kết luận những gì dữ liệu bài làm hỗ trợ.
-- Ví dụ: `Điểm yếu: Chưa nắm được ý rằng Murray từng được xem là một ngoại lệ chưa nổi bật trước đó.`; `Diễn giải: User chưa nối được mô tả về thành tích quá khứ với ý "outsider" và việc chưa từng thắng các giải lớn.`; `Bằng chứng: "he had been regarded as a talented outsider who entered but never won the major tournaments."`
-- Bằng chứng nên là câu/đoạn nguồn quan trọng nhất giúp chứng minh điểm yếu, không phải danh sách toàn bộ câu sai. Có thể dùng 1-2 bằng chứng nổi bật nếu cần.
-- Weakness note phải đủ cụ thể để Tutor hiểu bản chất lỗi; không biến thành nhận xét chung kiểu `cần đọc kỹ hơn` nếu dữ liệu cho phép mô tả rõ hơn.
-- NẾU đáp án/phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong weakness note. Phải nêu cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, kèm ngữ cảnh ngắn nếu cần.
-- Chỉ ghi lỗi từ vựng/grammar khi nhìn thấy bằng chứng trực tiếp trong câu trả lời của học sinh hoặc khi diễn giải cho thấy lỗi đó; tuyệt đối không suy đoán. Nếu không có lỗi từ vựng/grammar thì không cần tạo mục này.
+- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi TỔNG HỢP đầy đủ các điểm yếu của USER theo các lỗi sai. Không giới hạn số dòng; chỉ đưa những điểm yếu có bằng chứng hỗ trợ. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
+- Với Bài tập đọc/Reading, BẮT BUỘC phân loại điểm yếu theo đúng các nhóm khi dữ liệu có bằng chứng:
+  1) `Từ vựng chưa nắm` — chỉ dùng khi lỗi sai có liên quan trực tiếp đến việc không hiểu từ/cụm từ trong nguồn.
+  2) `Ngữ pháp chưa nắm` — chỉ dùng khi có bằng chứng trực tiếp về cấu trúc/ngữ pháp ảnh hưởng đến việc hiểu hoặc câu trả lời của user có lỗi grammar liên quan.
+  3) `Chưa nắm được ý đoạn văn` — dùng khi user hiểu sai ý, quan hệ thông tin, paraphrase, inference hoặc thông tin tổng thể của đoạn.
+- Mỗi nhóm phải viết theo cấu trúc: `Điểm yếu: ...` + `Diễn giải: ...` + `Bằng chứng: "..."`.
+- Chỉ tạo nhóm nào thực sự được bằng chứng bài làm hỗ trợ. Không bắt buộc phải có đủ cả 3 nhóm.
+- Nếu một lỗi thuộc nhiều nhóm, có thể ghi ở nhiều nhóm nhưng phải nói rõ vai trò của từng nhóm, không nhân bản máy móc.
+- Bằng chứng phải là câu/đoạn nguồn trực tiếp giúp giải thích điểm yếu. Không liệt kê lại toàn bộ câu sai; chọn 1-2 bằng chứng tiêu biểu cho mỗi nhóm.
+- Ví dụ: `Chưa nắm được ý đoạn văn: Cậu chưa nhận ra Murray từng được xem là một ngoại lệ chưa nổi bật trước đó.`; `Diễn giải: Cậu chưa nối được mô tả về thành tích quá khứ với ý "outsider" và việc chưa từng thắng các giải lớn.`; `Bằng chứng: "he had been regarded as a talented outsider who entered but never won the major tournaments."`
+- Với nhóm `Từ vựng chưa nắm`, nếu bằng chứng chứa từ/cụm then chốt như `outsider`, phải ghi rõ nghĩa trong ngữ cảnh và có thể nêu collocation liên quan.
+- Với nhóm `Ngữ pháp chưa nắm`, nếu bằng chứng chứa cấu trúc như `be regarded as + noun/adjective`, phải nêu rõ cấu trúc và vai trò của nó trong việc hiểu câu.
+- NẾU đáp án/phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong đúng nhóm tương ứng; không suy đoán.
 """
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
