@@ -4746,16 +4746,38 @@ def _extract_weakness_note(raw_text: str) -> tuple[str, str]:
     note = re.split(r'###END_WEAKNESS_NOTE###', after.strip(), maxsplit=1, flags=re.I)[0].strip()
     lines = [re.sub(r'^\s*[-•]\s*', '', x).strip() for x in note.splitlines()]
     lines = [x for x in lines if x]
-    return before.rstrip(), '\n'.join(lines[:15]).strip()
+    return before.rstrip(), '\n'.join(lines).strip()
 
 
 def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, note):
+    """Replace the weakness note for the exact user+course+lesson+content_type scope.
+
+    A learner may redo the same exercise. The newest diagnosis is authoritative for that
+    specific lesson, so older notes for the same scope must be deleted before the new one
+    is inserted. This prevents Free Chat Tutor from randomly selecting stale diagnoses.
+    """
     note = str(note or '').strip()
     if not note:
         return None
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            params=[int(user_id), str(lesson or '').strip(), str(content_type or '').strip()]
+            where=['user_id=%s','lesson=%s','content_type=%s']
+            if course_id is None:
+                where.append('course_id IS NULL')
+            else:
+                where.append('course_id=%s'); params.append(int(course_id))
+            if lesson_id is None or str(lesson_id).strip() == '':
+                where.append('(lesson_id IS NULL OR lesson_id='')')
+            else:
+                where.append('lesson_id=%s'); params.append(str(lesson_id).strip())
+
+            cur.execute(
+                "DELETE FROM learner_weakness_notes WHERE " + ' AND '.join(where),
+                tuple(params),
+            )
+            deleted_count = cur.rowcount or 0
             cur.execute("""INSERT INTO learner_weakness_notes
                 (user_id, course_id, lesson_id, lesson, content_type, weakness_note)
                 VALUES (%s,%s,%s,%s,%s,%s)
@@ -4763,7 +4785,14 @@ def _save_weakness_note(user_id, course_id, lesson_id, lesson, content_type, not
                 (int(user_id), course_id, lesson_id, str(lesson or ''), str(content_type or ''), note[:12000]))
             row = cur.fetchone()
         conn.commit()
+        print(
+            f"[WEAKNESS NOTE REPLACE] user={user_id} course_id={course_id} lesson_id={lesson_id} "
+            f"lesson={lesson!r} type={content_type!r} deleted_old={deleted_count} new_note_id={(row or {}).get('id')}"
+        )
         return dict(row or {})
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4785,9 +4814,14 @@ def _get_free_chat_tutor_note(user_id, course_id, chatbox_id):
             params=[int(user_id)]; where=['user_id=%s']
             if course_id is not None:
                 where.append('course_id=%s'); params.append(int(course_id))
-            cur.execute("SELECT id, lesson, content_type, weakness_note, created_at FROM learner_weakness_notes WHERE " + ' AND '.join(where) + " ORDER BY created_at DESC, id DESC LIMIT 5", tuple(params))
+            cur.execute(
+                """SELECT id, lesson, content_type, weakness_note, created_at
+                   FROM learner_weakness_notes
+                  WHERE """ + ' AND '.join(where) + " ORDER BY created_at DESC, id DESC LIMIT 5",
+                tuple(params),
+            )
             notes=[dict(r) for r in (cur.fetchall() or []) if str(r.get('weakness_note') or '').strip()]
-            chosen=random.choice(notes) if notes else None
+            chosen=notes[0] if notes else None
             cur.execute("""INSERT INTO free_chat_tutor_sessions(user_id,chatbox_id,course_id,weakness_note_id)
                 VALUES (%s,%s,%s,%s)
                 ON CONFLICT(user_id,chatbox_id) DO UPDATE SET
@@ -7923,11 +7957,11 @@ YÊU CẦU OUTPUT:
 - Ngay dòng đầu tiên phải ghi đúng dạng: **Điểm ước lượng: X.X/9.0** (thang điểm IELTS Writing, có thể dùng .5).
 - Điểm tổng phải phản ánh chất lượng bài viết dựa trên toàn bộ 6 tiêu chí; đây là điểm ước lượng của giáo viên, không phải điểm thi chính thức.
 - Sau dòng điểm, lần lượt nhận xét cả 6 tiêu chí và nêu rõ: Tốt ở đâu; Cần cải thiện ở đâu.
-- Sau 6 tiêu chí, đưa ra các điểm cần cải thiện quan trọng nhất.
+- Sau 6 tiêu chí, đưa ra 3-5 điểm cần cải thiện quan trọng nhất.
 - Có thể trích dẫn ngắn các đoạn trong bài làm để minh họa lỗi/điểm mạnh.
 - Không bịa yêu cầu không có trong đề.
 - Nếu đề có thông tin hình ảnh và Knowledge Vision có dữ kiện liên quan, dùng dữ kiện đó để đánh giá mức độ bám đề.
-- SAU phần nhận xét 6 tiêu chí và các điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi tổng hợp đầy đủ các weakness có bằng chứng. Không giới hạn số dòng; độ dài tùy số lượng và mức độ cụ thể của các điểm yếu thực tế.
+- SAU phần nhận xét 6 tiêu chí và 3-5 điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết đầy đủ các điểm yếu được xác định từ bài, không giới hạn số dòng.
 - NẾU bài essay có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc, BẮT BUỘC ghi rõ các lỗi tiêu biểu trong weakness note. Không được chỉ nói chung chung. Phải ưu tiên ghi cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, có thể trích ngắn câu chứa lỗi.
 - Ưu tiên lưu những lỗi xuất hiện thật trong bài làm của học sinh; không tự suy đoán điểm yếu từ phong cách viết nếu không có ví dụ/bằng chứng cụ thể.
 """
@@ -8025,7 +8059,7 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Diễn giải tối đa 20 từ/câu.
 - Nếu đây là bài đọc/Reading, SAU phần chấm câu phải có mục `📚 Từ vựng khó & cụm động từ cần lưu ý` gồm các từ/cụm thực sự xuất hiện trong bài đọc/đề, kèm giải thích ngắn gọn; không lấy từ ngoài nguồn. Chỉ chọn các từ/cụm đáng chú ý, không cần liệt kê toàn bộ.
 - Không thêm nhận xét chung ở cuối phần chấm câu ngoài mục từ vựng/cụm động từ nói trên và weakness note.
-- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi TỔNG HỢP đầy đủ các điểm yếu của USER theo các lỗi sai. Không giới hạn số dòng; chỉ đưa những điểm yếu có bằng chứng hỗ trợ. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
+- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi TỔNG HỢP điểm yếu của USER theo các lỗi sai. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
 - Với Bài tập đọc/Reading, BẮT BUỘC phân loại điểm yếu theo đúng các nhóm khi dữ liệu có bằng chứng:
   1) `Từ vựng chưa nắm` — chỉ dùng khi lỗi sai có liên quan trực tiếp đến việc không hiểu từ/cụm từ trong nguồn.
   2) `Ngữ pháp chưa nắm` — chỉ dùng khi có bằng chứng trực tiếp về cấu trúc/ngữ pháp ảnh hưởng đến việc hiểu hoặc câu trả lời của user có lỗi grammar liên quan.
@@ -8048,7 +8082,7 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                     gen_started=gen_started,
                     user_text=query_text.strip(),
                     reasoning_profile="low",
-                    max_output_tokens=4000,
+                    max_output_tokens=5000,
                 )
                 evaluation, weakness_note = _extract_weakness_note(evaluation)
                 evaluation=_format_reading_feedback_headings(evaluation)
