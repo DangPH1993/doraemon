@@ -643,6 +643,12 @@ class ChatRequest(BaseModel):
         value = self.message if self.message is not None else self.prompt
         return (value or "").strip()
 
+
+class PhrasingRequest(BaseModel):
+    course_id: int | None = None
+    task: str = ""
+    answer: str = ""
+
 def hash_password(p): return pwd_context.hash(p)
 def verify_password(p, h): return pwd_context.verify(p, h)
 
@@ -6123,6 +6129,118 @@ def _generate_chat_reply(
         f"elapsed={elapsed:.3f}s reply_chars={len(reply)}"
     )
     return reply, GEMINI_MODEL, elapsed
+
+
+
+@app.post("/api/learning/phrasing/start")
+def phrasing_start(
+    data: PhrasingRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Start a Phrasing session: create a high-difficulty English expression task."""
+    request_id = uuid.uuid4().hex[:12]
+    user = require_active_user(authorization)
+    course_id, course_name, authorized_courses = _resolve_request_course(user["id"], data.course_id)
+    if course_id is None:
+        raise HTTPException(400, "Hãy chọn khóa học trước khi bắt đầu Phrasing.")
+    lang_info = _course_language_info(course_id)
+    language = str(lang_info.get("language") or "english").lower()
+    if language not in {"en", "english", "eng"}:
+        raise HTTPException(400, "Phrasing hiện dành cho khóa học tiếng Anh.")
+
+    prompt = f"""Bạn là Doraemon, giáo viên tiếng Anh trong một tính năng tên Phrasing.
+Khóa học: {course_name or 'Tiếng Anh'}.
+
+Hãy TỰ CHỌN một tình huống đời thường hoặc học thuật có độ khó tương đối cao và một ý định giao tiếp cần người học diễn đạt bằng tiếng Anh.
+Ưu tiên những ý định buộc người học phải dùng cấu trúc tự nhiên, giới từ/cụm từ, trật tự từ, mức độ chính xác về quan hệ không gian/thời gian hoặc cách diễn đạt tinh tế; tránh câu dịch quá đơn giản kiểu "Tôi thích...".
+Ví dụ độ khó mong muốn: diễn đạt "có ba chiếc ô tô đang đỗ thẳng hàng dọc theo vỉa hè" sao cho tự nhiên bằng tiếng Anh.
+
+QUY TẮC:
+- Chỉ đưa ra ĐỀ BÀI bằng tiếng Việt để người học tự diễn đạt bằng tiếng Anh.
+- Không đưa đáp án, không gợi ý từ vựng tiếng Anh, không giải thích ngữ pháp ở lượt này.
+- Đề bài nên ngắn, rõ nghĩa, mô tả đúng một ý định.
+- Có thể yêu cầu một câu hoặc 2 câu nếu ý định cần nhiều thành phần.
+- Đổi chủ đề đa dạng giữa các lượt.
+- Cuối đề bài thêm đúng câu: "👉 Hãy diễn đạt ý này bằng tiếng Anh nhé."
+
+Chỉ trả về đề bài cho người học."""
+    gen_started = time.perf_counter()
+    reply, model_used, _ = _generate_chat_reply(
+        prompt,
+        content_type="Phrasing",
+        request_id=request_id,
+        gen_started=gen_started,
+        user_text="phrasing_start",
+        reasoning_profile="low",
+        max_output_tokens=700,
+    )
+    return {
+        "reply": reply or "Hãy diễn đạt ý này bằng tiếng Anh nhé.",
+        "model": model_used,
+        "course_id": course_id,
+        "course": course_name,
+        "task": reply or "",
+    }
+
+
+@app.post("/api/learning/phrasing/evaluate")
+def phrasing_evaluate(
+    data: PhrasingRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Evaluate a learner's English phrasing and teach a more natural expression."""
+    request_id = uuid.uuid4().hex[:12]
+    user = require_active_user(authorization)
+    course_id, course_name, authorized_courses = _resolve_request_course(user["id"], data.course_id)
+    if course_id is None:
+        raise HTTPException(400, "Hãy chọn khóa học trước khi tiếp tục Phrasing.")
+    task = str(data.task or "").strip()
+    answer = str(data.answer or "").strip()
+    if not task or not answer:
+        raise HTTPException(400, "Thiếu đề bài hoặc câu trả lời Phrasing.")
+
+    prompt = f"""Bạn là Doraemon, giáo viên tiếng Anh đang chấm một bài Phrasing.
+Khóa học: {course_name or 'Tiếng Anh'}.
+
+ĐỀ BÀI GỐC:
+{task}
+
+CÂU TRẢ LỜI CỦA NGƯỜI HỌC:
+{answer}
+
+Hãy đánh giá câu trả lời và dạy người học cách diễn đạt tự nhiên hơn.
+QUY TẮC:
+1. Trước tiên nói ngắn gọn câu trả lời có truyền đạt đúng ý hay chưa.
+2. Chỉ ra lỗi hoặc điểm chưa tự nhiên cụ thể (grammar, word choice, preposition, word order, collocation, article, nuance...). Nếu câu đúng thì nói rõ phần nào đã tốt.
+3. Đưa ra một câu tiếng Anh tự nhiên, phù hợp ngữ cảnh, diễn đạt đúng ý bài.
+4. Khi hữu ích, đưa thêm 1 cách diễn đạt tự nhiên khác và giải thích khác nhau ở sắc thái/cấu trúc.
+5. Giải thích bằng tiếng Việt, nhưng CÂU MẪU phải bằng tiếng Anh.
+6. Không biến thành bài giảng dài; ưu tiên học từ chính lỗi của câu trả lời.
+7. Không bịa lỗi. Nếu câu của người học đã tự nhiên, công nhận điều đó và chỉ đề xuất nâng cấp nếu có lý do rõ ràng.
+
+Định dạng:
+✅ Đánh giá: ...
+🔎 Điểm cần sửa: ...
+💡 Cách nói tự nhiên: ...
+✨ Cách nói khác (nếu hữu ích): ...
+"""
+    gen_started = time.perf_counter()
+    reply, model_used, _ = _generate_chat_reply(
+        prompt,
+        content_type="Phrasing",
+        request_id=request_id,
+        gen_started=gen_started,
+        user_text=answer,
+        reasoning_profile="low",
+        max_output_tokens=1200,
+    )
+    return {
+        "reply": reply or "Mình chưa tạo được phản hồi chấm Phrasing.",
+        "model": model_used,
+        "course_id": course_id,
+        "course": course_name,
+        "task": task,
+    }
 
 
 @app.post("/api/proxy-chat")
