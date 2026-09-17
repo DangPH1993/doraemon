@@ -5,7 +5,7 @@ SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-edit
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.26-tutor-evidence-vocab-grammar"
+BASELINE_VERSION = "19.133-grammar-b1-navigation-fix-followup-history-lightweight-answer-direct-exercise-ocr-v19-writing-v31.26-tutor-evidence-vocab-grammar"
 import os
 import ast
 import io
@@ -126,8 +126,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.132-grammar-ocr-two-stage")
-SERVER_VERSION = "31.34"
+print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
+SERVER_VERSION = "31.35"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7840,6 +7840,10 @@ Tin nhắn hiện tại:
             answered=bool((study_session or {}).get("curriculum_exercise_answered"))
 
             # Button navigation is deterministic and costs 0 Gemini/embedding/Pinecone.
+            # Keep the step we ENTERED at the start of this request: Grammar B1's
+            # hard gate below must only stop an attempt to advance FROM B1, not the
+            # legitimate B0 -> B1 navigation.
+            entered_step = current_step
             if ui_action == "curriculum_next" and requested_content_type != "Luyện viết" and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered):
                 try:
                     expected=int(action_plan_id or -1)
@@ -7875,7 +7879,8 @@ Tin nhắn hiện tại:
             # Doraemon can move to B2. Do not fall through to the generic LLM path when
             # the user presses Continue or types a continuation confirmation early.
             if requested_content_type == "Ngữ pháp" and current_step == 1 and not answered and (
-                ui_action == "curriculum_next" or (not data.action and _is_continue_confirmation(query_text))
+                (ui_action == "curriculum_next" and entered_step == 1)
+                or (not data.action and _is_continue_confirmation(query_text))
             ):
                 msg="✍️ Cậu hãy làm bài **B1** trước nhé. Gửi câu trả lời của cậu cho Doraemon, rồi tớ sẽ tạo **B2 · Đáp án**."
                 _set_curriculum_flow(user["id"],step=current_step,waiting="grammar_exercise_answer",exercise_answered=False)
