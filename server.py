@@ -127,7 +127,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.36"
+SERVER_VERSION = "31.39"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -6442,11 +6442,12 @@ def proxy_chat(
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
 
-    # Exercise completion is decided explicitly after the full B1/B2 grading result.
+    # Exercise completion is decided explicitly after the full exercise/grading result.
+    # Grammar lessons use B1/B2 but remain content_type="Ngữ pháp" throughout the session.
     if ui_action in {"exercise_finish_yes", "exercise_finish_no"} and study_session:
         lesson_label=(study_session or {}).get("lesson") or "bài học này"
         content_type=_normalize_content_type((study_session or {}).get("content_type"))
-        if content_type not in {"Bài tập","Luyện viết"}:
+        if content_type not in {"Bài tập","Luyện viết","Ngữ pháp"}:
             return {"reply":"⚠️ Trạng thái hoàn thành bài học dạng bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài học dạng bài tập không hợp lệ."}],"learning_progress":None}
         target_status = "completed" if ui_action == "exercise_finish_yes" else "in_progress"
         print(f"[EXERCISE FINISH] persist target_status={target_status} lesson={lesson_label!r} course_id={(study_session or {}).get('course_id')}")
