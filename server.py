@@ -49,7 +49,7 @@ except Exception:
     OpenAI = None
 
 try:
-    import fitz  # PyMuPDF - render scanned PDF pages
+    import pymupdf as fitz  # PyMuPDF - render scanned PDF pages
 except Exception:
     fitz = None
 
@@ -127,7 +127,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.35"
+SERVER_VERSION = "31.36"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15509,13 +15509,13 @@ function _sanitizeCurriculumRichHtml(value){
   let src=_decodeCurriculumRichEntities(value);
   if(!src)return '';
   const box=document.createElement('div');
-  if(/<\s*(?:b|strong|i|em|u|br|p|div|span|img)\b/i.test(src)){ box.innerHTML=src; }
+  if(/<\\s*(?:b|strong|i|em|u|br|p|div|span|img)\\b/i.test(src)){ box.innerHTML=src; }
   else { box.textContent=src; }
 
   // Legacy/paste-safe fallback: older saves may contain literal IMG markup as
   // plain text nodes. Convert every literal <img ...> occurrence into a real
   // DOM image before the final allow-list pass.
-  const literalImgRe=/<img\s+[^>]*src=[\"']([^\"']+)[\"'][^>]*>/ig;
+  const literalImgRe=/<img\\s+[^>]*src=[\"']([^\"']+)[\"'][^>]*>/ig;
   const walker=document.createTreeWalker(box,NodeFilter.SHOW_TEXT);
   const textNodes=[]; let n;
   while((n=walker.nextNode())){ if(literalImgRe.test(n.nodeValue||'')){ literalImgRe.lastIndex=0; textNodes.push(n); } }
@@ -15525,7 +15525,7 @@ function _sanitizeCurriculumRichHtml(value){
     while((match=literalImgRe.exec(text))){
       if(match.index>last)frag.appendChild(document.createTextNode(text.slice(last,match.index)));
       const rawSrc=String(match[1]||'').trim();
-      if(/^(?:https?:\/\/|\/)/i.test(rawSrc)){
+      if(/^(?:https?:\\/\\/|\\/)/i.test(rawSrc)){
         const img=document.createElement('img'); img.setAttribute('src',rawSrc); img.setAttribute('alt','Hình minh họa'); frag.appendChild(img);
       }else{ frag.appendChild(document.createTextNode(match[0])); }
       last=match.index+match[0].length;
@@ -15539,7 +15539,7 @@ function _sanitizeCurriculumRichHtml(value){
     const tag=el.tagName.toLowerCase();
     if(tag==='img'){
       const src=String(el.getAttribute('src')||'').trim();
-      if(!/^(?:https?:\/\/|\/)/i.test(src)){ el.remove(); return; }
+      if(!/^(?:https?:\\/\\/|\\/)/i.test(src)){ el.remove(); return; }
       const alt=String(el.getAttribute('alt')||'').trim();
       [...el.attributes].forEach(a=>el.removeAttribute(a.name));
       el.setAttribute('src',src); if(alt)el.setAttribute('alt',alt);
@@ -15597,7 +15597,7 @@ async function uploadCurriculumImageBlob(code,blob,filename){
   try{
     const r=await fetch(`/admin/api/curriculum/drafts/${encodeURIComponent(String(draftId))}/content-image`,{method:'POST',body:fd});
     const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw new Error(d.detail||('HTTP '+r.status));
-    insertCurriculumImageAtSelection(String(code),String(d.image_url||''),String(filename||'').replace(/\.[^.]+$/,''));
+    insertCurriculumImageAtSelection(String(code),String(d.image_url||''),String(filename||'').replace(/\\.[^.]+$/,''));
   }catch(e){alert('❌ Không tải được ảnh: '+e.message);}
 }
 function uploadCurriculumImageFile(input,code){const file=input?.files?.[0]; if(!file)return; uploadCurriculumImageBlob(String(code),file,file.name); input.value='';}
@@ -15924,9 +15924,9 @@ def _table_explanation_overlaps_chunk(explanation, marker, chunk):
     the same table image to every chunk that contains a substantial fragment of
     that table's Vision explanation.
     """
-    ch = re.sub(r"\s+", " ", str(chunk or "")).strip()
-    exp = re.sub(r"\s+", " ", str(explanation or "")).strip()
-    mark = re.sub(r"\s+", " ", str(marker or "")).strip()
+    ch = re.sub(r"\\s+", " ", str(chunk or "")).strip()
+    exp = re.sub(r"\\s+", " ", str(explanation or "")).strip()
+    mark = re.sub(r"\\s+", " ", str(marker or "")).strip()
     if not ch:
         return False
     if mark and mark in ch:
@@ -15952,7 +15952,7 @@ def _table_explanation_overlaps_chunk(explanation, marker, chunk):
 
 
 def kb_chunk_text(text, chunk_size=1200, overlap=200):
-    text = re.sub(r"\s+", " ", text or "").strip()
+    text = re.sub(r"\\s+", " ", text or "").strip()
     if not text:
         return []
     out=[]; start=0
@@ -16168,8 +16168,8 @@ def _parse_gemini_json(text: str):
     """
     raw = (text or "").strip()
     if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw)
+        raw = re.sub(r"^```(?:json)?\\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\\s*```$", "", raw)
     if not raw:
         raise ValueError("Gemini không trả về nội dung JSON.")
 
@@ -16339,13 +16339,13 @@ def _text_looks_like_table(extracted: str) -> bool:
     text = str(extracted or "").strip()
     if not text:
         return False
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines()]
+    lines = [re.sub(r"\\s+", " ", x).strip() for x in text.splitlines()]
     lines = [x for x in lines if x]
     if len(lines) < 3:
         return False
 
     pipe_lines = sum(1 for x in lines if x.count("|") >= 2)
-    separator_lines = sum(1 for x in lines if re.search(r"\|\s*:?-{2,}:?\s*(?:\||$)", x))
+    separator_lines = sum(1 for x in lines if re.search(r"\\|\\s*:?-{2,}:?\\s*(?:\\||$)", x))
     # Markdown-like table extraction: several pipe rows plus at least one
     # separator/header row.
     if pipe_lines >= 3 and separator_lines >= 1:
@@ -16851,15 +16851,15 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 except Exception as exc:
                     print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
             # Secondary native text path. Still zero tokens.
-            if len(re.sub(r'\s+','',extracted)) < 20:
+            if len(re.sub(r'\\s+','',extracted)) < 20:
                 try:
                     page_obj=reader.pages[page_no-1]
                     pypdf_text=(page_obj.extract_text() or '').strip()
-                    if len(re.sub(r'\s+','',pypdf_text)) >= 20:
+                    if len(re.sub(r'\\s+','',pypdf_text)) >= 20:
                         extracted=pypdf_text
                 except Exception as exc:
                     print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            text_len=len(re.sub(r'\s+','',extracted))
+            text_len=len(re.sub(r'\\s+','',extracted))
             png=None
             if text_len >= 20:
                 ocr_text=extracted
@@ -16925,7 +16925,7 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
             continue
         page_meta = metadata_for_page(records_meta, page_no)
         extracted = (page.extract_text() or "").strip()
-        text_len = len(re.sub(r"\s+", "", extracted))
+        text_len = len(re.sub(r"\\s+", "", extracted))
 
         # Keep the original V16 fast path for ordinary text pages.
         if text_len >= 30:
