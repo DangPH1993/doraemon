@@ -1,5 +1,5 @@
-# VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus"
+# VERSION: v19_110 — vocabulary table OCR + structured English vocabulary generation
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.44"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -3867,12 +3867,16 @@ def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
     return items, plan_slice
 
 
-def _vocabulary_master_text(items):
+def _vocabulary_master_text(items, subject=''):
+    subject_low=str(subject or '').casefold()
+    is_english=any(token in subject_low for token in ('tiếng anh','english','ielts','toeic'))
     lines=[]
     for i,item in enumerate(items or [],1):
         row=[f"{i}. {item.get('writing') or ''}".rstrip()]
-        if item.get('reading'): row.append(f"   📖 Cách đọc: {item['reading']}")
-        if item.get('pronunciation_vi'): row.append(f"   🔊 Phát âm tiếng Việt: {item['pronunciation_vi']}")
+        if item.get('reading'):
+            row.append(f"   🔤 Phiên âm: {item['reading']}" if is_english else f"   📖 Cách đọc: {item['reading']}")
+        if item.get('pronunciation_vi') and not is_english:
+            row.append(f"   🔊 Phát âm tiếng Việt: {item['pronunciation_vi']}")
         if item.get('meaning'): row.append(f"   🇻🇳 Nghĩa: {item['meaning']}")
         if item.get('example'): row.append(f"   Ví dụ: {item['example']}")
         lines.append("\n".join(row))
@@ -3902,7 +3906,7 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
                 "Doraemon sẽ không tự tạo từ vựng thay thế."
             )
             return [{"type":"text","text":msg}]
-        text=_vocabulary_master_text(master_items)
+        text=_vocabulary_master_text(master_items, cache.get('subject') if isinstance(cache, dict) else '')
         if plan_slice:
             text=(
                 f"🎯 Lộ trình hôm nay: **{plan_slice['quota']} từ** "
@@ -13937,7 +13941,64 @@ JSON:
          'content':{'content':'','source_refs':[],'images':[],'items':[],'deferred':True}},
     ]
 
-def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference='', *, exercise_question_pages=None, exercise_answer_pages=None):
+def _validate_generated_english_vocab_steps(steps, source_digest):
+    """Clamp English vocabulary items to words/IPA/meaning actually present in OCR.
+
+    The model may generate examples, but it must not invent or silently rewrite the
+    lexical fields extracted from the PDF table.
+    """
+    source_map={}
+    for raw in str(source_digest or '').splitlines():
+        line=raw.strip()
+        if line.count('|') < 2:
+            continue
+        parts=[str(x).strip() for x in line.split('|')]
+        if len(parts) < 4:
+            continue
+        header=' '.join(parts[:4]).casefold()
+        if 'từ vựng' in header or 'vocabulary' in header or 'pronunciation' in header or 'phiên âm' in header:
+            continue
+        word,_,pron,meaning=parts[:4]
+        if not word or len(word) > 120:
+            continue
+        # Avoid treating prose containing pipes as vocabulary rows. A word cell
+        # should be compact and normally begin with a letter/number.
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 .'’()/-]{0,119}$", word):
+            continue
+        key=_normalize_master_text(word)
+        if key and key not in source_map:
+            source_map[key]={'writing':word,'reading':pron,'meaning':meaning}
+
+    if not source_map:
+        return steps
+
+    for st in steps or []:
+        if not isinstance(st,dict) or str(st.get('code') or '').upper() != 'B1':
+            continue
+        content=st.get('content') if isinstance(st.get('content'),dict) else st
+        items=content.get('items') if isinstance(content.get('items'),list) else []
+        cleaned=[]; seen=set()
+        for item in items:
+            if not isinstance(item,dict):
+                continue
+            word=str(item.get('writing') or item.get('word') or item.get('term') or '').strip()
+            key=_normalize_master_text(word)
+            if not key or key in seen or key not in source_map:
+                continue
+            src=source_map[key]
+            cleaned.append({
+                'writing':src['writing'],
+                'reading':src['reading'],
+                'meaning':src['meaning'],
+                'example':str(item.get('example') or '').strip(),
+            })
+            seen.add(key)
+        content['items']=cleaned
+        st['content']=content
+        break
+    return steps
+
+def _curriculum_generate_all_steps(content_type, lesson, source_digest, grammar_reference='', *, exercise_question_pages=None, exercise_answer_pages=None, subject=''):
     """Generate all curriculum steps in exactly ONE GenAI call per lesson.
 
     OCR/Vision has already completed before this function runs.
@@ -13969,6 +14030,67 @@ QUY TẮC BƯỚC KHUNG:
 NGUỒN HIỆN TẠI:
 {source_digest}
 """
+    if ct == 'Từ vựng':
+        subject_text=str(subject or '').strip()
+        lower_subject=subject_text.casefold()
+        is_english=any(token in lower_subject for token in ('tiếng anh','english','ielts','toeic'))
+        if is_english:
+            vocab_schema='{\"writing\":\"...\",\"reading\":\"...\",\"meaning\":\"...\",\"example\":\"...\"}'
+            vocab_rules=(
+                '- Đây là khóa tiếng Anh. writing = cột Từ vựng/Vocabulary/Word.\n'
+                '- reading = cột Phiên âm/Pronunciation/IPA. Giữ NGUYÊN IPA từ OCR, không tự sửa.\n'
+                '- meaning = cột Ý nghĩa/Meaning/Definition. Giữ nguyên nghĩa đã OCR.\n'
+                '- example = AI tự tạo một câu tiếng Anh ngắn, tự nhiên, đúng với chính từ đó; đây là trường duy nhất được phép bổ sung ngoài nguồn.\n'
+                '- Không tự tạo thêm từ vựng ngoài những hàng có trong bảng OCR.\n'
+                '- Không đổi spelling, IPA hoặc nghĩa của từ nguồn.\n'
+                '- Có thể bỏ qua cột Từ loại vì schema học chỉ cần 4 trường.\n'
+            )
+        else:
+            vocab_schema='{\"writing\":\"...\",\"reading\":\"...\",\"pronunciation_vi\":\"...\",\"meaning\":\"...\",\"example\":\"...\"}'
+            vocab_rules=(
+                '- Với tiếng Nhật/ngoại ngữ khác, giữ schema writing + reading + pronunciation_vi + meaning + example khi nguồn có.\n'
+                '- reading/pronunciation phải lấy từ nguồn; không đoán nếu OCR không rõ.\n'
+                '- example chỉ được tạo khi có đủ nghĩa/từ để tạo ví dụ phù hợp.\n'
+            )
+        prompt=common+f"""
+
+YÊU CẦU RIÊNG CHO TỪ VỰNG:
+{vocab_rules}
+- B0 = giới thiệu rất ngắn về nhóm từ vựng của bài.
+- B1 = danh sách TỪ VỰNG ĐÃ OCR. Mỗi hàng nguồn tương ứng một item; không gộp hoặc nhân bản.
+- B2 = một số ví dụ/bài tập dựa trên CHÍNH các từ đã có ở B1.
+- Với B1, dùng đúng schema item: {vocab_schema}
+
+NGUỒN OCR HIỆN TẠI:
+{source_digest}
+
+TRẢ JSON DUY NHẤT:
+{{"steps":[
+  {{"code":"B0","title":"Giới thiệu từ vựng","type":"vocabulary","content":"...","items":[],"source_refs":[],"images":[]}},
+  {{"code":"B1","title":"Danh sách từ vựng","type":"vocabulary","content":"","items":[{vocab_schema}],"source_refs":[],"images":[]}},
+  {{"code":"B2","title":"Một số ví dụ và bài tập","type":"examples","content":"...","items":[],"source_refs":[],"images":[]}}
+]}}
+"""
+        data=_curriculum_ai_json(prompt, 'curriculum_all_steps_Tu_vung')
+        if isinstance(data,list): data={'steps':data}
+        if not isinstance(data,dict): data={}
+        steps=data.get('steps') if isinstance(data.get('steps'),list) else []
+        if not steps:
+            raise HTTPException(500,'AI không tạo được nội dung các bước Từ vựng.')
+        if is_english:
+            steps=_validate_generated_english_vocab_steps(steps, source_digest)
+            b1=next((st for st in steps if isinstance(st,dict) and str(st.get('code') or '').upper()=='B1'), None)
+            b1_items=((b1 or {}).get('content') or {}).get('items') if isinstance((b1 or {}).get('content'),dict) else []
+            if not isinstance(b1_items,list) or not b1_items:
+                raise HTTPException(500,'AI không tạo được danh sách từ vựng hợp lệ từ OCR bảng nguồn.')
+            if b1:
+                b1['title']='Danh sách từ vựng'
+                b1['type']='vocabulary'
+        for st in steps:
+            if isinstance(st,dict):
+                st.setdefault('vocabulary_refs',[])
+                st.setdefault('grammar_refs',[])
+        return steps
     if ct == 'Giáo trình':
         prompt=common+f"""
 
@@ -14280,7 +14402,7 @@ async def admin_curriculum_draft_upload(
             if ct == 'Ngữ pháp':
                 selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
                 grammar_pages=[selected_by_page[p] for p in cfg.get('selected_pages',[]) if p in selected_by_page]
-                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference,exercise_question_pages=grammar_pages)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference,exercise_question_pages=grammar_pages,subject=subject)
                 for st in generated:
                     code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
                     content=st.get('content') if isinstance(st.get('content'),dict) else st
@@ -14306,6 +14428,7 @@ async def admin_curriculum_draft_upload(
                     ct,ls,digest,grammar_reference,
                     exercise_question_pages=question_pages,
                     exercise_answer_pages=answer_pages,
+                    subject=subject,
                 )
                 for st in generated:
                     code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
@@ -14332,7 +14455,7 @@ async def admin_curriculum_draft_upload(
                 }
                 story_b0 = _resolve_curriculum_step_images(story_b0, pages)
                 normalized_steps.append({'code':'B0','title':'Nội dung truyện','type':'story','content':story_b0})
-                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference,subject=subject)
                 if ct == 'Truyện đọc':
                     # Apply the course master gate only to vocabulary/grammar items in the generated story steps.
                     generated = _filter_generated_course_knowledge(generated, course_id)
@@ -14346,7 +14469,7 @@ async def admin_curriculum_draft_upload(
                     normalized_steps.append({'code':code,'title':str(st.get('title') or title),'type':str(st.get('type') or step_type),'content':content})
                 print('[CURRICULUM ONE-CALL] type=Truyện đọc vision_first=1 genai_calls=1 total_steps=%s' % len(normalized_steps))
             else:
-                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference,subject=subject)
                 if ct == 'Giáo trình':
                     generated = _filter_generated_course_knowledge(generated, course_id)
                 plan=_normalize_curriculum_steps(ct,generated,digest)
@@ -16545,6 +16668,86 @@ Chỉ trả JSON đúng schema:
     images = data.get("images") if isinstance(data.get("images"), list) else []
     return text, images
 
+def gemini_ocr_vocabulary_table_page(page_png: bytes, page_no: int, source_file: str = ""):
+    """OCR a vocabulary table into a stable row/column representation.
+
+    This pass is source extraction only. It preserves the lexical values from the
+    PDF and leaves example generation to the later curriculum GenAI step.
+    """
+    if not gemini:
+        raise RuntimeError("Gemini chưa được khởi tạo.")
+    prompt = f"""Đây là trang {page_no} của tài liệu học từ vựng.
+
+Hãy OCR CHÍNH XÁC bảng từ vựng nhìn thấy trong ảnh.
+
+Mục tiêu của bước này chỉ là OCR nguồn để một bước AI khác xử lý tiếp.
+KHÔNG dịch, KHÔNG giải thích, KHÔNG tạo ví dụ, KHÔNG sửa dữ liệu nguồn.
+
+Giữ nguyên từng hàng và từng ô, đặc biệt các cột:
+- Từ vựng / Vocabulary / Word
+- Từ loại / Part of speech
+- Phiên âm / Pronunciation / IPA
+- Ý nghĩa / Meaning / Definition
+
+Quy tắc:
+- Không trộn dữ liệu giữa các hàng.
+- Không suy đoán IPA nếu ảnh không rõ.
+- Không bỏ dấu IPA hoặc ký tự đặc biệt.
+- Giữ nguyên spelling.
+- Ô thực sự trống -> chuỗi rỗng.
+- OCR toàn bộ bảng.
+
+Trả JSON duy nhất:
+{{
+  "headers": ["..."],
+  "rows": [
+    {{
+      "word": "...",
+      "part_of_speech": "...",
+      "pronunciation": "...",
+      "meaning": "..."
+    }}
+  ],
+  "text": "..."
+}}
+
+Trường text là bản OCR dạng dòng, giữ cấu trúc cột bằng dấu |, ví dụ:
+Từ vựng | Từ loại | Phiên âm | Ý nghĩa
+Watercolour | n | /.../ | Màu nước
+..."""
+    part = types.Part.from_bytes(data=page_png, mime_type="image/png")
+    response = gemini.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[part, prompt],
+        config=types.GenerateContentConfig(
+            temperature=0.0,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            response_mime_type="application/json",
+        ),
+    )
+    _log_gemini_usage(response, operation=f"vision_vocab_table_ocr:{source_file}:page_{page_no}")
+    data = _parse_gemini_json(response.text or "{}")
+    raw_rows = data.get("rows") if isinstance(data, dict) and isinstance(data.get("rows"), list) else []
+    rows=[]
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        item={
+            "word": str(row.get("word") or "").strip(),
+            "part_of_speech": str(row.get("part_of_speech") or "").strip(),
+            "pronunciation": str(row.get("pronunciation") or "").strip(),
+            "meaning": str(row.get("meaning") or "").strip(),
+        }
+        if any(item.values()):
+            rows.append(item)
+    headers=[str(x).strip() for x in (data.get("headers") or []) if str(x).strip()]
+    ocr_text=str(data.get("text") or "").strip()
+    if not ocr_text and rows:
+        lines=[" | ".join(headers or ["Từ vựng","Từ loại","Phiên âm","Ý nghĩa"]) ]
+        lines.extend(" | ".join([r["word"],r["part_of_speech"],r["pronunciation"],r["meaning"]]) for r in rows)
+        ocr_text="\n".join(lines)
+    return ocr_text, rows, headers
+
 def _detect_long_grid_lines(page_png: bytes):
     """Cheap local detector used ONLY to decide whether a page contains a table.
 
@@ -17226,6 +17429,63 @@ def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subjec
         ocr_text = extracted
         if not table_page:
             table_page = _page_has_table_grid(page, png, ocr_text or extracted)
+
+        primary_meta = page_meta[0] if page_meta else {}
+        page_content_type = _normalize_content_type(primary_meta.get('content_type'))
+
+        # Vocabulary tables require Vision OCR even when PdfReader returns enough text,
+        # because native extraction can scramble row/column relationships.
+        if table_page and page_content_type == 'Từ vựng':
+            vocab_ocr_text, vocab_rows, vocab_headers = gemini_ocr_vocabulary_table_page(
+                png, page_no, source_file=source_file
+            )
+            if vocab_ocr_text:
+                ocr_text = vocab_ocr_text
+                print(f'[VOCAB TABLE OCR] page={page_no} rows={len(vocab_rows)} headers={vocab_headers} genai=1')
+                page_units[page_no] = [{
+                    'type':'vocabulary_table_ocr',
+                    'unit_id':f'vocab-table:{page_no}',
+                    'text':ocr_text,
+                    'image_keys':[],
+                    'rows':vocab_rows,
+                    'headers':vocab_headers,
+                }]
+                page_texts[page_no]=ocr_text
+                # Store one source-page image for provenance.
+                if b2_ready():
+                    try:
+                        image_bytes=png
+                        width=height=None
+                        if Image is not None:
+                            im=Image.open(io.BytesIO(png)).convert('RGB')
+                            buf=io.BytesIO(); im.save(buf,format='JPEG',quality=90,optimize=True)
+                            image_bytes=buf.getvalue(); width,height=im.size
+                        key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/vocab_table_source.jpg"
+                        b2_put_bytes(key,image_bytes,'image/jpeg')
+                        conn=db()
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute("""INSERT INTO knowledge_images
+                                    (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,associated_text,width,height)
+                                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                    (source_file,subject,'Từ vựng',primary_meta.get('lesson'),primary_meta.get('topic'),page_no,key,b2_url(key),
+                                     'Original vocabulary table source',ocr_text,width,height))
+                            conn.commit()
+                        finally:
+                            conn.close()
+                        page_images[page_no]=[{'key':key,'description':'Original vocabulary table source','page':page_no,
+                                              'associated_text':ocr_text,'image_scope':'lesson'}]
+                        page_units[page_no][0]['image_keys']=[key]
+                    except Exception as exc:
+                        print(f'[VOCAB TABLE SOURCE IMAGE] page={page_no} skipped: {type(exc).__name__}: {exc}')
+                try: del preview
+                except Exception: pass
+                try: del png
+                except Exception: pass
+                try: del page
+                except Exception: pass
+                gc.collect()
+                continue
 
         stored = []
         if text_len < 30:
