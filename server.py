@@ -127,7 +127,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.41"
+SERVER_VERSION = "31.43"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -3712,15 +3712,106 @@ def _planned_vocab_slice(user_id, course_id, lesson):
         conn.close()
 
 
-def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
-    """Load vocabulary exclusively from curriculum_vocab_master.
+def _published_vocab_items_from_curriculum(course_id, lesson):
+    """Recover standalone vocabulary directly from the published DB lesson.
 
-    Published curriculum_steps may contain AI-generated vocabulary, so runtime
-    teaching of a Từ vựng lesson deliberately bypasses those items and reads the
-    canonical course master instead.
+    Some older publishes did not populate curriculum_vocab_master for standalone
+    Từ vựng lessons. The published curriculum_steps are still authoritative DB
+    content, so use B0/step_type=vocabulary as a deterministic recovery source.
+    """
+    if course_id in (None, '') or not lesson:
+        return []
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cs.step_code, cs.step_type, cs.content_json
+                FROM curriculum_lessons cl
+                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                WHERE cl.status='PUBLISHED'
+                  AND cl.course_id=%s
+                  AND lower(trim(cl.content_type))=lower(trim('Từ vựng'))
+                  AND (lower(trim(cl.lesson))=lower(trim(%s)) OR
+                       regexp_replace(lower(trim(cl.lesson)), '^bài\\s+', '', 'g')=regexp_replace(lower(trim(%s)), '^bài\\s+', '', 'g'))
+                ORDER BY cs.step_order, cs.id
+            """, (int(course_id), str(lesson).strip(), str(lesson).strip()))
+            rows=cur.fetchall() or []
+    finally:
+        conn.close()
+
+    out=[]
+    seen=set()
+    for r in rows:
+        code=str(r.get('step_code') or '').strip().upper()
+        stype=str(r.get('step_type') or '').strip().casefold()
+        if code != 'B0' and stype != 'vocabulary':
+            continue
+        content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+        raw_items=content.get('items') if isinstance(content.get('items'),list) else []
+        for item in raw_items:
+            if not isinstance(item,dict):
+                continue
+            writing=next((str(item.get(k) or '').strip() for k in ('writing','word','term','kanji','title','text') if str(item.get(k) or '').strip()), '')
+            reading=next((str(item.get(k) or '').strip() for k in ('reading','hiragana','kana','yomikata') if str(item.get(k) or '').strip()), '')
+            pronunciation_vi=next((str(item.get(k) or '').strip() for k in ('pronunciation_vi','vietnamese_pronunciation','vn_pronunciation') if str(item.get(k) or '').strip()), '')
+            meaning=next((str(item.get(k) or '').strip() for k in ('meaning','definition','translation','vietnamese_meaning') if str(item.get(k) or '').strip()), '')
+            example=next((str(item.get(k) or '').strip() for k in ('example','content') if str(item.get(k) or '').strip()), '')
+            if not any((writing,reading,meaning)):
+                continue
+            key=_normalize_master_text(writing or reading)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                'writing':writing,
+                'reading':reading,
+                'pronunciation_vi':pronunciation_vi,
+                'meaning':meaning,
+                'example':example,
+            })
+    return out
+
+
+def _upsert_published_vocab_master(course_id, lesson, items):
+    """Persist recovered published vocabulary into the canonical master table."""
+    if course_id in (None, '') or not lesson or not items:
+        return 0
+    inserted=0
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            for item in items:
+                key=_normalize_master_text(item.get('writing') or item.get('reading'))
+                if not key:
+                    continue
+                cur.execute("""
+                    INSERT INTO curriculum_vocab_master
+                        (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                        writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
+                        meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()
+                """, (
+                    int(course_id), key, item.get('writing',''), item.get('reading',''),
+                    item.get('pronunciation_vi',''), item.get('meaning',''), item.get('example',''), str(lesson).strip()
+                ))
+                inserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted
+
+
+def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
+    """Load vocabulary from the canonical DB master, with a DB-only published fallback.
+
+    Older standalone Từ vựng publishes could contain their items only in
+    curriculum_steps.content_json. Those rows are DB content too, so recover them
+    once and backfill curriculum_vocab_master instead of calling GenAI or RAG.
     """
     if course_id in (None, '') or not lesson:
         return [], None
+    lesson_text=str(lesson).strip()
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -3730,16 +3821,36 @@ def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
                 WHERE course_id=%s
                   AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
                 ORDER BY id
-            """, (int(course_id), str(lesson).strip()))
+            """, (int(course_id), lesson_text))
             rows=[dict(r) for r in cur.fetchall() or []]
     finally:
         conn.close()
 
-    plan_slice=_planned_vocab_slice(user_id, course_id, lesson) if user_id is not None else None
+    source='curriculum_vocab_master'
+    if not rows:
+        recovered=_published_vocab_items_from_curriculum(course_id, lesson_text)
+        if recovered:
+            backfilled=0
+            try:
+                backfilled=_upsert_published_vocab_master(course_id, lesson_text, recovered)
+            except Exception as exc:
+                print(f"[VOCAB MASTER BACKFILL] failed course_id={course_id} lesson={lesson_text!r}: {type(exc).__name__}: {exc}")
+            print(f"[VOCAB MASTER FALLBACK] course_id={course_id} lesson={lesson_text!r} published_items={len(recovered)} master_backfilled={backfilled}")
+            rows=[]
+            for item in recovered:
+                rows.append(dict(item))
+            source='curriculum_steps'
+        else:
+            print(f"[VOCAB MASTER LOOKUP] course_id={course_id} lesson={lesson_text!r} master_rows=0 published_curriculum_items=0")
+
+    plan_slice=_planned_vocab_slice(user_id, course_id, lesson_text) if user_id is not None else None
     if plan_slice:
         a=plan_slice['start_index']
         b=a+plan_slice['quota']
+        total_before_slice=len(rows)
         rows=rows[a:b]
+        print(f"[VOCAB PLAN SLICE] course_id={course_id} lesson={lesson_text!r} source={source} total={total_before_slice} start={a} quota={plan_slice['quota']} returned={len(rows)}")
+
     items=[]
     for r in rows:
         item={
@@ -3748,10 +3859,11 @@ def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
             'pronunciation_vi':str(r.get('pronunciation_vi') or '').strip(),
             'meaning':str(r.get('meaning') or '').strip(),
             'example':str(r.get('example') or '').strip(),
-            '_master_id': int(r.get('id')),
+            '_master_id': int(r.get('id')) if r.get('id') not in (None,'') else None,
         }
         if any(item[k] for k in ('writing','reading','meaning')):
             items.append(item)
+    print(f"[VOCAB DB SOURCE] course_id={course_id} lesson={lesson_text!r} source={source} items={len(items)}")
     return items, plan_slice
 
 
@@ -13371,25 +13483,33 @@ def _rebuild_course_curriculum_knowledge_master(course_id):
     conn=db(); vocab={}; grammar={}
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT cl.lesson, cs.step_code, cs.content_json
+            cur.execute("""SELECT cl.lesson, cl.content_type, cs.step_code, cs.step_type, cs.content_json
                           FROM curriculum_lessons cl
                           JOIN curriculum_steps cs ON cs.lesson_id=cl.id
                           WHERE cl.status='PUBLISHED' AND cl.course_id=%s
-                            AND lower(trim(cl.content_type))='giáo trình'
-                            AND upper(trim(cs.step_code)) IN ('B1','B2')
+                            AND (
+                                (lower(trim(cl.content_type))='giáo trình' AND upper(trim(cs.step_code)) IN ('B1','B2'))
+                                OR
+                                (lower(trim(cl.content_type))='từ vựng' AND (upper(trim(cs.step_code))='B0' OR lower(trim(cs.step_type))='vocabulary'))
+                            )
                           ORDER BY cl.id, cs.step_order, cs.id""", (cid,))
             rows=cur.fetchall() or []
             for row in rows:
                 content=row.get('content_json') if isinstance(row.get('content_json'),dict) else {}
                 items=content.get('items') if isinstance(content.get('items'),list) else []
                 code=str(row.get('step_code') or '').upper(); lesson=str(row.get('lesson') or '').strip()
+                ct_row=str(row.get('content_type') or '').strip().casefold()
                 for item in items:
                     if not isinstance(item,dict):
                         continue
-                    key=_vocab_master_key(item) if code=='B1' else _grammar_master_key(item)
+                    if ct_row == 'từ vựng':
+                        key=_vocab_master_key(item)
+                        target=vocab
+                    else:
+                        key=_vocab_master_key(item) if code=='B1' else _grammar_master_key(item)
+                        target=vocab if code=='B1' else grammar
                     if not key:
                         continue
-                    target=vocab if code=='B1' else grammar
                     target.setdefault(key,(lesson,item))
 
             for key,(lesson,item) in vocab.items():
