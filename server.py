@@ -1,5 +1,5 @@
-# VERSION: v19_110 — vocabulary table OCR + structured English vocabulary generation
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.44"
+# VERSION: v31.45 — DOCX-only vocabulary import + item-by-item navigation
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.45"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -127,7 +127,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.43"
+SERVER_VERSION = "31.45"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -228,6 +228,7 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_chatbox_id VARCHAR(128);""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course_id BIGINT;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS selected_course_id BIGINT;""")
+            cur.execute("ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_vocab_index INTEGER NOT NULL DEFAULT 0;")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, content_hash VARCHAR(128) NOT NULL,
                 subject VARCHAR(255) NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,
@@ -3756,6 +3757,8 @@ def _published_vocab_items_from_curriculum(course_id, lesson):
             pronunciation_vi=next((str(item.get(k) or '').strip() for k in ('pronunciation_vi','vietnamese_pronunciation','vn_pronunciation') if str(item.get(k) or '').strip()), '')
             meaning=next((str(item.get(k) or '').strip() for k in ('meaning','definition','translation','vietnamese_meaning') if str(item.get(k) or '').strip()), '')
             example=next((str(item.get(k) or '').strip() for k in ('example','content') if str(item.get(k) or '').strip()), '')
+            image_key=str(item.get('image_key') or '').strip()
+            source_file=str(item.get('source_file') or '').strip()
             if not any((writing,reading,meaning)):
                 continue
             key=_normalize_master_text(writing or reading)
@@ -3768,6 +3771,8 @@ def _published_vocab_items_from_curriculum(course_id, lesson):
                 'pronunciation_vi':pronunciation_vi,
                 'meaning':meaning,
                 'example':example,
+                'image_key':image_key,
+                'source_file':source_file,
             })
     return out
 
@@ -3786,14 +3791,18 @@ def _upsert_published_vocab_master(course_id, lesson, items):
                     continue
                 cur.execute("""
                     INSERT INTO curriculum_vocab_master
-                        (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                        (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson,image_key,source_file)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(course_id,normalized_key) DO UPDATE SET
                         writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
-                        meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()
+                        meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,
+                        image_key=CASE WHEN EXCLUDED.image_key<>'' THEN EXCLUDED.image_key ELSE curriculum_vocab_master.image_key END,
+                        source_file=CASE WHEN EXCLUDED.source_file<>'' THEN EXCLUDED.source_file ELSE curriculum_vocab_master.source_file END,
+                        last_seen_at=NOW()
                 """, (
                     int(course_id), key, item.get('writing',''), item.get('reading',''),
-                    item.get('pronunciation_vi',''), item.get('meaning',''), item.get('example',''), str(lesson).strip()
+                    item.get('pronunciation_vi',''), item.get('meaning',''), item.get('example',''), str(lesson).strip(),
+                    item.get('image_key',''), item.get('source_file','')
                 ))
                 inserted += 1
         conn.commit()
@@ -3803,30 +3812,69 @@ def _upsert_published_vocab_master(course_id, lesson, items):
 
 
 def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
-    """Load vocabulary from the canonical DB master, with a DB-only published fallback.
+    """Load vocabulary from the canonical DB master in published lesson order.
 
-    Older standalone Từ vựng publishes could contain their items only in
-    curriculum_steps.content_json. Those rows are DB content too, so recover them
-    once and backfill curriculum_vocab_master instead of calling GenAI or RAG.
+    Preferred source is the published lesson's content_json item IDs. This keeps
+    duplicate vocabulary terms isolated per lesson even though the master table
+    has one canonical row per course/normalized_key. Legacy lessons without item
+    IDs still fall back to source_lesson matching and the published-DB recovery.
     """
     if course_id in (None, '') or not lesson:
         return [], None
     lesson_text=str(lesson).strip()
     conn=db()
+    rows=[]
+    source='curriculum_vocab_master'
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # 1) Exact published lesson order from stored content_json.
             cur.execute("""
-                SELECT id, writing, reading, pronunciation_vi, meaning, example
-                FROM curriculum_vocab_master
-                WHERE course_id=%s
-                  AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
-                ORDER BY id
+                SELECT cs.content_json
+                FROM curriculum_lessons cl
+                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                WHERE cl.status='PUBLISHED' AND cl.course_id=%s
+                  AND lower(trim(cl.content_type))=lower(trim('Từ vựng'))
+                  AND lower(trim(cl.lesson))=lower(trim(%s))
+                  AND (upper(trim(cs.step_code))='B0' OR lower(trim(cs.step_type))='vocabulary')
+                ORDER BY cs.step_order,cs.id LIMIT 1
             """, (int(course_id), lesson_text))
-            rows=[dict(r) for r in cur.fetchall() or []]
+            pub=cur.fetchone()
+            pub_content=pub.get('content_json') if isinstance(pub,dict) and isinstance(pub.get('content_json'),dict) else {}
+            pub_items=pub_content.get('items') if isinstance(pub_content.get('items'),list) else []
+            ids=[]
+            for item in pub_items:
+                if not isinstance(item,dict):
+                    continue
+                try:
+                    iid=int(item.get('id')) if item.get('id') not in (None,'') else None
+                except Exception:
+                    iid=None
+                if iid and iid not in ids:
+                    ids.append(iid)
+            if ids:
+                cur.execute("""
+                    SELECT id,writing,reading,pronunciation_vi,meaning,example,image_key,source_file
+                    FROM curriculum_vocab_master
+                    WHERE course_id=%s AND id = ANY(%s)
+                """, (int(course_id), ids))
+                by_id={int(r['id']):dict(r) for r in cur.fetchall() or []}
+                rows=[by_id[i] for i in ids if i in by_id]
+                if rows:
+                    source='curriculum_lesson_items'
+
+            # 2) Canonical lesson source fallback for older publishes.
+            if not rows:
+                cur.execute("""
+                    SELECT id, writing, reading, pronunciation_vi, meaning, example, image_key, source_file
+                    FROM curriculum_vocab_master
+                    WHERE course_id=%s
+                      AND lower(trim(coalesce(source_lesson,'')))=lower(trim(%s))
+                    ORDER BY id
+                """, (int(course_id), lesson_text))
+                rows=[dict(r) for r in cur.fetchall() or []]
     finally:
         conn.close()
 
-    source='curriculum_vocab_master'
     if not rows:
         recovered=_published_vocab_items_from_curriculum(course_id, lesson_text)
         if recovered:
@@ -3836,9 +3884,7 @@ def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
             except Exception as exc:
                 print(f"[VOCAB MASTER BACKFILL] failed course_id={course_id} lesson={lesson_text!r}: {type(exc).__name__}: {exc}")
             print(f"[VOCAB MASTER FALLBACK] course_id={course_id} lesson={lesson_text!r} published_items={len(recovered)} master_backfilled={backfilled}")
-            rows=[]
-            for item in recovered:
-                rows.append(dict(item))
+            rows=[dict(item) for item in recovered]
             source='curriculum_steps'
         else:
             print(f"[VOCAB MASTER LOOKUP] course_id={course_id} lesson={lesson_text!r} master_rows=0 published_curriculum_items=0")
@@ -3859,6 +3905,8 @@ def _vocabulary_items_from_master(course_id, lesson, *, user_id=None):
             'pronunciation_vi':str(r.get('pronunciation_vi') or '').strip(),
             'meaning':str(r.get('meaning') or '').strip(),
             'example':str(r.get('example') or '').strip(),
+            'image_key':str(r.get('image_key') or '').strip(),
+            'source_file':str(r.get('source_file') or '').strip(),
             '_master_id': int(r.get('id')) if r.get('id') not in (None,'') else None,
         }
         if any(item[k] for k in ('writing','reading','meaning')):
@@ -3883,6 +3931,47 @@ def _vocabulary_master_text(items, subject=''):
     return "\n\n".join(lines).strip()
 
 
+def _published_curriculum_vocabulary_item_blocks(cache, *, course_id=None, user_id=None, vocab_index=0):
+    """Render one vocabulary item at a time with Back/Next navigation."""
+    items,_plan_slice=_vocabulary_items_from_master(
+        course_id, cache.get('lesson') if isinstance(cache,dict) else None, user_id=user_id
+    )
+    if not items:
+        lesson=cache.get('lesson') if isinstance(cache,dict) else 'bài này'
+        return [{"type":"text","text":f"🤖 Chưa có dữ liệu Từ vựng trong DB cho bài **{lesson or 'này'}**."}]
+    idx=max(0,min(int(vocab_index or 0),len(items)-1))
+    item=dict(items[idx])
+    subject=str((cache or {}).get('subject') or '').casefold()
+    is_english=any(t in subject for t in ('tiếng anh','english','ielts','toeic'))
+    image_url=b2_url(item.get('image_key')) if item.get('image_key') else None
+    public={
+        "id":item.get("_master_id"),
+        "writing":item.get("writing") or "",
+        "pronunciation":item.get("reading") or "",
+        "meaning":item.get("meaning") or "",
+        "example":item.get("example") or "",
+        "image_url":image_url,
+        "index":idx,
+        "total":len(items),
+        "lesson":(cache or {}).get("lesson") or "",
+        "is_english":is_english,
+    }
+    blocks=[{"type":"vocabulary_item","vocabulary":public}]
+    options=[]
+    if idx>0:
+        options.append({"label":"← Trước","action":f"vocab_prev:{idx}","display_label":"← Từ trước"})
+    if idx < len(items)-1:
+        options.append({"label":"Tiếp theo →","action":f"vocab_next:{idx}","display_label":"Từ tiếp theo →"})
+    else:
+        blocks.append({"type":"text","text":"✅ Cậu đã xem hết các từ vựng trong phần này."})
+        options=[]
+    if options:
+        blocks.append({"type":"choice","id":"vocabulary_nav","options":options})
+    else:
+        blocks.extend(_curriculum_final_blocks())
+    return blocks
+
+
 def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, answered=False, course_id=None, user_id=None):
     """Deterministic DB-first UI for Từ vựng/Ngữ pháp/Bài tập/Truyện đọc.
 
@@ -3895,23 +3984,12 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
     blocks=[]
     title=f"**{step['code']} · {step['title']}**" if step.get("title") else f"**{step['code']}**"
     if ct == "Từ vựng":
-        master_items, plan_slice = _vocabulary_items_from_master(
-            course_id, cache.get('lesson') if isinstance(cache, dict) else None, user_id=user_id
+        # Vocabulary is a dedicated item-by-item DB lane. The caller's persisted
+        # curriculum_vocab_index controls which word is shown.
+        vocab_index=int((cache or {}).get("_runtime_vocab_index") or 0) if isinstance(cache,dict) else 0
+        return _published_curriculum_vocabulary_item_blocks(
+            cache, course_id=course_id, user_id=user_id, vocab_index=vocab_index
         )
-        # Hard rule: runtime Từ vựng must never fall back to AI-generated
-        # curriculum_steps.items. The DB master is the only teaching source.
-        if not master_items:
-            msg=(
-                f"🤖 Chưa có dữ liệu từ vựng trong DB master cho bài **{cache.get('lesson') if isinstance(cache, dict) else step.get('title') or 'này'}**. "
-                "Doraemon sẽ không tự tạo từ vựng thay thế."
-            )
-            return [{"type":"text","text":msg}]
-        text=_vocabulary_master_text(master_items, cache.get('subject') if isinstance(cache, dict) else '')
-        if plan_slice:
-            text=(
-                f"🎯 Lộ trình hôm nay: **{plan_slice['quota']} từ** "
-                f"(ngày {plan_slice['unit_index']}).\n\n" + text
-            )
     else:
         text=str(step.get("text") or "").strip()
     if text:
@@ -4240,7 +4318,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 SELECT study_session_active,study_session_content_type,study_session_course,study_session_course_id,
                        study_session_lesson,study_session_topic,study_session_started_at,
                        study_end_prompt_pending,study_session_chatbox_id,
-                       curriculum_step,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,curriculum_writing_suggestion_shown,curriculum_writing_vision,curriculum_writing_prompt,curriculum_writing_result
+                       curriculum_step,curriculum_vocab_index,curriculum_waiting,curriculum_exercise_answered,curriculum_intro_history,curriculum_intro_b0b1_history,curriculum_global_exercise_result,curriculum_writing_suggestion_shown,curriculum_writing_vision,curriculum_writing_prompt,curriculum_writing_result
                 FROM user_learning_state WHERE user_id=%s
             """, (user_id,))
             row = cur.fetchone()
@@ -4261,6 +4339,7 @@ def _get_study_session(user_id, chatbox_id=None):
                 "end_prompt_pending": bool(row.get("study_end_prompt_pending")),
                 "chatbox_id": stored_chatbox,
                 "curriculum_step": int(row.get("curriculum_step") or 0),
+                "curriculum_vocab_index": int(row.get("curriculum_vocab_index") or 0),
                 "curriculum_waiting": str(row.get("curriculum_waiting") or "continue"),
                 "curriculum_exercise_answered": bool(row.get("curriculum_exercise_answered")),
                 "curriculum_global_exercise_question": str(row.get("curriculum_global_exercise_question") or ""),
@@ -4310,6 +4389,7 @@ def _start_study_session(user_id, scope, chatbox_id=None):
                     study_session_started_at=NOW(),
                     study_end_prompt_pending=FALSE,
                     curriculum_step=0,
+                    curriculum_vocab_index=0,
                     curriculum_waiting='continue',
                     curriculum_exercise_answered=FALSE,
                     curriculum_global_exercise_question='',
@@ -4374,6 +4454,7 @@ def _finish_study_session(user_id):
                     study_session_started_at=NULL,
                     study_end_prompt_pending=FALSE,
                     curriculum_step=0,
+                    curriculum_vocab_index=0,
                     curriculum_waiting='continue',
                     curriculum_exercise_answered=FALSE,
                     curriculum_global_exercise_question='',
@@ -4496,7 +4577,7 @@ def _set_curriculum_global_exercise_result(user_id, text):
     finally:
         conn.close()
 
-def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=None):
+def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=None, vocab_index=None):
     """Persist the lightweight Giáo trình step state for the current study session."""
     sets=[]; vals=[]
     if step is not None:
@@ -4505,6 +4586,8 @@ def _set_curriculum_flow(user_id, *, step=None, waiting=None, exercise_answered=
         sets.append("curriculum_waiting=%s"); vals.append(str(waiting))
     if exercise_answered is not None:
         sets.append("curriculum_exercise_answered=%s"); vals.append(bool(exercise_answered))
+    if vocab_index is not None:
+        sets.append("curriculum_vocab_index=%s"); vals.append(max(0,int(vocab_index)))
     if not sets:
         return
     sets.append("updated_at=NOW()")
@@ -8113,12 +8196,47 @@ Tin nhắn hiện tại:
             waiting=str((study_session or {}).get("curriculum_waiting") or "continue")
             answered=bool((study_session or {}).get("curriculum_exercise_answered"))
 
+            # Từ vựng has one curriculum step (B0) but multiple DB vocabulary items.
+            # Navigate inside the item list instead of advancing the curriculum step.
+            if requested_content_type == "Từ vựng":
+                try:
+                    vocab_index=int((study_session or {}).get("curriculum_vocab_index") or 0)
+                except Exception:
+                    vocab_index=0
+                vocab_action=ui_action in {"vocab_next","vocab_prev"}
+                if vocab_action:
+                    try:
+                        requested_idx=int(action_plan_id or vocab_index)
+                    except Exception:
+                        requested_idx=vocab_index
+                    items,_=_vocabulary_items_from_master(selected_course_id, requested_lesson, user_id=user["id"])
+                    if items:
+                        if ui_action == "vocab_next":
+                            vocab_index=min(len(items)-1, requested_idx+1)
+                        else:
+                            vocab_index=max(0, requested_idx-1)
+                        _set_curriculum_flow(user["id"],step=0,waiting="vocabulary_nav",exercise_answered=False,vocab_index=vocab_index)
+                        study_session["curriculum_step"]=0
+                        study_session["curriculum_vocab_index"]=vocab_index
+                        cache_for_vocab=dict(runtime_lesson_cache or {})
+                        cache_for_vocab["_runtime_vocab_index"]=vocab_index
+                        blocks=_published_curriculum_vocabulary_item_blocks(cache_for_vocab,course_id=selected_course_id,user_id=user["id"],vocab_index=vocab_index)
+                        print(f"[CURRICULUM VOCAB NAV] request={request_id} lesson={requested_lesson!r} action={ui_action} index={vocab_index} total={len(items)} genai=0 embedding=0 pinecone=0")
+                        return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":"db-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
+                elif not data.action and _is_continue_confirmation(query_text):
+                    items,_=_vocabulary_items_from_master(selected_course_id, requested_lesson, user_id=user["id"])
+                    if items and vocab_index < len(items)-1:
+                        vocab_index += 1
+                        _set_curriculum_flow(user["id"],step=0,waiting="vocabulary_nav",exercise_answered=False,vocab_index=vocab_index)
+                        study_session["curriculum_vocab_index"]=vocab_index
+                # Initial render and ordinary no-action turns are handled below.
+
             # Button navigation is deterministic and costs 0 Gemini/embedding/Pinecone.
             # Keep the step we ENTERED at the start of this request: Grammar B1's
             # hard gate below must only stop an attempt to advance FROM B1, not the
             # legitimate B0 -> B1 navigation.
             entered_step = current_step
-            if ui_action == "curriculum_next" and requested_content_type != "Luyện viết" and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered):
+            if ui_action == "curriculum_next" and requested_content_type not in {"Luyện viết","Từ vựng"} and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered):
                 try:
                     expected=int(action_plan_id or -1)
                 except Exception:
@@ -8134,7 +8252,7 @@ Tin nhắn hiện tại:
                     print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} advance={current_step}")
 
             # Text 'tiếp' is also a pure DB navigation turn.
-            elif (requested_content_type != "Luyện viết"
+            elif (requested_content_type not in {"Luyện viết","Từ vựng"}
                   and not data.action
                   and not (requested_content_type == "Bài tập" and waiting == "exercise_answer")
                   and not (requested_content_type == "Ngữ pháp" and current_step == 1 and not answered)
@@ -8474,16 +8592,19 @@ YÊU CẦU OUTPUT BẮT BUỘC:
             # vocabulary items from curriculum_vocab_master and NEVER ask GenAI to
             # compose/reconstruct the vocabulary list. GenAI is reserved for a real
             # learner question after the DB lesson content has been shown.
-            if requested_content_type == "Từ vựng" and not data.action and (
-                    plan_start_action or lesson_confirmed_scope or
-                    (curriculum_flow_active if 'curriculum_flow_active' in locals() else False) and int(current_step)==0):
-                blocks=_published_curriculum_non_giao_trinh_blocks(
-                    step, runtime_lesson_cache, requested_content_type, answered=False,
-                    course_id=selected_course_id, user_id=user['id']
+            if requested_content_type == "Từ vựng" and (
+                    ui_action == "lesson_confirm_yes"
+                    or (not data.action and (plan_start_action or lesson_confirmed_scope or
+                    (curriculum_flow_active if 'curriculum_flow_active' in locals() else False) and int(current_step)==0))):
+                vocab_index=int((study_session or {}).get("curriculum_vocab_index") or 0)
+                cache_for_vocab=dict(runtime_lesson_cache or {})
+                cache_for_vocab["_runtime_vocab_index"]=vocab_index
+                blocks=_published_curriculum_vocabulary_item_blocks(
+                    cache_for_vocab, course_id=selected_course_id, user_id=user['id'], vocab_index=vocab_index
                 )
-                _set_curriculum_flow(user["id"],step=current_step,waiting="continue",exercise_answered=False)
-                print(f"[CURRICULUM DB-FIRST VOCAB START] request={request_id} lesson={requested_lesson!r} genai=0 embedding=0 pinecone=0 source=curriculum_vocab_master")
-                return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":"db-direct","sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
+                _set_curriculum_flow(user["id"],step=0,waiting="vocabulary_nav",exercise_answered=False,vocab_index=vocab_index)
+                print(f"[CURRICULUM DB-FIRST VOCAB START] request={request_id} lesson={requested_lesson!r} index={vocab_index} genai=0 embedding=0 pinecone=0 source=curriculum_vocab_master")
+                return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":"db-direct","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None}
 
             # Any other ordinary learner question in the active lesson is a
             # separate GenAI teacher turn, grounded by the current DB step.
@@ -8518,6 +8639,10 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
             if requested_content_type == "Bài tập" and answered:
                 blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=True,course_id=selected_course_id,user_id=user["id"])
+            elif requested_content_type == "Từ vựng":
+                cache_for_vocab=dict(runtime_lesson_cache or {})
+                cache_for_vocab["_runtime_vocab_index"]=int((study_session or {}).get("curriculum_vocab_index") or 0)
+                blocks=_published_curriculum_vocabulary_item_blocks(cache_for_vocab,course_id=selected_course_id,user_id=user["id"],vocab_index=cache_for_vocab["_runtime_vocab_index"])
             else:
                 blocks=_published_curriculum_non_giao_trinh_blocks(step,runtime_lesson_cache,requested_content_type,answered=False,course_id=selected_course_id,user_id=user["id"])
 
@@ -11988,6 +12113,141 @@ def admin_course_delete(course_id:int,payload:dict):
     finally:
         conn.close()
 
+def _docx_vocabulary_entries(file_bytes: bytes):
+    """Parse structured vocabulary blocks from DOCX using native OOXML only.
+
+    No OCR, GenAI, embeddings or Pinecone are used here. The DOCX is expected to
+    contain repeated blocks in the form:
+      Từ vựng: ...
+      Phiên âm: ...
+      Nghĩa: ...
+      Ví dụ: ...
+      Ảnh minh hoạ
+      <embedded image>
+    Numbering before the field labels is optional. Only content between the first
+    `Từ vựng:` marker and the next marker is treated as a vocabulary entry.
+    """
+    NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+    import xml.etree.ElementTree as ET
+
+    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as zf:
+        names=set(zf.namelist())
+        if "word/document.xml" not in names:
+            raise HTTPException(400,"DOCX không hợp lệ: thiếu word/document.xml.")
+        doc=ET.fromstring(zf.read("word/document.xml"))
+        rel_map={}
+        rel_path="word/_rels/document.xml.rels"
+        if rel_path in names:
+            rels=ET.fromstring(zf.read(rel_path))
+            for rel in rels.findall(f"{{{NS_REL}}}Relationship"):
+                rid=rel.attrib.get("Id")
+                target=rel.attrib.get("Target","")
+                if rid and target:
+                    target=target.lstrip("/")
+                    if not target.startswith("word/"):
+                        target="word/"+target
+                    rel_map[rid]=target
+
+        def para_text(p):
+            parts=[]
+            for t in p.iter(f"{{{NS_W}}}t"):
+                parts.append(t.text or "")
+            return "".join(parts).strip()
+
+        def para_images(p):
+            out=[]
+            for blip in p.iter(f"{{{NS_A}}}blip"):
+                rid=blip.attrib.get(f"{{{NS_R}}}embed")
+                target=rel_map.get(rid)
+                if not target or target not in names:
+                    continue
+                raw=zf.read(target)
+                ext=Path(target).suffix.lower()
+                ctype=mimetypes.types_map.get(ext,"application/octet-stream")
+                out.append((Path(target).name,raw,ctype))
+            return out
+
+        entry_re=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?từ\s+vựng\s*:\s*(.+?)\s*$",re.IGNORECASE)
+        pron_re=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?phiên\s+âm\s*:\s*(.*)$",re.IGNORECASE)
+        meaning_re=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?nghĩa\s*:\s*(.*)$",re.IGNORECASE)
+        example_re=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?ví\s+dụ\s*:\s*(.*)$",re.IGNORECASE)
+        image_label_re=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?ảnh\s+minh\s+họa\s*:??\s*$",re.IGNORECASE)
+        image_label_re2=re.compile(r"^(?:(?:\d+|\d+[.)])\s*[.)]?\s*)?ảnh\s+minh\s+hoạ\s*:??\s*$",re.IGNORECASE)
+
+        entries=[]
+        current=None
+        awaiting_image=False
+
+        def commit_current():
+            nonlocal current, awaiting_image
+            if not current:
+                awaiting_image=False
+                return
+            word=str(current.get("vocabulary") or "").strip()
+            pron=str(current.get("pronunciation") or "").strip()
+            meaning=str(current.get("meaning") or "").strip()
+            example=str(current.get("example") or "").strip()
+            imgs=current.pop("images",[]) or []
+            current["image"]=imgs[0] if imgs else None
+            if word:
+                entries.append({
+                    "vocabulary":word,
+                    "pronunciation":pron,
+                    "meaning":meaning,
+                    "example":example,
+                    "image":current.get("image"),
+                })
+            current=None
+            awaiting_image=False
+
+        for p in doc.iter(f"{{{NS_W}}}p"):
+            text=para_text(p)
+            imgs=para_images(p)
+            m=entry_re.match(text)
+            if m:
+                commit_current()
+                current={"vocabulary":m.group(1).strip(),"pronunciation":"","meaning":"","example":"","images":[]}
+                if imgs:
+                    current["images"].extend(imgs)
+                continue
+            if current is None:
+                continue
+            m=pron_re.match(text)
+            if m:
+                current["pronunciation"]=m.group(1).strip()
+                awaiting_image=False
+                continue
+            m=meaning_re.match(text)
+            if m:
+                current["meaning"]=m.group(1).strip()
+                awaiting_image=False
+                continue
+            m=example_re.match(text)
+            if m:
+                current["example"]=m.group(1).strip()
+                awaiting_image=False
+                continue
+            if image_label_re.match(text) or image_label_re2.match(text):
+                awaiting_image=True
+                if imgs:
+                    current["images"].extend(imgs)
+                    awaiting_image=False
+                continue
+            if imgs:
+                # Images in ordinary paragraphs within the block are associated
+                # with the current vocabulary; the first image wins.
+                current["images"].extend(imgs)
+                awaiting_image=False
+
+        commit_current()
+        # Keep vocabulary entries even when example/image is absent. The learner
+        # can still study the word; source values are never invented.
+        return [e for e in entries if e.get("vocabulary")]
+
+
 def _docx_collocation_entries(file_bytes: bytes):
     """Parse generic Collocation blocks from DOCX without GenAI.
 
@@ -12422,6 +12682,201 @@ def _collocation_row(row):
     d=dict(row)
     d["image_url"]=b2_url(d.get("image_key")) if d.get("image_key") else None
     return d
+
+
+def _vocabulary_row(row):
+    d=dict(row)
+    d["image_url"]=b2_url(d.get("image_key")) if d.get("image_key") else None
+    return d
+
+
+@app.get("/admin/api/vocabularies")
+def admin_vocabularies(password: str, course_id: Optional[int] = None, lesson: str = "", q: str = "", limit: int = 50):
+    check_admin(password)
+    safe_limit=max(1,min(int(limit or 50),100))
+    lesson_q=str(lesson or "").strip()
+    query=str(q or "").strip()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where=[]; params=[]
+            if course_id is not None:
+                where.append("v.course_id=%s"); params.append(int(course_id))
+            if lesson_q:
+                where.append("lower(trim(v.source_lesson))=lower(trim(%s))"); params.append(lesson_q)
+            if query:
+                where.append("(v.writing ILIKE %s OR v.reading ILIKE %s OR v.meaning ILIKE %s OR v.example ILIKE %s)")
+                like=f"%{query}%"; params.extend([like,like,like,like])
+            where_sql=(" WHERE "+" AND ".join(where)) if where else ""
+            cur.execute(f"SELECT COUNT(*) AS total FROM curriculum_vocab_master v{where_sql}",tuple(params))
+            count=int((cur.fetchone() or {}).get("total") or 0)
+            rows=[]
+            if query or lesson_q:
+                cur.execute(f"""SELECT v.id,v.course_id,COALESCE(c.name,'') AS course_name,
+                                      v.writing,v.reading,v.pronunciation_vi,v.meaning,v.example,
+                                      v.image_key,v.source_file,v.source_lesson,v.last_seen_at
+                                   FROM curriculum_vocab_master v LEFT JOIN courses c ON c.id=v.course_id
+                                   {where_sql}
+                                   ORDER BY v.writing
+                                   LIMIT %s""",tuple(params+[safe_limit]))
+                rows=[_vocabulary_row(r) for r in cur.fetchall()]
+            return {"success":True,"vocabularies":rows,"count":count,"query":query,"lesson":lesson_q}
+    finally:
+        conn.close()
+
+
+@app.post("/admin/api/vocabularies/upload")
+async def admin_vocabularies_upload(password: str = Form(""), course_id: int = Form(...), lesson: str = Form(""), file: UploadFile = File(...)):
+    check_admin(password)
+    filename=str(file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(400,"Chỉ hỗ trợ file .docx cho danh sách Từ vựng.")
+    lesson=str(lesson or "").strip()
+    if not lesson:
+        raise HTTPException(400,"Tên bài học là bắt buộc.")
+    data=await file.read()
+    if not data:
+        raise HTTPException(400,"File DOCX rỗng.")
+    entries=_docx_vocabulary_entries(data)
+    if not entries:
+        raise HTTPException(400,"Không bóc tách được Từ vựng nào từ file DOCX. Kiểm tra nhãn `Từ vựng:`.")
+    image_entries=sum(1 for e in entries if e.get("image"))
+    if image_entries and not b2_ready():
+        raise HTTPException(500,"Backblaze B2 chưa được cấu hình nên không thể lưu ảnh minh hoạ của Từ vựng.")
+
+    safe_lesson=re.sub(r"[^A-Za-z0-9._-]+","_",lesson)[:120] or "lesson"
+    source_file=f"vocab/{int(course_id)}/{safe_lesson}.docx"
+    parsed_items=[]; seen=set(); created=updated=images_saved=0
+
+    # Store images first so the DB transaction only receives final image keys.
+    for idx,e in enumerate(entries,1):
+        word=str(e.get("vocabulary") or "").strip()
+        key=_normalize_master_text(word)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        image_key=""
+        image=e.get("image")
+        if image:
+            image_name,raw,ctype=image
+            safe_name=re.sub(r"[^A-Za-z0-9._-]+","_",Path(image_name).stem)[:80] or "image"
+            ext=Path(image_name).suffix.lower() or ".bin"
+            image_key=f"vocab/{int(course_id)}/{safe_lesson}/{idx:04d}_{safe_name}{ext}"
+            b2_put_bytes(image_key,raw,ctype)
+            images_saved+=1
+        parsed_items.append({
+            "writing":word,
+            "reading":str(e.get("pronunciation") or "").strip(),
+            "pronunciation_vi":"",
+            "meaning":str(e.get("meaning") or "").strip(),
+            "example":str(e.get("example") or "").strip(),
+            "image_key":image_key,
+            "source_file":source_file,
+        })
+
+    if not parsed_items:
+        raise HTTPException(400,"File DOCX không có bản ghi Từ vựng hợp lệ.")
+
+    conn=db(); lesson_id=None; version=None
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(int(course_id),))
+            course=cur.fetchone()
+            if not course: raise HTTPException(404,"Không tìm thấy khóa học.")
+            if str(course.get("status") or "ACTIVE").upper()!='ACTIVE':
+                raise HTTPException(400,"Khóa học đang tắt, không thể upload Từ vựng.")
+
+            for item in parsed_items:
+                key=_normalize_master_text(item["writing"])
+                cur.execute("""INSERT INTO curriculum_vocab_master
+                    (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson,image_key,source_file)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                      writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
+                      meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,
+                      image_key=CASE WHEN EXCLUDED.image_key<>'' THEN EXCLUDED.image_key ELSE curriculum_vocab_master.image_key END,
+                      source_file=EXCLUDED.source_file,last_seen_at=NOW()
+                    RETURNING id,(xmax=0) AS inserted""",
+                    (int(course_id),key,item["writing"],item["reading"],item["pronunciation_vi"],item["meaning"],item["example"],lesson,item["image_key"],source_file))
+                rr=cur.fetchone()
+                if rr and rr.get("inserted"): created+=1
+                else: updated+=1
+                item["master_id"]=int(rr["id"])
+
+            cur.execute("""UPDATE curriculum_lessons SET status='ARCHIVED'
+                           WHERE course_id=%s AND content_type='Từ vựng'
+                             AND lower(trim(lesson))=lower(trim(%s)) AND status='PUBLISHED'""",(int(course_id),lesson))
+            cur.execute("""SELECT COALESCE(MAX(version),0)+1 AS next_version
+                           FROM curriculum_lessons WHERE source_file=%s AND content_type='Từ vựng' AND lesson=%s""",(source_file,lesson))
+            version=int((cur.fetchone() or {}).get("next_version") or 1)
+            raw_meta={"source_file":filename,"source_format":"docx","parser":"native_ooxml","genai_used":False,"ocr_used":False,"entries":parsed_items}
+            cur.execute("""INSERT INTO curriculum_lessons
+                (draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json)
+                VALUES(NULL,%s,%s,%s,'Từ vựng',%s,'PUBLISHED',%s,%s::jsonb) RETURNING id""",
+                (source_file,int(course_id),str(course.get("name") or ""),lesson,version,json.dumps(raw_meta,ensure_ascii=False)))
+            lesson_id=int(cur.fetchone()["id"])
+            content={
+                "title":lesson,
+                "content":"",
+                "items":[{
+                    "id":x["master_id"],
+                    "writing":x["writing"],
+                    "reading":x["reading"],
+                    "pronunciation_vi":x["pronunciation_vi"],
+                    "meaning":x["meaning"],
+                    "example":x["example"],
+                    "image_key":x["image_key"],
+                    "source_file":x["source_file"],
+                } for x in parsed_items],
+                "source_refs":[],
+                "images":[],
+                "source_format":"docx",
+                "genai_used":False,
+                "ocr_used":False,
+            }
+            cur.execute("""INSERT INTO curriculum_steps(lesson_id,step_code,step_order,title,step_type,content_json)
+                           VALUES(%s,'B0',1,%s,'vocabulary',%s::jsonb)""",
+                        (lesson_id,lesson,json.dumps(content,ensure_ascii=False)))
+            for x in parsed_items:
+                cur.execute("""INSERT INTO curriculum_lesson_items(lesson_id,item_type,item_id)
+                               VALUES(%s,'vocabulary',%s) ON CONFLICT DO NOTHING""",(lesson_id,x["master_id"]))
+        conn.commit()
+        print(f"[VOCAB DOCX UPLOAD] course_id={course_id} lesson={lesson!r} parsed={len(parsed_items)} images={images_saved} genai=0 ocr=0 lesson_id={lesson_id} version={version}")
+        return {"success":True,"filename":filename,"source_file":source_file,"course_id":int(course_id),"lesson":lesson,
+                "parsed":len(parsed_items),"created":created,"updated":updated,"images":images_saved,"lesson_id":lesson_id,
+                "version":version,"genai_used":False,"ocr_used":False}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+@app.patch("/admin/api/vocabularies/{vocabulary_id}")
+def admin_vocabulary_update(vocabulary_id:int, payload:dict):
+    check_admin(str(payload.get("password") or ""))
+    writing=str(payload.get("writing") or "").strip()
+    reading=str(payload.get("reading") or "").strip()
+    meaning=str(payload.get("meaning") or "").strip()
+    example=str(payload.get("example") or "").strip()
+    if not writing: raise HTTPException(400,"Từ vựng không được để trống.")
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""UPDATE curriculum_vocab_master
+                           SET writing=%s,reading=%s,meaning=%s,example=%s,last_seen_at=NOW()
+                           WHERE id=%s
+                           RETURNING id,course_id,writing,reading,pronunciation_vi,meaning,example,image_key,source_file,source_lesson""",
+                        (writing,reading,meaning,example,int(vocabulary_id)))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"Không tìm thấy Từ vựng.")
+        conn.commit()
+        return {"success":True,"vocabulary":_vocabulary_row(row)}
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        conn.close()
 
 
 @app.get("/admin/api/collocations")
@@ -13085,6 +13540,7 @@ def init_curriculum_db():
                 id BIGSERIAL PRIMARY KEY, course_id BIGINT NOT NULL, normalized_key TEXT NOT NULL,
                 writing TEXT NOT NULL DEFAULT '', reading TEXT NOT NULL DEFAULT '', pronunciation_vi TEXT NOT NULL DEFAULT '',
                 meaning TEXT NOT NULL DEFAULT '', example TEXT NOT NULL DEFAULT '', source_lesson VARCHAR(255) NOT NULL DEFAULT '',
+                image_key TEXT NOT NULL DEFAULT '', source_file VARCHAR(500) NOT NULL DEFAULT '',
                 first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(course_id, normalized_key)
             );""")
@@ -13096,6 +13552,8 @@ def init_curriculum_db():
                 UNIQUE(course_id, normalized_key)
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_vocab_master_course ON curriculum_vocab_master(course_id, normalized_key);")
+            cur.execute("ALTER TABLE curriculum_vocab_master ADD COLUMN IF NOT EXISTS image_key TEXT NOT NULL DEFAULT '';")
+            cur.execute("ALTER TABLE curriculum_vocab_master ADD COLUMN IF NOT EXISTS source_file VARCHAR(500) NOT NULL DEFAULT '';")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_grammar_master_course ON curriculum_grammar_master(course_id, normalized_key);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_lessons_scope ON curriculum_lessons(content_type, lesson, status);")
             cur.execute("ALTER TABLE curriculum_lessons ADD COLUMN IF NOT EXISTS course_id BIGINT;")
@@ -13522,13 +13980,18 @@ def _rebuild_course_curriculum_knowledge_master(course_id):
                 pron=str(item.get('pronunciation_vi') or item.get('vietnamese_pronunciation') or item.get('vn_pronunciation') or '').strip()
                 meaning=str(item.get('meaning') or item.get('definition') or item.get('translation') or item.get('vietnamese_meaning') or '').strip()
                 example=str(item.get('example') or item.get('content') or '').strip()
+                image_key=str(item.get('image_key') or '').strip()
+                source_file=str(item.get('source_file') or '').strip()
                 cur.execute("""INSERT INTO curriculum_vocab_master
-                    (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    (course_id,normalized_key,writing,reading,pronunciation_vi,meaning,example,source_lesson,image_key,source_file)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(course_id,normalized_key) DO UPDATE SET
                       writing=EXCLUDED.writing,reading=EXCLUDED.reading,pronunciation_vi=EXCLUDED.pronunciation_vi,
-                      meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()""",
-                    (cid,key,writing,reading,pron,meaning,example,lesson))
+                      meaning=EXCLUDED.meaning,example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,
+                      image_key=CASE WHEN EXCLUDED.image_key<>'' THEN EXCLUDED.image_key ELSE curriculum_vocab_master.image_key END,
+                      source_file=CASE WHEN EXCLUDED.source_file<>'' THEN EXCLUDED.source_file ELSE curriculum_vocab_master.source_file END,
+                      last_seen_at=NOW()""",
+                    (cid,key,writing,reading,pron,meaning,example,lesson,image_key,source_file))
 
             for key,(lesson,item) in grammar.items():
                 pattern=str(item.get('pattern') or item.get('structure') or item.get('grammar') or '').strip()
@@ -14171,6 +14634,8 @@ def _curriculum_step_plan(content_type, source_digest):
     return steps
 
 def _curriculum_generate_step(content_type, lesson, step, source_digest, previous_digest=''):
+    if str(content_type or '').strip() == 'Từ vựng':
+        raise HTTPException(400, 'Từ vựng được import riêng từ DOCX, không dùng GenAI Curriculum Studio.')
     extra_rules=""
     if str(content_type or "").strip() == "Từ vựng":
         extra_rules="""\n\nQUY TẮC BẮT BUỘC CHO TỪ VỰNG:
@@ -14231,6 +14696,8 @@ async def admin_curriculum_draft_upload(
     check_admin(password)
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400,'Vui lòng chọn file PDF.')
+    if str(content_type or '').strip() == 'Từ vựng':
+        raise HTTPException(400,'Từ vựng không còn upload qua Curriculum Studio/PDF. Hãy dùng mục Upload Từ vựng bằng DOCX: bóc tách trực tiếp, không OCR/GenAI.')
     # Bài tập không cần GenAI. Các loại curriculum khác vẫn dùng Gemini.
     if str(content_type or '').strip() != 'Bài tập' and not gemini:
         raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
@@ -14277,6 +14744,8 @@ async def admin_curriculum_draft_upload(
             spg=str(cfg.get('suggestion_pages') or '').strip()
             normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg,'suggestion_pages':spg})
         configs=normalized
+    if any(str(cfg.get('content_type') or '').strip() == 'Từ vựng' for cfg in configs):
+        raise HTTPException(400,'Từ vựng không upload qua PDF/Curriculum Studio. Hãy dùng Upload Từ vựng bằng DOCX.')
 
     source_file=os.path.basename(file.filename)
     temp_pdf_path=None
@@ -15344,7 +15813,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 <input id="overlap" type="number" value="200" min="0" max="4900" title="Độ chồng lấn" style="width:110px">
 </div>
 <div style="margin-top:12px">
-  <div style="font-weight:700;margin-bottom:7px">📚 Cấu hình nội dung trong PDF</div>
+  <div style="font-weight:700;margin-bottom:7px">📚 Cấu hình nội dung trong PDF (Từ vựng dùng Upload DOCX riêng)</div>
   <div class="small" style="margin-bottom:8px">
     Một file PDF chỉ chọn <b>1 Khóa học</b>. Bạn có thể tạo nhiều dòng để mô tả nhiều bài học/chủ đề/câu hỏi/đáp án trong cùng file.
   </div>
@@ -15411,6 +15880,75 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 
 <script>
 let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0, adminCourses=[];
+
+function ensureVocabularyAdminSection(){
+  const panel=document.getElementById("panel"); if(!panel || document.getElementById("vocabularyAdminCard")) return;
+  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="vocabularyAdminCard">
+    <h3>📚 Từ vựng</h3>
+    <div class="small" style="margin-bottom:10px">Upload <b>.docx</b> theo cấu trúc <b>Từ vựng / Phiên âm / Nghĩa / Ví dụ / Ảnh minh hoạ</b>. Server đọc trực tiếp DOCX, <b>không OCR, không GenAI</b>.</div>
+    <div style="display:grid;grid-template-columns:240px 1fr;gap:8px;margin-bottom:10px">
+      <select id="vocabularyCourse"><option value="">-- Chọn khóa học --</option></select>
+      <input id="vocabularyLesson" placeholder="Tên bài học, ví dụ: Đồ dùng học tập">
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+      <input id="vocabularyDocx" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" style="flex:1;min-width:260px">
+      <button type="button" onclick="uploadVocabularies()">⬆️ Upload DOCX</button>
+      <button type="button" class="gray" onclick="loadVocabulariesAdmin()">🔄 Làm mới</button>
+    </div>
+    <div id="vocabularyStatus" class="small" style="margin:6px 0 10px"></div>
+    <div id="vocabularyCountBox" style="display:none;margin-bottom:10px;padding:10px 12px;border:1px solid #ddd;border-radius:8px;background:#fafafa">
+      <span id="vocabularyCountText" style="font-weight:700"></span>
+    </div>
+    <div id="vocabularySearchRow" style="display:none;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <input id="vocabularySearch" type="search" placeholder="Tìm Từ vựng..." style="flex:1;min-width:260px" onkeydown="if(event.key==='Enter')searchVocabularies()">
+      <button type="button" onclick="searchVocabularies()">🔎 Tìm kiếm</button>
+    </div>
+    <div id="vocabularyAdminList"></div>
+  </div>`);
+  const sel=document.getElementById('vocabularyCourse');
+  sel.innerHTML='<option value="">-- Chọn khóa học --</option>'+adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE').map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('');
+  sel.addEventListener('change',()=>{document.getElementById('vocabularySearch').value='';loadVocabulariesAdmin();});
+}
+async function loadVocabulariesAdmin(){
+  ensureVocabularyAdminSection();
+  const cid=document.getElementById('vocabularyCourse')?.value||''; const lesson=(document.getElementById('vocabularyLesson')?.value||'').trim();
+  const box=document.getElementById('vocabularyAdminList'), countBox=document.getElementById('vocabularyCountBox'), searchRow=document.getElementById('vocabularySearchRow');
+  if(!box)return;
+  if(!cid){countBox.style.display='none';searchRow.style.display='none';box.innerHTML='<div class="small">Hãy chọn khóa học để xem số lượng Từ vựng.</div>';return;}
+  try{
+    const qs='password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid)+(lesson?'&lesson='+encodeURIComponent(lesson):'');
+    const d=await api('/admin/api/vocabularies?'+qs);
+    countBox.style.display='block';searchRow.style.display='flex';document.getElementById('vocabularyCountText').textContent=`Hiện có ${Number(d.count||0)} Từ vựng${lesson?' trong bài "'+lesson+'"':''}`;
+    box.innerHTML='<div class="small">Nhập từ khóa và bấm 🔎 Tìm kiếm để sửa Từ vựng cụ thể.</div>';
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function searchVocabularies(){
+  const cid=document.getElementById('vocabularyCourse')?.value||''; const lesson=(document.getElementById('vocabularyLesson')?.value||'').trim(); const q=(document.getElementById('vocabularySearch')?.value||'').trim(); const box=document.getElementById('vocabularyAdminList');
+  if(!box||!cid)return; if(!q&&!lesson){box.innerHTML='<div class="small">Nhập Từ vựng hoặc tên bài để tìm.</div>';return;}
+  try{
+    const qs='password='+encodeURIComponent(pw)+'&course_id='+encodeURIComponent(cid)+(lesson?'&lesson='+encodeURIComponent(lesson):'')+(q?'&q='+encodeURIComponent(q):'');
+    const d=await api('/admin/api/vocabularies?'+qs); const rows=d.vocabularies||[];
+    if(!rows.length){box.innerHTML='<div class="small">Không tìm thấy Từ vựng phù hợp.</div>';return;}
+    box.innerHTML=`<div style="font-weight:700;margin-bottom:8px">Kết quả tìm kiếm: ${rows.length}${d.count>rows.length?' / '+d.count:''}</div>`+rows.map(r=>`<div style="display:grid;grid-template-columns:180px 190px 1fr 1fr 180px auto;gap:8px;align-items:start;padding:10px 0;border-top:1px solid #eee">
+      <div><input id="vw-word-${Number(r.id)}" value="${esc(r.writing||'')}" style="width:100%;font-weight:700"><div class="small">${esc(r.course_name||'')} · ${esc(r.source_lesson||'')}</div></div>
+      <textarea id="vw-reading-${Number(r.id)}" rows="2" placeholder="Phiên âm">${esc(r.reading||'')}</textarea>
+      <textarea id="vw-meaning-${Number(r.id)}" rows="2" placeholder="Nghĩa">${esc(r.meaning||'')}</textarea>
+      <textarea id="vw-example-${Number(r.id)}" rows="3" placeholder="Ví dụ">${esc(r.example||'')}</textarea>
+      <div>${r.image_url?`<img src="${esc(r.image_url)}" alt="" style="width:180px;max-height:100px;object-fit:cover;border-radius:8px;border:1px solid #ddd">`:'<span class="small">Không có ảnh</span>'}</div>
+      <div><button type="button" onclick="saveVocabulary(${Number(r.id)})">💾 Lưu</button></div>
+    </div>`).join('');
+  }catch(e){box.innerHTML='<span style="color:#c00">❌ '+esc(e.message)+'</span>';}
+}
+async function uploadVocabularies(){
+  const cid=document.getElementById('vocabularyCourse')?.value||''; const lesson=(document.getElementById('vocabularyLesson')?.value||'').trim(); const file=document.getElementById('vocabularyDocx')?.files?.[0]; const st=document.getElementById('vocabularyStatus');
+  if(!cid){st.textContent='❌ Hãy chọn khóa học.';return;} if(!lesson){st.textContent='❌ Hãy nhập tên bài học.';return;} if(!file){st.textContent='❌ Hãy chọn file .docx.';return;}
+  const fd=new FormData(); fd.append('password',pw); fd.append('course_id',cid); fd.append('lesson',lesson); fd.append('file',file);
+  try{st.textContent='⏳ Đang đọc DOCX trực tiếp và lưu ảnh...'; const r=await fetch('/admin/api/vocabularies/upload',{method:'POST',body:fd}); const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status)); st.textContent=`✅ Đã đọc ${d.parsed} Từ vựng · mới ${d.created} · cập nhật ${d.updated} · ${d.images||0} ảnh · GenAI=0`; document.getElementById('vocabularyDocx').value=''; document.getElementById('vocabularySearch').value=''; await loadVocabulariesAdmin(); await loadKnowledgeCatalog();}catch(e){st.textContent='❌ '+e.message;}
+}
+async function saveVocabulary(id){
+  const writing=document.getElementById('vw-word-'+id)?.value||''; const reading=document.getElementById('vw-reading-'+id)?.value||''; const meaning=document.getElementById('vw-meaning-'+id)?.value||''; const example=document.getElementById('vw-example-'+id)?.value||'';
+  try{await api('/admin/api/vocabularies/'+id,{method:'PATCH',body:JSON.stringify({password:pw,writing,reading,meaning,example})}); await searchVocabularies();}catch(e){alert('❌ '+e.message)}
+}
 
 function ensureCollocationAdminSection(){
   const panel=document.getElementById("panel"); if(!panel || document.getElementById("collocationAdminCard")) return;
@@ -15598,6 +16136,8 @@ async function login(){
     document.getElementById("panel").style.display="block";
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadCourses();
+    ensureVocabularyAdminSection();
+    await loadVocabulariesAdmin();
     ensureCollocationAdminSection();
     await loadCollocationsAdmin();
     ensurePhrasalVerbAdminSection();
@@ -15756,7 +16296,7 @@ async function uploadKnowledge(event){
 
 
 function curriculumTypeOptions(selected){
-  const types=['Giáo trình','Bài tập','Luyện viết','Từ vựng','Ngữ pháp','Truyện đọc'];
+  const types=['Giáo trình','Bài tập','Luyện viết','Ngữ pháp','Truyện đọc'];
   return types.map(t=>`<option value="${esc(t)}" ${t===selected?'selected':''}>${esc(t)}</option>`).join('');
 }
 function addCurriculumArticleRow(values={}){
