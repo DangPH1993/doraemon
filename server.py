@@ -6560,9 +6560,15 @@ def proxy_chat(
                 'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':lesson}
 
     if action_head in {'review_open','review_choose'}:
-        msg,blocks,_=_build_learning_discovery_blocks(user['id'],int(selected_course_id),selected_course_name,'REVIEW_RECOMMENDATION')
-        return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':blocks,
-                'learning_progress':None,'review':True,'review_selection':True}
+        # Opening the review chat must actually expose today's scheduled lesson
+        # review(s). Previously this action returned only a placeholder message,
+        # so the web client showed no lesson choices/questions.
+        msg,blocks,_=_build_learning_discovery_blocks(
+            user['id'], int(selected_course_id), selected_course_name, 'REVIEW_RECOMMENDATION'
+        )
+        return {'reply':msg,'model':'local-router','sources':[],'images':[],
+                'content_blocks':blocks,'learning_progress':None,
+                'review':True,'review_selection':True}
 
     if action_head in {'review_wrong','review_wrong_lesson','review_wrong_due'}:
         requested_lesson=None
@@ -11699,11 +11705,12 @@ def learning_review_today(course_id: Optional[int] = None, authorization: Option
         'next_review_at':r.get('next_review_at'),'completed_at':r.get('completed_at')
     } for r in scheduled]
     count=len(planned)
+    review_available=bool(scheduled_payload or planned or due.get('vocabulary') or due.get('grammar'))
     return {'course_id':int(selected_course_id),'course':selected_course_name,'course_name':selected_course_name,
             'due':due,'due_items':due,'pending_items':[],
             'scheduled_lessons':scheduled_payload,'scheduled_count':len(scheduled_payload),
             'review_items':planned,'review_items_count':count,
-            'count':count,'review_available':bool(count)}
+            'count':count,'review_available':review_available}
 
 @app.post('/learning/review/start')
 def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
