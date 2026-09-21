@@ -1,5 +1,5 @@
-# VERSION: v31.45 — DOCX-only vocabulary import + item-by-item navigation
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.45"
+# VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.48"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -1484,12 +1484,20 @@ def record_learning_event(user_id, event):
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
             row = dict(cur.fetchone())
         conn.commit()
-        _sync_active_plan_completion(user_id, row)
+        plan_updated = _sync_active_plan_completion(user_id, row)
         if str(row.get("status") or "").lower() == "completed":
+            print(
+                f"[LESSON COMPLETED] user={user_id} course_id={course_id} "
+                f"content_type={content_type!r} lesson={lesson!r} progress_id={row.get('id')} "
+                f"completed_at={row.get('completed_at')} plan_items_updated={int(plan_updated or 0)}"
+            )
             try:
                 _schedule_review_for_completed_lesson(row)
             except Exception as exc:
-                print(f"[REVIEW SCHEDULE] create skipped user={user_id}: {type(exc).__name__}: {exc}")
+                print(
+                    f"[REVIEW SCHEDULE] create failed user={user_id} course_id={course_id} "
+                    f"content_type={content_type!r} lesson={lesson!r}: {type(exc).__name__}: {exc}"
+                )
         return row
     finally:
         conn.close()
@@ -1585,40 +1593,68 @@ def _ensure_learning_progress_started(user_id, study_session):
 
 
 def _sync_active_plan_completion(user_id, row):
+    """Mark the matching active study-plan item complete for every curriculum type.
+
+    The old vocabulary branch used two WHERE clauses in one UPDATE ... FROM statement,
+    which is invalid PostgreSQL and caused vocabulary completion to be saved in
+    learning_progress but not in study_plan_items.  This version uses the same
+    single-target pattern for both Từ vựng and Ngữ pháp, scoped by user/course/type/lesson.
+    """
     if not row or str(row.get('status') or '').lower() != 'completed':
-        return
+        return 0
     lesson=str(row.get('lesson') or '').strip()
     if not lesson:
-        return
+        return 0
+    content_type=_normalize_content_type(row.get('content_type') or '')
+    course_id=row.get('course_id')
     conn=db()
     try:
         with conn.cursor() as cur:
-            content_type=str(row.get('content_type') or '')
-            if _normalize_content_type(content_type) == 'Từ vựng':
+            if course_id not in (None, ''):
                 cur.execute("""
-                    UPDATE study_plan_items i SET status='completed', completed_at=NOW()
-                    FROM study_plans p
-                    WHERE i.id=(
+                    WITH target AS (
                         SELECT i2.id
                         FROM study_plan_items i2
                         JOIN study_plans p2 ON p2.id=i2.study_plan_id
-                        WHERE p2.user_id=%s AND p2.status='ACTIVE'
-                          AND lower(trim(coalesce(p2.content_type,'')))=lower(trim('Từ vựng'))
+                        WHERE p2.user_id=%s AND p2.course_id=%s AND p2.status='ACTIVE'
+                          AND lower(trim(coalesce(p2.content_type,'')))=lower(trim(%s))
                           AND lower(trim(coalesce(i2.lesson,'')))=lower(trim(%s))
-                          AND i2.status<>'completed'
+                          AND coalesce(lower(trim(i2.status)),'pending') <> 'completed'
                           AND i2.plan_date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
                         ORDER BY i2.plan_date ASC, i2.unit_index ASC, i2.id ASC
                         LIMIT 1
                     )
-                    WHERE p.id=i.study_plan_id
-                """,(user_id,lesson))
+                    UPDATE study_plan_items i
+                       SET status='completed', completed_at=NOW()
+                     WHERE i.id IN (SELECT id FROM target)
+                """, (user_id, int(course_id), content_type, lesson))
             else:
-                cur.execute("""UPDATE study_plan_items i SET status='completed', completed_at=NOW()
-                    FROM study_plans p WHERE i.study_plan_id=p.id AND p.user_id=%s AND p.status='ACTIVE'
-                    AND lower(i.lesson)=lower(%s) AND lower(coalesce(p.content_type,''))=lower(coalesce(%s,''))
-                    AND i.status<>'completed'""",(user_id,lesson,content_type))
+                cur.execute("""
+                    WITH target AS (
+                        SELECT i2.id
+                        FROM study_plan_items i2
+                        JOIN study_plans p2 ON p2.id=i2.study_plan_id
+                        WHERE p2.user_id=%s AND p2.status='ACTIVE'
+                          AND lower(trim(coalesce(p2.content_type,'')))=lower(trim(%s))
+                          AND lower(trim(coalesce(i2.lesson,'')))=lower(trim(%s))
+                          AND coalesce(lower(trim(i2.status)),'pending') <> 'completed'
+                          AND i2.plan_date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
+                        ORDER BY i2.plan_date ASC, i2.unit_index ASC, i2.id ASC
+                        LIMIT 1
+                    )
+                    UPDATE study_plan_items i
+                       SET status='completed', completed_at=NOW()
+                     WHERE i.id IN (SELECT id FROM target)
+                """, (user_id, content_type, lesson))
+            updated=int(cur.rowcount or 0)
         conn.commit()
-    finally: conn.close()
+        print(
+            f"[STUDY PLAN COMPLETE] user={user_id} course_id={course_id} "
+            f"content_type={content_type!r} lesson={lesson!r} updated_items={updated}"
+        )
+        return updated
+    finally:
+        conn.close()
 
 def _clean_scope_value(value):
     """Normalize course/content/lesson/topic metadata for matching."""
@@ -10160,6 +10196,100 @@ def _review_lesson_item_ids(course_id, content_type, lesson):
         conn.close()
 
 
+def _published_curriculum_lesson_source(course_id, content_type, lesson):
+    """Return whether a published lesson has usable DB source content.
+
+    Lesson-level review schedules must not depend on the presence of a separate master
+    table row. Standalone Ngữ pháp lessons, in particular, are stored in
+    curriculum_steps and historically did not populate curriculum_grammar_master.
+    """
+    if course_id in (None, '') or not str(lesson or '').strip():
+        return []
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cs.step_code,cs.step_order,cs.step_type,cs.content_json
+                FROM curriculum_lessons cl
+                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                WHERE cl.status='PUBLISHED'
+                  AND cl.course_id=%s
+                  AND lower(trim(coalesce(cl.content_type,'')))=lower(trim(%s))
+                  AND lower(trim(coalesce(cl.lesson,'')))=lower(trim(%s))
+                ORDER BY cs.step_order,cs.id
+            """, (int(course_id), str(content_type or ''), str(lesson or '').strip()))
+            return [dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+
+
+def _ensure_review_master_from_published_lesson(course_id, content_type, lesson):
+    """Backfill review master rows from published curriculum_steps when possible.
+
+    Vocabulary already has a deterministic recovery path. Grammar is also recovered
+    when the published step contains structured items; no new facts are invented.
+    """
+    ct=_normalize_content_type(content_type or '')
+    if course_id in (None, '') or not str(lesson or '').strip():
+        return {'vocabulary':0,'grammar':0}
+
+    if ct == 'Từ vựng':
+        try:
+            recovered=_published_vocab_items_from_curriculum(int(course_id), str(lesson).strip())
+            if recovered:
+                n=_upsert_published_vocab_master(int(course_id), str(lesson).strip(), recovered)
+                print(f"[REVIEW MASTER BACKFILL] course_id={course_id} content_type='Từ vựng' lesson={lesson!r} items={len(recovered)} upserted={n}")
+                return {'vocabulary':len(recovered),'grammar':0}
+        except Exception as exc:
+            print(f"[REVIEW MASTER BACKFILL] vocab skipped course_id={course_id} lesson={lesson!r}: {type(exc).__name__}: {exc}")
+        return {'vocabulary':0,'grammar':0}
+
+    if ct != 'Ngữ pháp':
+        return {'vocabulary':0,'grammar':0}
+
+    rows=_published_curriculum_lesson_source(int(course_id),ct,str(lesson).strip())
+    items=[]; seen=set()
+    for r in rows:
+        content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+        raw_items=content.get('items') if isinstance(content.get('items'),list) else []
+        for item in raw_items:
+            if not isinstance(item,dict):
+                continue
+            pattern=str(item.get('pattern') or item.get('structure') or item.get('grammar') or '').strip()
+            meaning=str(item.get('meaning') or item.get('definition') or item.get('translation') or '').strip()
+            explanation=str(item.get('explanation') or item.get('content') or '').strip()
+            example=str(item.get('example') or '').strip()
+            if not any((pattern,meaning,explanation,example)):
+                continue
+            key=_grammar_master_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append({'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example})
+    if not items:
+        return {'vocabulary':0,'grammar':0}
+
+    conn=db(); upserted=0
+    try:
+        with conn.cursor() as cur:
+            for item in items:
+                key=_grammar_master_key(item)
+                cur.execute("""
+                    INSERT INTO curriculum_grammar_master
+                      (course_id,normalized_key,pattern,meaning,explanation,example,source_lesson)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                      pattern=EXCLUDED.pattern,meaning=EXCLUDED.meaning,explanation=EXCLUDED.explanation,
+                      example=EXCLUDED.example,source_lesson=EXCLUDED.source_lesson,last_seen_at=NOW()
+                """, (int(course_id),key,item['pattern'],item['meaning'],item['explanation'],item['example'],str(lesson).strip()))
+                upserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"[REVIEW MASTER BACKFILL] course_id={course_id} content_type='Ngữ pháp' lesson={lesson!r} structured_items={len(items)} upserted={upserted}")
+    return {'vocabulary':0,'grammar':upserted}
+
+
 def _get_review_interval_days(user_id):
     conn=db()
     try:
@@ -10295,28 +10425,61 @@ def _is_manual_review_request(text):
 
 
 def _schedule_review_for_completed_lesson(row):
+    """Create a durable lesson-level review schedule after completion.
+
+    Scheduling is based on the existence of a published DB lesson, not on whether
+    curriculum_vocab_master/curriculum_grammar_master happens to contain rows. This
+    is important for standalone Ngữ pháp lessons whose source of truth is
+    curriculum_steps. Master rows are backfilled opportunistically when structured
+    items exist.
+    """
     if not row or str(row.get('status') or '').lower() != 'completed':
-        return
-    content_type=str(row.get('content_type') or 'Giáo trình')
+        return False
+    content_type=_normalize_content_type(row.get('content_type') or 'Giáo trình')
     if content_type not in {'Giáo trình','Bài tập','Ngữ pháp','Từ vựng'}:
-        return
+        return False
     lesson=str(row.get('lesson') or '').strip()
     course_id=row.get('course_id')
-    if not lesson or course_id in (None,''):
-        return
-    # For a lesson-level review schedule, a vocabulary/grammar mapping is enough.
+    user_id=row.get('user_id')
+    if not lesson or course_id in (None,'') or user_id in (None,''):
+        print(f"[REVIEW SCHEDULE] skipped user={user_id} course_id={course_id} lesson={lesson!r} reason=missing_scope")
+        return False
+
+    # Repair/recover deterministic master mappings before deciding whether the
+    # lesson can be reviewed. This fixes older vocab uploads and structured grammar.
+    try:
+        _ensure_review_master_from_published_lesson(int(course_id),content_type,lesson)
+    except Exception as exc:
+        print(f"[REVIEW MASTER BACKFILL] failed course_id={course_id} content_type={content_type!r} lesson={lesson!r}: {type(exc).__name__}: {exc}")
+
     ids=_review_lesson_item_ids(int(course_id),content_type,lesson)
-    if not ids['vocabulary'] and not ids['grammar']:
-        return
+    source_rows=_published_curriculum_lesson_source(int(course_id),content_type,lesson)
+    if not source_rows and not (ids['vocabulary'] or ids['grammar']):
+        print(f"[REVIEW SCHEDULE] skipped user={user_id} course_id={course_id} content_type={content_type!r} lesson={lesson!r} reason=no_published_lesson_source")
+        return False
+
     now=datetime.now(timezone.utc)
-    interval_days=_get_review_interval_days(int(row.get('user_id')))
+    interval_days=_get_review_interval_days(int(user_id))
     next_at=now+timedelta(days=interval_days)
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute("""UPDATE learning_progress SET review_scheduled_at=%s,review_completed_at=NULL,next_review_at=%s WHERE id=%s""",(now,next_at,row.get('id')))
+            cur.execute("""
+                UPDATE learning_progress
+                   SET review_scheduled_at=%s,
+                       review_completed_at=NULL,
+                       next_review_at=%s
+                 WHERE id=%s
+            """,(now,next_at,row.get('id')))
         conn.commit()
-        print(f"[REVIEW SCHEDULE] user={row.get('user_id')} course_id={course_id} lesson={lesson!r} due={next_at.isoformat()} vocab={len(ids['vocabulary'])} grammar={len(ids['grammar'])}")
+        source='master' if (ids['vocabulary'] or ids['grammar']) else 'curriculum_steps'
+        print(
+            f"[REVIEW SCHEDULE] user={user_id} course_id={course_id} content_type={content_type!r} "
+            f"lesson={lesson!r} source={source} interval_days={interval_days} "
+            f"review_scheduled_at={now.isoformat()} next_review_at={next_at.isoformat()} "
+            f"vocab={len(ids['vocabulary'])} grammar={len(ids['grammar'])} steps={len(source_rows)}"
+        )
+        return True
     finally:
         conn.close()
 
@@ -10341,10 +10504,18 @@ def _review_scheduled_lessons(user_id, course_id):
                 key=(str(r.get('content_type') or ''),str(r.get('lesson') or '').casefold(),str(r.get('topic') or '').casefold())
                 if key in seen: continue
                 seen.add(key)
-                ids=_review_lesson_item_ids(int(course_id),str(r.get('content_type') or 'Giáo trình'),str(r.get('lesson') or ''))
+                ct=str(r.get('content_type') or 'Giáo trình')
+                lesson=str(r.get('lesson') or '')
+                try:
+                    _ensure_review_master_from_published_lesson(int(course_id),ct,lesson)
+                except Exception as exc:
+                    print(f"[REVIEW MASTER BACKFILL] due lookup skipped course_id={course_id} content_type={ct!r} lesson={lesson!r}: {type(exc).__name__}: {exc}")
+                ids=_review_lesson_item_ids(int(course_id),ct,lesson)
+                source_rows=_published_curriculum_lesson_source(int(course_id),ct,lesson)
                 r['vocabulary_ids']=ids['vocabulary']; r['grammar_ids']=ids['grammar']
                 r['vocabulary_count']=len(ids['vocabulary']); r['grammar_count']=len(ids['grammar'])
-                if ids['vocabulary'] or ids['grammar']:
+                r['review_source']='master' if (ids['vocabulary'] or ids['grammar']) else ('curriculum_steps' if source_rows else 'unknown')
+                if ids['vocabulary'] or ids['grammar'] or source_rows:
                     rows.append(r)
             return rows
     finally:
@@ -11135,9 +11306,107 @@ def _review_default_session_data(user_id, course_id):
     return {'vocabulary':vocab,'grammar':grammar}
 
 
+def _review_source_lesson_questions(course_id, lesson, content_type, max_questions=8):
+    """Create DB-source-only MCQ questions for a scheduled lesson without master rows.
+
+    This is a fallback for standalone Ngữ pháp lessons whose published B0/B1 content
+    lives in curriculum_steps but has no structured grammar-master items. The source
+    text is fetched from PostgreSQL and the model may only turn that source into quiz
+    wording; it may not introduce new grammar facts. Questions use negative synthetic
+    item IDs and therefore never enter the durable wrong-answer tables.
+    """
+    rows=_published_curriculum_lesson_source(int(course_id),str(content_type or ''),str(lesson or '').strip())
+    if not rows:
+        return []
+    source_parts=[]
+    for r in rows:
+        code=str(r.get('step_code') or '').strip().upper()
+        content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+        text=str(content.get('content') or '').strip()
+        if not text and isinstance(content.get('text'),str):
+            text=str(content.get('text') or '').strip()
+        if not text:
+            continue
+        # Keep the review prompt bounded while preserving the published source.
+        source_parts.append(f"[{code}]\n{text[:18000]}")
+    source='\n\n'.join(source_parts).strip()
+    if not source:
+        return []
+
+    n=max(1,min(8,int(max_questions or 8)))
+    prompt=f"""Bạn là Doraemon, tạo câu hỏi ôn tập cho bài học đã publish trong DB.
+LOẠI NỘI DUNG: {content_type}
+BÀI HỌC: {lesson}
+
+NGUYÊN TẮC BẮT BUỘC:
+- Chỉ được dùng thông tin có trong NGUỒN DB dưới đây.
+- Không thêm cấu trúc, quy tắc, từ vựng hay ví dụ không có trong nguồn.
+- Tạo tối đa {n} câu trắc nghiệm, mỗi câu có đúng 4 lựa chọn A/B/C/D.
+- Câu hỏi phải kiểm tra trực tiếp nội dung/ngữ pháp của bài học, không hỏi kiến thức ngoài nguồn.
+- answer chỉ là một trong A/B/C/D; answer_text là nội dung đáp án đúng.
+- Không hiển thị đáp án đúng trong phần question.
+- Trả JSON duy nhất dạng {{"questions":[{{"question_type":"multiple_choice","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{{"A":"...","B":"...","C":"...","D":"..."}},"answer":"A","answer_text":"..."}}]}}
+
+NGUỒN DB:
+{source}
+"""
+    try:
+        reply,_,_=_generate_chat_reply(
+            'Bạn là gia sư Doraemon. Hãy tạo quiz đúng nguồn DB và trả JSON duy nhất.\n'+prompt,
+            content_type=str(content_type or '') or None,
+            request_id=f'review-source-{int(course_id)}-{int(time.time()*1000)}',
+            gen_started=time.perf_counter(),
+            user_text='',
+            reasoning_profile='low'
+        )
+        parsed=_review_json_from_text(reply)
+        generated=(parsed.get('questions') if isinstance(parsed,dict) else []) or []
+    except Exception as exc:
+        print(f"[REVIEW SOURCE QUIZ] generation failed course_id={course_id} lesson={lesson!r}: {type(exc).__name__}: {exc}")
+        return []
+
+    questions=[]
+    for idx,q in enumerate(generated[:n]):
+        if not isinstance(q,dict):
+            continue
+        opts=q.get('options') if isinstance(q.get('options'),list) else []
+        option_letters=q.get('option_letters') if isinstance(q.get('option_letters'),dict) else {}
+        clean=[]
+        for letter in ('A','B','C','D'):
+            val=str(option_letters.get(letter) or '').strip()
+            if val:
+                clean.append(val)
+        if len(clean)!=4:
+            clean=[]
+            for x in opts:
+                val=re.sub(r'^[A-D][.)]\s*','',str(x or '').strip(),flags=re.I)
+                if val and val not in clean:
+                    clean.append(val)
+                if len(clean)>=4:
+                    break
+        ans=str(q.get('answer') or '').strip().upper()
+        if len(clean)!=4 or ans not in {'A','B','C','D'}:
+            continue
+        # Negative IDs keep source-only questions out of the durable item review tables.
+        iid=-(idx+1)
+        option_map={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+        questions.append({
+            'item_type':'lesson','item_id':iid,'question_type':'multiple_choice',
+            'question':str(q.get('question') or '').strip(),
+            'options':[f'{k}. {option_map[k]}' for k in ('A','B','C','D')],
+            'option_letters':option_map,'answer':ans,
+            'answer_text':str(q.get('answer_text') or option_map.get(ans) or '').strip(),
+            'answer_criteria':str(q.get('answer_text') or option_map.get(ans) or '').strip(),
+            'source_lesson':str(lesson).strip(),
+        })
+    print(f"[REVIEW SOURCE QUIZ] course_id={course_id} content_type={content_type!r} lesson={lesson!r} questions={len(questions)}")
+    return questions
+
+
 def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12, only_failed=False, all_failed_due=False):
     requested_lesson=str(lesson or '').strip()
     requested_type=str(content_type or '').strip() or None
+    source_questions=None
     if requested_lesson:
         if only_failed:
             data=_review_failed_items_for_lesson(user_id,course_id,requested_lesson,requested_type)
@@ -11145,10 +11414,19 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
                 raise HTTPException(404,f'Bài {requested_lesson!r} hiện chưa có từ vựng/ngữ pháp nào bị trả lời sai để làm lại.')
         else:
             ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
-            if not ids['vocabulary'] and not ids['grammar']:
-                raise HTTPException(404,f'Bài {requested_lesson!r} chưa được xác nhận hoàn thành hoặc chưa có từ vựng/ngữ pháp trong DB để ôn.')
-            due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
-            data=_review_master_payload(int(course_id),due)
+            if ids['vocabulary'] or ids['grammar']:
+                due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
+                data=_review_master_payload(int(course_id),due)
+            else:
+                # Standalone grammar can be fully published in curriculum_steps without
+                # structured master rows. Use that exact published DB source as a quiz fallback.
+                ct=requested_type or 'Ngữ pháp'
+                if not _published_curriculum_lesson_source(int(course_id),ct,requested_lesson):
+                    raise HTTPException(404,f'Bài {requested_lesson!r} chưa có dữ liệu DB đã publish để ôn.')
+                source_questions=_review_source_lesson_questions(int(course_id),requested_lesson,ct,max_questions)
+                if not source_questions:
+                    raise HTTPException(404,f'Bài {requested_lesson!r} chưa tạo được câu hỏi ôn từ nội dung DB đã publish.')
+                data={'vocabulary':[],'grammar':[]}
         source_lesson=requested_lesson
     else:
         if only_failed:
@@ -11173,7 +11451,10 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
                 raise HTTPException(404,'Hiện chưa có nội dung nào đến lịch ôn tập.')
 
     max_q=max(1,min(12,int(max_questions or 12)))
-    questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None,only_failed=only_failed)
+    if source_questions is not None:
+        questions=source_questions[:max_q]
+    else:
+        questions=_review_genai_one_call(int(course_id),data,max_q,lesson=source_lesson if source_lesson!='review_due' else None,only_failed=only_failed)
     if not questions:
         # DB-safe fallback: vocabulary MCQ and simple grammar meaning MCQ.
         questions=[]
@@ -11518,8 +11799,10 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             course_id=int(sess['course_id'])
             item_type=str(q.get('item_type') or '')
             item_id=int(q.get('item_id') or 0)
-            if correct: _clear_success_review(user_id,course_id,item_type,item_id)
-            else: _schedule_failed_review(user_id,course_id,item_type,item_id)
+            durable_item = item_type in {'vocabulary','grammar'} and item_id > 0
+            if durable_item:
+                if correct: _clear_success_review(user_id,course_id,item_type,item_id)
+                else: _schedule_failed_review(user_id,course_id,item_type,item_id)
             answers=sess.get('answers_json') or {}
             if not isinstance(answers,dict): answers={}
             answers[str(q_index)]={'item_type':item_type,'item_id':item_id,'answer':str(answer or ''),'correct':bool(correct),'answered_at':datetime.now(timezone.utc).isoformat()}
@@ -11747,7 +12030,7 @@ def learning_review_finish(payload: dict, authorization: Optional[str] = Header(
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT course_id,source_lesson FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
+            cur.execute("SELECT course_id,source_lesson,review_scope FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
             sess=cur.fetchone()
             cur.execute("DELETE FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
         conn.commit()
