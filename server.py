@@ -1,5 +1,6 @@
+# VERSION: v31.49 — welcome/review de-dup + applied grammar review + wrong-answer persistence
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.48"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.49"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -127,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.45"
+SERVER_VERSION = "31.49"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -229,6 +230,8 @@ def init_db():
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS study_session_course_id BIGINT;""")
             cur.execute("""ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS selected_course_id BIGINT;""")
             cur.execute("ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS curriculum_vocab_index INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS last_welcome_brief_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE user_learning_state ADD COLUMN IF NOT EXISTS last_welcome_brief_course_id BIGINT;")
             cur.execute("""CREATE TABLE IF NOT EXISTS knowledge_assets (
                 id BIGSERIAL PRIMARY KEY, source_file VARCHAR(500) NOT NULL, content_hash VARCHAR(128) NOT NULL,
                 subject VARCHAR(255) NOT NULL, page_count INTEGER NOT NULL DEFAULT 0,
@@ -5696,6 +5699,247 @@ def _format_course_guide_message(course):
     if g.get('cta'): lines.append(str(g['cta']).strip())
     return "\n".join(lines)
 
+def _review_grammar_question_is_applied(question):
+    """Reject theory-only grammar review questions.
+
+    Grammar review must make the learner apply the rule to a sentence rather than
+    merely recall a definition or describe a pattern.
+    """
+    q=dict(question or {})
+    text=' '.join([
+        str(q.get('question') or ''),
+        ' '.join(str(x or '') for x in (q.get('options') or []) if x is not None),
+    ]).strip().casefold()
+    if not text:
+        return False
+    theory_markers=(
+        'ý nghĩa của cấu trúc', 'nghĩa của cấu trúc', 'ý nghĩa tiếng việt của cấu trúc',
+        'cấu trúc này có nghĩa', 'cấu trúc này được dùng như thế nào',
+        'được dùng như thế nào', 'cách dùng của cấu trúc', 'ngữ pháp nào',
+        'định nghĩa của cấu trúc', 'pattern này có nghĩa', 'what does this structure mean',
+        'what is the meaning of', 'how is this structure used', 'which grammar rule',
+    )
+    if any(x in text for x in theory_markers):
+        applied_markers=(
+            '____', 'điền', 'hoàn thành', 'chọn câu đúng', 'chọn đáp án đúng',
+            'dạng đúng', 'trong câu', 'câu nào phù hợp', 'chọn từ', 'viết lại',
+            'complete the sentence', 'fill in', 'correct form', 'choose the sentence',
+            'in the sentence', 'which sentence', 'choose the correct form'
+        )
+        return any(x in text for x in applied_markers)
+    applied_markers=(
+        '____', 'điền', 'hoàn thành', 'chọn câu đúng', 'chọn đáp án đúng',
+        'dạng đúng', 'trong câu', 'câu nào phù hợp', 'chọn từ', 'viết lại',
+        'complete the sentence', 'fill in', 'correct form', 'choose the sentence',
+        'in the sentence', 'which sentence', 'choose the correct form'
+    )
+    return any(x in text for x in applied_markers)
+
+
+def _review_grammar_fallback_question(item):
+    """Build an applied grammar question directly from a DB-backed example.
+
+    No example => no question. This intentionally avoids falling back to a
+    theory/definition question.
+    """
+    row=dict(item or {})
+    pattern=str(row.get('pattern') or '').strip()
+    example=str(row.get('example') or '').strip()
+    meaning=str(row.get('meaning') or '').strip()
+    if not example:
+        return None
+
+    answer=''
+    masked=example
+    if pattern and pattern in example:
+        answer=pattern
+        masked=example.replace(pattern,'____',1)
+    else:
+        tokens=re.findall(r"\b[A-Za-z][A-Za-z'-]{2,}\b",example)
+        stop={
+            'the','a','an','is','are','am','was','were','be','been','being','to','of','in',
+            'on','for','with','and','or','but','this','that','these','those','from','by','at',
+            'as','do','does','did','have','has','had','will','would','can','could','may','might',
+            'must','should','not','than','then','so','if','it','its','their','there','they','you',
+            'he','she','we','i','me','my','our','your','his','her','them','what','which','who'
+        }
+        candidates=[t for t in tokens if t.casefold() not in stop]
+        low_pattern=pattern.casefold()
+        preferred=[]
+        if 'ing' in low_pattern or 'gerund' in low_pattern or 'v-ing' in low_pattern:
+            preferred=[t for t in candidates if t.casefold().endswith('ing')]
+        elif 'to v' in low_pattern or 'to + v' in low_pattern:
+            m=re.search(r'\bto\s+([A-Za-z][A-Za-z\'-]{2,})\b',example,re.I)
+            if m: preferred=[m.group(1)]
+        elif 'ed' in low_pattern or 'past participle' in low_pattern or 'v3' in low_pattern:
+            preferred=[t for t in candidates if t.casefold().endswith('ed')]
+        if preferred:
+            answer=preferred[0]
+        elif candidates:
+            answer=candidates[0]
+        if answer:
+            masked=re.sub(r'\b'+re.escape(answer)+r'\b','____',example,count=1,flags=re.I)
+    if '____' not in masked or not answer:
+        return None
+    return {
+        'item_type':'grammar','item_id':int(row.get('id') or 0),
+        'question_type':'fill_blank',
+        'question':f'Hoàn thành câu sau bằng cách áp dụng cấu trúc **{pattern or "ngữ pháp của bài"}**:\n{masked}',
+        'options':[],'option_letters':{},'answer':answer,
+        'answer_text':answer,
+        'answer_criteria':meaning or answer,
+        'pattern':pattern,'meaning':meaning,
+        'explanation':str(row.get('explanation') or '').strip(),
+        'example':example,
+    }
+
+
+def _ensure_review_grammar_master(course_id, source_lesson, *, question_text='', answer='', pattern='', meaning='', explanation='', normalized_key=None):
+    """Create/return a stable grammar-master proxy for a review question."""
+    lesson=str(source_lesson or '').strip()
+    if course_id in (None,'') or not lesson:
+        return None
+    qtext=str(question_text or '').strip()
+    key=str(normalized_key or '').strip()
+    if not key:
+        digest=hashlib.sha1(f"grammar-review|{int(course_id)}|{lesson.casefold()}|{qtext}".encode('utf-8')).hexdigest()[:24]
+        key=f"__review__{lesson.casefold()}__{digest}"
+    pat=str(pattern or '').strip()
+    if not pat:
+        pat=f"{lesson} · Câu ôn"
+    meaning_text=str(meaning or '').strip() or (f"Đáp án tham chiếu: {answer}" if answer else '')
+    example=str(qtext or '').strip()
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO curriculum_grammar_master(
+                    course_id,normalized_key,pattern,meaning,explanation,example,source_lesson,first_seen_at,last_seen_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                ON CONFLICT(course_id,normalized_key) DO UPDATE SET
+                    pattern=EXCLUDED.pattern,
+                    meaning=EXCLUDED.meaning,
+                    explanation=EXCLUDED.explanation,
+                    example=EXCLUDED.example,
+                    source_lesson=EXCLUDED.source_lesson,
+                    last_seen_at=NOW()
+                RETURNING id
+            """,(int(course_id),key,pat,meaning_text,str(explanation or '').strip(),example,lesson))
+            row=cur.fetchone()
+        conn.commit()
+        return int(row['id']) if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _extract_grammar_question_block(text, number):
+    """Extract one numbered B1 grammar question from the published exercise text."""
+    raw=str(text or '').replace('\r\n','\n').replace('\r','\n')
+    lines=raw.split('\n')
+    target=int(number)
+    starts=[]
+    for idx,line in enumerate(lines):
+        m=re.match(r'^\s*(?:câu\s*)?(\d{1,3})\s*[.)\-:]?\s+(.*)$',line,flags=re.I)
+        if m:
+            try: n=int(m.group(1))
+            except Exception: continue
+            if 1 <= n <= 100:
+                starts.append((idx,n))
+    start=None; end=len(lines)
+    for idx,n in starts:
+        if n==target:
+            start=idx
+            break
+    if start is None:
+        return raw[:6000].strip()
+    for idx,n in starts:
+        if idx>start and n!=target:
+            end=idx
+            break
+    block='\n'.join(lines[start:end]).strip()
+    return block[:6000]
+
+
+def _persist_grammar_b1_wrong_review(user_id, course_id, lesson, b1_text, student_text, b2_text):
+    """Persist each grammar B1 question answered incorrectly into the wrong-review queue."""
+    official=_exercise_answer_map_from_text(b2_text)
+    numbers=_exercise_question_numbers_from_text(b1_text)
+    if not numbers and official:
+        numbers=sorted(official.keys())
+    if not official:
+        print(f"[GRAMMAR WRONG REVIEW] skipped user={user_id} course_id={course_id} lesson={lesson!r} reason=no_official_answer_map")
+        return 0
+    student={} if _is_exercise_no_answer(student_text) else _exercise_student_answer_map_from_text(student_text)
+    saved=0; labels=[]
+    for n in numbers or sorted(official.keys()):
+        expected=str(official.get(n) or '').strip()
+        if not expected:
+            continue
+        got=str(student.get(n) or '').strip()
+        if not got:
+            wrong=True
+        else:
+            norm=lambda x: re.sub(r'\s+','',str(x or '').strip().casefold())
+            wrong=norm(got) != norm(expected)
+            if wrong:
+                m1=re.fullmatch(r'[A-D]',norm(got))
+                m2=re.fullmatch(r'[A-D]',norm(expected))
+                if m1 and m2:
+                    wrong=(m1.group(0)!=m2.group(0))
+        if not wrong:
+            continue
+        block=_extract_grammar_question_block(b1_text,n)
+        proxy_id=_ensure_review_grammar_master(
+            int(course_id),lesson,
+            question_text=block,
+            answer=expected,
+            pattern=f"{lesson} · Câu {n}",
+            meaning=f"Đáp án đúng: {expected}",
+            explanation='Ôn lại cách áp dụng ngữ pháp trong câu hỏi gốc của B1.',
+            normalized_key=f"__b1__{int(course_id)}__{lesson.casefold()}__q{int(n)}"
+        )
+        if proxy_id:
+            _schedule_failed_review(user_id,int(course_id),'grammar',proxy_id)
+            saved+=1; labels.append(f"Q{n}:master={proxy_id}")
+    print(f"[GRAMMAR WRONG REVIEW] user={user_id} course_id={course_id} lesson={lesson!r} saved={saved} items={', '.join(labels) if labels else 'none'}")
+    return saved
+
+
+def _mark_welcome_brief_shown(user_id, course_id):
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO user_learning_state(user_id,last_welcome_brief_at,last_welcome_brief_course_id,updated_at)
+                           VALUES(%s,NOW(),%s,NOW())
+                           ON CONFLICT(user_id) DO UPDATE SET
+                             last_welcome_brief_at=NOW(),last_welcome_brief_course_id=EXCLUDED.last_welcome_brief_course_id,updated_at=NOW()""",
+                        (user_id,int(course_id) if course_id is not None else None))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _welcome_brief_recently_shown(user_id, course_id, window_seconds=180):
+    if course_id in (None,''):
+        return False
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT last_welcome_brief_at,last_welcome_brief_course_id FROM user_learning_state WHERE user_id=%s",(user_id,))
+            row=cur.fetchone()
+        if not row or int(row.get('last_welcome_brief_course_id') or 0)!=int(course_id) or not row.get('last_welcome_brief_at'):
+            return False
+        dt=row['last_welcome_brief_at']
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        age=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()
+        return 0 <= age <= int(window_seconds)
+    finally:
+        conn.close()
+
+
 def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=None):
     """
     Build the same concise onboarding/returning-user message for both
@@ -5836,112 +6080,32 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
             "learning_history": [],
         }
 
-    # Returning users receive the same learning/review briefing used by chat.
-    daily_blocks=[]
+    # Returning users receive ONE canonical daily briefing.
+    # Do not append Study Plan summaries or historical in-progress lessons here;
+    # the daily briefing already contains today's actionable learning/review state.
     if selected_course_id is not None:
         try:
-            _,daily_blocks,_=_build_learning_discovery_blocks(user["id"],selected_course_id,selected_course_name,"LEARN_RECOMMENDATION")
+            _, daily_blocks, _ = _build_learning_discovery_blocks(
+                user["id"], selected_course_id, selected_course_name, "LEARN_RECOMMENDATION"
+            )
+            _mark_welcome_brief_shown(user["id"], selected_course_id)
+            print(f"[WELCOME BRIEF] user={user['id']} course_id={selected_course_id} canonical=1 blocks={len(daily_blocks)}")
         except Exception as exc:
             print(f"[WELCOME REVIEW BRIEF] skipped: {type(exc).__name__}: {exc}")
             daily_blocks=[{"type":"text","text":f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖"}]
     else:
         daily_blocks=[{"type":"text","text":f"Chào {nickname}! 👋 Mừng cậu quay lại với Doraemon. 🤖"}]
 
-    # Planned users with one or more unfinished plans are asked per plan whether
-    # they want to follow that plan today. Fully completed plans are hidden.
-    if profile.get("learning_mode") == "planned":
-        active_plans, plan_blocks = _build_plan_choice_blocks(user["id"], include_header=False, course_id=selected_course_id)
-        if active_plans:
-            header=(f"Mừng cậu quay lại với Doraemon! 🤖\n\n{curriculum}\n\n")
-            blocks=daily_blocks + [{"type":"text","text":header.rstrip()}] + plan_blocks
-            if unfinished_rows:
-                seen_old=set(); parts_old=[]
-                for row in unfinished_rows:
-                    key=(row.get('content_type'),row.get('lesson'),row.get('topic'))
-                    if key in seen_old: continue
-                    seen_old.add(key)
-                    label=str(row.get('content_type') or 'Nội dung')
-                    detail=' '.join(str(x).strip() for x in (row.get('lesson'),row.get('topic')) if x and str(x).strip())
-                    state=str(row.get('status') or '').strip().lower()
-                    state_text='đang học dở' if state in {'in_progress','active'} else 'cần ôn'
-                    parts_old.append(f"• {label}: {detail or 'nội dung'} – {state_text}")
-                    if len(parts_old)>=8: break
-                if parts_old:
-                    blocks.append({"type":"text","text":"📖 Những phần cậu đang học dở/cần ôn từ các phiên học trước:\n" + "\n".join(parts_old)})
-            message="\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=='text')
-            return {"success":True,"mode":"planned_returning","message":message,"content_blocks":blocks,"learning_history":unfinished_rows,"study_plans":active_plans,"study_plan":active_plans[0]}
-
-    parts = []
-    seen = set()
-    for row in unfinished_rows:
-        key = (
-            row.get("content_type"),
-            row.get("lesson"),
-            row.get("topic"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-
-        label = str(row.get("content_type") or "Nội dung")
-        detail = " ".join(
-            str(x).strip()
-            for x in (row.get("lesson"), row.get("topic"))
-            if x and str(x).strip()
-        )
-        status = str(row.get("status") or "").strip().lower()
-        page = row.get("current_page")
-        position = row.get("current_position")
-
-        if status in {"needs_review", "review"}:
-            state_text = "cần ôn lại"
-        else:
-            state_text = "đang học dở"
-
-        extras = []
-        if page:
-            extras.append(f"trang {page}")
-        if position not in (None, "", 0):
-            extras.append(f"vị trí {position}")
-        suffix = f" – {', '.join(extras)}" if extras else ""
-
-        parts.append(
-            f"• {label}{(': ' + detail) if detail else ''} – {state_text}{suffix}"
-        )
-        if len(parts) >= 6:
-            break
-
-    if parts:
-        unfinished_summary = "\n".join(parts)
-        progress_text = (
-            "📖 Những phần cậu đang học dở/cần ôn:\n"
-            f"{unfinished_summary}"
-        )
-        closing = (
-            "\n\nCậu muốn học tiếp từ chỗ đang dở hay chọn một phần khác? 😊"
-        )
-    else:
-        progress_text = (
-            "📖 Hiện tại cậu không có phần nào đang học dở hoặc cần ôn "
-            "được lưu trong tiến độ."
-        )
-        closing = "\n\nCậu muốn bắt đầu hoặc chọn một phần để học tiếp? 😊"
-
-    base_return = (
-        f"{curriculum}\n\n"
-        f"{progress_text}"
-        f"{closing}"
-    )
-    blocks=daily_blocks + [{"type":"text","text":base_return}]
-    message="\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=='text')
+    message="\n\n".join(str(b.get("text") or "") for b in daily_blocks if b.get("type")=="text")
     return {
         "success": True,
         "mode": "returning",
         "message": message,
-        "content_blocks": blocks,
-        "learning_history": unfinished_rows,
+        "content_blocks": daily_blocks,
+        "learning_history": [],
+        "study_plans": [],
+        "study_plan": None,
     }
-
 
 
 
@@ -8478,6 +8642,12 @@ YÊU CẦU:
                 gen_started=time.perf_counter()
                 answer,response_model,gen_elapsed=_generate_chat_reply(grammar_prompt,content_type='Ngữ pháp',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=3000)
                 answer=(answer or '').strip() or 'Doraemon chưa tạo được phần đáp án. Cậu thử gửi lại bài làm nhé.'
+                try:
+                    _persist_grammar_b1_wrong_review(
+                        user['id'], selected_course_id, requested_lesson, grammar_exercise, query_text.strip(), answer
+                    )
+                except Exception as exc:
+                    print(f"[GRAMMAR WRONG REVIEW] persist failed user={user['id']} lesson={requested_lesson!r}: {type(exc).__name__}: {exc}")
                 _set_curriculum_global_exercise_result(user['id'],answer)
                 _set_curriculum_flow(user['id'],step=current_step+1,waiting='continue',exercise_answered=True)
                 study_session['curriculum_step']=current_step+1
@@ -11021,7 +11191,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             'Với multiple_choice phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
             'Với fill_blank phải có câu ví dụ từ DATA bị khuyết đúng một từ/cụm từ.',
             'Vocabulary: chỉ tạo multiple_choice. Câu hỏi phải tự đủ ngữ cảnh',
-            'Grammar: dựa đúng pattern/meaning/explanation/example trong DATA để tạo câu hỏi trắc nghiệm hoặc điền chỗ trống. Câu hỏi phải tự đủ ngữ cảnh.',
+            'Grammar: bắt buộc là bài tập áp dụng vào câu. Ưu tiên điền từ/cụm từ, chọn dạng đúng của động từ, hoàn thành câu, chọn câu đúng hoặc sửa câu. Tuyệt đối không hỏi định nghĩa, ý nghĩa, tên cấu trúc hoặc hỏi cấu trúc này được dùng như thế nào.',
             'Không hiển thị đáp án đúng trong question.',
             'Trả JSON duy nhất dạng {"questions":[{"item_type":"vocabulary"|"grammar","item_id":number,"question_type":"multiple_choice"|"fill_blank","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A"|"B"|"C"|"D"|"...","answer_text":"...","answer_criteria":"...","blank_target":"..."}]}.',
         ],
@@ -11083,6 +11253,9 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         meaning=str(item.get('meaning') or '').strip()
         explanation=str(item.get('explanation') or '').strip()
         example=str(item.get('example') or '').strip()
+        if ai_q and not _review_grammar_question_is_applied(ai_q):
+            print(f"[REVIEW GRAMMAR VALIDATION] rejected theory question item_id={item_id} lesson={lesson!r}")
+            ai_q={}
         qtype=str(ai_q.get('question_type') or '').strip()
         question=str(ai_q.get('question') or '').strip()
         options=ai_q.get('options') if isinstance(ai_q.get('options'),list) else []
@@ -11093,10 +11266,14 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         if qtype not in {'multiple_choice','fill_blank'}:
             qtype='multiple_choice'
         if not question:
-            if qtype=='fill_blank' and example:
-                question=f'Điền vào chỗ trống theo cấu trúc **{pattern or "này"}**:\n{example}'
-            else:
-                question=f'Cấu trúc **{pattern or "này"}** được dùng như thế nào?'
+            fallback_q=_review_grammar_fallback_question({
+                'id':item_id,'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example
+            })
+            if fallback_q:
+                questions.append(fallback_q)
+                continue
+            print(f"[REVIEW GRAMMAR VALIDATION] skipped_no_applied_example item_id={item_id} lesson={lesson!r}")
+            continue
         if qtype=='multiple_choice':
             clean=[]
             # Prefer the model-provided explicit A-D map.
@@ -11312,8 +11489,8 @@ def _review_source_lesson_questions(course_id, lesson, content_type, max_questio
     This is a fallback for standalone Ngữ pháp lessons whose published B0/B1 content
     lives in curriculum_steps but has no structured grammar-master items. The source
     text is fetched from PostgreSQL and the model may only turn that source into quiz
-    wording; it may not introduce new grammar facts. Questions use negative synthetic
-    item IDs and therefore never enter the durable wrong-answer tables.
+    wording; it may not introduce new grammar facts. Each accepted grammar question is
+    mapped to a stable review master row so wrong answers can enter the durable queue.
     """
     rows=_published_curriculum_lesson_source(int(course_id),str(content_type or ''),str(lesson or '').strip())
     if not rows:
@@ -11342,7 +11519,7 @@ NGUYÊN TẮC BẮT BUỘC:
 - Chỉ được dùng thông tin có trong NGUỒN DB dưới đây.
 - Không thêm cấu trúc, quy tắc, từ vựng hay ví dụ không có trong nguồn.
 - Tạo tối đa {n} câu trắc nghiệm, mỗi câu có đúng 4 lựa chọn A/B/C/D.
-- Câu hỏi phải kiểm tra trực tiếp nội dung/ngữ pháp của bài học, không hỏi kiến thức ngoài nguồn.
+- Câu hỏi phải là bài tập áp dụng trực tiếp nội dung/ngữ pháp vào câu: điền từ/cụm từ, chọn dạng đúng, hoàn thành câu, chọn câu đúng hoặc sửa câu. Không hỏi định nghĩa/ý nghĩa/tên cấu trúc hay 'cấu trúc này được dùng như thế nào'.
 - answer chỉ là một trong A/B/C/D; answer_text là nội dung đáp án đúng.
 - Không hiển thị đáp án đúng trong phần question.
 - Trả JSON duy nhất dạng {{"questions":[{{"question_type":"multiple_choice","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{{"A":"...","B":"...","C":"...","D":"..."}},"answer":"A","answer_text":"..."}}]}}
@@ -11369,6 +11546,9 @@ NGUỒN DB:
     for idx,q in enumerate(generated[:n]):
         if not isinstance(q,dict):
             continue
+        if str(content_type or '').strip() == 'Ngữ pháp' and not _review_grammar_question_is_applied(q):
+            print(f"[REVIEW SOURCE QUIZ] rejected theory question lesson={lesson!r}")
+            continue
         opts=q.get('options') if isinstance(q.get('options'),list) else []
         option_letters=q.get('option_letters') if isinstance(q.get('option_letters'),dict) else {}
         clean=[]
@@ -11387,12 +11567,23 @@ NGUỒN DB:
         ans=str(q.get('answer') or '').strip().upper()
         if len(clean)!=4 or ans not in {'A','B','C','D'}:
             continue
-        # Negative IDs keep source-only questions out of the durable item review tables.
-        iid=-(idx+1)
         option_map={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+        question_text=str(q.get('question') or '').strip()
+        proxy_id=_ensure_review_grammar_master(
+            int(course_id),str(lesson).strip(),
+            question_text=question_text,
+            answer=ans,
+            pattern=f"{lesson} · Ôn tập",
+            meaning=str(q.get('answer_text') or option_map.get(ans) or '').strip(),
+            explanation='Câu ôn được tạo trực tiếp từ nội dung bài đã publish trong curriculum_steps.',
+        ) if str(content_type or '').strip() == 'Ngữ pháp' else None
+        if str(content_type or '').strip() == 'Ngữ pháp' and not proxy_id:
+            continue
         questions.append({
-            'item_type':'lesson','item_id':iid,'question_type':'multiple_choice',
-            'question':str(q.get('question') or '').strip(),
+            'item_type':'grammar' if str(content_type or '').strip() == 'Ngữ pháp' else 'lesson',
+            'item_id':int(proxy_id) if proxy_id else -(idx+1),
+            'question_type':'multiple_choice',
+            'question':question_text,
             'options':[f'{k}. {option_map[k]}' for k in ('A','B','C','D')],
             'option_letters':option_map,'answer':ans,
             'answer_text':str(q.get('answer_text') or option_map.get(ans) or '').strip(),
@@ -11468,24 +11659,9 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
             for other in (data.get('grammar') or []):
                 m=str(other.get('meaning') or '').strip()
                 if m and m not in pool: pool.append(m)
-            if len(pool)>=4:
-                opts=random.sample(pool[:4],4)
-                letter=next(k for k,v in zip('ABCD',opts) if v==meaning)
-                q={
-                    'item_type':'grammar','item_id':int(item.get('id') or 0),'question_type':'multiple_choice',
-                    'question':f'Cấu trúc {pattern or "này"} có ý nghĩa/cách dùng nào đúng?',
-                    'options':[f'{k}. {v}' for k,v in zip('ABCD',opts)],
-                    'option_letters':{k:v for k,v in zip('ABCD',opts)},'answer':letter,'answer_text':meaning,
-                    'answer_criteria':meaning,'pattern':pattern,
-                }
+            q=_review_grammar_fallback_question(item)
+            if q:
                 questions.append(q)
-            else:
-                questions.append({
-                    'item_type':'grammar','item_id':int(item.get('id') or 0),'question_type':'fill_blank',
-                    'question':f'Điền ý nghĩa tiếng Việt của cấu trúc {pattern or "này"}: ______',
-                    'options':[],'option_letters':{},'answer':meaning,'answer_text':meaning,'answer_criteria':meaning,
-                    'pattern':pattern,
-                })
     if not questions:
         raise HTTPException(500,'Không có dữ liệu DB hợp lệ để tạo câu hỏi ôn tập.')
 
@@ -11901,6 +12077,15 @@ def learning_review_reminder(authorization: Optional[str] = Header(default=None)
     selected_course_id, selected_course_name, _=_resolve_request_course(user['id'],course_id)
     if selected_course_id is None:
         return {'review_available':False,'message':'Hãy chọn khóa học trong Cấu hình trước.','content_blocks':[]}
+    if _welcome_brief_recently_shown(user['id'], selected_course_id, window_seconds=180):
+        print(f"[REVIEW REMINDER] suppressed_after_welcome user={user['id']} course_id={selected_course_id} window_seconds=180")
+        return {
+            'review_available':False,
+            'suppressed':'already_shown_in_welcome',
+            'course_id':int(selected_course_id),
+            'course':selected_course_name,
+            'content_blocks':[]
+        }
     built=_build_review_reminder_blocks(user['id'],selected_course_id,selected_course_name)
     if not built:
         return {'review_available':False,'course_id':int(selected_course_id),'course':selected_course_name,'content_blocks':[]}
