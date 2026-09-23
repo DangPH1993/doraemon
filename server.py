@@ -1,6 +1,6 @@
-# VERSION: v31.51 — restore welcome endpoint after v31.50 regression; keep MCQ4 review flow — welcome/review de-dup + applied grammar review + wrong-answer persistence
+# VERSION: v31.52 — fix grammar review options to stay on the same grammar target — welcome/review de-dup + applied grammar review + wrong-answer persistence
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.49"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.51"
+SERVER_VERSION = "31.52"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5737,11 +5737,12 @@ def _review_grammar_question_is_applied(question):
 
 
 def _review_grammar_fallback_question(item, all_grammar=None):
-    """Build an applied grammar MCQ with exactly four options from DB data.
+    """Build an applied grammar MCQ with exactly four related options.
 
-    Review questions have one format only: A/B/C/D. The question must apply the
-    grammar pattern to a concrete sentence/example; options are alternative
-    forms/phrases around that same grammar point, not unrelated meanings.
+    The fallback must never borrow another grammar item's pattern/example as a
+    distractor. It keeps the original exercise sentence, identifies the expected
+    answer from the persisted B1/B2 data, and generates three alternatives derived
+    from that same lexical/grammatical target.
     """
     row=dict(item or {})
     item_id=int(row.get('id') or 0)
@@ -5751,88 +5752,159 @@ def _review_grammar_fallback_question(item, all_grammar=None):
     if not example:
         return None
 
-    # Try to identify a concrete target in the example that can be varied.
-    target=''
-    low_pattern=pattern.casefold()
-    tokens=re.findall(r"\b[A-Za-z][A-Za-z'-]{2,}\b", example)
-    if 'ing' in low_pattern or 'gerund' in low_pattern or 'v-ing' in low_pattern:
-        candidates=[t for t in tokens if t.casefold().endswith('ing')]
-    elif 'to v' in low_pattern or 'to + v' in low_pattern or 'infinitive' in low_pattern:
-        m=re.search(r'\bto\s+([A-Za-z][A-Za-z\'-]{2,})\b', example, re.I)
-        candidates=[m.group(0) if m else '']
-    else:
-        candidates=[]
-        # Look for a verb-like word; avoid common function words.
-        stop={'the','a','an','is','are','am','was','were','be','been','being','to','of','in','on','for','with','and','or','but','this','that','these','those','from','by','at','as','do','does','did','have','has','had','will','would','can','could','may','might','must','should','not','than','then','so','if','it','its','their','there','they','you','he','she','we','i','me','my','our','your','his','her','them','what','which','who'}
-        candidates=[t for t in tokens if t.casefold() not in stop]
-    candidates=[str(x).strip() for x in candidates if str(x).strip()]
-    if candidates:
-        target=candidates[0]
-
-    # Construct a sentence with a blank. Keep the rest of the example intact.
-    if target and target in example:
-        masked=example.replace(target,'____',1)
-    else:
-        # For Japanese examples, use the longest meaningful segment as a target.
-        jp=[x for x in re.findall(r'[ぁ-んァ-ン一-龯々ー]{2,}', example) if x!=pattern]
-        target=max(jp,key=len) if jp else ''
-        masked=example.replace(target,'____',1) if target else example
-    if '____' not in masked or not target:
+    # B1 wrong-review proxy rows store the official answer as "Đáp án đúng: ...".
+    expected=''
+    m=re.search(r'Đáp án\s+đúng\s*:\s*(.+)$', meaning, flags=re.I|re.M)
+    if m:
+        expected=re.sub(r'\s+',' ',m.group(1)).strip()
+    if not expected:
+        raw_answer=str(row.get('answer') or '').strip()
+        if raw_answer and not re.fullmatch(r'[A-D]',raw_answer,flags=re.I):
+            expected=raw_answer
+    if not expected and meaning and not meaning.casefold().startswith(('đáp án','câu ôn')) and len(meaning)<=80:
+        expected=meaning.strip()
+    if not expected:
         return None
 
-    # Build alternatives around the same grammar point. Prefer candidates from
-    # other grammar examples/patterns; otherwise use deterministic form variants.
-    option_pool=[]
-    for other in all_grammar or []:
-        if int(other.get('id') or 0)==item_id:
+    # Keep only the actual question text. Original A/B/C/D lines must never leak
+    # into the learner-facing question.
+    lines=[str(x).strip() for x in example.replace('\r\n','\n').replace('\r','\n').split('\n')]
+    question_lines=[]
+    for line in lines:
+        if not line:
+            if question_lines:
+                question_lines.append('')
             continue
-        ex=str(other.get('example') or '').strip()
-        pat=str(other.get('pattern') or '').strip()
-        for val in (pat, ex):
-            if val and val.casefold()!=target.casefold() and val not in option_pool:
-                option_pool.append(val)
-
-    # English verb-form distractors when the target is a Latin word.
-    if re.fullmatch(r"[A-Za-z][A-Za-z'-]*", target):
-        stem=re.sub(r'(?i)(ing|ed|s)$','',target)
-        variants=[target, f'to {stem}', f'{stem}ed', f'{stem}ing']
-        for v in variants:
-            if v.casefold()!=target.casefold() and v not in option_pool:
-                option_pool.append(v)
-    # Japanese kana/kanji alternatives are sourced from the same lesson data if available.
-
-    # Keep options concise and related to the target slot.
-    distractors=[]
-    for v in option_pool:
-        v=str(v).strip()
-        if not v or v.casefold()==target.casefold() or v in distractors:
-            continue
-        # Avoid entire sentences as distractors; they obscure the grammar choice.
-        if '\n' in v or len(v)>80:
-            continue
-        distractors.append(v)
-        if len(distractors)>=3:
+        if re.match(r'^\s*[A-D][.)]\s+',line,flags=re.I):
             break
-    if len(distractors)<3:
+        question_lines.append(line)
+    question_text='\n'.join(question_lines).strip() or example
+
+    # Prefer an existing blank from the original B1 question.
+    masked=question_text
+    if not re.search(r'_{2,}',masked):
+        ell=re.search(r'\.\.\.|……+',masked)
+        if ell:
+            masked=masked[:ell.start()]+'____'+masked[ell.end():]
+    if '____' not in masked:
+        try:
+            masked=re.sub(re.escape(expected), '____', masked, count=1, flags=re.I)
+        except Exception:
+            pass
+    if '____' not in masked:
         return None
 
-    options=[target]+distractors[:3]
+    def _english_forms(answer):
+        raw=str(answer or '').strip()
+        if not re.fullmatch(r'[A-Za-z][A-Za-z\-\']*(?:\s+[A-Za-z][A-Za-z\-\']*)?',raw):
+            return []
+        low=raw.casefold()
+        irregular={
+            'send':'sent','go':'went','come':'came','run':'ran','write':'wrote',
+            'take':'took','make':'made','see':'saw','meet':'met','eat':'ate',
+            'give':'gave','get':'got','begin':'began','forget':'forgot',
+            'remember':'remembered','admit':'admitted','avoid':'avoided',
+            'enjoy':'enjoyed','finish':'finished','decide':'decided','expect':'expected',
+        }
+        if low.startswith('to ') and len(raw.split())==2:
+            base=raw.split()[1]
+            past=irregular.get(base.casefold(),base+'ed')
+            return [raw,base,base+'ing',past]
+        if low.endswith('ing') and len(raw)>4:
+            base=raw[:-3]
+            if base.endswith('e') and len(base)>2:
+                base=base
+            else:
+                # recover doubled-consonant forms such as running -> run
+                if len(base)>=2 and base[-1]==base[-2]:
+                    base=base[:-1]
+            past=irregular.get(base.casefold(),base+'ed')
+            return [raw,base,'to '+base,past]
+        if low.endswith('ed') and len(raw)>3:
+            base=raw[:-2]
+            return [raw,base,base+'ing','to '+base]
+        if low.endswith('s') and len(raw)>3:
+            base=raw[:-1]
+            return [raw,base,base+'ing','to '+base]
+        past=irregular.get(low,raw+'ed')
+        return [raw,raw+'ing',past,'to '+raw]
+
+    forms=_english_forms(expected)
+
+    # For non-English answers, use only the original B1 answer choices if available;
+    # never use another lesson's title, pattern, or entire example as a distractor.
+    if len(forms)<4:
+        source_opts=[]
+        for line in lines:
+            mm=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$',line,flags=re.I)
+            if mm:
+                val=mm.group(2).strip()
+                if val and val.casefold()!=expected.casefold() and val not in source_opts and len(val)<=80:
+                    source_opts.append(val)
+        if len(source_opts)>=3:
+            forms=[expected]+source_opts[:3]
+    if len(forms)<4:
+        return None
+
+    options=[]
+    seen=set()
+    for value in forms:
+        value=str(value or '').strip()
+        key=value.casefold()
+        if not value or key in seen:
+            continue
+        seen.add(key); options.append(value)
+        if len(options)>=4:
+            break
+    if len(options)!=4 or expected.casefold() not in {x.casefold() for x in options}:
+        return None
+
     random.shuffle(options)
     letters=('A','B','C','D')
     option_letters={k:options[i] for i,k in enumerate(letters)}
-    answer_letter=next(k for k,v in option_letters.items() if v==target)
+    answer_letter=next(k for k,v in option_letters.items() if v.casefold()==expected.casefold())
     return {
         'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
-        'question':f'Hoàn thành câu sau bằng cách chọn dạng đúng theo cấu trúc **{pattern or "ngữ pháp của bài"}**:\n{masked}',
+        'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or "cấu trúc ngữ pháp"}**:\n{masked}',
         'options':[f'{k}. {option_letters[k]}' for k in letters],
         'option_letters':option_letters,
         'answer':answer_letter,
-        'answer_text':target,
-        'answer_criteria':meaning or pattern or target,
+        'answer_text':next(v for v in option_letters.values() if v.casefold()==expected.casefold()),
+        'answer_criteria':meaning or pattern or expected,
         'pattern':pattern,'meaning':meaning,
         'explanation':str(row.get('explanation') or '').strip(),
         'example':example,
     }
+
+
+def _review_grammar_options_are_related(question, option_letters, answer_letter):
+    """Reject grammar MCQs whose options come from another lesson/question."""
+    try:
+        vals=[str(option_letters.get(k) or '').strip() for k in ('A','B','C','D')]
+        if len(vals)!=4 or any(not x or len(x)>80 for x in vals):
+            return False
+        correct=str(option_letters.get(answer_letter) or '').strip()
+        if not correct:
+            return False
+        if any(re.search(r'\b(?:câu|lesson|bài)\s*\d+\b',v,flags=re.I) for v in vals):
+            return False
+        # Reject whole unrelated sentences as options when the correct answer is a
+        # short grammatical form.
+        if len(correct.split())<=3 and any(len(v.split())>6 for v in vals):
+            return False
+        core=re.sub(r'^to\s+','',correct,flags=re.I)
+        core=re.sub(r'(?i)(ing|ed|s)$','',core)
+        if re.fullmatch(r'[A-Za-z][A-Za-z\-\']*',core):
+            related=0
+            for v in vals:
+                vc=re.sub(r'^to\s+','',v,flags=re.I)
+                vc=re.sub(r'(?i)(ing|ed|s)$','',vc)
+                if vc.casefold()==core.casefold():
+                    related+=1
+            return related==4
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_review_grammar_master(course_id, source_lesson, *, question_text='', answer='', pattern='', meaning='', explanation='', normalized_key=None):
@@ -11318,6 +11390,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         valid_ai = qtype=='multiple_choice' and len(clean)==4 and answer in {'A','B','C','D'} and bool(question)
         if valid_ai:
             option_letters={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+            valid_ai = _review_grammar_options_are_related(question, option_letters, answer)
             correct_text=option_letters[answer]
             questions.append({
                 'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
