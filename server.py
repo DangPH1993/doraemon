@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.52"
+SERVER_VERSION = "31.53"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5794,6 +5794,34 @@ def _review_grammar_fallback_question(item, all_grammar=None):
     if '____' not in masked:
         return None
 
+    # When the persisted official answer is a choice letter (A/B/C/D), the
+    # original B1 block already contains the four authoritative answer choices.
+    # Reuse those choices exactly instead of trying to synthesize forms from the
+    # letter itself. This is essential for WRONG_ONLY sessions where the failed
+    # answer was stored as a letter.
+    if re.fullmatch(r'[A-D]', expected, flags=re.I):
+        source_map={}
+        for line in lines:
+            mm=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$', line, flags=re.I)
+            if mm:
+                letter=mm.group(1).upper(); value=mm.group(2).strip()
+                if value and letter not in source_map and len(value)<=100:
+                    source_map[letter]=value
+        if set(source_map)=={'A','B','C','D'}:
+            option_letters={k:source_map[k] for k in ('A','B','C','D')}
+            return {
+                'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
+                'question':f'Chọn đáp án đúng theo cấu trúc **{pattern or "ngữ pháp của bài"}**:\n{masked}',
+                'options':[f'{k}. {option_letters[k]}' for k in ('A','B','C','D')],
+                'option_letters':option_letters,
+                'answer':expected.upper(),
+                'answer_text':option_letters[expected.upper()],
+                'answer_criteria':meaning or pattern or option_letters[expected.upper()],
+                'pattern':pattern,'meaning':meaning,
+                'explanation':str(row.get('explanation') or '').strip(),
+                'example':example,
+            }
+
     def _english_forms(answer):
         raw=str(answer or '').strip()
         if not re.fullmatch(r'[A-Za-z][A-Za-z\-\']*(?:\s+[A-Za-z][A-Za-z\-\']*)?',raw):
@@ -11027,6 +11055,27 @@ def _build_post_review_next_step(user_id, course_id, course_name, finished_scope
         ]}]
         return msg,blocks
 
+    # WRONG_ONLY is a continuous retry flow. Do not send the learner back to the
+    # selection menu after every question/session. When questions remain due, start
+    # the next batch immediately. A wrong answer is rescheduled for later, while
+    # unanswered remaining wrong items stay due and therefore continue in order.
+    if scope=='WRONG_ONLY':
+        try:
+            due_now=_review_due_items(user_id,course_id)
+            remaining=len(due_now.get('vocabulary') or [])+len(due_now.get('grammar') or [])
+            if remaining:
+                nxt=_start_review_chat_session(
+                    user_id,course_id,course_name,
+                    lesson=None,content_type=None,chatbox_id=None,
+                    max_questions=12,only_failed=True,all_failed_due=True
+                )
+                msg=str(nxt.get('reply') or '').strip()
+                blocks=nxt.get('content_blocks') or []
+                print(f'[REVIEW WRONG AUTO-NEXT] user={user_id} course_id={course_id} remaining_due={remaining} next_session={nxt.get("session_id")}')
+                return msg,blocks
+        except Exception as exc:
+            print(f'[REVIEW WRONG AUTO-NEXT] skipped: {type(exc).__name__}: {exc}')
+
     # Then look for another scheduled lesson or due wrong queue.
     scheduled=_review_scheduled_lessons(user_id,course_id)
     due=_review_due_items(user_id,course_id)
@@ -11391,8 +11440,9 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         if valid_ai:
             option_letters={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
             valid_ai = _review_grammar_options_are_related(question, option_letters, answer)
-            correct_text=option_letters[answer]
-            questions.append({
+            if valid_ai:
+                correct_text=option_letters[answer]
+                questions.append({
                 'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
                 'question':question,
                 'options':[f'{k}. {option_letters[k]}' for k in ('A','B','C','D')],
@@ -11400,9 +11450,9 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
                 'answer':answer,
                 'answer_text':correct_text,
                 'answer_criteria':meaning or explanation or pattern or correct_text,
-                'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example,
-            })
-            continue
+                    'pattern':pattern,'meaning':meaning,'explanation':explanation,'example':example,
+                })
+                continue
 
         fallback=_review_grammar_fallback_question(item, selected_grammar)
         if fallback:
@@ -11707,6 +11757,7 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
     finally:
         conn.close()
     sid=int(row['id'])
+    print(f'[REVIEW WRONG BATCH] user={user_id} course_id={course_id} only_failed={int(bool(only_failed))} lesson={source_lesson!r} questions={len(questions)}')
     first_text,_=_review_question_blocks(sid,questions[0],0,len(questions))
     intro=f'🔄 Bắt đầu {"làm lại các nội dung đã sai của" if only_failed else "ôn lại"} bài **{source_lesson}** nhé.\n\nDoraemon sẽ hỏi từng câu một; cậu trả lời xong mình mới sang câu tiếp theo.'
     first_text=first_text
