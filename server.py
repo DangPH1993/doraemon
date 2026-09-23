@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.54"
+SERVER_VERSION = "31.55"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -11911,6 +11911,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                 JOIN curriculum_vocab_master m
                   ON m.id=r.vocab_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
+                  AND (r.next_review_at IS NULL OR (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)
                   AND EXISTS (
                       SELECT 1 FROM curriculum_lesson_items cli
                       JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
@@ -11929,6 +11930,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                 JOIN curriculum_grammar_master m
                   ON m.id=r.grammar_id AND m.course_id=r.course_id
                 WHERE r.user_id=%s AND r.course_id=%s
+                  AND (r.next_review_at IS NULL OR (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)
                   AND EXISTS (
                       SELECT 1 FROM curriculum_lesson_items cli
                       JOIN curriculum_lessons cl ON cl.id=cli.lesson_id
@@ -11949,6 +11951,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                     JOIN curriculum_vocab_master m
                       ON m.id=r.vocab_id AND m.course_id=r.course_id
                     WHERE r.user_id=%s AND r.course_id=%s
+                      AND (r.next_review_at IS NULL OR (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)
                       AND lower(trim(coalesce(m.source_lesson,'')))=lower(trim(%s))
                     ORDER BY r.vocab_id
                 """,(user_id,int(course_id),lesson))
@@ -11961,46 +11964,53 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                     JOIN curriculum_grammar_master m
                       ON m.id=r.grammar_id AND m.course_id=r.course_id
                     WHERE r.user_id=%s AND r.course_id=%s
+                      AND (r.next_review_at IS NULL OR (r.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date)
                       AND lower(trim(coalesce(m.source_lesson,'')))=lower(trim(%s))
                     ORDER BY r.grammar_id
                 """,(user_id,int(course_id),lesson))
                 grammar=[dict(x) for x in cur.fetchall()]
 
-            print(f"[REVIEW WRONG-ONLY STATE] lesson={lesson!r} vocab={len(vocab)} grammar={len(grammar)}")
+            print(f"[REVIEW WRONG-ONLY STATE] lesson={lesson!r} vocab_due={len(vocab)} grammar_due={len(grammar)} source=due_only")
             return {'vocabulary':vocab,'grammar':grammar}
     finally:
         conn.close()
 
 def _review_first_failed_lesson(user_id, course_id):
-    """Return the lesson with current unresolved review items.
+    """Return the lesson with WRONG items that are actually due now.
 
-    No review-session history is consulted; the durable review tables are the
-    only source of truth for what still needs retry.
+    A wrong answer is rescheduled into the future. It must therefore NOT be used
+    to start another WRONG_ONLY lesson immediately, otherwise the same item is
+    shown again right after the learner answers it.
     """
+    today=_now_local().date()
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT lesson,MIN(first_wrong_at) AS first_wrong_at
+                SELECT lesson, MIN(last_wrong_at) AS first_wrong_at
                 FROM (
-                    SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                    SELECT m.source_lesson AS lesson, r.last_wrong_at, r.next_review_at
                     FROM user_vocabulary_review r
                     JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
-                    WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
-                    GROUP BY m.source_lesson
+                    WHERE r.user_id=%s AND r.course_id=%s
+                      AND COALESCE(trim(m.source_lesson),'')<>''
                     UNION ALL
-                    SELECT m.source_lesson AS lesson, MIN(r.last_wrong_at) AS first_wrong_at
+                    SELECT m.source_lesson AS lesson, r.last_wrong_at, r.next_review_at
                     FROM user_grammar_review r
                     JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
-                    WHERE r.user_id=%s AND r.course_id=%s AND COALESCE(trim(m.source_lesson),'')<>''
-                    GROUP BY m.source_lesson
+                    WHERE r.user_id=%s AND r.course_id=%s
+                      AND COALESCE(trim(m.source_lesson),'')<>''
                 ) x
+                WHERE x.next_review_at IS NULL
+                   OR (x.next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= %s
                 GROUP BY lesson
-                ORDER BY first_wrong_at DESC NULLS LAST, lesson
+                ORDER BY first_wrong_at ASC NULLS LAST, lesson
                 LIMIT 1
-            """,(user_id,int(course_id),user_id,int(course_id)))
+            """,(user_id,int(course_id),user_id,int(course_id),today))
             row=cur.fetchone()
-            return (str(row.get('lesson') or '').strip() if row else None, None)
+            lesson=str(row.get('lesson') or '').strip() if row else None
+            print(f"[REVIEW FIRST FAILED DUE] user={user_id} course_id={course_id} lesson={lesson!r}")
+            return (lesson, None)
     finally:
         conn.close()
 
