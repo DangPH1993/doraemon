@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.55"
+SERVER_VERSION = "31.56"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -746,32 +746,44 @@ def _vn_display(dt):
     return local.strftime("%d/%m/%Y %H:%M GMT+7") if local else None
 
 def _authorized_courses(user_id):
-    """Return currently active paid courses for the user."""
-    conn = db()
+    """Return every active course.
+
+    Free users may access all courses but are restricted to five lessons per
+    content type. A paid monthly subscription is account-level (course_id NULL)
+    and covers every active course until the same expiry timestamp. Legacy
+    course-scoped paid rows are treated as paid-all for compatibility.
+    """
+    conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT DISTINCT ON (s.course_id)
-                       s.course_id, c.code, c.name, c.language, c.level,
-                       s.id AS subscription_id, s.plan, s.started_at, s.expires_at
-                FROM subscriptions s
-                JOIN courses c ON c.id=s.course_id
-                WHERE s.user_id=%s
-                  AND s.course_id IS NOT NULL
-                  AND upper(coalesce(s.status,''))='ACTIVE'
-                  AND s.expires_at IS NOT NULL
-                  AND s.expires_at > %s
-                  AND upper(coalesce(c.status,'ACTIVE'))='ACTIVE'
-                ORDER BY s.course_id, s.expires_at DESC, s.id DESC
-            """, (user_id, _now_local()))
-            rows=[dict(r) for r in cur.fetchall()]
+            cur.execute("""SELECT id,name,code,language,level FROM courses
+                           WHERE upper(coalesce(status,'ACTIVE'))='ACTIVE'
+                           ORDER BY sort_order,name,id""")
+            course_rows=[dict(r) for r in cur.fetchall()]
+            cur.execute("""SELECT plan,started_at,expires_at,status,course_id,id
+                           FROM subscriptions
+                           WHERE user_id=%s AND upper(coalesce(status,''))='ACTIVE'
+                             AND upper(trim(coalesce(plan,'Free'))) <> 'FREE'
+                             AND (expires_at IS NULL OR expires_at > %s)
+                           ORDER BY (course_id IS NULL) DESC,expires_at DESC NULLS LAST,id DESC""",
+                        (user_id,_now_local()))
+            paid_rows=[dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
-    rows.sort(key=lambda r:(str(r.get('name') or '').casefold(), int(r.get('course_id') or 0)))
-    for row in rows:
-        row['expires_at_vn'] = _vn_display(row.get('expires_at'))
-        row['started_at_vn'] = _vn_display(row.get('started_at'))
-    return rows
+    paid=paid_rows[0] if paid_rows else None
+    plan=str(paid.get('plan') or '1 tháng') if paid else 'Free'
+    started_at=paid.get('started_at') if paid else None
+    expires_at=paid.get('expires_at') if paid else None
+    out=[]
+    for c in course_rows:
+        row={'course_id':int(c['id']),'code':c.get('code'),'name':c.get('name'),
+             'language':c.get('language'),'level':c.get('level'),
+             'subscription_id':int(paid['id']) if paid else None,'plan':plan,
+             'started_at':started_at,'expires_at':expires_at}
+        row['expires_at_vn']=_vn_display(expires_at) if expires_at else None
+        row['started_at_vn']=_vn_display(started_at) if started_at else None
+        out.append(row)
+    return out
 
 
 def _get_saved_selected_course_id(user_id):
@@ -816,62 +828,65 @@ def _resolve_request_course(user_id, requested_course_id):
 
 
 def _package_info(user_id):
-    conn = db()
+    """Return the account-level package state and today's GenAI request quota."""
+    conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT id,plan,course_id,started_at,expires_at,status FROM subscriptions
-                           WHERE user_id=%s ORDER BY id DESC LIMIT 1""", (user_id,))
-            sub = cur.fetchone()
-            if not sub:
-                sub = {"id":None,"plan":"Free","course_id":None,"started_at":None,"expires_at":None,"status":"ACTIVE"}
+                           WHERE user_id=%s ORDER BY id DESC LIMIT 1""",(user_id,))
+            latest=cur.fetchone()
+            cur.execute("""SELECT id,plan,started_at,expires_at,status,course_id
+                           FROM subscriptions
+                           WHERE user_id=%s AND upper(coalesce(status,''))='ACTIVE'
+                             AND upper(trim(coalesce(plan,'Free'))) <> 'FREE'
+                             AND (expires_at IS NULL OR expires_at > %s)
+                           ORDER BY (course_id IS NULL) DESC,expires_at DESC NULLS LAST,id DESC LIMIT 1""",
+                        (user_id,_now_local()))
+            paid=cur.fetchone()
             cur.execute("""SELECT question_count FROM daily_question_usage
-                           WHERE user_id=%s AND usage_date=%s""", (user_id, _now_local().date()))
+                           WHERE user_id=%s AND usage_date=%s""",(user_id,_now_local().date()))
             row=cur.fetchone(); used=int(row['question_count']) if row else 0
     finally:
         conn.close()
     courses=_authorized_courses(user_id)
-    if courses:
-        primary=courses[0]
-        return {"id":sub.get("id"),"plan":sub.get("plan") or "1 tháng",
-                "course_id":primary.get("course_id"),"course_name":primary.get("name"),
-                "started_at":sub.get("started_at"),"expires_at":sub.get("expires_at"),
-                "expires_at_vn":_vn_display(sub.get("expires_at")),"status":"ACTIVE",
-                "courses":courses,"daily_limit":None,"used_today":used,"remaining_today":None,"unlimited":True}
-    return {"id":sub.get("id"),"plan":"Free","course_id":None,"course_name":None,
-            "started_at":sub.get("started_at"),"expires_at":None,"expires_at_vn":None,"status":"ACTIVE",
-            "courses":[],"daily_limit":5,"used_today":used,"remaining_today":max(0,5-used),"unlimited":False}
+    if paid:
+        limit=200
+        return {'id':paid.get('id'),'plan':paid.get('plan') or '1 tháng','course_id':None,
+                'course_name':'Tất cả khóa học','started_at':paid.get('started_at'),
+                'expires_at':paid.get('expires_at'),'expires_at_vn':_vn_display(paid.get('expires_at')) if paid.get('expires_at') else None,
+                'status':'ACTIVE','courses':courses,'daily_limit':limit,'used_today':used,
+                'remaining_today':max(0,limit-used),'unlimited':False,'all_courses':True}
+    return {'id':latest.get('id') if latest else None,'plan':'Free','course_id':None,'course_name':'Tất cả khóa học',
+            'started_at':latest.get('started_at') if latest else None,'expires_at':None,'expires_at_vn':None,
+            'status':'ACTIVE','courses':courses,'daily_limit':5,'used_today':used,'remaining_today':max(0,5-used),
+            'unlimited':False,'all_courses':True}
 
 def subscription_status(user_id):
-    info = _package_info(user_id)
-    return {k: info.get(k) for k in ("id","plan","started_at","expires_at","status")}, None
+    info=_package_info(user_id)
+    return {k:info.get(k) for k in ('id','plan','started_at','expires_at','status')}, None
 
 def enforce_question_limit(user_id):
-    info = _package_info(user_id)
-    if info.get("unlimited"):
-        return info
-    today = _now_local().date()
-    conn = db()
+    info=_package_info(user_id)
+    limit=int(info.get('daily_limit') or 5); plan=str(info.get('plan') or 'Free')
+    today=_now_local().date(); conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""INSERT INTO daily_question_usage(user_id,usage_date,question_count)
                            VALUES(%s,%s,1)
                            ON CONFLICT(user_id,usage_date) DO UPDATE
                            SET question_count=daily_question_usage.question_count+1
-                           RETURNING question_count""", (user_id, today))
-            used = int(cur.fetchone()["question_count"])
-            if used > 5:
+                           RETURNING question_count""",(user_id,today))
+            used=int(cur.fetchone()['question_count'])
+            if used>limit:
                 conn.rollback()
-                raise HTTPException(429, detail={
-                    "code": "FREE_DAILY_LIMIT",
-                    "message": "Gói Free đã dùng hết 5 lượt hỏi hôm nay. Vui lòng thử lại vào ngày mai hoặc nâng cấp gói.",
-                    "plan": "Free", "daily_limit": 5, "used_today": 5, "remaining_today": 0
-                })
+                code='FREE_DAILY_LIMIT' if plan.casefold()=='free' else 'PAID_DAILY_LIMIT'
+                raise HTTPException(429,detail={'code':code,
+                    'message':f'Gói {plan} đã dùng hết {limit} lượt hỏi GenAI hôm nay. Vui lòng thử lại vào ngày mai.',
+                    'plan':plan,'daily_limit':limit,'used_today':limit,'remaining_today':0})
         conn.commit()
     finally:
         conn.close()
-    info["used_today"] = used
-    info["remaining_today"] = max(0, 5-used)
-    return info
+    info['used_today']=used; info['remaining_today']=max(0,limit-used); return info
 
 
 @app.get("/payments/packages")
@@ -4396,6 +4411,68 @@ def _get_study_session(user_id, chatbox_id=None):
         conn.close()
 
 
+def _catalog_rows_for_courses(course_ids):
+    ids=sorted({int(x) for x in (course_ids or []) if x is not None})
+    if not ids: return []
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT kd.subject,kd.course_id,COALESCE(c.name,kd.subject) AS course_name,
+                                 kd.content_type,kd.lesson,kd.lesson_pages,kd.topic,kd.topic_pages,
+                                 kd.question_pages,kd.answer_pages,kd.source_file,kd.namespace
+                          FROM knowledge_documents kd LEFT JOIN courses c ON c.id=kd.course_id
+                          WHERE kd.course_id=ANY(%s)
+                          UNION ALL
+                          SELECT cl.subject,cl.course_id,COALESCE(c.name,cl.subject) AS course_name,
+                                 cl.content_type,cl.lesson,NULL::VARCHAR,NULL::VARCHAR,NULL::VARCHAR,
+                                 NULL::VARCHAR,NULL::VARCHAR,cl.source_file,'__default__'::VARCHAR
+                          FROM curriculum_lessons cl LEFT JOIN courses c ON c.id=cl.course_id
+                          WHERE cl.status='PUBLISHED' AND cl.course_id=ANY(%s)
+                          ORDER BY course_name,content_type,lesson,topic,source_file""",(ids,ids))
+            return [dict(x) for x in cur.fetchall()]
+    finally: conn.close()
+
+def _lesson_key(content_type, lesson):
+    ct=_normalize_content_type(content_type) or str(content_type or '').strip()
+    return (ct.casefold(),re.sub(r'\s+',' ',str(lesson or '').strip()).casefold())
+
+def _free_unlocked_lesson_keys(user_id,catalog_rows):
+    limit=5; buckets={}
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT content_type,lesson,MIN(COALESCE(created_at,last_studied_at,NOW())) AS first_seen
+                           FROM learning_progress WHERE user_id=%s AND COALESCE(TRIM(lesson),'')<>''
+                           GROUP BY content_type,LOWER(TRIM(lesson)),lesson
+                           ORDER BY first_seen,content_type,lesson""",(user_id,))
+            progress=[dict(x) for x in cur.fetchall()]
+    finally: conn.close()
+    for r in progress:
+        ct,lk=_lesson_key(r.get('content_type'),r.get('lesson'))
+        bucket=buckets.setdefault(ct,set())
+        if lk and len(bucket)<limit: bucket.add(lk)
+    for r in catalog_rows:
+        ct,lk=_lesson_key(r.get('content_type'),r.get('lesson'))
+        if not ct or not lk: continue
+        bucket=buckets.setdefault(ct,set())
+        if len(bucket)<limit: bucket.add(lk)
+    return buckets
+
+def _content_access_state(user_id,course_id,content_type,lesson,catalog_rows=None):
+    info=_package_info(user_id); plan=str(info.get('plan') or 'Free')
+    if plan.casefold()!='free': return {'allowed':True,'locked':False,'plan':plan,'limit':None,'used':None}
+    rows=catalog_rows if catalog_rows is not None else _catalog_rows_for_courses([c.get('course_id') for c in _authorized_courses(user_id)])
+    unlocked=_free_unlocked_lesson_keys(user_id,rows); ct,lk=_lesson_key(content_type,lesson)
+    used=len(unlocked.get(ct,set())); allowed=lk in unlocked.get(ct,set())
+    return {'allowed':allowed,'locked':not allowed,'plan':'Free','limit':5,'used':used}
+
+def _assert_content_access(user_id,course_id,content_type,lesson):
+    st=_content_access_state(user_id,course_id,content_type,lesson)
+    if st.get('allowed'): return st
+    ct=_normalize_content_type(content_type) or str(content_type or 'nội dung').strip()
+    msg=(f'🔒 Bài **{lesson}** đang bị khóa trong gói Free. Gói Free chỉ mở tối đa **5 bài {ct}**. Các bài khác cần nâng cấp gói để học. 😊')
+    raise HTTPException(403,detail={'code':'FREE_CONTENT_LOCKED','message':msg,'content_type':ct,'lesson':lesson,'free_limit':5,'used':int(st.get('used') or 0)})
+
 def _start_study_session(user_id, scope, chatbox_id=None):
     """Persist an explicitly confirmed lesson as the only active scope for this chatbox."""
     scope = scope or {}
@@ -4405,6 +4482,7 @@ def _start_study_session(user_id, scope, chatbox_id=None):
     content_type = _normalize_content_type(scope.get("content_type")) or None
     course = str(scope.get("course") or scope.get("course_name") or "").strip() or None
     course_id = int(scope.get("course_id")) if scope.get("course_id") not in (None, "") else None
+    _assert_content_access(user_id, course_id, content_type, lesson)
     topic = str(scope.get("topic") or "").strip() or None
     chatbox = str(chatbox_id or "").strip() or None
     conn = db()
@@ -6943,19 +7021,16 @@ def proxy_chat(
     if not data.text and not data.action:
         raise HTTPException(400, "Tin nhắn không được để trống.")
 
-    # Every plain-text user turn gets a tiny GenAI follow-up classification before
-    # any intent-specific early return. Structured UI actions are explicit state
-    # transitions and do not need conversational follow-up detection.
+    # Count the daily GenAI request quota BEFORE the follow-up classifier because
+    # that classifier itself calls GenAI. One normal learner turn = one quota unit.
+    if not _is_pure_greeting(data.text) and not _is_review_schedule_request(data.text) and not _is_learning_intent_candidate(data.text) and not data.proactive and not data.action:
+        enforce_question_limit(user["id"])
+
     plan_recent_history = _normalize_chat_history(data.chat_history, max_messages=20)
     chat_followup_detected = None
     if not data.action and data.text:
         chat_followup_detected = _classify_chat_followup(data.text, plan_recent_history)
         print(f'[CHAT FOLLOW-UP ROUTER] request={request_id} follow_up={int(bool(chat_followup_detected))}')
-
-    # Paid packages are unlimited. Free is limited to 5 accepted questions/day.
-    # Standalone greetings are onboarding actions and do not consume a question.
-    if not _is_pure_greeting(data.text) and not _is_review_schedule_request(data.text) and not _is_learning_intent_candidate(data.text) and not data.proactive and not data.action:
-        enforce_question_limit(user["id"])
 
     # A standalone greeting is a session/onboarding action, NOT a knowledge
     # question. Do not send "Chào" through embedding/Pinecone/Gemini, because
@@ -7359,7 +7434,12 @@ def proxy_chat(
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
             lesson_confirmed_scope = decoded
-            _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
+            try:
+                _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
+            except HTTPException as exc:
+                detail=exc.detail if isinstance(exc.detail,dict) else {"message":str(exc.detail)}
+                msg=str(detail.get("message") or "Bài này đang bị khóa trong gói hiện tại.")
+                return {"reply":msg,"model":"package-gate","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"package_locked":True}
             study_session = dict(_get_study_session(user["id"], data.chatbox_id) or {})
             try:
                 _ensure_learning_progress_started(user["id"], study_session)
@@ -12550,32 +12630,21 @@ def learning_catalog(course_id: Optional[int] = None, authorization: Optional[st
             raise HTTPException(403,"Bạn chưa được cấp quyền học khóa học này hoặc khóa học đã hết hạn.")
         course_ids=[int(course_id)]
     elif len(course_ids)>1:
-        return {"success":True,"documents":[],"requires_course_selection":True,"courses":authorized}
+        return {"success":True,"documents":[],"requires_course_selection":True,"courses":authorized,"subscription":_package_info(user["id"])}
     if not course_ids:
-        return {"success":True,"documents":[],"requires_course_selection":False,"courses":[]}
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT kd.subject,kd.course_id,COALESCE(c.name,kd.subject) AS course_name,
-                       kd.content_type,kd.lesson,kd.lesson_pages,kd.topic,kd.topic_pages,
-                       kd.question_pages,kd.answer_pages,kd.source_file,kd.namespace
-                FROM knowledge_documents kd
-                LEFT JOIN courses c ON c.id=kd.course_id
-                WHERE kd.course_id = ANY(%s)
-                UNION ALL
-                SELECT cl.subject,cl.course_id,COALESCE(c.name,cl.subject) AS course_name,
-                       cl.content_type,cl.lesson,NULL::VARCHAR AS lesson_pages,NULL::VARCHAR AS topic,
-                       NULL::VARCHAR AS topic_pages,NULL::VARCHAR AS question_pages,NULL::VARCHAR AS answer_pages,
-                       cl.source_file,'__default__'::VARCHAR AS namespace
-                FROM curriculum_lessons cl
-                LEFT JOIN courses c ON c.id=cl.course_id
-                WHERE cl.status='PUBLISHED' AND cl.course_id = ANY(%s)
-                ORDER BY course_name,lesson,topic,source_file
-            """,(course_ids,course_ids))
-            rows=[dict(x) for x in cur.fetchall()]
-        return {"success":True,"documents":rows}
-    finally: conn.close()
+        return {"success":True,"documents":[],"requires_course_selection":False,"courses":authorized,"subscription":_package_info(user["id"])}
+    rows=_catalog_rows_for_courses(course_ids)
+    info=_package_info(user["id"]); is_free=str(info.get('plan') or 'Free').casefold()=='free'
+    all_rows=_catalog_rows_for_courses([int(c['course_id']) for c in authorized if c.get('course_id') is not None]) if is_free else rows
+    unlocked=_free_unlocked_lesson_keys(user['id'],all_rows) if is_free else {}
+    for r in rows:
+        ct,lk=_lesson_key(r.get('content_type'),r.get('lesson'))
+        locked=is_free and lk not in unlocked.get(ct,set())
+        r['locked']=bool(locked); r['lock_reason']='FREE_CONTENT_LIMIT' if locked else None
+        r['free_content_limit']=5 if is_free else None
+        r['free_unlocked_count']=len(unlocked.get(ct,set())) if is_free else None
+    return {"success":True,"documents":rows,"requires_course_selection":False,"courses":authorized,"subscription":info}
+
 
 def check_admin(password: str):
     expected = os.getenv("ADMIN_PANEL_PASSWORD", os.getenv("ADMIN_WS_TOKEN", ""))
@@ -16540,7 +16609,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 
 <div class="card">
 <h3>💳 Cấu hình gói thanh toán</h3>
-<div class="small" style="margin-bottom:10px">Thiết lập giá và QR code cho 1 tháng / 3 tháng / 6 tháng. Sau khi user chuyển khoản, Admin xác nhận rồi cấp gói tương ứng.</div>
+<div class="small" style="margin-bottom:10px">Thiết lập giá và QR code cho 1 / 3 / 6 tháng. Mỗi gói trả phí áp dụng cho <b>tất cả khóa học</b>, cùng thời hạn và <b>200 request GenAI/ngày</b>. Gói Free: tất cả khóa học, <b>5 request/ngày</b> và tối đa <b>5 bài cho mỗi loại nội dung</b>.</div>
 <div id="paymentPackagesAdmin"></div>
 </div>
 
@@ -17399,33 +17468,25 @@ async function savePaymentPackage(months){
 async function loadUsers(){
   const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
   document.getElementById("count").textContent="  Tổng: "+d.users.length;
-  const activeAdminCourses=adminCourses.filter(c=>String(c.status||'ACTIVE').toUpperCase()==='ACTIVE');
   document.getElementById("users").innerHTML=d.users.map(u=>{
     const s=u.subscription||{}, st=u.status||"PENDING", courses=Array.isArray(s.courses)?s.courses:[];
-    const paidCourses=courses.filter(c=>c && c.course_id!=null);
-    const courseRows=paidCourses.length ? paidCourses.map(c=>{
-      const ex=c.expires_at?new Intl.DateTimeFormat("vi-VN",{dateStyle:"short",timeStyle:"short",timeZone:"Asia/Ho_Chi_Minh"}).format(new Date(c.expires_at)):"-";
-      return `<div style="margin-top:7px;padding:8px 10px;background:#f7f9fc;border:1px solid #dfe5ee;border-radius:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
-        <div style="min-width:250px;flex:1"><b>🎓 ${esc(c.code||'')} · ${esc(c.name||'')}</b><br><span class="small">Gói: <b>${esc(c.plan||'')}</b> · hết hạn: <b>${esc(ex)}</b></span></div>
-        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},1)">1 tháng</button>
-        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},3)">3 tháng</button>
-        <button onclick="event.stopPropagation();renewCourse(${u.id},${Number(c.course_id)},6)">6 tháng</button>
-        <button class="red" onclick="event.stopPropagation();lockCourse(${u.id},${Number(c.course_id)},'${esc(c.name||'')}')">Khóa khóa</button>
-      </div>`;
-    }).join('') : `<div class="small" style="margin-top:7px;color:#667085">Chưa được cấp khóa học trả phí.</div>`;
+    const isPaid=String(s.plan||'Free').trim().toLowerCase()!=='free' && Number(s.daily_limit||0)===200;
+    const courseRows=isPaid ? `<div style="margin-top:7px;padding:8px 10px;background:#f7f9fc;border:1px solid #dfe5ee;border-radius:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+        <div style="min-width:250px;flex:1"><b>🎓 Tất cả khóa học</b><br><span class="small">Gói: <b>${esc(s.plan||'')}</b> · hết hạn: <b>${esc(s.expires_at_vn||'-')}</b> · ${Number(s.used_today||0)}/200 request hôm nay</span></div>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},1)">1 tháng</button>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},3)">3 tháng</button>
+        <button onclick="event.stopPropagation();renewCourse(${u.id},6)">6 tháng</button>
+      </div>` : `<div class="small" style="margin-top:7px;color:#667085">Gói Free · tất cả khóa học · ${Number(s.used_today||0)}/5 request hôm nay.</div>`;
     const grantRow=`<div style="margin-top:9px;padding-top:8px;border-top:1px dashed #cfd7e3;display:flex;gap:6px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
-      <select id="user-course-${u.id}" onclick="event.stopPropagation()" style="min-width:240px;padding:6px">
-        <option value="">-- Chọn khóa học để cấp quyền --</option>
-        ${activeAdminCourses.map(c=>`<option value="${esc(c.id)}">${esc(c.code)} · ${esc(c.name)}</option>`).join('')}
-      </select>
+      <span class="small" style="color:#475467">Kích hoạt cho <b>tất cả khóa học</b>:</span>
       <button onclick="event.stopPropagation();act(${u.id},1)">+ 1 tháng</button>
       <button onclick="event.stopPropagation();act(${u.id},3)">+ 3 tháng</button>
       <button onclick="event.stopPropagation();act(${u.id},6)">+ 6 tháng</button>
-      ${paidCourses.length ? `<button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Về Free</button>` : ''}
+      ${isPaid ? `<button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Về Free</button>` : ''}
     </div>`;
-    const headerInfo=paidCourses.length
-      ? `<div><span class="status-${st}"><b>${st}</b></span> · ${paidCourses.length} khóa đang kích hoạt</div>`
-      : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · đã hỏi hôm nay: ${Number(s.used_today||0)}/5</div>`;
+    const headerInfo=isPaid
+      ? `<div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||'')} · tất cả khóa học · 200 request/ngày</div>`
+      : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · tất cả khóa học · 5 request/ngày</div>`;
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
       <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
       ${headerInfo}
@@ -17514,23 +17575,13 @@ async function sendAdminMessage(){
   }
 }
 async function act(id,m){
-  const sel=document.getElementById("user-course-"+id);
-  const courseId=sel?sel.value:"";
-  if(!courseId){alert("Hãy chọn khóa học trước khi cấp/gia hạn.");return;}
-  const courseName=(adminCourses.find(c=>String(c.id)===String(courseId))||{}).name||"khóa học";
-  if(!confirm("Cấp/gia hạn "+m+" tháng cho "+courseName+"?"))return;
-  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m,course_id:Number(courseId)})});
+  if(!confirm("Kích hoạt/gia hạn gói "+m+" tháng cho user này? Gói sẽ áp dụng cho tất cả khóa học."))return;
+  await api("/admin/api/users/"+id+"/activate",{method:"POST",body:JSON.stringify({password:pw,months:m})});
   loadUsers();
 }
-async function renewCourse(userId,courseId,months){
-  const courseName=(adminCourses.find(c=>String(c.id)===String(courseId))||{}).name||"khóa học";
-  if(!confirm("Gia hạn "+months+" tháng cho "+courseName+"?"))return;
-  await api("/admin/api/users/"+userId+"/activate",{method:"POST",body:JSON.stringify({password:pw,months,course_id:Number(courseId)})});
-  loadUsers();
-}
-async function lockCourse(userId,courseId,courseName){
-  if(!confirm("Khóa riêng khóa "+courseName+" của user này? Các khóa khác vẫn giữ nguyên."))return;
-  await api("/admin/api/users/"+userId+"/courses/"+courseId+"/lock",{method:"POST",body:JSON.stringify({password:pw})});
+async function renewCourse(userId,months){
+  if(!confirm("Gia hạn gói "+months+" tháng cho user này? Gói sẽ áp dụng cho tất cả khóa học."))return;
+  await api("/admin/api/users/"+userId+"/activate",{method:"POST",body:JSON.stringify({password:pw,months})});
   loadUsers();
 }
 async function resetFree(id){
@@ -19352,57 +19403,54 @@ def admin_users(password: str):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
-                    s.id subscription_id,s.plan,s.course_id,s.started_at,s.expires_at,s.status subscription_status,
-                    COALESCE(dq.question_count,0) AS used_today
-                    FROM users u LEFT JOIN LATERAL
-                    (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
-                    LEFT JOIN daily_question_usage dq ON dq.user_id=u.id AND dq.usage_date=%s
-                    ORDER BY u.id DESC""",(_now_local().date(),))
+                       s.id subscription_id,s.plan,s.course_id,s.started_at,s.expires_at,s.status subscription_status,
+                       COALESCE(dq.question_count,0) AS used_today
+                       FROM users u LEFT JOIN LATERAL
+                       (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
+                       LEFT JOIN daily_question_usage dq ON dq.user_id=u.id AND dq.usage_date=%s
+                       ORDER BY u.id DESC""",(_now_local().date(),))
             rows=cur.fetchall()
     finally: conn.close()
-    out=[]
+    now=_now_local(); out=[]
     for r in rows:
         courses=_authorized_courses(r['id'])
-        paid=bool(courses); primary=courses[0] if courses else None
-        out.append({"id":r['id'],"phone":r['phone'],"nickname":r['nickname'],"status":r['status'],"created_at":r['created_at'],
-                    "subscription":{"id":r['subscription_id'],"plan":str(r['plan'] or 'Free') if paid else 'Free',
-                                    "course_id":primary.get('course_id') if primary else None,
-                                    "course_name":", ".join(str(c.get('name') or '') for c in courses) if courses else None,
-                                    "courses":courses,
-                                    "started_at":r['started_at'] if paid else None,
-                                    "expires_at":r['expires_at'] if paid else None,
-                                    "expires_at_vn":_vn_display(r['expires_at']) if paid else None,
-                                    "status":"ACTIVE","used_today":int(r['used_today'] or 0),"daily_limit":None if paid else 5}})
-    return {"users":out}
+        paid=(str(r.get('subscription_status') or '').upper()=='ACTIVE'
+              and str(r.get('plan') or 'Free').strip().casefold()!='free'
+              and r.get('expires_at') is not None and r.get('expires_at')>now)
+        plan=str(r.get('plan') or 'Free') if paid else 'Free'; limit=200 if paid else 5
+        out.append({'id':r['id'],'phone':r['phone'],'nickname':r['nickname'],'status':r['status'],'created_at':r['created_at'],
+                    'subscription':{'id':r['subscription_id'],'plan':plan,'course_id':None,'course_name':'Tất cả khóa học',
+                                    'courses':courses,'started_at':r['started_at'] if paid else None,'expires_at':r['expires_at'] if paid else None,
+                                    'expires_at_vn':_vn_display(r['expires_at']) if paid else None,'status':'ACTIVE',
+                                    'used_today':int(r['used_today'] or 0),'daily_limit':limit,'all_courses':True}})
+    return {'users':out}
 
 @app.post("/admin/api/users/{user_id}/activate")
 def admin_activate(user_id:int,data:dict):
-    check_admin(str(data.get("password","")))
-    months=int(data.get("months",1))
-    if months not in (1,3,6): raise HTTPException(400,"Thời hạn phải 1, 3 hoặc 6 tháng.")
-    try: course_id=int(data.get("course_id"))
-    except Exception: raise HTTPException(400,"Phải chọn khóa học trước khi kích hoạt/gia hạn gói.")
-    conn=db()
+    """Activate/renew an account-level package covering all active courses."""
+    check_admin(str(data.get('password','')))
+    months=int(data.get('months',1))
+    if months not in (1,3,6): raise HTTPException(400,'Thời hạn phải 1, 3 hoặc 6 tháng.')
+    conn=db(); now=_now_local()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
-            if not cur.fetchone(): raise HTTPException(404,"Không tìm thấy user.")
-            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(course_id,))
-            course=cur.fetchone()
-            if not course: raise HTTPException(404,"Không tìm thấy khóa học.")
-            if str(course['status'] or 'ACTIVE').upper()!='ACTIVE': raise HTTPException(400,"Khóa học đang tắt, không thể cấp quyền.")
-            cur.execute("""SELECT id,expires_at FROM subscriptions WHERE user_id=%s AND course_id=%s AND status='ACTIVE' ORDER BY id DESC LIMIT 1""",(user_id,course_id))
-            old=cur.fetchone(); now=_now_local()
-            start_dt=old['expires_at'] if old and old['expires_at'] and old['expires_at']>now else now
-            exp=_add_calendar_months(start_dt,months); plan_name=f"{months} tháng"
-            if old:
-                cur.execute("UPDATE subscriptions SET plan=%s,started_at=%s,expires_at=%s,status='ACTIVE' WHERE id=%s",(plan_name,start_dt,exp,old['id']))
-            else:
-                cur.execute("INSERT INTO subscriptions(user_id,course_id,plan,started_at,expires_at,status) VALUES(%s,%s,%s,%s,%s,'ACTIVE')",(user_id,course_id,plan_name,start_dt,exp))
-            cur.execute("UPDATE users SET status='ACTIVE' WHERE id=%s",(user_id,))
+            cur.execute('SELECT id FROM users WHERE id=%s',(user_id,))
+            if not cur.fetchone(): raise HTTPException(404,'Không tìm thấy user.')
+            cur.execute("""SELECT MAX(expires_at) AS max_expires_at FROM subscriptions
+                           WHERE user_id=%s AND status='ACTIVE' AND expires_at IS NOT NULL AND expires_at>%s""",(user_id,now))
+            old=cur.fetchone() or {}; old_exp=old.get('max_expires_at')
+            start_dt=old_exp if old_exp and old_exp>now else now; exp=_add_calendar_months(start_dt,months)
+            plan_name=f'{months} tháng'
+            cur.execute("UPDATE subscriptions SET status='EXPIRED',expires_at=LEAST(COALESCE(expires_at,%s),%s) WHERE user_id=%s AND status='ACTIVE'",(now,now,user_id))
+            cur.execute("""INSERT INTO subscriptions(user_id,course_id,plan,started_at,expires_at,status)
+                           VALUES(%s,NULL,%s,%s,%s,'ACTIVE') RETURNING id""",(user_id,plan_name,start_dt,exp))
+            sub_id=cur.fetchone()['id']; cur.execute('UPDATE users SET status=\'ACTIVE\' WHERE id=%s',(user_id,))
         conn.commit()
+    except Exception:
+        conn.rollback(); raise
     finally: conn.close()
-    return {"success":True,"course_id":course_id,"course_name":course['name'],"expires_at":exp,"expires_at_vn":_vn_display(exp),"timezone":"Asia/Ho_Chi_Minh"}
+    return {'success':True,'subscription_id':sub_id,'plan':plan_name,'scope':'ALL_COURSES','course_name':'Tất cả khóa học',
+            'expires_at':exp,'expires_at_vn':_vn_display(exp),'daily_limit':200,'timezone':'Asia/Ho_Chi_Minh'}
 
 
 @app.post("/admin/api/chat/send")
@@ -19466,35 +19514,10 @@ def admin_ws_token(password: str):
     return {"token": ADMIN_WS_TOKEN}
 
 @app.post("/admin/api/users/{user_id}/courses/{course_id}/lock")
-def admin_lock_user_course(user_id:int, course_id:int, data:dict):
-    """Expire one paid course for a user without affecting other courses or the account."""
-    check_admin(str(data.get("password", "")))
-    now=_now_local()
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM users WHERE id=%s",(user_id,))
-            if not cur.fetchone():
-                raise HTTPException(404,"Không tìm thấy user.")
-            cur.execute("SELECT id,name FROM courses WHERE id=%s",(course_id,))
-            course=cur.fetchone()
-            if not course:
-                raise HTTPException(404,"Không tìm thấy khóa học.")
-            cur.execute("""UPDATE subscriptions SET status='EXPIRED', expires_at=LEAST(COALESCE(expires_at,%s),%s)
-                           WHERE id=(SELECT id FROM subscriptions WHERE user_id=%s AND course_id=%s AND status='ACTIVE'
-                                     ORDER BY expires_at DESC NULLS LAST,id DESC LIMIT 1)
-                           RETURNING id""",(now,now,user_id,course_id))
-            row=cur.fetchone()
-            if not row:
-                raise HTTPException(404,"User không có khóa học đang hoạt động này.")
-        conn.commit()
-    except HTTPException:
-        conn.rollback(); raise
-    except Exception:
-        conn.rollback(); raise
-    finally:
-        conn.close()
-    return {"success":True,"user_id":user_id,"course_id":course_id,"course_name":course['name'],"status":"EXPIRED"}
+def admin_lock_user_course(user_id:int,course_id:int,data:dict):
+    check_admin(str(data.get('password','')))
+    raise HTTPException(410,'Gói trả phí hiện áp dụng cho toàn bộ khóa học; không còn khóa riêng từng khóa học.')
+
 
 @app.post("/admin/api/users/{user_id}/reset-free")
 def admin_reset_free(user_id:int,data:dict):
@@ -19518,7 +19541,7 @@ def admin_reset_free(user_id:int,data:dict):
             # Close every older subscription so there is no ambiguity about
             # which package is active. Keep rows for audit/history.
             cur.execute(
-                "UPDATE subscriptions SET status='EXPIRED', expires_at=COALESCE(expires_at,%s) WHERE user_id=%s AND status='ACTIVE' AND course_id IS NOT NULL",
+                "UPDATE subscriptions SET status='EXPIRED', expires_at=COALESCE(expires_at,%s) WHERE user_id=%s AND status='ACTIVE'",
                 (now, user_id)
             )
 
