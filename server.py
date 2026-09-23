@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.53"
+SERVER_VERSION = "31.54"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5736,7 +5736,99 @@ def _review_grammar_question_is_applied(question):
     return any(x in text for x in applied_markers)
 
 
-def _review_grammar_fallback_question(item, all_grammar=None):
+def _review_grammar_proxy_question_from_published_source(course_id, item):
+    """Build a valid MCQ4 directly from the original published B1 question.
+
+    Wrong-review proxy rows may only store the official answer as a choice letter.
+    The safest source for the four options is therefore the original B1 exercise
+    in curriculum_steps for the same lesson/question number.
+    """
+    row=dict(item or {})
+    lesson=str(row.get('source_lesson') or '').strip()
+    pattern=str(row.get('pattern') or '').strip()
+    meaning=str(row.get('meaning') or '').strip()
+    if course_id in (None,'') or not lesson:
+        return None
+
+    qm=re.search(r'\b(?:câu|question)?\s*(\d{1,3})\b',pattern,flags=re.I)
+    if not qm:
+        return None
+    qnum=int(qm.group(1))
+    am=re.search(r'đáp án\s+đúng\s*:\s*([A-D])\b',meaning,flags=re.I)
+    answer=(am.group(1).upper() if am else str(row.get('answer') or '').strip().upper())
+    if answer not in {'A','B','C','D'}:
+        return None
+
+    rows=_published_curriculum_lesson_source(int(course_id),'Ngữ pháp',lesson)
+    if not rows:
+        return None
+    b1_text=''
+    for r in rows:
+        if str(r.get('step_code') or '').strip().upper()=='B1':
+            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+            b1_text=str(content.get('content') or content.get('text') or '').strip()
+            if b1_text:
+                break
+    if not b1_text:
+        parts=[]
+        for r in rows:
+            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+            txt=str(content.get('content') or content.get('text') or '').strip()
+            if txt: parts.append(txt)
+        b1_text='\n'.join(parts)
+    if not b1_text:
+        return None
+
+    block=_extract_grammar_question_block(b1_text,qnum).strip()
+    if not block:
+        return None
+
+    # Support both line-separated choices and compact inline choices.
+    source_map={}
+    for line in block.splitlines():
+        m=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$',line,flags=re.I)
+        if m and m.group(1).upper() not in source_map:
+            val=m.group(2).strip()
+            if val: source_map[m.group(1).upper()]=val
+    if set(source_map)!=set('ABCD'):
+        compact=' '.join(x.strip() for x in block.splitlines() if x.strip())
+        for m in re.finditer(r'(?<!\w)([A-D])[.)]\s*([^\n]+?)(?=\s+[A-D][.)]\s+|$)',compact,flags=re.I):
+            letter=m.group(1).upper(); val=m.group(2).strip()
+            if val and letter not in source_map and len(val)<=120:
+                source_map[letter]=val
+    if set(source_map)!=set('ABCD'):
+        return None
+
+    # Remove the answer-option lines from the question text.
+    qlines=[]
+    for line in block.splitlines():
+        if re.match(r'^\s*[A-D][.)]\s+',line,flags=re.I):
+            break
+        qlines.append(line)
+    question='\n'.join(qlines).strip()
+    if not question:
+        return None
+    # Preserve the source blank; if missing, do not invent a new target.
+    if not re.search(r'_{2,}',question):
+        return None
+
+    option_letters={k:source_map[k] for k in 'ABCD'}
+    if not _review_grammar_options_are_related(question,option_letters,answer):
+        return None
+    return {
+        'item_type':'grammar','item_id':int(row.get('id') or 0),'question_type':'multiple_choice',
+        'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or lesson}**:\n{question}',
+        'options':[f'{k}. {option_letters[k]}' for k in 'ABCD'],
+        'option_letters':option_letters,'answer':answer,
+        'answer_text':option_letters[answer],
+        'answer_criteria':meaning or f'Đáp án đúng: {answer}',
+        'pattern':pattern,'meaning':meaning,
+        'explanation':str(row.get('explanation') or '').strip(),
+        'example':question,
+    }
+
+
+def _review_grammar_fallback_question(item, all_grammar=None, course_id=None):
     """Build an applied grammar MCQ with exactly four related options.
 
     The fallback must never borrow another grammar item's pattern/example as a
@@ -5793,6 +5885,18 @@ def _review_grammar_fallback_question(item, all_grammar=None):
             pass
     if '____' not in masked:
         return None
+
+    # WRONG_ONLY proxy rows often persist only the correct choice letter (A/B/C/D)
+    # while their master `example` contains only the sentence. In that case, recover
+    # the authoritative four choices from the published B1 question in curriculum_steps.
+    if re.fullmatch(r'[A-D]', expected, flags=re.I) and course_id not in (None, "") and str(row.get("source_lesson") or "").strip():
+        try:
+            recovered = _review_grammar_proxy_question_from_published_source(int(course_id), row)
+            if recovered:
+                print(f"[REVIEW FORMAT GUARANTEE] item_type=grammar item_id={item_id} source=published_b1 format=MCQ4")
+                return recovered
+        except Exception as exc:
+            print(f"[REVIEW B1 SOURCE FALLBACK] item_id={item_id} skipped: {type(exc).__name__}: {exc}")
 
     # When the persisted official answer is a choice letter (A/B/C/D), the
     # original B1 block already contains the four authoritative answer choices.
@@ -11177,7 +11281,7 @@ def _review_master_payload(course_id, due):
                                FROM curriculum_vocab_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,vids))
                 vocab=[dict(x) for x in cur.fetchall()]
             if gids:
-                cur.execute("""SELECT id,pattern,meaning,explanation,example
+                cur.execute("""SELECT id,pattern,meaning,explanation,example,source_lesson
                                FROM curriculum_grammar_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,gids))
                 grammar=[dict(x) for x in cur.fetchall()]
             return {"vocabulary":vocab,"grammar":grammar}
@@ -11454,12 +11558,32 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
                 })
                 continue
 
-        fallback=_review_grammar_fallback_question(item, selected_grammar)
+        fallback=_review_grammar_fallback_question(item, selected_grammar, course_id)
         if fallback:
             print(f"[REVIEW FORMAT GUARANTEE] item_type=grammar item_id={item_id} lesson={lesson!r} format=MCQ4 source=fallback")
             questions.append(fallback)
         else:
             print(f"[REVIEW FORMAT GUARANTEE] skipped item_type=grammar item_id={item_id} lesson={lesson!r} reason=no_safe_mcq4")
+
+    # Backfill every selected DB item that the model rejected/skipped.
+    # A review batch must not shrink from N failed items to one question merely
+    # because the LLM failed to produce a valid MCQ for some items.
+    existing={(str(q.get('item_type') or ''), int(q.get('item_id') or 0)) for q in questions}
+    for item in selected_vocab:
+        key=('vocabulary', int(item.get('id') or 0))
+        if key in existing:
+            continue
+        q=_review_vocab_question(item, selected_vocab, mode='mcq')
+        if q:
+            questions.append(q); existing.add(key)
+    for item in selected_grammar:
+        key=('grammar', int(item.get('id') or 0))
+        if key in existing:
+            continue
+        q=_review_grammar_fallback_question(item, selected_grammar, course_id)
+        if q:
+            print(f"[REVIEW FORMAT GUARANTEE] item_type=grammar item_id={int(item.get('id') or 0)} source=backfill format=MCQ4")
+            questions.append(q); existing.add(key)
 
     # Final format guarantee: every generated review question must be 4-choice MCQ.
     questions=[q for q in questions if str(q.get('question_type') or '')== 'multiple_choice'
@@ -11738,7 +11862,7 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
             for other in (data.get('grammar') or []):
                 m=str(other.get('meaning') or '').strip()
                 if m and m not in pool: pool.append(m)
-            q=_review_grammar_fallback_question(item)
+            q=_review_grammar_fallback_question(item, course_id=course_id)
             if q:
                 questions.append(q)
     if not questions:
