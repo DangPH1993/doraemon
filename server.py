@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.63"
+SERVER_VERSION = "31.64"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -360,6 +360,8 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed_at TIMESTAMPTZ
             );""")
+            cur.execute("ALTER TABLE user_vocabulary_review ADD COLUMN IF NOT EXISTS question_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;")
+            cur.execute("ALTER TABLE user_grammar_review ADD COLUMN IF NOT EXISTS question_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_vocab_review_due ON user_vocabulary_review(user_id,course_id,next_review_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_user_grammar_review_due ON user_grammar_review(user_id,course_id,next_review_at);")
             cur.execute("ALTER TABLE user_review_sessions ADD COLUMN IF NOT EXISTS chatbox_id VARCHAR(128);")
@@ -6394,18 +6396,42 @@ def _persist_grammar_b1_wrong_review(user_id, course_id, lesson, b1_text, studen
         if not wrong:
             continue
         block=_extract_grammar_question_block(b1_text,n)
+        option_map,question_text=_review_extract_choice_map(block)
+        expected_clean=re.sub(r'[`*_~]+','',str(expected or '')).strip()
+        correct_letter=None
+        for letter,val in option_map.items():
+            vclean=re.sub(r'[`*_~]+','',str(val or '')).strip()
+            if vclean.casefold()==expected_clean.casefold() or expected_clean.casefold() in vclean.casefold() or vclean.casefold() in expected_clean.casefold():
+                correct_letter=letter
+                break
         proxy_id=_ensure_review_grammar_master(
             int(course_id),lesson,
             question_text=block,
-            answer=expected,
+            answer=(correct_letter or expected),
             pattern=f"{lesson} · Câu {n}",
             meaning=f"Đáp án đúng: {expected}",
             explanation='Ôn lại cách áp dụng ngữ pháp trong câu hỏi gốc của B1.',
             normalized_key=f"__b1__{int(course_id)}__{lesson.casefold()}__q{int(n)}"
         )
+        target_id=proxy_id
         if proxy_id:
-            _schedule_failed_review(user_id,int(course_id),'grammar',proxy_id)
-            saved+=1; labels.append(f"Q{n}:master={proxy_id}")
+            snapshot={
+                'item_type':'grammar','item_id':int(proxy_id),'question_type':'multiple_choice',
+                'question':question_text or _review_source_text(block),
+                'options':[f'{k}. {option_map[k]}' for k in ('A','B','C','D')] if set(option_map)==set('ABCD') else [],
+                'option_letters':{k:option_map[k] for k in ('A','B','C','D')} if set(option_map)==set('ABCD') else {},
+                'answer':correct_letter or expected.upper() if str(correct_letter or expected).upper() in {'A','B','C','D'} else '',
+                'answer_text':option_map.get(correct_letter,'') if correct_letter else expected,
+                'answer_criteria':expected,
+                'pattern':f"{lesson} · Câu {n}",
+                'meaning':f"Đáp án đúng: {expected}",
+                'explanation':'Ôn lại cách áp dụng ngữ pháp trong câu hỏi gốc của B1.',
+                'example':question_text or _review_source_text(block),
+                'source_lesson':lesson,
+                'wrong_answer':got,
+            }
+            _schedule_failed_review(user_id,int(course_id),'grammar',target_id,question=snapshot,wrong_answer=got)
+            saved+=1; labels.append(f"Q{n}:master={proxy_id}:snapshot={int(bool(snapshot.get('question')) and len(snapshot.get('options') or [])==4)}")
     print(f"[GRAMMAR WRONG REVIEW] user={user_id} course_id={course_id} lesson={lesson!r} saved={saved} items={', '.join(labels) if labels else 'none'}")
     return saved
 
@@ -11492,7 +11518,7 @@ def _review_due_items(user_id, course_id):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT r.vocab_id AS item_id,r.wrong_count,r.next_review_at,
+            cur.execute("""SELECT r.vocab_id AS item_id,r.wrong_count,r.next_review_at,r.question_snapshot,
                                   m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
                            FROM user_vocabulary_review r
                            JOIN curriculum_vocab_master m ON m.id=r.vocab_id AND m.course_id=r.course_id
@@ -11735,8 +11761,11 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
                 questions.append(q)
         for item in selected_grammar:
             item_id=int(item.get('id') or 0)
-            q=_review_grammar_question_from_stored_example(item)
-            source='stored_example' if q else ''
+            q=_review_question_from_snapshot(item)
+            source='snapshot' if q else ''
+            if not q:
+                q=_review_grammar_question_from_stored_example(item)
+                source='stored_example' if q else ''
             if not q:
                 q=_review_grammar_proxy_question_from_published_source(int(course_id),item)
                 source='published_b1' if q else ''
@@ -11744,6 +11773,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
                 q=_review_grammar_fallback_question(item,selected_grammar,course_id)
                 source='grammar_fallback' if q else ''
             if q:
+                _save_review_snapshot(user_id,int(course_id),'grammar',item_id,q)
                 questions.append(q)
                 print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source={source}")
             else:
@@ -12236,7 +12266,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT DISTINCT r.vocab_id AS id,
+                SELECT DISTINCT r.vocab_id AS id,r.question_snapshot,
                        m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
                 FROM user_vocabulary_review r
                 JOIN curriculum_vocab_master m
@@ -12255,8 +12285,8 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
             vocab=[dict(x) for x in cur.fetchall()]
 
             cur.execute("""
-                SELECT DISTINCT r.grammar_id AS id,
-                       m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
+                SELECT DISTINCT r.grammar_id AS id,r.question_snapshot,
+                       m.pattern,m.meaning,m.explanation,m.example,m.source_lesson,m.normalized_key
                 FROM user_grammar_review r
                 JOIN curriculum_grammar_master m
                   ON m.id=r.grammar_id AND m.course_id=r.course_id
@@ -12276,7 +12306,7 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
             # Backward compatibility for curriculum rows without lesson-item mapping.
             if not vocab:
                 cur.execute("""
-                    SELECT DISTINCT r.vocab_id AS id,
+                    SELECT DISTINCT r.vocab_id AS id,r.question_snapshot,
                            m.writing,m.reading,m.pronunciation_vi,m.meaning,m.example,m.source_lesson
                     FROM user_vocabulary_review r
                     JOIN curriculum_vocab_master m
@@ -12289,8 +12319,8 @@ def _review_failed_items_for_lesson(user_id, course_id, lesson, content_type=Non
                 vocab=[dict(x) for x in cur.fetchall()]
             if not grammar:
                 cur.execute("""
-                    SELECT DISTINCT r.grammar_id AS id,
-                           m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
+                    SELECT DISTINCT r.grammar_id AS id,r.question_snapshot,
+                           m.pattern,m.meaning,m.explanation,m.example,m.source_lesson,m.normalized_key
                     FROM user_grammar_review r
                     JOIN curriculum_grammar_master m
                       ON m.id=r.grammar_id AND m.course_id=r.course_id
@@ -12523,7 +12553,7 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             durable_item = item_type in {'vocabulary','grammar'} and item_id > 0
             if durable_item:
                 if correct: _clear_success_review(user_id,course_id,item_type,item_id)
-                else: _schedule_failed_review(user_id,course_id,item_type,item_id)
+                else: _schedule_failed_review(user_id,course_id,item_type,item_id,question=q,wrong_answer=answer)
             answers=sess.get('answers_json') or {}
             if not isinstance(answers,dict): answers={}
             answers[str(q_index)]={'item_type':item_type,'item_id':item_id,'answer':str(answer or ''),'correct':bool(correct),'answered_at':datetime.now(timezone.utc).isoformat()}
@@ -12562,6 +12592,105 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
         conn.close()
 
 
+def _review_snapshot_from_question(q, *, wrong_answer=''):
+    """Persist a durable snapshot of the exact review question shown to the learner."""
+    row=dict(q or {})
+    item_type=str(row.get('item_type') or '').strip()
+    try:
+        item_id=int(row.get('item_id') or 0)
+    except Exception:
+        item_id=0
+    options=row.get('options') if isinstance(row.get('options'),list) else []
+    option_letters=row.get('option_letters') if isinstance(row.get('option_letters'),dict) else {}
+    snap={
+        'item_type':item_type,
+        'item_id':item_id,
+        'question_type':str(row.get('question_type') or 'multiple_choice'),
+        'question':str(row.get('question') or '').strip(),
+        'options':[str(x) for x in options],
+        'option_letters':{str(k):str(v) for k,v in option_letters.items() if str(k) in {'A','B','C','D'}},
+        'answer':str(row.get('answer') or '').strip().upper(),
+        'answer_text':str(row.get('answer_text') or '').strip(),
+        'answer_criteria':str(row.get('answer_criteria') or '').strip(),
+        'pattern':str(row.get('pattern') or '').strip(),
+        'meaning':str(row.get('meaning') or '').strip(),
+        'explanation':str(row.get('explanation') or '').strip(),
+        'example':str(row.get('example') or '').strip(),
+        'source_lesson':str(row.get('source_lesson') or '').strip(),
+    }
+    if wrong_answer:
+        snap['wrong_answer']=str(wrong_answer).strip()
+    return snap
+
+def _review_question_from_snapshot(row):
+    """Rebuild a review MCQ directly from the durable question snapshot."""
+    raw=row.get('question_snapshot') if isinstance(row,dict) else None
+    if not isinstance(raw,dict) or not raw.get('question'):
+        return None
+    snap=dict(raw)
+    item_type=str(snap.get('item_type') or row.get('item_type') or '').strip()
+    try:
+        item_id=int(snap.get('item_id') or row.get('id') or 0)
+    except Exception:
+        item_id=int(row.get('id') or 0) if isinstance(row,dict) else 0
+    letters=snap.get('option_letters') if isinstance(snap.get('option_letters'),dict) else {}
+    opts=snap.get('options') if isinstance(snap.get('options'),list) else []
+    if len(letters)==4:
+        option_letters={k:str(letters.get(k) or '').strip() for k in ('A','B','C','D')}
+    else:
+        clean=[]
+        for x in opts:
+            val=re.sub(r'^[A-D][.)]?\s*','',str(x or '').strip(),flags=re.I)
+            if val and val not in clean:
+                clean.append(val)
+        if len(clean)!=4:
+            return None
+        option_letters={k:clean[i] for i,k in enumerate(('A','B','C','D'))}
+    if any(not option_letters[k] for k in ('A','B','C','D')):
+        return None
+    answer=str(snap.get('answer') or '').strip().upper()
+    question_type=str(snap.get('question_type') or 'multiple_choice').strip()
+    if question_type!='multiple_choice' or answer not in {'A','B','C','D'}:
+        return None
+    return {
+        'item_type':item_type or 'grammar',
+        'item_id':item_id,
+        'question_type':'multiple_choice',
+        'question':str(snap.get('question') or '').strip(),
+        'options':[f'{k}. {option_letters[k]}' for k in ('A','B','C','D')],
+        'option_letters':option_letters,
+        'answer':answer,
+        'answer_text':str(snap.get('answer_text') or option_letters[answer]).strip(),
+        'answer_criteria':str(snap.get('answer_criteria') or snap.get('answer_text') or option_letters[answer]).strip(),
+        'pattern':str(snap.get('pattern') or '').strip(),
+        'meaning':str(snap.get('meaning') or '').strip(),
+        'explanation':str(snap.get('explanation') or '').strip(),
+        'example':str(snap.get('example') or snap.get('question') or '').strip(),
+        'source_lesson':str(snap.get('source_lesson') or '').strip(),
+    }
+
+def _save_review_snapshot(user_id, course_id, item_type, item_id, question, wrong_answer=''):
+    """Save/refresh the exact review-question snapshot without changing scheduling."""
+    if not isinstance(question,dict):
+        return False
+    snap=_review_snapshot_from_question(question,wrong_answer=wrong_answer)
+    if not snap.get('question'):
+        return False
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            table='user_vocabulary_review' if item_type=='vocabulary' else 'user_grammar_review'
+            col='vocab_id' if item_type=='vocabulary' else 'grammar_id'
+            cur.execute(f"UPDATE {table} SET question_snapshot=%s::jsonb WHERE user_id=%s AND course_id=%s AND {col}=%s",
+                        (json.dumps(snap,ensure_ascii=False),user_id,course_id,item_id))
+            changed=cur.rowcount>0
+        conn.commit()
+        if changed:
+            print(f"[REVIEW SNAPSHOT BACKFILL] user={user_id} course_id={course_id} type={item_type} item_id={item_id}")
+        return changed
+    finally:
+        conn.close()
+
 def _clear_success_review(user_id, course_id, item_type, item_id):
     conn=db()
     try:
@@ -12574,21 +12703,25 @@ def _clear_success_review(user_id, course_id, item_type, item_id):
         conn.close()
 
 
-def _schedule_failed_review(user_id, course_id, item_type, item_id):
+def _schedule_failed_review(user_id, course_id, item_type, item_id, question=None, wrong_answer=''):
+    """Upsert wrong-review state and persist the exact question/answer snapshot."""
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             table='user_vocabulary_review' if item_type=='vocabulary' else 'user_grammar_review'
             col='vocab_id' if item_type=='vocabulary' else 'grammar_id'
-            cur.execute(f"SELECT wrong_count FROM {table} WHERE user_id=%s AND course_id=%s AND {col}=%s FOR UPDATE",(user_id,course_id,item_id))
+            cur.execute(f"SELECT wrong_count,question_snapshot FROM {table} WHERE user_id=%s AND course_id=%s AND {col}=%s FOR UPDATE",(user_id,course_id,item_id))
             old=cur.fetchone(); wrong_count=int(old.get('wrong_count') or 0)+1 if old else 1
             delay={1:1,2:3,3:7}.get(wrong_count,14)
             next_at=_now_local()+timedelta(days=delay)
+            snapshot=_review_snapshot_from_question(question,wrong_answer=wrong_answer) if isinstance(question,dict) else None
+            snapshot_json=json.dumps(snapshot or (old.get('question_snapshot') if old else {}) or {},ensure_ascii=False)
             if old:
-                cur.execute(f"UPDATE {table} SET wrong_count=%s,last_wrong_at=NOW(),next_review_at=%s WHERE user_id=%s AND course_id=%s AND {col}=%s",(wrong_count,next_at,user_id,course_id,item_id))
+                cur.execute(f"UPDATE {table} SET wrong_count=%s,last_wrong_at=NOW(),next_review_at=%s,question_snapshot=%s::jsonb WHERE user_id=%s AND course_id=%s AND {col}=%s",(wrong_count,next_at,snapshot_json,user_id,course_id,item_id))
             else:
-                cur.execute(f"INSERT INTO {table}(user_id,course_id,{col},wrong_count,last_wrong_at,next_review_at) VALUES(%s,%s,%s,%s,NOW(),%s)",(user_id,course_id,item_id,wrong_count,next_at))
+                cur.execute(f"INSERT INTO {table}(user_id,course_id,{col},wrong_count,last_wrong_at,next_review_at,question_snapshot) VALUES(%s,%s,%s,%s,NOW(),%s,%s::jsonb)",(user_id,course_id,item_id,wrong_count,next_at,snapshot_json))
         conn.commit()
+        print(f"[REVIEW SNAPSHOT SAVED] user={user_id} course_id={course_id} type={item_type} item_id={item_id} has_snapshot={int(bool(snapshot))}")
     finally:
         conn.close()
 
@@ -12661,7 +12794,7 @@ def _review_planned_content(user_id, course_id):
             vocab=[dict(r) for r in cur.fetchall()]
 
             cur.execute("""
-                SELECT r.grammar_id AS item_id, r.wrong_count, r.next_review_at,
+                SELECT r.grammar_id AS item_id, r.wrong_count, r.next_review_at, r.question_snapshot,
                        m.source_lesson, m.pattern, m.meaning, m.explanation, m.example
                 FROM user_grammar_review r
                 JOIN curriculum_grammar_master m
