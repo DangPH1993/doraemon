@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.65"
+SERVER_VERSION = "31.66"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -12047,6 +12047,112 @@ def _review_default_session_data(user_id, course_id):
     return {'vocabulary':vocab,'grammar':grammar}
 
 
+def _review_b1_source_questions_direct(course_id, lesson, content_type, max_questions=12):
+    """Build scheduled grammar review questions directly from the published B1/B2 DB.
+
+    For a named Ngữ pháp lesson, the source of truth is the published lesson steps:
+    B1 contains the original exercise + A/B/C/D choices and B2 contains the
+    authoritative answers. This path deliberately avoids GenAI so a malformed
+    model response can never turn a valid DB lesson into a 500/no-data error.
+    """
+    ct=_normalize_content_type(content_type or '')
+    lesson=str(lesson or '').strip()
+    if ct != 'Ngữ pháp' or not lesson or course_id in (None,''):
+        return []
+
+    rows=_published_curriculum_lesson_source(int(course_id),ct,lesson)
+    if not rows:
+        print(f"[REVIEW B1 DIRECT] course_id={course_id} lesson={lesson!r} source_rows=0")
+        return []
+
+    b1=''; b2=''
+    for r in rows:
+        code=str(r.get('step_code') or '').strip().upper()
+        content=_review_source_text(r.get('content_json'))
+        if code=='B1' and content:
+            b1=content
+        elif code=='B2' and content:
+            b2=content
+    if not b1:
+        print(f"[REVIEW B1 DIRECT] course_id={course_id} lesson={lesson!r} source_rows={len(rows)} b1=0")
+        return []
+
+    answer_map=_exercise_answer_map_from_text(b2) if b2 else {}
+    numbers=_exercise_question_numbers_from_text(b1)
+    if not numbers:
+        # Fallback: inspect numbered blocks directly, preserving source order.
+        starts=[]
+        raw=b1.replace('\\r\\n','\\n').replace('\\r','\\n')
+        for m in re.finditer(r'(?m)^\\s*(?:câu\\s*)?(\\d{1,3})[.)]\\s+',raw,flags=re.I):
+            starts.append(int(m.group(1)))
+        numbers=sorted(set(starts))
+
+    questions=[]
+    for n in numbers:
+        block=_extract_grammar_question_block(b1,n).strip()
+        if not block:
+            continue
+        option_map,question=_review_extract_choice_map(block)
+        if set(option_map)!=set('ABCD') or not question:
+            continue
+        expected=str(answer_map.get(int(n)) or '').strip()
+        # B2 can sometimes store the answer as a full choice letter while the
+        # question source itself contains the authoritative choice text.
+        answer=''
+        if re.fullmatch(r'[A-D]',expected,flags=re.I):
+            answer=expected.upper()
+        elif expected:
+            for k,v in option_map.items():
+                if str(v).strip().casefold()==expected.casefold():
+                    answer=k
+                    break
+        if answer not in {'A','B','C','D'}:
+            # A scheduled lesson review must never invent an answer. Skip only
+            # the item whose authoritative B2 answer is unavailable.
+            continue
+
+        if not re.search(r'_{2,}|\\.\\.\\.|……+',question):
+            correct_text=option_map.get(answer,'')
+            if correct_text:
+                masked=re.sub(re.escape(correct_text),'____',question,count=1,flags=re.I)
+                if masked!=question:
+                    question=masked
+        if not re.search(r'_{2,}',question):
+            # Keep the original source rather than manufacturing a different
+            # sentence. A choice-based B1 question is still valid as-is.
+            question=question.strip()
+
+        proxy_id=_ensure_review_grammar_master(
+            int(course_id),lesson,
+            question_text=block,
+            answer=answer,
+            pattern=f"{lesson} · Câu {int(n)}",
+            meaning=f"Đáp án đúng: {answer}",
+            explanation='Câu ôn lấy trực tiếp từ bài tập B1 đã publish trong DB; đáp án lấy từ B2.',
+            normalized_key=f"__b1__{int(course_id)}__{lesson.casefold()}__q{int(n)}"
+        )
+        if not proxy_id:
+            continue
+        questions.append({
+            'item_type':'grammar','item_id':int(proxy_id),'question_type':'multiple_choice',
+            'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{lesson}**:\n{question}',
+            'options':[f'{k}. {option_map[k]}' for k in ('A','B','C','D')],
+            'option_letters':option_map,'answer':answer,
+            'answer_text':option_map[answer],
+            'answer_criteria':f'Đáp án đúng: {option_map[answer]}',
+            'pattern':f'{lesson} · Câu {int(n)}',
+            'meaning':f'Đáp án đúng: {answer}',
+            'explanation':'Câu ôn lấy trực tiếp từ bài tập B1 đã publish trong DB; đáp án lấy từ B2.',
+            'example':question,
+            'source_lesson':lesson,
+        })
+        if len(questions)>=max(1,min(12,int(max_questions or 12))):
+            break
+
+    print(f"[REVIEW B1 DIRECT] course_id={course_id} lesson={lesson!r} source_rows={len(rows)} b1_questions={len(numbers)} b2_answers={len(answer_map)} recovered={len(questions)}")
+    return questions
+
+
 def _review_source_lesson_questions(course_id, lesson, content_type, max_questions=8):
     """Create DB-source-only MCQ questions for a scheduled lesson without master rows.
 
@@ -12168,20 +12274,28 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
             if not data['vocabulary'] and not data['grammar']:
                 raise HTTPException(404,f'Bài {requested_lesson!r} hiện chưa có từ vựng/ngữ pháp nào bị trả lời sai để làm lại.')
         else:
-            ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
-            if ids['vocabulary'] or ids['grammar']:
-                due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
-                data=_review_master_payload(int(course_id),due)
-            else:
-                # Standalone grammar can be fully published in curriculum_steps without
-                # structured master rows. Use that exact published DB source as a quiz fallback.
-                ct=requested_type or 'Ngữ pháp'
-                if not _published_curriculum_lesson_source(int(course_id),ct,requested_lesson):
-                    raise HTTPException(404,f'Bài {requested_lesson!r} chưa có dữ liệu DB đã publish để ôn.')
-                source_questions=_review_source_lesson_questions(int(course_id),requested_lesson,ct,max_questions)
-                if not source_questions:
-                    raise HTTPException(404,f'Bài {requested_lesson!r} chưa tạo được câu hỏi ôn từ nội dung DB đã publish.')
+            effective_type=requested_type or 'Ngữ pháp'
+            # Named grammar lessons are reviewed directly from the published B1/B2
+            # curriculum source. This is the canonical DB source and avoids sending
+            # a valid lesson through the GenAI validator just to create MCQ4.
+            if _normalize_content_type(effective_type) == 'Ngữ pháp':
+                source_questions=_review_b1_source_questions_direct(int(course_id),requested_lesson,effective_type,max_questions)
+            if source_questions:
                 data={'vocabulary':[],'grammar':[]}
+            else:
+                ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
+                if ids['vocabulary'] or ids['grammar']:
+                    due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
+                    data=_review_master_payload(int(course_id),due)
+                else:
+                    # Standalone grammar/curriculum source fallback.
+                    ct=requested_type or 'Ngữ pháp'
+                    if not _published_curriculum_lesson_source(int(course_id),ct,requested_lesson):
+                        raise HTTPException(404,f'Bài {requested_lesson!r} chưa có dữ liệu DB đã publish để ôn.')
+                    source_questions=_review_source_lesson_questions(int(course_id),requested_lesson,ct,max_questions)
+                    if not source_questions:
+                        raise HTTPException(404,f'Bài {requested_lesson!r} chưa tạo được câu hỏi ôn từ nội dung DB đã publish.')
+                    data={'vocabulary':[],'grammar':[]}
         source_lesson=requested_lesson
     else:
         if only_failed:
