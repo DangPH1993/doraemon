@@ -1,4 +1,4 @@
-# VERSION: v31.52 — fix grammar review options to stay on the same grammar target — welcome/review de-dup + applied grammar review + wrong-answer persistence
+# VERSION: v31.63 — robust DB-first WRONG_ONLY grammar recovery from stored/rich-text/published B1 sources
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.62"
+SERVER_VERSION = "31.63"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5814,73 +5814,122 @@ def _review_grammar_question_is_applied(question):
     return any(x in text for x in applied_markers)
 
 
+def _review_source_text(value):
+    """Flatten curriculum rich-text/JSON into plain text while keeping choice boundaries."""
+    if value is None:
+        return ''
+    if isinstance(value, (dict, list, tuple)):
+        parts=[]
+        if isinstance(value, dict):
+            # Common rich-text keys first so the resulting text follows author order.
+            preferred=('content','text','html','body','markdown','value','label','question','options','items','children','blocks')
+            seen=set()
+            for key in preferred:
+                if key in value and key not in seen:
+                    seen.add(key)
+                    txt=_review_source_text(value.get(key))
+                    if txt: parts.append(txt)
+            for key,val in value.items():
+                if key in seen: continue
+                txt=_review_source_text(val)
+                if txt: parts.append(txt)
+        else:
+            for val in value:
+                txt=_review_source_text(val)
+                if txt: parts.append(txt)
+        return '\n'.join(x for x in parts if x).strip()
+    text=html.unescape(str(value))
+    text=re.sub(r'<br\s*/?>', '\n', text, flags=re.I)
+    text=re.sub(r'</(?:p|li|div|tr|td|th|h[1-6]|ol|ul)>', '\n', text, flags=re.I)
+    text=re.sub(r'<li[^>]*>', '\n', text, flags=re.I)
+    text=re.sub(r'<[^>]+>', ' ', text)
+    text=text.replace('\xa0',' ')
+    text=re.sub(r'[ \t]+', ' ', text)
+    text=re.sub(r'\n\s*\n+', '\n', text)
+    return text.strip()
+
+
+def _review_extract_choice_map(raw_text):
+    """Extract A/B/C/D options from common plain-text and rich-text formats."""
+    text=_review_source_text(raw_text)
+    if not text:
+        return {}, ''
+    # Normalize list bullets and markdown around choice labels, but keep the text.
+    text=re.sub(r'[`*~_]+', '', text)
+    text=re.sub(r'\r\n?', '\n', text)
+    lines=[x.strip() for x in text.split('\n') if x.strip()]
+
+    marker=r'(?:^|\s)(?:[-*•▪●]+\s*)?(?:\(?\[?([A-D])\]?\)?[.\):：\-]\s+|\(?\[?([A-D])\]?\)?\s{2,})'
+    values={}
+
+    # First, parse line-oriented choices. Allow numbering/bullets before A-D.
+    line_re=re.compile(r'^\s*(?:\d+[.)]\s*)?(?:[-*•▪●]+\s*)?(?:\(?\[?([A-D])\]?\)?[.\):：\-]|\(?\[?([A-D])\]?\)?)\s+(.*?)\s*$', re.I)
+    for line in lines:
+        m=line_re.match(line)
+        if not m:
+            continue
+        letter=(m.group(1) or m.group(2) or '').upper()
+        value=(m.group(3) or '').strip()
+        if letter in 'ABCD' and value and letter not in values:
+            values[letter]=value
+
+    if set(values)!=set('ABCD'):
+        # Parse inline choices while allowing HTML/rich-text flattening.
+        compact=' '.join(lines)
+        inline_re=re.compile(r'(?<![A-Za-z])(?:\(?\[?([A-D])\]?\)?)[.\):：\-]\s*(.+?)(?=\s+(?:\(?\[?[A-D]\]?\)?)[.\):：\-]\s*|$)', re.I)
+        for m in inline_re.finditer(compact):
+            letter=m.group(1).upper()
+            value=m.group(2).strip()
+            if value and letter not in values and len(value)<=180:
+                values[letter]=value
+
+    if set(values)!=set('ABCD'):
+        return {}, text
+
+    # Question is everything before the first A/B/C/D option marker.
+    compact=' '.join(lines)
+    first_re=re.search(r'(?<![A-Za-z])(?:\(?\[?[A-D]\]?\)?)[.\):：\-]\s+', compact, flags=re.I)
+    question=compact[:first_re.start()].strip() if first_re else ''
+    if not question:
+        qlines=[]
+        for line in lines:
+            if line_re.match(line): break
+            qlines.append(line)
+        question=' '.join(qlines).strip()
+    question=re.sub(r'^\s*(?:câu\s*)?\d{1,3}\s*[.)\-:]\s*', '', question, flags=re.I).strip()
+    return values,question
+
+
 def _review_grammar_question_from_stored_example(item):
-    """Recover a grammar MCQ4 from the persisted B1 question block."""
+    """Recover a grammar MCQ4 from curriculum_grammar_master.example, including rich text."""
     row=dict(item or {})
     item_id=int(row.get('id') or 0)
     pattern=str(row.get('pattern') or '').strip()
     meaning=str(row.get('meaning') or '').strip()
-    example=str(row.get('example') or '').replace('\r\n','\n').replace('\r','\n').strip()
+    raw_example=row.get('example')
+    example=_review_source_text(raw_example)
     if not example:
         return None
 
-    # WRONG_ONLY proxy rows normally store the official answer as A/B/C/D.
-    m=re.search(r'đáp\s*án\s+đúng\s*:\s*([A-D])\b', meaning, flags=re.I)
+    m=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*([A-D])\b', meaning, flags=re.I)
     answer=(m.group(1).upper() if m else str(row.get('answer') or '').strip().upper())
     if answer not in {'A','B','C','D'}:
         return None
 
-    # Normalize light Markdown around choice labels without destroying sentence text.
-    text=example.replace('\r\n','\n').replace('\r','\n')
-    lines=[re.sub(r'[`*]+','',x).strip() for x in text.split('\n') if x.strip()]
-
-    source_map={}
-    # Standard one-choice-per-line format.
-    for line in lines:
-        mm=re.match(r'^\s*([A-D])[.)::]?\s*(.+?)\s*$', line, flags=re.I)
-        if mm:
-            letter=mm.group(1).upper()
-            value=mm.group(2).strip()
-            if value and letter not in source_map:
-                source_map[letter]=value
-
-    # Inline format: A. ... B. ... C. ... D. ...
-    if set(source_map)!=set('ABCD'):
-        compact=' '.join(lines)
-        for mm in re.finditer(r'(?<![A-Za-z])([A-D])[.)::]\s*(.+?)(?=\s+[A-D][.)::]\s+|$)', compact, flags=re.I):
-            letter=mm.group(1).upper()
-            value=re.sub(r'[`*]+','',mm.group(2)).strip()
-            if value and letter not in source_map and len(value)<=160:
-                source_map[letter]=value
-
-    if set(source_map)!=set('ABCD'):
+    source_map,question=_review_extract_choice_map(example)
+    if set(source_map)!=set('ABCD') or not question:
         return None
 
-    # Build the sentence portion before the first answer choice.
-    joined=' '.join(lines)
-    first=re.search(r'(?<![A-Za-z])[A-D][.)::]\s+', joined, flags=re.I)
-    if first:
-        question=joined[:first.start()].strip()
-    else:
-        qlines=[]
-        for line in lines:
-            if re.match(r'^\s*[A-D][.)::]\s+', line, flags=re.I):
-                break
-            qlines.append(line)
-        question='\n'.join(qlines).strip()
-
-    # Remove a leading question number such as "1." or "Câu 1:".
-    question=re.sub(r'^\s*(?:câu\s*)?\d{1,3}\s*[.)\-:]\s*', '', question, flags=re.I)
-    if not question:
-        return None
-
-    # Keep an original blank when present; otherwise mask the correct option text.
+    # Preserve the original blank. If the original text has no visible blank,
+    # replace the authoritative correct option text exactly once.
     if not re.search(r'_{2,}|\.\.\.|……+', question):
         correct_text=source_map.get(answer,'')
         if correct_text:
             masked=re.sub(re.escape(correct_text), '____', question, count=1, flags=re.I)
             if masked!=question:
                 question=masked
+    if not question:
+        return None
 
     print(f'[REVIEW STORED B1] item_id={item_id} source=curriculum_grammar_master.example')
     return {
@@ -5896,137 +5945,142 @@ def _review_grammar_question_from_stored_example(item):
         'example':question,
     }
 
-
 def _review_grammar_proxy_question_from_published_source(course_id, item):
-    """Build a valid MCQ4 directly from the original published B1 question.
-
-    WRONG_ONLY grammar rows are durable review pointers. Their stored `example`
-    may be incomplete, so the authoritative source is the published B1 step in
-    `curriculum_steps`. The lookup intentionally does NOT require the lesson's
-    content_type to be exactly ``Ngữ pháp`` because older curriculum data can use
-    another label while still containing the same B1/B2 steps.
-    """
+    """Recover the original grammar question from any DB-backed B1 source."""
     row=dict(item or {})
-    lesson=str(row.get('source_lesson') or '').strip()
+    item_id=int(row.get('id') or 0)
     pattern=str(row.get('pattern') or '').strip()
     meaning=str(row.get('meaning') or '').strip()
-    # The persisted B1 question block is the most reliable source. Use it first;
-    # this also works for legacy rows whose lesson name or question number can no
-    # no longer be resolved against curriculum_lessons.
+    lesson=str(row.get('source_lesson') or '').strip()
+    normalized_key=str(row.get('normalized_key') or '').strip()
+
+    # Best source: persisted B1 block stored when the wrong answer was recorded.
     stored=_review_grammar_question_from_stored_example(row)
     if stored:
         return stored
 
-    if course_id in (None,'') or not lesson:
+    if course_id in (None,''):
         return None
 
-    # Prefer an explicit question number from the proxy pattern.  Accept common
-    # spellings such as "Câu 3", "Question 3", or "Q3".
+    # Recover lesson/question from the stable proxy key when available:
+    # __b1__<course>__<lesson>__q<number>
     qnum=None
-    for pat in (
-        r'(?i)\b(?:câu|question)\s*#?\s*(\d{1,3})\b',
-        r'(?i)\bq\s*#?\s*(\d{1,3})\b',
-    ):
-        m=re.search(pat,pattern)
-        if m:
-            qnum=int(m.group(1)); break
+    km=re.match(r'^__b1__\d+__(.+)__q(\d+)$', normalized_key, flags=re.I)
+    if km:
+        lesson_from_key=str(km.group(1)).replace('__','_').strip()
+        if lesson_from_key: lesson=lesson or lesson_from_key
+        qnum=int(km.group(2))
     if qnum is None:
-        # The legacy proxy example may begin with the original numbered question.
-        example=str(row.get('example') or '').replace('\r\n','\n').replace('\r','\n')
-        m=re.match(r'^\s*(?:câu\s*)?(\d{1,3})\s*[.)\-:]\s+',example,flags=re.I)
-        if m:
-            qnum=int(m.group(1))
+        for pat in (
+            r'(?i)\b(?:câu|question)\s*#?\s*(\d{1,3})\b',
+            r'(?i)\bq\s*#?\s*(\d{1,3})\b',
+        ):
+            m=re.search(pat,pattern)
+            if m:
+                qnum=int(m.group(1)); break
     if qnum is None:
-        return None
+        ex=_review_source_text(row.get('example'))
+        m=re.match(r'^\s*(?:câu\s*)?(\d{1,3})\s*[.)\-:]\s+',ex,flags=re.I)
+        if m: qnum=int(m.group(1))
 
-    am=re.search(r'đáp\s*án\s+đúng\s*:\s*([A-D])\b',meaning,flags=re.I)
+    am=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*([A-D])\b',meaning,flags=re.I)
     answer=(am.group(1).upper() if am else str(row.get('answer') or '').strip().upper())
     if answer not in {'A','B','C','D'}:
         return None
 
-    # Query by course + lesson + PUBLISHED status only; do not hard-code a
-    # content_type here. This makes WRONG_ONLY compatible with legacy lessons.
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT cs.step_code,cs.step_order,cs.step_type,cs.content_json
-                FROM curriculum_lessons cl
-                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
-                WHERE cl.status='PUBLISHED'
-                  AND cl.course_id=%s
-                  AND lower(trim(coalesce(cl.lesson,'')))=lower(trim(%s))
-                ORDER BY cs.step_order,cs.id
-            """,(int(course_id),lesson))
-            rows=[dict(r) for r in cur.fetchall() or []]
-    finally:
-        conn.close()
+    def fetch_source(lesson_filter=None):
+        conn=db()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if lesson_filter:
+                    cur.execute("""
+                        SELECT cs.step_code,cs.step_order,cs.step_type,cs.content_json
+                        FROM curriculum_lessons cl
+                        JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                        WHERE cl.status='PUBLISHED' AND cl.course_id=%s
+                          AND lower(trim(coalesce(cl.lesson,'')))=lower(trim(%s))
+                        ORDER BY cs.step_order,cs.id
+                    """,(int(course_id),lesson_filter))
+                else:
+                    cur.execute("""
+                        SELECT cl.lesson,cs.step_code,cs.step_order,cs.step_type,cs.content_json
+                        FROM curriculum_lessons cl
+                        JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                        WHERE cl.status='PUBLISHED' AND cl.course_id=%s
+                        ORDER BY lower(trim(coalesce(cl.lesson,''))),cs.step_order,cs.id
+                    """,(int(course_id),))
+                return [dict(r) for r in cur.fetchall() or []]
+        finally:
+            conn.close()
+
+    rows=fetch_source(lesson if lesson else None)
+    # If lesson-scoped lookup failed because the proxy source_lesson is stale or
+    # mismatched, scan every published B1 step in the course and match the stored text.
     if not rows:
+        rows=fetch_source(None)
+    if not rows:
+        print(f'[REVIEW PUBLISHED B1] item_id={item_id} source_rows=0 course_id={course_id}')
         return None
 
-    # Prefer the B1 step; when step_code is absent, use the richest text that
-    # contains numbered answer choices.
-    candidates=[]
+    source_example=_review_source_text(row.get('example'))
+    source_norm=re.sub(r'[^a-z0-9]+',' ',source_example.casefold()).strip() if source_example else ''
+    best=None
     for r in rows:
+        content=r.get('content_json')
+        txt=_review_source_text(content)
+        if not txt: continue
         code=str(r.get('step_code') or '').strip().upper()
-        content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
-        txt=str(content.get('content') or content.get('text') or '').strip()
-        if txt:
-            candidates.append((0 if code=='B1' else 1,txt))
-    candidates.sort(key=lambda x:x[0])
-    b1_text=''
-    for _,txt in candidates:
-        if re.search(r'(?mi)^\s*(?:câu\s*)?\d{1,3}\s*[.)\-:]',txt) and re.search(r'(?mi)^\s*[A-D][.)]\s+',txt):
-            b1_text=txt
-            break
-    if not b1_text and candidates:
-        b1_text=candidates[0][1]
-    if not b1_text:
+        # Prefer explicit B1 content; the parser itself determines if the text has choices.
+        if code not in {'B1',''}:
+            continue
+        q_candidates=[]
+        if qnum is not None:
+            block=_extract_grammar_question_block(txt,qnum).strip()
+            if block: q_candidates=[block]
+        else:
+            # Parse every numbered question in the source when proxy numbering is absent.
+            numbers=_exercise_question_numbers_from_text(txt)
+            q_candidates=[_extract_grammar_question_block(txt,n).strip() for n in numbers]
+        if not q_candidates:
+            q_candidates=[txt]
+        for block in q_candidates:
+            option_map,question=_review_extract_choice_map(block)
+            if set(option_map)!=set('ABCD') or not question:
+                continue
+            score=0
+            if code=='B1': score+=100
+            if lesson and str(r.get('lesson') or '').strip().casefold()==lesson.casefold(): score+=300
+            if qnum is not None: score+=20
+            if source_norm:
+                qnorm=re.sub(r'[^a-z0-9]+',' ',question.casefold()).strip()
+                qt=set(qnorm.split()); st=set(source_norm.split())
+                if qt and st: score+=min(180,int(180*len(qt&st)/max(1,len(st))))
+            best_candidate=(score,r,option_map,question)
+            if best is None or score>best[0]:
+                best=best_candidate
+    if not best:
+        print(f'[REVIEW PUBLISHED B1] item_id={item_id} source_rows={len(rows)} parsed=0 course_id={course_id}')
         return None
 
-    block=_extract_grammar_question_block(b1_text,qnum).strip()
-    if not block:
-        return None
-
-    # Support line-separated choices first, then compact inline choices.
-    source_map={}
-    for line in block.splitlines():
-        m=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$',line,flags=re.I)
-        if m and m.group(1).upper() not in source_map:
-            val=m.group(2).strip()
-            if val: source_map[m.group(1).upper()]=val
-    if set(source_map)!=set('ABCD'):
-        compact=' '.join(x.strip() for x in block.splitlines() if x.strip())
-        for m in re.finditer(r'(?<!\w)([A-D])[.)]\s*(.+?)(?=\s+[A-D][.)]\s+|$)',compact,flags=re.I):
-            letter=m.group(1).upper(); val=m.group(2).strip()
-            if val and letter not in source_map and len(val)<=120:
-                source_map[letter]=val
-    if set(source_map)!=set('ABCD'):
-        return None
-
-    qlines=[]
-    for line in block.splitlines():
-        if re.match(r'^\s*[A-D][.)]\s+',line,flags=re.I):
-            break
-        qlines.append(line)
-    question='\n'.join(qlines).strip()
-    if not question:
-        return None
-
-    option_letters={k:source_map[k] for k in 'ABCD'}
-    print(f"[REVIEW PUBLISHED B1] course_id={course_id} lesson={lesson!r} qnum={qnum} item_id={int(row.get('id') or 0)} source=curriculum_steps")
+    _,r,option_letters,question=best
+    if not re.search(r'_{2,}|\.\.\.|……+',question):
+        correct_text=option_letters.get(answer,'')
+        if correct_text:
+            masked=re.sub(re.escape(correct_text),'____',question,count=1,flags=re.I)
+            if masked!=question: question=masked
+    source_lesson=str(r.get('lesson') or lesson).strip()
+    print(f"[REVIEW PUBLISHED B1] course_id={course_id} lesson={source_lesson!r} qnum={qnum} item_id={item_id} source=curriculum_steps")
     return {
-        'item_type':'grammar','item_id':int(row.get('id') or 0),'question_type':'multiple_choice',
-        'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or lesson}**:\n{question}',
+        'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
+        'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or source_lesson or "ngữ pháp của bài"}**:\n{question}',
         'options':[f'{k}. {option_letters[k]}' for k in 'ABCD'],
         'option_letters':option_letters,'answer':answer,
         'answer_text':option_letters[answer],
-        'answer_criteria':meaning or f'Đáp án đúng: {answer}',
+        'answer_criteria':meaning or f'Đáp án đúng: {option_letters[answer]}',
         'pattern':pattern,'meaning':meaning,
         'explanation':str(row.get('explanation') or '').strip(),
         'example':question,
     }
-
 
 def _review_grammar_fallback_question(item, all_grammar=None, course_id=None):
     """Build an applied grammar MCQ with exactly four related options.
@@ -11446,7 +11500,7 @@ def _review_due_items(user_id, course_id):
                            ORDER BY r.next_review_at,r.vocab_id""",(user_id,course_id))
             vocab_all=[dict(x) for x in cur.fetchall()]
             cur.execute("""SELECT r.grammar_id AS item_id,r.wrong_count,r.next_review_at,
-                                  m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
+                                  m.id,m.normalized_key,m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
                            FROM user_grammar_review r
                            JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
                            WHERE r.user_id=%s AND r.course_id=%s
@@ -11505,7 +11559,7 @@ def _review_master_payload(course_id, due):
                                FROM curriculum_vocab_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,vids))
                 vocab=[dict(x) for x in cur.fetchall()]
             if gids:
-                cur.execute("""SELECT id,pattern,meaning,explanation,example,source_lesson
+                cur.execute("""SELECT id,normalized_key,pattern,meaning,explanation,example,source_lesson
                                FROM curriculum_grammar_master WHERE course_id=%s AND id=ANY(%s)""",(course_id,gids))
                 grammar=[dict(x) for x in cur.fetchall()]
             return {"vocabulary":vocab,"grammar":grammar}
@@ -11682,14 +11736,18 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         for item in selected_grammar:
             item_id=int(item.get('id') or 0)
             q=_review_grammar_question_from_stored_example(item)
+            source='stored_example' if q else ''
             if not q:
                 q=_review_grammar_proxy_question_from_published_source(int(course_id),item)
+                source='published_b1' if q else ''
             if not q:
                 q=_review_grammar_fallback_question(item,selected_grammar,course_id)
+                source='grammar_fallback' if q else ''
             if q:
                 questions.append(q)
+                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source={source}")
             else:
-                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source_unavailable=1")
+                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source_unavailable=1 normalized_key={str(item.get('normalized_key') or '')!r} source_lesson={str(item.get('source_lesson') or '')!r} example_chars={len(str(item.get('example') or ''))}")
 
         # Final deterministic format guarantee.
         questions=[q for q in questions if isinstance(q,dict)
