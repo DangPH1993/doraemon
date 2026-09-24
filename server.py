@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.59"
+SERVER_VERSION = "31.60"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5886,13 +5886,13 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
     question='\n'.join(qlines).strip()
     if not question:
         return None
-    # Preserve the source blank; if missing, do not invent a new target.
-    if not re.search(r'_{2,}',question):
-        return None
 
     option_letters={k:source_map[k] for k in 'ABCD'}
-    if not _review_grammar_options_are_related(question,option_letters,answer):
-        return None
+    # These four choices come from the published B1 exercise itself, so they are
+    # already authoritative for this exact question. Do not run the generic
+    # morphology/relatedness validator here: it can reject legitimate pairs such
+    # as begin/began/beginning/to begin even though all four choices belong to the
+    # same original question.
     return {
         'item_type':'grammar','item_id':int(row.get('id') or 0),'question_type':'multiple_choice',
         'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or lesson}**:\n{question}',
@@ -5936,6 +5936,19 @@ def _review_grammar_fallback_question(item, all_grammar=None, course_id=None):
     if not expected:
         return None
 
+    # WRONG_ONLY proxy rows store the official answer as A/B/C/D while the
+    # persisted example can be only a sentence, or can use formatting that does not
+    # contain a literal blank. Recover the four authoritative choices from the
+    # published B1 exercise BEFORE requiring a blank in the stored example.
+    if re.fullmatch(r'[A-D]', expected, flags=re.I) and course_id not in (None, "") and str(row.get("source_lesson") or "").strip():
+        try:
+            recovered = _review_grammar_proxy_question_from_published_source(int(course_id), row)
+            if recovered:
+                print(f"[REVIEW FORMAT GUARANTEE] item_type=grammar item_id={item_id} source=published_b1 format=MCQ4")
+                return recovered
+        except Exception as exc:
+            print(f"[REVIEW B1 SOURCE FALLBACK] item_id={item_id} skipped: {type(exc).__name__}: {exc}")
+
     # Keep only the actual question text. Original A/B/C/D lines must never leak
     # into the learner-facing question.
     lines=[str(x).strip() for x in example.replace('\r\n','\n').replace('\r','\n').split('\n')]
@@ -5962,19 +5975,9 @@ def _review_grammar_fallback_question(item, all_grammar=None, course_id=None):
         except Exception:
             pass
     if '____' not in masked:
-        return None
-
-    # WRONG_ONLY proxy rows often persist only the correct choice letter (A/B/C/D)
-    # while their master `example` contains only the sentence. In that case, recover
-    # the authoritative four choices from the published B1 question in curriculum_steps.
-    if re.fullmatch(r'[A-D]', expected, flags=re.I) and course_id not in (None, "") and str(row.get("source_lesson") or "").strip():
-        try:
-            recovered = _review_grammar_proxy_question_from_published_source(int(course_id), row)
-            if recovered:
-                print(f"[REVIEW FORMAT GUARANTEE] item_type=grammar item_id={item_id} source=published_b1 format=MCQ4")
-                return recovered
-        except Exception as exc:
-            print(f"[REVIEW B1 SOURCE FALLBACK] item_id={item_id} skipped: {type(exc).__name__}: {exc}")
+        # A legacy proxy may contain the sentence without a visible blank. It is
+        # still a valid applied MCQ when paired with its exact B1 choices.
+        masked=question_text
 
     # When the persisted official answer is a choice letter (A/B/C/D), the
     # original B1 block already contains the four authoritative answer choices.
