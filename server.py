@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.61"
+SERVER_VERSION = "31.62"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5814,6 +5814,89 @@ def _review_grammar_question_is_applied(question):
     return any(x in text for x in applied_markers)
 
 
+def _review_grammar_question_from_stored_example(item):
+    """Recover a grammar MCQ4 from the persisted B1 question block."""
+    row=dict(item or {})
+    item_id=int(row.get('id') or 0)
+    pattern=str(row.get('pattern') or '').strip()
+    meaning=str(row.get('meaning') or '').strip()
+    example=str(row.get('example') or '').replace('\r\n','\n').replace('\r','\n').strip()
+    if not example:
+        return None
+
+    # WRONG_ONLY proxy rows normally store the official answer as A/B/C/D.
+    m=re.search(r'đáp\s*án\s+đúng\s*:\s*([A-D])\b', meaning, flags=re.I)
+    answer=(m.group(1).upper() if m else str(row.get('answer') or '').strip().upper())
+    if answer not in {'A','B','C','D'}:
+        return None
+
+    # Normalize light Markdown around choice labels without destroying sentence text.
+    text=example.replace('\r\n','\n').replace('\r','\n')
+    lines=[re.sub(r'[`*]+','',x).strip() for x in text.split('\n') if x.strip()]
+
+    source_map={}
+    # Standard one-choice-per-line format.
+    for line in lines:
+        mm=re.match(r'^\s*([A-D])[.)::]?\s*(.+?)\s*$', line, flags=re.I)
+        if mm:
+            letter=mm.group(1).upper()
+            value=mm.group(2).strip()
+            if value and letter not in source_map:
+                source_map[letter]=value
+
+    # Inline format: A. ... B. ... C. ... D. ...
+    if set(source_map)!=set('ABCD'):
+        compact=' '.join(lines)
+        for mm in re.finditer(r'(?<![A-Za-z])([A-D])[.)::]\s*(.+?)(?=\s+[A-D][.)::]\s+|$)', compact, flags=re.I):
+            letter=mm.group(1).upper()
+            value=re.sub(r'[`*]+','',mm.group(2)).strip()
+            if value and letter not in source_map and len(value)<=160:
+                source_map[letter]=value
+
+    if set(source_map)!=set('ABCD'):
+        return None
+
+    # Build the sentence portion before the first answer choice.
+    joined=' '.join(lines)
+    first=re.search(r'(?<![A-Za-z])[A-D][.)::]\s+', joined, flags=re.I)
+    if first:
+        question=joined[:first.start()].strip()
+    else:
+        qlines=[]
+        for line in lines:
+            if re.match(r'^\s*[A-D][.)::]\s+', line, flags=re.I):
+                break
+            qlines.append(line)
+        question='\n'.join(qlines).strip()
+
+    # Remove a leading question number such as "1." or "Câu 1:".
+    question=re.sub(r'^\s*(?:câu\s*)?\d{1,3}\s*[.)\-:]\s*', '', question, flags=re.I)
+    if not question:
+        return None
+
+    # Keep an original blank when present; otherwise mask the correct option text.
+    if not re.search(r'_{2,}|\.\.\.|……+', question):
+        correct_text=source_map.get(answer,'')
+        if correct_text:
+            masked=re.sub(re.escape(correct_text), '____', question, count=1, flags=re.I)
+            if masked!=question:
+                question=masked
+
+    print(f'[REVIEW STORED B1] item_id={item_id} source=curriculum_grammar_master.example')
+    return {
+        'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
+        'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or "ngữ pháp của bài"}**:\n{question}',
+        'options':[f'{k}. {source_map[k]}' for k in ('A','B','C','D')],
+        'option_letters':source_map,
+        'answer':answer,
+        'answer_text':source_map[answer],
+        'answer_criteria':f'Đáp án đúng: {source_map[answer]}',
+        'pattern':pattern,'meaning':meaning,
+        'explanation':str(row.get('explanation') or '').strip(),
+        'example':question,
+    }
+
+
 def _review_grammar_proxy_question_from_published_source(course_id, item):
     """Build a valid MCQ4 directly from the original published B1 question.
 
@@ -5827,6 +5910,13 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
     lesson=str(row.get('source_lesson') or '').strip()
     pattern=str(row.get('pattern') or '').strip()
     meaning=str(row.get('meaning') or '').strip()
+    # The persisted B1 question block is the most reliable source. Use it first;
+    # this also works for legacy rows whose lesson name or question number can no
+    # no longer be resolved against curriculum_lessons.
+    stored=_review_grammar_question_from_stored_example(row)
+    if stored:
+        return stored
+
     if course_id in (None,'') or not lesson:
         return None
 
@@ -11580,6 +11670,34 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
     selected_ids.update({('grammar',int(x.get('id') or 0)) for x in grammar})
     selected_vocab=vocab
     selected_grammar=grammar
+
+    # WRONG_ONLY is a retry queue over durable DB items. Do not call the LLM to
+    # invent/reconstruct these questions. Reuse the original B1 choices directly.
+    if only_failed:
+        questions=[]
+        for item in selected_vocab:
+            q=_review_vocab_question(item,selected_vocab,mode='mcq')
+            if q:
+                questions.append(q)
+        for item in selected_grammar:
+            item_id=int(item.get('id') or 0)
+            q=_review_grammar_question_from_stored_example(item)
+            if not q:
+                q=_review_grammar_proxy_question_from_published_source(int(course_id),item)
+            if not q:
+                q=_review_grammar_fallback_question(item,selected_grammar,course_id)
+            if q:
+                questions.append(q)
+            else:
+                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source_unavailable=1")
+
+        # Final deterministic format guarantee.
+        questions=[q for q in questions if isinstance(q,dict)
+                   and str(q.get('question_type') or '')=='multiple_choice'
+                   and isinstance(q.get('options'),list) and len(q.get('options'))==4
+                   and str(q.get('answer') or '').upper() in {'A','B','C','D'}]
+        print(f"[REVIEW WRONG-ONLY DB FIRST] course_id={course_id} selected_vocab={len(selected_vocab)} selected_grammar={len(selected_grammar)} recovered={len(questions)}")
+        return questions[:max_q]
 
     prompt_data={
         'task':'Tạo câu hỏi ôn tập tiếng Nhật theo kiểu quiz, MỖI LẦN CHỈ 1 CÂU cho người học.',
