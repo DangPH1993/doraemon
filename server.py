@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.64"
+SERVER_VERSION = "31.65"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -12550,10 +12550,21 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
             course_id=int(sess['course_id'])
             item_type=str(q.get('item_type') or '')
             item_id=int(q.get('item_id') or 0)
+            review_scope=str(sess.get('review_scope') or 'FULL').upper()
             durable_item = item_type in {'vocabulary','grammar'} and item_id > 0
+
+            # WRONG_ONLY is a one-shot retry queue: once the learner has answered
+            # the failed question again, remove it permanently from the wrong-review
+            # tables regardless of whether the retry is correct or incorrect.
+            # A mistake during the retry must NOT schedule the same question again.
             if durable_item:
-                if correct: _clear_success_review(user_id,course_id,item_type,item_id)
-                else: _schedule_failed_review(user_id,course_id,item_type,item_id,question=q,wrong_answer=answer)
+                if review_scope == 'WRONG_ONLY':
+                    _clear_success_review(user_id,course_id,item_type,item_id)
+                    print(f"[REVIEW WRONG-ONLY CONSUMED] user={user_id} course_id={course_id} type={item_type} item_id={item_id} retry_correct={int(bool(correct))} deleted=1")
+                elif correct:
+                    _clear_success_review(user_id,course_id,item_type,item_id)
+                else:
+                    _schedule_failed_review(user_id,course_id,item_type,item_id,question=q,wrong_answer=answer)
             answers=sess.get('answers_json') or {}
             if not isinstance(answers,dict): answers={}
             answers[str(q_index)]={'item_type':item_type,'item_id':item_id,'answer':str(answer or ''),'correct':bool(correct),'answered_at':datetime.now(timezone.utc).isoformat()}
@@ -12568,7 +12579,27 @@ def _process_review_answer(user_id, session_id, answer, expected_item_type=None,
                 conn.commit(); finished=False
             result={'success':True,'session_id':sid,'course_id':course_id,'item_type':item_type,'item_id':item_id,
                     'correct':bool(correct),'explanation':explanation,'finished':finished,'next_question_index':next_idx}
-            feedback=('✅ Chính xác!' if correct else f'❌ Chưa đúng. {explanation}')
+            correct_letter=str(q.get('answer') or '').strip().upper()
+            correct_text=str(q.get('answer_text') or '').strip()
+            stored_explanation=str(q.get('explanation') or '').strip()
+            if _review_effective_question_type(q) == 'multiple_choice':
+                if correct_letter in {'A','B','C','D'} and correct_text:
+                    answer_expl=f'Đáp án đúng: **{correct_letter}** — {correct_text}.'
+                elif correct_letter in {'A','B','C','D'}:
+                    answer_expl=f'Đáp án đúng: **{correct_letter}**.'
+                else:
+                    answer_expl=''
+                if stored_explanation and stored_explanation.casefold() not in answer_expl.casefold():
+                    answer_expl += (' ' if answer_expl else '') + stored_explanation
+                if correct:
+                    feedback='✅ Chính xác!' + (f'\n{answer_expl}' if answer_expl else '')
+                else:
+                    feedback='❌ Chưa đúng.' + (f'\n{answer_expl}' if answer_expl else (f'\n{explanation}' if explanation else ''))
+            else:
+                if correct:
+                    feedback='✅ Chính xác!' + (f'\n{explanation}' if explanation else '')
+                else:
+                    feedback=f'❌ Chưa đúng. {explanation}' if explanation else '❌ Chưa đúng.'
             if finished:
                 source_lesson=str(sess.get('source_lesson') or '')
                 review_scope=str(sess.get('review_scope') or 'FULL').upper()
