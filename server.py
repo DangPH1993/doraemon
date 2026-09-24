@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.60"
+SERVER_VERSION = "31.61"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5817,9 +5817,11 @@ def _review_grammar_question_is_applied(question):
 def _review_grammar_proxy_question_from_published_source(course_id, item):
     """Build a valid MCQ4 directly from the original published B1 question.
 
-    Wrong-review proxy rows may only store the official answer as a choice letter.
-    The safest source for the four options is therefore the original B1 exercise
-    in curriculum_steps for the same lesson/question number.
+    WRONG_ONLY grammar rows are durable review pointers. Their stored `example`
+    may be incomplete, so the authoritative source is the published B1 step in
+    `curriculum_steps`. The lookup intentionally does NOT require the lesson's
+    content_type to be exactly ``Ngữ pháp`` because older curriculum data can use
+    another label while still containing the same B1/B2 steps.
     """
     row=dict(item or {})
     lesson=str(row.get('source_lesson') or '').strip()
@@ -5828,32 +5830,67 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
     if course_id in (None,'') or not lesson:
         return None
 
-    qm=re.search(r'\b(?:câu|question)?\s*(\d{1,3})\b',pattern,flags=re.I)
-    if not qm:
+    # Prefer an explicit question number from the proxy pattern.  Accept common
+    # spellings such as "Câu 3", "Question 3", or "Q3".
+    qnum=None
+    for pat in (
+        r'(?i)\b(?:câu|question)\s*#?\s*(\d{1,3})\b',
+        r'(?i)\bq\s*#?\s*(\d{1,3})\b',
+    ):
+        m=re.search(pat,pattern)
+        if m:
+            qnum=int(m.group(1)); break
+    if qnum is None:
+        # The legacy proxy example may begin with the original numbered question.
+        example=str(row.get('example') or '').replace('\r\n','\n').replace('\r','\n')
+        m=re.match(r'^\s*(?:câu\s*)?(\d{1,3})\s*[.)\-:]\s+',example,flags=re.I)
+        if m:
+            qnum=int(m.group(1))
+    if qnum is None:
         return None
-    qnum=int(qm.group(1))
-    am=re.search(r'đáp án\s+đúng\s*:\s*([A-D])\b',meaning,flags=re.I)
+
+    am=re.search(r'đáp\s*án\s+đúng\s*:\s*([A-D])\b',meaning,flags=re.I)
     answer=(am.group(1).upper() if am else str(row.get('answer') or '').strip().upper())
     if answer not in {'A','B','C','D'}:
         return None
 
-    rows=_published_curriculum_lesson_source(int(course_id),'Ngữ pháp',lesson)
+    # Query by course + lesson + PUBLISHED status only; do not hard-code a
+    # content_type here. This makes WRONG_ONLY compatible with legacy lessons.
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cs.step_code,cs.step_order,cs.step_type,cs.content_json
+                FROM curriculum_lessons cl
+                JOIN curriculum_steps cs ON cs.lesson_id=cl.id
+                WHERE cl.status='PUBLISHED'
+                  AND cl.course_id=%s
+                  AND lower(trim(coalesce(cl.lesson,'')))=lower(trim(%s))
+                ORDER BY cs.step_order,cs.id
+            """,(int(course_id),lesson))
+            rows=[dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
     if not rows:
         return None
-    b1_text=''
+
+    # Prefer the B1 step; when step_code is absent, use the richest text that
+    # contains numbered answer choices.
+    candidates=[]
     for r in rows:
-        if str(r.get('step_code') or '').strip().upper()=='B1':
-            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
-            b1_text=str(content.get('content') or content.get('text') or '').strip()
-            if b1_text:
-                break
-    if not b1_text:
-        parts=[]
-        for r in rows:
-            content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
-            txt=str(content.get('content') or content.get('text') or '').strip()
-            if txt: parts.append(txt)
-        b1_text='\n'.join(parts)
+        code=str(r.get('step_code') or '').strip().upper()
+        content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+        txt=str(content.get('content') or content.get('text') or '').strip()
+        if txt:
+            candidates.append((0 if code=='B1' else 1,txt))
+    candidates.sort(key=lambda x:x[0])
+    b1_text=''
+    for _,txt in candidates:
+        if re.search(r'(?mi)^\s*(?:câu\s*)?\d{1,3}\s*[.)\-:]',txt) and re.search(r'(?mi)^\s*[A-D][.)]\s+',txt):
+            b1_text=txt
+            break
+    if not b1_text and candidates:
+        b1_text=candidates[0][1]
     if not b1_text:
         return None
 
@@ -5861,7 +5898,7 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
     if not block:
         return None
 
-    # Support both line-separated choices and compact inline choices.
+    # Support line-separated choices first, then compact inline choices.
     source_map={}
     for line in block.splitlines():
         m=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$',line,flags=re.I)
@@ -5870,14 +5907,13 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
             if val: source_map[m.group(1).upper()]=val
     if set(source_map)!=set('ABCD'):
         compact=' '.join(x.strip() for x in block.splitlines() if x.strip())
-        for m in re.finditer(r'(?<!\w)([A-D])[.)]\s*([^\n]+?)(?=\s+[A-D][.)]\s+|$)',compact,flags=re.I):
+        for m in re.finditer(r'(?<!\w)([A-D])[.)]\s*(.+?)(?=\s+[A-D][.)]\s+|$)',compact,flags=re.I):
             letter=m.group(1).upper(); val=m.group(2).strip()
             if val and letter not in source_map and len(val)<=120:
                 source_map[letter]=val
     if set(source_map)!=set('ABCD'):
         return None
 
-    # Remove the answer-option lines from the question text.
     qlines=[]
     for line in block.splitlines():
         if re.match(r'^\s*[A-D][.)]\s+',line,flags=re.I):
@@ -5888,11 +5924,7 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
         return None
 
     option_letters={k:source_map[k] for k in 'ABCD'}
-    # These four choices come from the published B1 exercise itself, so they are
-    # already authoritative for this exact question. Do not run the generic
-    # morphology/relatedness validator here: it can reject legitimate pairs such
-    # as begin/began/beginning/to begin even though all four choices belong to the
-    # same original question.
+    print(f"[REVIEW PUBLISHED B1] course_id={course_id} lesson={lesson!r} qnum={qnum} item_id={int(row.get('id') or 0)} source=curriculum_steps")
     return {
         'item_type':'grammar','item_id':int(row.get('id') or 0),'question_type':'multiple_choice',
         'question':f'Hoàn thành câu sau bằng cách chọn đáp án đúng theo **{pattern or lesson}**:\n{question}',
@@ -11590,6 +11622,25 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             by_key[key]=q
 
     questions=[]
+
+    # WRONG_ONLY grammar review should be deterministic and DB-first: recover each
+    # failed question from its original published B1 source before accepting any
+    # GenAI-generated grammar question. This prevents a malformed AI response from
+    # turning a 12-item retry batch into zero questions.
+    recovered_wrong_grammar={}
+    if only_failed:
+        for item in selected_grammar:
+            try:
+                rq=_review_grammar_proxy_question_from_published_source(int(course_id),item)
+            except Exception as exc:
+                rq=None
+                print(f"[REVIEW PUBLISHED B1] item_id={int(item.get('id') or 0)} error={type(exc).__name__}: {exc}")
+            if rq:
+                recovered_wrong_grammar[('grammar',int(item.get('id') or 0))]=rq
+                questions.append(rq)
+        if recovered_wrong_grammar:
+            print(f"[REVIEW WRONG-ONLY DB FIRST] course_id={course_id} recovered={len(recovered_wrong_grammar)}")
+
     for item in selected_vocab:
         item_id=int(item.get('id') or 0)
         ai_q=by_key.get(('vocabulary',item_id)) or {}
@@ -11616,6 +11667,8 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
 
     for item in selected_grammar:
         item_id=int(item.get('id') or 0)
+        if ('grammar',item_id) in recovered_wrong_grammar:
+            continue
         ai_q=by_key.get(('grammar',item_id)) or {}
         if ai_q and not _review_grammar_question_is_applied(ai_q):
             print(f"[REVIEW GRAMMAR VALIDATION] rejected theory question item_id={item_id} lesson={lesson!r}")
