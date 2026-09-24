@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.66"
+SERVER_VERSION = "31.67"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1390,13 +1390,12 @@ def _normalize_content_type(value):
 
 
 def _review_days(content_type, score=None, status="in_progress"):
-    """Review schedule: exercises do not use a total score; other learning keeps the existing schedule."""
-    if content_type == "Truyện đọc":
-        return None
-    # Bài tập intentionally has no score-based review schedule.
-    if status == "completed":
-        return 7 if content_type in {"Từ vựng", "Ngữ pháp"} else None
-    return 3 if content_type in {"Từ vựng", "Ngữ pháp"} else None
+    """Legacy helper: lesson-level review scheduling is disabled.
+
+    Review items are created only when a learner actually answers a vocabulary or
+    grammar question incorrectly. Those wrong-answer rows use _schedule_failed_review.
+    """
+    return None
 
 
 def record_learning_event(user_id, event):
@@ -1511,13 +1510,11 @@ def record_learning_event(user_id, event):
                 f"content_type={content_type!r} lesson={lesson!r} progress_id={row.get('id')} "
                 f"completed_at={row.get('completed_at')} plan_items_updated={int(plan_updated or 0)}"
             )
-            try:
-                _schedule_review_for_completed_lesson(row)
-            except Exception as exc:
-                print(
-                    f"[REVIEW SCHEDULE] create failed user={user_id} course_id={course_id} "
-                    f"content_type={content_type!r} lesson={lesson!r}: {type(exc).__name__}: {exc}"
-                )
+            print(
+                f"[REVIEW SCHEDULE] disabled user={user_id} course_id={course_id} "
+                f"content_type={content_type!r} lesson={lesson!r}; "
+                "only wrong answers from vocabulary/grammar are reviewable"
+            )
         return row
     finally:
         conn.close()
@@ -5592,12 +5589,10 @@ def _study_plan_brief_for_auto_chat(user_id, course_id=None):
     review_note=""
     if course_id is not None:
         try:
-            scheduled=_review_scheduled_lessons(user_id,course_id)
             due=_review_due_items(user_id,course_id)
             due_n=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
-            if scheduled or due_n:
-                names=', '.join(str(x.get('lesson') or '') for x in scheduled[:3] if x.get('lesson'))
-                review_note=f" Lịch ôn hôm nay={names or 'có kiến thức cần ôn'}; item cần ôn lại={due_n}."
+            if due_n:
+                review_note=f" Có {due_n} câu từ vựng/ngữ pháp đã làm sai và đến lịch làm lại."
         except Exception as exc:
             print(f"[REVIEW BRIEF] skipped: {type(exc).__name__}: {exc}")
     today=_now_local().date()
@@ -6748,15 +6743,12 @@ def _is_learning_intent_candidate(text: str):
 
 
 def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LEARN_RECOMMENDATION'):
-    """Build a natural daily learning/review briefing after GenAI identifies intent.
+    """Build daily learning briefing without lesson-level review schedules.
 
-    Wording is contextual: avoid saying "ngoài ra" when the wrong-answer queue is
-    the only actionable item. The same DB state drives both LEARN_RECOMMENDATION
-    and REVIEW_RECOMMENDATION, while the text clearly distinguishes lesson-review
-    schedules from wrong-answer retry schedules.
+    The only review queue exposed here is wrong vocabulary/grammar answers that
+    were persisted during learning and are due for retry.
     """
     intent=str(intent or 'LEARN_RECOMMENDATION').upper()
-    scheduled=_review_scheduled_lessons(user_id,course_id)
     due=_review_due_items(user_id,course_id)
     wrong_items=[*(due.get('vocabulary') or []),*(due.get('grammar') or [])]
     wrong_count=len(wrong_items)
@@ -6765,7 +6757,7 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     parts=[]
     if intent=='LEARN_RECOMMENDATION':
-        parts.append('👋 Chào cậu! Doraemon đã xem lịch học và ôn tập hôm nay.')
+        parts.append('👋 Chào cậu! Doraemon đã xem lịch học và phần câu sai cần làm lại hôm nay.')
         if today_plan_items:
             parts.append(f'🎯 Hôm nay cậu có **{len(today_plan_items)} nội dung học theo lộ trình**:')
             for item in today_plan_items[:12]:
@@ -6791,85 +6783,35 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
                     plan_text=f' (dự kiến {plan_date})'
             parts.append(f'🎯 Theo lộ trình, bài học tiếp theo là **{next_lesson}**{plan_text}.')
 
-    if scheduled:
-        if len(scheduled)==1:
-            r=scheduled[0]
-            lesson=str(r.get('lesson') or '').strip()
-            counts=[]
-            if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
-            if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
-            parts.append(f'📚 Hôm nay cậu cần ôn lại bài **{lesson}**{(" ("+", ".join(counts)+")") if counts else ""}.')
-        else:
-            parts.append(f'📚 Hôm nay cậu có **{len(scheduled)} bài đến lịch ôn tập**:')
-            for r in scheduled[:10]:
-                lesson=str(r.get('lesson') or '').strip()
-                counts=[]
-                if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
-                if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
-                parts.append(f'• **{lesson}**{(" – "+", ".join(counts)) if counts else ""}')
-
-    # The wrong-answer queue gets context-sensitive wording. If there is no
-    # lesson/review content before it, use "Nhưng" rather than "Ngoài ra".
     if wrong_count:
-        primary_exists=bool(scheduled or next_plan)
-        lead='📝 Ngoài ra, cậu có' if primary_exists else '📝 Nhưng cậu có'
-        parts.append(f'{lead} **{wrong_count} nội dung đã làm sai** và đã đến lịch làm lại.')
-
+        parts.append(f'📝 Cậu có **{wrong_count} câu từ vựng/ngữ pháp đã làm sai** và đã đến lịch làm lại.')
         wrong_lessons=[]
         for it in wrong_items:
             lesson=str(it.get('source_lesson') or '').strip()
             if lesson and lesson.casefold() not in [x.casefold() for x in wrong_lessons]:
                 wrong_lessons.append(lesson)
         if wrong_lessons:
-            parts.append('📌 Các bài có nội dung sai cần làm lại: ' + ', '.join(f'**{x}**' for x in wrong_lessons[:10]) + '.')
+            parts.append('📌 Câu sai thuộc các bài: ' + ', '.join(f'**{x}**' for x in wrong_lessons[:10]) + '.')
 
-    # Explicitly explain the absence of lesson-level work when the user asks
-    # what to LEARN today, matching the requested natural wording.
-    if intent=='LEARN_RECOMMENDATION' and not today_plan_items and not scheduled:
-        if wrong_count:
-            parts.insert(1, '📚 Hôm nay cậu không có bài học nào theo lộ trình và không có bài nào cần ôn tập.')
-        else:
-            parts.append('📚 Hôm nay cậu không có bài học nào theo lộ trình và không có bài nào cần ôn tập.')
+    if intent=='LEARN_RECOMMENDATION' and not today_plan_items and not next_plan and not wrong_count:
+        parts.append('📚 Hôm nay cậu không có bài học mới theo lộ trình và chưa có câu sai từ vựng/ngữ pháp đến lịch làm lại.')
+    elif intent=='REVIEW_RECOMMENDATION' and not wrong_count:
+        parts.append('✅ Hiện chưa có câu từ vựng/ngữ pháp nào đã làm sai và đến lịch làm lại.')
 
-    if intent=='REVIEW_RECOMMENDATION' and not scheduled:
-        if wrong_count:
-            parts.insert(0, '📚 Hôm nay cậu không có bài ôn tập định kỳ đến lịch.')
-        else:
-            parts.append('✅ Hôm nay cậu chưa có bài ôn tập nào đến lịch.')
-
-    choices=[]
-    # Với nhiều nội dung đến lịch trong Study Plan, KHÔNG render từng bài thành
-    # button. Chatbox thu nhỏ có chiều rộng/chiều cao hạn chế, nhiều button sẽ
-    # tràn hoặc bị che mất. Chỉ liệt kê tên bài bằng text để người dùng gõ tên
-    # bài muốn học; router hiện tại sẽ xử lý lesson/content_type từ câu nhập đó.
     if intent=='LEARN_RECOMMENDATION' and today_plan_items:
         parts.append('👉 Cậu chỉ cần **gõ tên bài muốn học** (ví dụ: `dã ngoại` hoặc `danh từ`), Doraemon sẽ mở đúng nội dung theo lộ trình.')
-    for r in scheduled[:10]:
-        lesson=str(r.get('lesson') or '').strip()
-        if not lesson:
-            continue
-        ct=str(r.get('content_type') or 'Giáo trình')
-        action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':ct},ensure_ascii=False,separators=(',',':')))
-        choices.append({'label':f'Ôn {lesson}','action':f'review_lesson:{action}'})
+
     if wrong_count:
-        choices.append({'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'})
+        parts.append('Cậu muốn làm lại phần sai trước chứ?')
 
-    if choices:
-        if today_plan_items:
-            parts.append('Cậu muốn ôn tập phần nào trước?')
-        elif scheduled or next_plan:
-            parts.append('Cậu muốn ôn tập phần nào trước?')
-        else:
-            parts.append('Cậu muốn làm lại phần sai trước chứ?')
-    elif intent=='LEARN_RECOMMENDATION' and today_plan_items:
-        # Không tạo choice block cho các bài học theo lộ trình; giữ toàn bộ danh
-        # sách ở dạng text để thao tác được ổn định cả ở chatbox thu nhỏ.
-        pass
+    msg='\n\n'.join(parts)
+    blocks=[{'type':'text','text':msg}]
+    if wrong_count:
+        blocks.append({'type':'choice','id':'learning_discovery_selection','options':[
+            {'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'}
+        ]})
+    return msg,blocks,bool(wrong_count)
 
-    blocks=[{'type':'text','text':'\n\n'.join(parts)}]
-    if choices:
-        blocks.append({'type':'choice','id':'learning_discovery_selection','options':choices})
-    return '\n\n'.join(str(b.get('text') or '') for b in blocks if b.get('type')=='text'),blocks,bool(choices)
 
 
 def _chat_model_for_content(
@@ -7289,54 +7231,43 @@ def proxy_chat(
     action_raw=str(data.action or '').strip()
     action_head=action_raw.split(':',1)[0].casefold() if action_raw else ''
     if action_head == 'review_lesson':
-        raw=action_raw.split(':',1)[1] if ':' in action_raw else ''
-        try:
-            decoded=json.loads(urllib.parse.unquote(raw))
-        except Exception:
-            decoded={}
-        lesson=str(decoded.get('lesson') or '').strip()
-        ctype=str(decoded.get('content_type') or '').strip() or None
-        if not lesson:
-            raise HTTPException(400,'Thiếu tên bài cần ôn.')
-        result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,lesson,ctype,data.chatbox_id,12)
-        print(f'[REVIEW CHAT START] user={user["id"]} course_id={selected_course_id} lesson={lesson!r} session={result["session_id"]} questions={len(result["questions"])}')
-        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
-                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_lesson':lesson}
+        msg='📚 Ôn theo từng bài đã được bỏ. Doraemon chỉ hỗ trợ **làm lại các câu Từ vựng/Ngữ pháp đã trả lời sai trong lúc học**.'
+        return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
+                'learning_progress':None,'review':True}
 
     if action_head in {'review_open','review_choose'}:
-        # Opening the review chat must actually expose today's scheduled lesson
-        # review(s). Previously this action returned only a placeholder message,
-        # so the web client showed no lesson choices/questions.
-        msg,blocks,_=_build_learning_discovery_blocks(
-            user['id'], int(selected_course_id), selected_course_name, 'REVIEW_RECOMMENDATION'
-        )
-        return {'reply':msg,'model':'local-router','sources':[],'images':[],
-                'content_blocks':blocks,'learning_progress':None,
-                'review':True,'review_selection':True}
+        try:
+            result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
+                                              lesson=None,content_type=None,chatbox_id=data.chatbox_id,
+                                              max_questions=12,only_failed=True,all_failed_due=True)
+            return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
+                    'learning_progress':None,'review_session_id':result['session_id'],'review':True,
+                    'review_wrong_only':True,'review_lesson':result['source_lesson']}
+        except HTTPException as exc:
+            if exc.status_code==404:
+                msg='✅ Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.'
+                return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
+                        'learning_progress':None,'review':True}
+            raise
 
     if action_head in {'review_wrong','review_wrong_lesson','review_wrong_due'}:
-        requested_lesson=None
-        requested_type=None
-        if ':' in action_raw:
-            raw=action_raw.split(':',1)[1]
-            try:
-                decoded=json.loads(urllib.parse.unquote(raw))
-            except Exception:
-                decoded={}
-            requested_lesson=str(decoded.get('lesson') or '').strip() or None
-            requested_type=str(decoded.get('content_type') or '').strip() or None
-        if action_head=='review_wrong' and requested_lesson is None:
-            requested_lesson, _=_review_first_failed_lesson(user['id'],int(selected_course_id))
-        if action_head=='review_wrong_due' and requested_lesson is None:
+        # Lesson information is deliberately ignored: the only supported review
+        # queue is all due wrong vocabulary/grammar answers across the course.
+        try:
             result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
-                                              lesson=None,content_type=None,chatbox_id=data.chatbox_id,max_questions=12,only_failed=True,all_failed_due=True)
-        else:
-            result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
-                                              lesson=requested_lesson,content_type=requested_type,
-                                              chatbox_id=data.chatbox_id,max_questions=12,only_failed=True)
-        print(f'[REVIEW WRONG CHAT START] user={user["id"]} course_id={selected_course_id} lesson={result["source_lesson"]!r} session={result["session_id"]} questions={len(result["questions"])}')
-        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
-                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':result['source_lesson']}
+                                              lesson=None,content_type=None,chatbox_id=data.chatbox_id,
+                                              max_questions=12,only_failed=True,all_failed_due=True)
+        except HTTPException as exc:
+            if exc.status_code==404:
+                msg='✅ Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.'
+                return {'reply':msg,'model':'local-router','sources':[],'images':[],
+                        'content_blocks':[{'type':'text','text':msg}],
+                        'learning_progress':None,'review':True,'review_wrong_only':True}
+            raise
+        print(f'[REVIEW WRONG CHAT START] user={user["id"]} course_id={selected_course_id} lesson=None session={result["session_id"]} questions={len(result["questions"])}')
+        return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],
+                'content_blocks':result['content_blocks'],'learning_progress':None,
+                'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':None}
 
     if action_head == 'review_answer':
         raw=action_raw.split(':',1)[1] if ':' in action_raw else ''
@@ -7354,7 +7285,7 @@ def proxy_chat(
                 'learning_progress':None,'review_session_id':sid,'review':True,'review_answered':True,'correct':result['correct'],'finished':result['finished']}
 
     if action_head == 'review_keep':
-        msg='Được nhé 🤖 Doraemon sẽ giữ lịch ôn lại, chưa bắt đầu phiên ôn này.'
+        msg='Được nhé 🤖 Doraemon sẽ chưa bắt đầu làm lại các câu sai. Khi nào cậu muốn làm lại, chỉ cần chọn **Làm lại phần sai**.'
         return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
                 'learning_progress':None,'review':True}
 
@@ -7390,26 +7321,21 @@ def proxy_chat(
     if intent_result in {'WRONG_ONLY_REVIEW'} or _is_wrong_review_request(data.text):
         print(f'[REVIEW INTENT] WRONG_ONLY text={data.text[:160]!r}')
         if selected_course_id is None:
-            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết bài cần làm lại nhé."
-            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-        lesson_row=_find_completed_lesson(user["id"],selected_course_id,data.text)
-        lesson=str(lesson_row.get('lesson') or '').strip() if lesson_row else ''
-        if not lesson:
-            msg="Doraemon chưa xác định được tên bài. Cậu nói rõ tên bài nhé, ví dụ: 'mình muốn làm lại những câu sai của bài Dã ngoại'."
+            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết phần sai nào cần làm lại nhé."
             return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
         try:
-            result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,lesson=lesson,
-                                              content_type=(lesson_row or {}).get('content_type'),chatbox_id=data.chatbox_id,
-                                              max_questions=12,only_failed=True)
+            result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
+                                              lesson=None,content_type=None,chatbox_id=data.chatbox_id,
+                                              max_questions=12,only_failed=True,all_failed_due=True)
         except HTTPException as exc:
             if exc.status_code==404:
-                msg=f"Bài **{lesson}** hiện chưa có nội dung nào bị trả lời sai trong các lần ôn trước. 😊"
+                msg='✅ Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.'
                 return {'reply':msg,'model':'local-router','sources':[],'images':[],'content_blocks':[{'type':'text','text':msg}],
-                        'learning_progress':None,'review':True,'review_wrong_only':True,'review_lesson':lesson}
+                        'learning_progress':None,'review':True,'review_wrong_only':True}
             raise
-        print(f'[REVIEW WRONG-ONLY START] user={user["id"]} course_id={selected_course_id} lesson={lesson!r} session={result["session_id"]} questions={len(result["questions"])}')
+        print(f'[REVIEW WRONG-ONLY START] user={user["id"]} course_id={selected_course_id} lesson=None session={result["session_id"]} questions={len(result["questions"])}')
         return {'reply':result['reply'],'model':'review-genai','sources':[],'images':[],'content_blocks':result['content_blocks'],
-                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':lesson}
+                'learning_progress':None,'review_session_id':result['session_id'],'review':True,'review_wrong_only':True,'review_lesson':None}
 
     if intent_result in {'LEARN_RECOMMENDATION','REVIEW_RECOMMENDATION'}:
         msg,blocks,_=_build_learning_discovery_blocks(user['id'],int(selected_course_id),selected_course_name,intent_result)
@@ -7417,26 +7343,29 @@ def proxy_chat(
                 'review_discovery':True,'learning_intent':intent_result}
 
     if intent_result=='SPECIFIC_LESSON_REVIEW' or _is_manual_review_request(data.text):
-        if selected_course_id is None:
-            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết cần ôn bài nào nhé."
-            return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-        lesson_row=_find_completed_lesson(user["id"],selected_course_id,data.text)
-        if lesson_row:
-            msg,blocks=_build_manual_review_chat_blocks(user["id"],selected_course_id,selected_course_name,lesson_row)
-        else:
-            msg="Doraemon chưa tìm thấy bài đã học có tên này trong khóa đang chọn. Cậu thử nói rõ tên bài nhé."
-            blocks=[{"type":"text","text":msg}]
-        print(f"[REVIEW MANUAL FASTPATH] user={user['id']} course_id={selected_course_id!r} genai=0 lesson={lesson_row.get('lesson') if lesson_row else None!r}")
-        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review_schedule":True}
+        msg='📚 Ôn theo từng bài đã được bỏ. Doraemon chỉ hỗ trợ **làm lại các câu Từ vựng/Ngữ pháp đã trả lời sai trong lúc học**.'
+        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None,"review":True}
 
     if _is_review_schedule_request(data.text):
         if selected_course_id is None:
-            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon xác định lịch ôn đúng khóa nhé."
+            msg="Hãy chọn khóa học trong Cấu hình trước để Doraemon biết phần sai cần làm lại nhé."
             blocks=[{"type":"text","text":msg}]
         else:
-            msg,blocks=_build_review_schedule_chat_blocks(user["id"],selected_course_id,selected_course_name)
-        print(f"[REVIEW CHAT FASTPATH] user={user['id']} course_id={selected_course_id!r} genai=0")
-        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review_schedule":True}
+            try:
+                result=_start_review_chat_session(user['id'],int(selected_course_id),selected_course_name,
+                                                  lesson=None,content_type=None,chatbox_id=data.chatbox_id,
+                                                  max_questions=12,only_failed=True,all_failed_due=True)
+                msg,blocks=result['reply'],result['content_blocks']
+                return {"reply":msg,"model":"review-genai","sources":[],"images":[],"content_blocks":blocks,
+                        "learning_progress":None,"review_session_id":result['session_id'],"review":True,
+                        "review_wrong_only":True,"review_lesson":None}
+            except HTTPException as exc:
+                if exc.status_code!=404:
+                    raise
+                msg='✅ Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.'
+                blocks=[{"type":"text","text":msg}]
+        print(f"[REVIEW CHAT FASTPATH] user={user['id']} course_id={selected_course_id!r} wrong_only=1")
+        return {"reply":msg,"model":"local-router","sources":[],"images":[],"content_blocks":blocks,"learning_progress":None,"review":True}
 
     # Selected-text context is supplied by the desktop app when the learner
     # highlights text and chooses “Hỏi Doraemon”. Initialize it before ANY
@@ -11144,122 +11073,21 @@ def _is_manual_review_request(text):
 
 
 def _schedule_review_for_completed_lesson(row):
-    """Create a durable lesson-level review schedule after completion.
+    """Legacy no-op: lesson-level review has been removed.
 
-    Scheduling is based on the existence of a published DB lesson, not on whether
-    curriculum_vocab_master/curriculum_grammar_master happens to contain rows. This
-    is important for standalone Ngữ pháp lessons whose source of truth is
-    curriculum_steps. Master rows are backfilled opportunistically when structured
-    items exist.
+    Wrong-answer review is created only from an actually incorrect vocabulary or
+    grammar answer via _schedule_failed_review. Existing legacy schedule columns
+    are intentionally ignored.
     """
-    if not row or str(row.get('status') or '').lower() != 'completed':
-        return False
-    content_type=_normalize_content_type(row.get('content_type') or 'Giáo trình')
-    if content_type not in {'Giáo trình','Bài tập','Ngữ pháp','Từ vựng'}:
-        return False
-    lesson=str(row.get('lesson') or '').strip()
-    course_id=row.get('course_id')
-    user_id=row.get('user_id')
-    if not lesson or course_id in (None,'') or user_id in (None,''):
-        print(f"[REVIEW SCHEDULE] skipped user={user_id} course_id={course_id} lesson={lesson!r} reason=missing_scope")
-        return False
-
-    # Repair/recover deterministic master mappings before deciding whether the
-    # lesson can be reviewed. This fixes older vocab uploads and structured grammar.
-    try:
-        _ensure_review_master_from_published_lesson(int(course_id),content_type,lesson)
-    except Exception as exc:
-        print(f"[REVIEW MASTER BACKFILL] failed course_id={course_id} content_type={content_type!r} lesson={lesson!r}: {type(exc).__name__}: {exc}")
-
-    ids=_review_lesson_item_ids(int(course_id),content_type,lesson)
-    source_rows=_published_curriculum_lesson_source(int(course_id),content_type,lesson)
-    if not source_rows and not (ids['vocabulary'] or ids['grammar']):
-        print(f"[REVIEW SCHEDULE] skipped user={user_id} course_id={course_id} content_type={content_type!r} lesson={lesson!r} reason=no_published_lesson_source")
-        return False
-
-    now=datetime.now(timezone.utc)
-    interval_days=_get_review_interval_days(int(user_id))
-    next_at=now+timedelta(days=interval_days)
-    conn=db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE learning_progress
-                   SET review_scheduled_at=%s,
-                       review_completed_at=NULL,
-                       next_review_at=%s
-                 WHERE id=%s
-            """,(now,next_at,row.get('id')))
-        conn.commit()
-        source='master' if (ids['vocabulary'] or ids['grammar']) else 'curriculum_steps'
-        print(
-            f"[REVIEW SCHEDULE] user={user_id} course_id={course_id} content_type={content_type!r} "
-            f"lesson={lesson!r} source={source} interval_days={interval_days} "
-            f"review_scheduled_at={now.isoformat()} next_review_at={next_at.isoformat()} "
-            f"vocab={len(ids['vocabulary'])} grammar={len(ids['grammar'])} steps={len(source_rows)}"
-        )
-        return True
-    finally:
-        conn.close()
-
+    return False
 
 def _review_scheduled_lessons(user_id, course_id):
-    now=_now_local()
-    conn=db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id,content_type,lesson,topic,completed_at,review_scheduled_at,next_review_at
-                FROM learning_progress
-                WHERE user_id=%s AND course_id=%s AND status='completed'
-                  AND next_review_at IS NOT NULL
-                  AND (next_review_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date <= (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date
-                  AND (review_completed_at IS NULL OR review_completed_at < review_scheduled_at)
-                ORDER BY next_review_at ASC, completed_at ASC NULLS LAST, id ASC
-            """,(user_id,course_id))
-            rows=[]; seen=set()
-            for rr in cur.fetchall():
-                r=dict(rr)
-                key=(str(r.get('content_type') or ''),str(r.get('lesson') or '').casefold(),str(r.get('topic') or '').casefold())
-                if key in seen: continue
-                seen.add(key)
-                ct=str(r.get('content_type') or 'Giáo trình')
-                lesson=str(r.get('lesson') or '')
-                try:
-                    _ensure_review_master_from_published_lesson(int(course_id),ct,lesson)
-                except Exception as exc:
-                    print(f"[REVIEW MASTER BACKFILL] due lookup skipped course_id={course_id} content_type={ct!r} lesson={lesson!r}: {type(exc).__name__}: {exc}")
-                ids=_review_lesson_item_ids(int(course_id),ct,lesson)
-                source_rows=_published_curriculum_lesson_source(int(course_id),ct,lesson)
-                r['vocabulary_ids']=ids['vocabulary']; r['grammar_ids']=ids['grammar']
-                r['vocabulary_count']=len(ids['vocabulary']); r['grammar_count']=len(ids['grammar'])
-                r['review_source']='master' if (ids['vocabulary'] or ids['grammar']) else ('curriculum_steps' if source_rows else 'unknown')
-                if ids['vocabulary'] or ids['grammar'] or source_rows:
-                    rows.append(r)
-            return rows
-    finally:
-        conn.close()
-
+    """Legacy compatibility helper: lesson-level review is disabled."""
+    return []
 
 def _mark_review_schedule_completed(user_id, course_id, source_lesson):
-    """Finish one lesson-review occurrence and schedule the next occurrence."""
-    lesson=str(source_lesson or '').strip()
-    if not lesson or lesson == 'review_due':
-        return
-    interval_days=_get_review_interval_days(user_id)
-    next_at=datetime.now(timezone.utc)+timedelta(days=interval_days)
-    conn=db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE learning_progress SET review_completed_at=NOW(),next_review_at=%s
-                           WHERE user_id=%s AND course_id=%s AND status='completed'
-                             AND lower(trim(coalesce(lesson,'')))=lower(trim(%s))
-                             AND review_scheduled_at IS NOT NULL""",(next_at,user_id,course_id,lesson))
-        conn.commit()
-        print(f"[REVIEW SCHEDULE] lesson reviewed user={user_id} course_id={course_id} lesson={lesson!r} next={next_at.isoformat()} interval_days={interval_days}")
-    finally:
-        conn.close()
-
+    """Legacy compatibility helper: no lesson-level review is scheduled anymore."""
+    return False
 
 def _is_review_schedule_request(text):
     low=str(text or '').strip().casefold()
@@ -11342,58 +11170,29 @@ def _next_plan_lesson_for_welcome(user_id, course_id):
 
 
 def _review_selection_blocks(user_id, course_id, course_name, *, greeting_prefix=None):
-    """Build one deterministic review briefing used by chat, welcome and proactive reminders.
-
-    Scheduled lesson reviews and due wrong-answer items are separate queues.  The
-    learner chooses which queue/lesson to do first; no review session is started here.
-    """
-    scheduled=_review_scheduled_lessons(user_id,course_id)
+    """Build the review briefing for the ONLY supported review queue: wrong answers."""
     due=_review_due_items(user_id,course_id)
-    print(f'[REVIEW SELECTION STATE] user={user_id} course_id={course_id} scheduled={len(scheduled)} wrong_due={len(due.get("vocabulary") or [])+len(due.get("grammar") or [])}')
+    wrong_items=[*(due.get('vocabulary') or []),*(due.get('grammar') or [])]
+    wrong_count=len(wrong_items)
+    print(f'[REVIEW SELECTION STATE] user={user_id} course_id={course_id} wrong_due={wrong_count}')
 
     parts=[]
     if greeting_prefix:
         parts.append(greeting_prefix.rstrip())
 
-    scheduled_choices=[]
-    if scheduled:
-        if len(scheduled)==1:
-            r=scheduled[0]
-            lesson=str(r.get('lesson') or '').strip()
-            counts=[]
-            if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
-            if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
-            parts.append(f"📚 Hôm nay cậu cần ôn lại bài **{lesson}**{(' (' + ', '.join(counts) + ')') if counts else ''}.")
-            action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':str(r.get('content_type') or 'Giáo trình')},ensure_ascii=False,separators=(',',':')))
-            scheduled_choices.append({'label':f'Ôn bài {lesson}','action':f'review_lesson:{action}'})
-        else:
-            parts.append(f"📚 Hôm nay cậu có **{len(scheduled)} bài đến lịch ôn định kỳ**:")
-            for r in scheduled[:8]:
-                lesson=str(r.get('lesson') or '').strip()
-                counts=[]
-                if r.get('vocabulary_count'): counts.append(f"{int(r['vocabulary_count'])} từ vựng")
-                if r.get('grammar_count'): counts.append(f"{int(r['grammar_count'])} ngữ pháp")
-                parts.append(f"• **{lesson}**{(' – ' + ', '.join(counts)) if counts else ''}")
-                action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':str(r.get('content_type') or 'Giáo trình')},ensure_ascii=False,separators=(',',':')))
-                scheduled_choices.append({'label':f'Ôn {lesson}','action':f'review_lesson:{action}'})
-
-    wrong_items=[*(due.get('vocabulary') or []),*(due.get('grammar') or [])]
-    wrong_count=len(wrong_items)
     if wrong_count:
-        parts.append(f"📝 Ngoài ra, cậu có **{wrong_count} nội dung đã làm sai** và đã đến lịch làm lại.")
+        parts.append(f"📝 Cậu có **{wrong_count} câu từ vựng/ngữ pháp đã làm sai** và đã đến lịch làm lại.")
         wrong_lessons=[]
         conn=None
         try:
-            # Resolve lesson labels for the retry queue so the user can understand
-            # what the wrong-answer content belongs to without extra context.
             conn=db()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for it in wrong_items:
                     iid=int(it.get('item_id') or 0)
                     if str(it.get('writing') or '').strip():
-                        cur.execute("""SELECT source_lesson FROM curriculum_vocab_master WHERE id=%s AND course_id=%s""",(iid,course_id))
+                        cur.execute("SELECT source_lesson FROM curriculum_vocab_master WHERE id=%s AND course_id=%s",(iid,course_id))
                     else:
-                        cur.execute("""SELECT source_lesson FROM curriculum_grammar_master WHERE id=%s AND course_id=%s""",(iid,course_id))
+                        cur.execute("SELECT source_lesson FROM curriculum_grammar_master WHERE id=%s AND course_id=%s",(iid,course_id))
                     rr=cur.fetchone()
                     lesson=str((rr or {}).get('source_lesson') or '').strip()
                     if lesson and lesson.casefold() not in [x.casefold() for x in wrong_lessons]:
@@ -11404,96 +11203,49 @@ def _review_selection_blocks(user_id, course_id, course_name, *, greeting_prefix
             if conn:
                 conn.close()
         if wrong_lessons:
-            parts.append('📌 Bài có nội dung sai cần làm lại: ' + ', '.join(f'**{x}**' for x in wrong_lessons[:8]) + '.')
+            parts.append('📌 Nội dung sai thuộc các bài: ' + ', '.join(f'**{x}**' for x in wrong_lessons[:8]) + '.')
 
-    available=bool(scheduled_choices or wrong_count)
-    if not available:
-        parts.append('✅ Hôm nay chưa có nội dung ôn tập nào đến lịch.')
-        msg='\n\n'.join(parts)
-        return msg,[{'type':'text','text':msg}],False
+    if not wrong_count:
+        parts.append('✅ Hiện chưa có câu từ vựng/ngữ pháp nào đã làm sai và đến lịch làm lại.')
 
-    parts.append("Cậu muốn ôn tập phần nào trước?")
+    parts.append('Cậu muốn làm lại phần sai chứ?' if wrong_count else 'Khi làm sai câu từ vựng/ngữ pháp, Doraemon sẽ lưu câu đó để cậu làm lại sau.')
     msg='\n\n'.join(parts)
     blocks=[{'type':'text','text':msg}]
-
-    # Show lesson choices first, then one wrong-only choice. The wrong queue is
-    # intentionally started from the most relevant unresolved lesson by server.
-    all_choices=list(scheduled_choices[:8])
     if wrong_count:
-        all_choices.append({'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong'})
-    if all_choices:
-        blocks.append({'type':'choice','id':'review_selection','options':all_choices})
-    return msg,blocks,True
+        blocks.append({'type':'choice','id':'review_selection','options':[
+            {'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'}
+        ]})
+    return msg,blocks,bool(wrong_count)
+
 
 
 def _build_post_review_next_step(user_id, course_id, course_name, finished_scope, source_lesson):
-    """Describe the next review queue after a session finishes, without auto-starting it."""
-    scope=str(finished_scope or 'FULL').upper()
-    lesson=str(source_lesson or '').strip()
+    """After review, continue only with remaining wrong-answer items."""
+    due=_review_due_items(user_id,course_id)
+    remaining=len(due.get('vocabulary') or [])+len(due.get('grammar') or [])
+    scope=str(finished_scope or 'WRONG_ONLY').upper()
 
-    # Immediately after a full lesson review, the learner should see items that
-    # were just answered incorrectly, even though their retry date may be tomorrow.
-    immediate_wrong={'vocabulary':[],'grammar':[]}
-    if scope=='FULL' and lesson and lesson!='review_due':
+    if scope=='WRONG_ONLY' and remaining:
         try:
-            raw_wrong=_review_failed_items_for_lesson(user_id,course_id,lesson,None)
-            # Be defensive against legacy/older helper implementations that may
-            # return a flat list instead of the canonical {vocabulary, grammar} dict.
-            if isinstance(raw_wrong, dict):
-                immediate_wrong={
-                    'vocabulary':raw_wrong.get('vocabulary') or [],
-                    'grammar':raw_wrong.get('grammar') or [],
-                }
-            elif isinstance(raw_wrong, list):
-                immediate_wrong={'vocabulary':[],'grammar':raw_wrong}
-            else:
-                immediate_wrong={'vocabulary':[],'grammar':[]}
-        except Exception as exc:
-            print(f'[REVIEW NEXT] lesson wrong-state lookup skipped: {type(exc).__name__}: {exc}')
-            immediate_wrong={'vocabulary':[],'grammar':[]}
-    immediate_wrong_count=len(immediate_wrong.get('vocabulary') or [])+len(immediate_wrong.get('grammar') or [])
-    if immediate_wrong_count:
-        action=urllib.parse.quote(json.dumps({'lesson':lesson,'content_type':None},ensure_ascii=False,separators=(',',':')))
-        msg=(f'🎉 Cậu đã ôn xong bài **{lesson}** rồi!\n\n'
-             f'Trong lúc ôn, cậu còn **{immediate_wrong_count} nội dung** chưa đúng. '
-             'Giờ mình làm lại những nội dung này nhé?')
-        blocks=[{'type':'text','text':msg},{'type':'choice','id':'review_next_wrong','options':[
-            {'label':f'Làm lại phần sai ({immediate_wrong_count})','action':f'review_wrong_lesson:{action}'},
-            {'label':'Để sau','action':'review_keep'}
-        ]}]
-        return msg,blocks
-
-    # WRONG_ONLY is a continuous retry flow. Do not send the learner back to the
-    # selection menu after every question/session. When questions remain due, start
-    # the next batch immediately. A wrong answer is rescheduled for later, while
-    # unanswered remaining wrong items stay due and therefore continue in order.
-    if scope=='WRONG_ONLY':
-        try:
-            due_now=_review_due_items(user_id,course_id)
-            remaining=len(due_now.get('vocabulary') or [])+len(due_now.get('grammar') or [])
-            if remaining:
-                nxt=_start_review_chat_session(
-                    user_id,course_id,course_name,
-                    lesson=None,content_type=None,chatbox_id=None,
-                    max_questions=12,only_failed=True,all_failed_due=True
-                )
-                msg=str(nxt.get('reply') or '').strip()
-                blocks=nxt.get('content_blocks') or []
-                print(f'[REVIEW WRONG AUTO-NEXT] user={user_id} course_id={course_id} remaining_due={remaining} next_session={nxt.get("session_id")}')
-                return msg,blocks
+            nxt=_start_review_chat_session(
+                user_id,course_id,course_name,
+                lesson=None,content_type=None,chatbox_id=None,
+                max_questions=12,only_failed=True,all_failed_due=True
+            )
+            msg=str(nxt.get('reply') or '').strip()
+            blocks=nxt.get('content_blocks') or []
+            print(f'[REVIEW WRONG AUTO-NEXT] user={user_id} course_id={course_id} remaining_due={remaining} next_session={nxt.get("session_id")}')
+            return msg,blocks
         except Exception as exc:
             print(f'[REVIEW WRONG AUTO-NEXT] skipped: {type(exc).__name__}: {exc}')
 
-    # Then look for another scheduled lesson or due wrong queue.
-    scheduled=_review_scheduled_lessons(user_id,course_id)
-    due=_review_due_items(user_id,course_id)
-    if scheduled or due.get('vocabulary') or due.get('grammar'):
-        msg,blocks,_=_review_selection_blocks(user_id,course_id,course_name,
-            greeting_prefix=f'🎉 Cậu đã hoàn thành phần ôn tập **{lesson or "vừa rồi"}**!')
-        return msg,blocks
+    if remaining:
+        msg=f'🎉 Cậu đã hoàn thành phần ôn vừa rồi. Hiện còn **{remaining} câu sai** đến lịch làm lại.'
+        return msg,[{'type':'text','text':msg},{'type':'choice','id':'review_remaining','options':[{'label':f'Làm lại phần sai ({remaining})','action':'review_wrong_due'}]}]
 
-    msg=f'🎉 Cậu đã hoàn thành phần ôn tập **{lesson or "vừa rồi"}** và hiện không còn nội dung ôn nào đến lịch. 🤖'
+    msg='🎉 Cậu đã hoàn thành phần làm lại. Hiện không còn câu từ vựng/ngữ pháp sai nào đến lịch làm lại. 🤖'
     return msg,[{'type':'text','text':msg}]
+
 
 
 def _build_review_reminder_blocks(user_id, course_id, course_name):
@@ -11503,7 +11255,8 @@ def _build_review_reminder_blocks(user_id, course_id, course_name):
 
 
 def _build_review_schedule_chat_blocks(user_id, course_id, course_name):
-    return _build_learning_discovery_blocks(user_id,course_id,course_name,'REVIEW_RECOMMENDATION')[:2]
+    """Compatibility wrapper: expose only the wrong-answer review queue."""
+    return _review_selection_blocks(user_id,course_id,course_name)[:2]
 
 
 def _review_due_items(user_id, course_id):
@@ -12264,60 +12017,31 @@ NGUỒN DB:
     return questions
 
 
-def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12, only_failed=False, all_failed_due=False):
-    requested_lesson=str(lesson or '').strip()
-    requested_type=str(content_type or '').strip() or None
+def _start_review_chat_session(user_id, course_id, course_name, lesson=None, content_type=None, chatbox_id=None, max_questions=12, only_failed=True, all_failed_due=False):
+    # Lesson-level review has been removed. This constructor is now strictly for
+    # retrying durable wrong vocabulary/grammar answers.
+    if not only_failed:
+        raise HTTPException(410,'Ôn theo từng bài đã được bỏ. Chỉ hỗ trợ làm lại câu Từ vựng/Ngữ pháp đã làm sai trong lúc học.')
+    if str(lesson or '').strip() or str(content_type or '').strip():
+        raise HTTPException(410,'Ôn theo từng bài đã được bỏ. Chỉ hỗ trợ làm lại câu Từ vựng/Ngữ pháp đã làm sai trong lúc học.')
+    requested_lesson=''
+    requested_type=None
     source_questions=None
-    if requested_lesson:
-        if only_failed:
-            data=_review_failed_items_for_lesson(user_id,course_id,requested_lesson,requested_type)
-            if not data['vocabulary'] and not data['grammar']:
-                raise HTTPException(404,f'Bài {requested_lesson!r} hiện chưa có từ vựng/ngữ pháp nào bị trả lời sai để làm lại.')
-        else:
-            effective_type=requested_type or 'Ngữ pháp'
-            # Named grammar lessons are reviewed directly from the published B1/B2
-            # curriculum source. This is the canonical DB source and avoids sending
-            # a valid lesson through the GenAI validator just to create MCQ4.
-            if _normalize_content_type(effective_type) == 'Ngữ pháp':
-                source_questions=_review_b1_source_questions_direct(int(course_id),requested_lesson,effective_type,max_questions)
-            if source_questions:
-                data={'vocabulary':[],'grammar':[]}
-            else:
-                ids=_review_items_for_completed_lesson(user_id,course_id,requested_lesson,requested_type)
-                if ids['vocabulary'] or ids['grammar']:
-                    due={'vocabulary':[{'item_id':int(x)} for x in ids['vocabulary']], 'grammar':[{'item_id':int(x)} for x in ids['grammar']]}
-                    data=_review_master_payload(int(course_id),due)
-                else:
-                    # Standalone grammar/curriculum source fallback.
-                    ct=requested_type or 'Ngữ pháp'
-                    if not _published_curriculum_lesson_source(int(course_id),ct,requested_lesson):
-                        raise HTTPException(404,f'Bài {requested_lesson!r} chưa có dữ liệu DB đã publish để ôn.')
-                    source_questions=_review_source_lesson_questions(int(course_id),requested_lesson,ct,max_questions)
-                    if not source_questions:
-                        raise HTTPException(404,f'Bài {requested_lesson!r} chưa tạo được câu hỏi ôn từ nội dung DB đã publish.')
-                    data={'vocabulary':[],'grammar':[]}
-        source_lesson=requested_lesson
+    if all_failed_due:
+        due=_review_due_items(user_id,course_id)
+        data=_review_master_payload(int(course_id),{
+            'vocabulary':[{'item_id':int(x.get('item_id'))} for x in (due.get('vocabulary') or [])],
+            'grammar':[{'item_id':int(x.get('item_id'))} for x in (due.get('grammar') or [])]
+        })
+        source_lesson='review_wrong_due'
+        if not data['vocabulary'] and not data['grammar']:
+            raise HTTPException(404,'Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.')
     else:
-        if only_failed:
-            if all_failed_due:
-                due=_review_due_items(user_id,course_id)
-                data=_review_master_payload(int(course_id),{
-                    'vocabulary':[{'item_id':int(x.get('item_id'))} for x in (due.get('vocabulary') or [])],
-                    'grammar':[{'item_id':int(x.get('item_id'))} for x in (due.get('grammar') or [])]
-                })
-                source_lesson='review_wrong_due'
-                if not data['vocabulary'] and not data['grammar']:
-                    raise HTTPException(404,'Hiện chưa có nội dung nào đã làm sai và đến lịch để làm lại.')
-            else:
-                source_lesson, first=_review_first_failed_lesson(user_id,course_id)
-                if not source_lesson:
-                    raise HTTPException(404,'Không có bài nào có nội dung đã trả lời sai để làm lại.')
-                data=_review_failed_items_for_lesson(user_id,course_id,source_lesson,None)
-        else:
-            data=_review_default_session_data(user_id,course_id)
-            source_lesson='review_due'
-            if not data['vocabulary'] and not data['grammar']:
-                raise HTTPException(404,'Hiện chưa có nội dung nào đến lịch ôn tập.')
+        source_lesson, _first=_review_first_failed_lesson(user_id,course_id)
+        if not source_lesson:
+            raise HTTPException(404,'Không có câu Từ vựng/Ngữ pháp nào đã làm sai để làm lại.')
+        data=_review_failed_items_for_lesson(user_id,course_id,source_lesson,None)
+
 
     max_q=max(1,min(12,int(max_questions or 12)))
     if source_questions is not None:
@@ -12881,18 +12605,9 @@ def learning_review_settings_update(payload: dict, authorization: Optional[str] 
     try: days=int(payload.get('review_interval_days') or 2)
     except Exception: raise HTTPException(400,'Số ngày ôn tập không hợp lệ.')
     days=_set_review_interval_days(user['id'],days)
-    # Rebase future lesson-review schedules that have not yet been reviewed.
-    conn=db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""UPDATE learning_progress
-                           SET next_review_at=completed_at + (%s * INTERVAL '1 day')
-                           WHERE user_id=%s AND status='completed' AND review_scheduled_at IS NOT NULL
-                             AND review_completed_at IS NULL AND completed_at IS NOT NULL""",(days,user['id']))
-        conn.commit()
-    finally:
-        conn.close()
-    return {'success':True,'review_interval_days':days}
+    # Kept for backward compatibility. Lesson-level schedules are disabled, so this
+    # setting no longer changes when a completed lesson becomes reviewable.
+    return {'success':True,'review_interval_days':days,'lesson_review_disabled':True}
 
 @app.get('/learning/review/reminder')
 def learning_review_reminder(authorization: Optional[str] = Header(default=None), course_id: Optional[int] = None):
@@ -12988,34 +12703,31 @@ def learning_review_today(course_id: Optional[int] = None, authorization: Option
     if selected_course_id is None:
         raise HTTPException(400, 'Cần chọn khóa học để xem nội dung cần ôn tập.')
     due=_review_due_items(user['id'], selected_course_id)
-    scheduled=_review_scheduled_lessons(user['id'], selected_course_id)
     planned=_review_planned_content(user['id'], selected_course_id)
-    scheduled_payload=[{
-        'lesson':r.get('lesson'),'content_type':r.get('content_type'),
-        'vocabulary_count':int(r.get('vocabulary_count') or 0),'grammar_count':int(r.get('grammar_count') or 0),
-        'next_review_at':r.get('next_review_at'),'completed_at':r.get('completed_at')
-    } for r in scheduled]
     count=len(planned)
-    review_available=bool(scheduled_payload or planned or due.get('vocabulary') or due.get('grammar'))
+    review_available=bool(planned or due.get('vocabulary') or due.get('grammar'))
     return {'course_id':int(selected_course_id),'course':selected_course_name,'course_name':selected_course_name,
             'due':due,'due_items':due,'pending_items':[],
-            'scheduled_lessons':scheduled_payload,'scheduled_count':len(scheduled_payload),
+            'scheduled_lessons':[],'scheduled_count':0,
             'review_items':planned,'review_items_count':count,
             'count':count,'review_available':review_available}
 
 @app.post('/learning/review/start')
 def learning_review_start(payload: dict, authorization: Optional[str] = Header(default=None)):
+    """Start the only supported review mode: wrong vocabulary/grammar answers."""
     user=require_active_user(authorization)
     course_id=int(payload.get('course_id') or 0)
     selected_course_id, selected_course_name, _ = _resolve_request_course(user['id'], course_id)
     if selected_course_id is None:
         raise HTTPException(403,'Khóa học không được phép.')
+    if str(payload.get('lesson') or '').strip() or str(payload.get('content_type') or '').strip():
+        raise HTTPException(410,'Ôn theo từng bài đã được bỏ. Chỉ hỗ trợ làm lại câu Từ vựng/Ngữ pháp đã làm sai.')
     result=_start_review_chat_session(
         user['id'],int(selected_course_id),selected_course_name,
-        lesson=str(payload.get('lesson') or '').strip() or None,
-        content_type=str(payload.get('content_type') or '').strip() or None,
+        lesson=None,content_type=None,
         chatbox_id=str(payload.get('chatbox_id') or '').strip() or None,
-        max_questions=int(payload.get('max_questions') or 12)
+        max_questions=int(payload.get('max_questions') or 12),
+        only_failed=True,all_failed_due=True
     )
     return {k:result[k] for k in ('session_id','course_id','course','questions','reply','content_blocks','source_lesson')}
 
@@ -13043,8 +12755,6 @@ def learning_review_finish(payload: dict, authorization: Optional[str] = Header(
             cur.execute("DELETE FROM user_review_sessions WHERE id=%s AND user_id=%s",(sid,user['id']))
         conn.commit()
     finally: conn.close()
-    if sess and str(sess.get('review_scope') or 'FULL').upper() == 'FULL':
-        _mark_review_schedule_completed(user['id'],int(sess['course_id']),sess.get('source_lesson'))
     return {'success':True}
 
 @app.get("/learning/plan")
