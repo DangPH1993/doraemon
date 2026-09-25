@@ -7073,6 +7073,10 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
     next_plan=today_plan_items[0] if today_plan_items else (_next_plan_lesson_for_welcome(user_id,course_id) if intent=='LEARN_RECOMMENDATION' else None)
 
     parts=[]
+    # Structured action metadata for the learner UI.  The text briefing remains
+    # unchanged, but each plan lesson is accompanied by a direct button that
+    # opens that exact lesson instead of asking the learner to type its name.
+    plan_action_items=[]
     if intent=='LEARN_RECOMMENDATION':
         parts.append('👋 Chào cậu! Doraemon đã xem lịch học và phần câu sai cần làm lại hôm nay.')
         if today_plan_items:
@@ -7089,6 +7093,12 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
                         date_text=f' ({plan_date})'
                 target_text=str(item.get('target') or '').strip()
                 parts.append(f'• **{lesson}** ({ct}){date_text}{(" – "+target_text) if target_text else ""}')
+                plan_action_items.append({
+                    'course_id': int(course_id) if course_id is not None else None,
+                    'content_type': ct,
+                    'lesson': lesson,
+                    'topic': str(item.get('topic') or '').strip() or None,
+                })
         elif next_plan:
             next_lesson=str(next_plan.get('lesson') or '').strip()
             plan_date=next_plan.get('plan_date')
@@ -7099,6 +7109,12 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
                 except Exception:
                     plan_text=f' (dự kiến {plan_date})'
             parts.append(f'🎯 Theo lộ trình, bài học tiếp theo là **{next_lesson}**{plan_text}.')
+            plan_action_items.append({
+                'course_id': int(course_id) if course_id is not None else None,
+                'content_type': str(next_plan.get('content_type') or 'Giáo trình'),
+                'lesson': next_lesson,
+                'topic': str(next_plan.get('topic') or '').strip() or None,
+            })
 
     if wrong_count:
         parts.append(f'📝 Cậu có **{wrong_count} câu từ vựng/ngữ pháp đã làm sai** và đã đến lịch làm lại.')
@@ -7123,6 +7139,19 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     msg='\n\n'.join(parts)
     blocks=[{'type':'text','text':msg}]
+    # Render one direct CTA for every plan lesson mentioned in the briefing.
+    # The client uses these metadata fields to call the same exact lesson-opening
+    # flow as clicking the lesson in the curriculum list.
+    for item in plan_action_items:
+        if item.get('lesson'):
+            blocks.append({
+                'type':'study_plan_lesson',
+                'course_id':item.get('course_id'),
+                'content_type':item.get('content_type') or 'Giáo trình',
+                'lesson':item.get('lesson'),
+                'topic':item.get('topic'),
+                'label':'Học theo lộ trình',
+            })
     if wrong_count:
         blocks.append({'type':'choice','id':'learning_discovery_selection','options':[
             {'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'}
