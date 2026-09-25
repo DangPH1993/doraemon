@@ -1,4 +1,4 @@
-# VERSION: v31.63 — robust DB-first WRONG_ONLY grammar recovery from stored/rich-text/published B1 sources
+# VERSION: v31.70 — WRONG_ONLY generates a new similar MCQ from the saved wrong-answer snapshot
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.69"
+SERVER_VERSION = "31.70"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -11428,7 +11428,7 @@ def _review_due_items(user_id, course_id):
                            WHERE r.user_id=%s AND r.course_id=%s
                            ORDER BY r.next_review_at,r.vocab_id""",(user_id,course_id))
             vocab_all=[dict(x) for x in cur.fetchall()]
-            cur.execute("""SELECT r.grammar_id AS item_id,r.wrong_count,r.next_review_at,
+            cur.execute("""SELECT r.grammar_id AS item_id,r.wrong_count,r.next_review_at,r.question_snapshot,
                                   m.id,m.normalized_key,m.pattern,m.meaning,m.explanation,m.example,m.source_lesson
                            FROM user_grammar_review r
                            JOIN curriculum_grammar_master m ON m.id=r.grammar_id AND m.course_id=r.course_id
@@ -11624,11 +11624,245 @@ def _review_vocab_question(item, all_vocab, mode=None):
     return None
 
 
+
+def _review_wrong_item_prompt_payload(item, item_type):
+    """Prepare only the information already persisted for a failed item.
+
+    WRONG_ONLY generation must not reconstruct the old question from curriculum
+    tables. The original question/answer snapshot is the primary source. Legacy
+    master fields are accepted only as a compatibility view of the same persisted
+    review item when the snapshot is incomplete.
+    """
+    row=dict(item or {})
+    snap=row.get('question_snapshot') if isinstance(row.get('question_snapshot'),dict) else {}
+    def pick(*keys):
+        for source in (snap,row):
+            for key in keys:
+                val=source.get(key) if isinstance(source,dict) else None
+                if val not in (None,'',[]):
+                    if isinstance(val,(dict,list)):
+                        return val
+                    text=str(val).strip()
+                    if text:
+                        return text
+        return ''
+
+    original_question=pick('question','example')
+    original_answer=pick('answer_text','answer','answer_criteria')
+    original_options=pick('options','option_letters')
+    wrong_answer=pick('wrong_answer')
+    pattern=pick('pattern','grammar','structure')
+    meaning=pick('meaning','translation','definition')
+    explanation=pick('explanation')
+    writing=pick('writing','word','term')
+    reading=pick('reading','hiragana','kana','pronunciation_vi')
+
+    # Legacy rows often have meaning="Đáp án đúng: ..." instead of answer_text.
+    if isinstance(original_answer,str):
+        m=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*(.+)$',original_answer,flags=re.I|re.M)
+        if m:
+            original_answer=m.group(1).strip()
+
+    return {
+        'item_type':str(item_type or row.get('item_type') or '').strip(),
+        'item_id':int(row.get('id') or row.get('item_id') or 0),
+        'original_question':str(original_question or '').strip(),
+        'original_answer':str(original_answer or '').strip(),
+        'original_options':original_options,
+        'wrong_answer':str(wrong_answer or '').strip(),
+        'pattern':str(pattern or '').strip(),
+        'meaning':str(meaning or '').strip(),
+        'explanation':str(explanation or '').strip(),
+        'writing':str(writing or '').strip(),
+        'reading':str(reading or '').strip(),
+    }
+
+
+def _review_similar_questions_from_saved_wrong_items(course_id, selected_vocab, selected_grammar, max_q):
+    """Generate NEW MCQ4 review questions from saved wrong-answer snapshots.
+
+    No curriculum/master lookup is performed here. The saved failed-question data is
+    the source. A new sentence/question is intentionally generated so the learner
+    cannot simply memorize the previous option letter.
+    """
+    items=[]
+    for it in selected_vocab or []:
+        items.append(_review_wrong_item_prompt_payload(it,'vocabulary'))
+    for it in selected_grammar or []:
+        items.append(_review_wrong_item_prompt_payload(it,'grammar'))
+    items=items[:max_q]
+    if not items:
+        return []
+
+    prompt_data={
+        'task':'Tạo câu hỏi ÔN LẠI mới dựa trên những câu mà người học đã trả lời sai.',
+        'rules':[
+            'Mỗi input item phải tạo đúng 1 câu hỏi mới.',
+            'Câu mới phải TƯƠNG TỰ về kiến thức/mục tiêu với câu sai đã lưu nhưng KHÔNG được chép nguyên câu cũ.',
+            'Mỗi câu phải là multiple_choice với đúng 4 lựa chọn A/B/C/D.',
+            'answer chỉ là A/B/C/D và phải khớp đúng một lựa chọn.',
+            'Grammar: kiểm tra lại chính điểm ngữ pháp mà câu sai đã kiểm tra; tạo một câu mới tương đương về kỹ năng áp dụng.',
+            'Vocabulary: kiểm tra lại chính từ/cụm từ đã sai; có thể tạo ngữ cảnh/câu mới nhưng vẫn phải kiểm tra cùng từ/cụm từ.',
+            'Ưu tiên dùng thông tin đã lưu trong original_question, original_answer, original_options, pattern, meaning và wrong_answer.',
+            'Nếu dữ liệu cũ chỉ có câu hỏi hoặc chỉ có đáp án thì vẫn phải cố tạo câu ôn mới từ phần dữ liệu còn lại; không trả lời rằng thiếu DB.',
+            'Không hỏi định nghĩa tên cấu trúc ngữ pháp; với grammar hãy kiểm tra khả năng áp dụng vào câu.',
+            'Không đưa đáp án đúng vào phần question.',
+            'Giữ nguyên item_id và item_type của input.',
+            'Trả JSON duy nhất: {"questions":[{"item_type":"grammar|vocabulary","item_id":123,"question_type":"multiple_choice","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","answer_text":"...","explanation":"..."}]}'
+        ],
+        'DATA':items,
+    }
+    payload=json.dumps(prompt_data,ensure_ascii=False,separators=(',',':'))
+    try:
+        reply,model,_=_generate_chat_reply(
+            'Bạn là Doraemon. Hãy tạo câu ôn MỚI từ các câu sai đã lưu.\n'+payload,
+            content_type=None,
+            request_id=f'review-similar-{int(course_id)}-{int(time.time()*1000)}',
+            gen_started=time.perf_counter(),
+            user_text='',
+            reasoning_profile='low'
+        )
+        parsed=_review_json_from_text(reply)
+        generated=(parsed.get('questions') if isinstance(parsed,dict) else parsed) or []
+    except Exception as exc:
+        print(f'[REVIEW SIMILAR GENAI] generation failed course_id={course_id}: {type(exc).__name__}: {exc}')
+        return []
+    if not isinstance(generated,list):
+        return []
+
+    source_by_key={ (x['item_type'],x['item_id']):x for x in items if x.get('item_id') }
+    generated_keys=set()
+    normalized=[]
+    for idx,q in enumerate(generated):
+        if not isinstance(q,dict):
+            continue
+        raw_type=str(q.get('item_type') or '').strip().casefold()
+        item_type='vocabulary' if raw_type in {'vocabulary','vocab','từ vựng'} else 'grammar' if raw_type in {'grammar','ngữ pháp'} else ''
+        try:
+            item_id=int(q.get('item_id') or 0)
+        except Exception:
+            item_id=0
+        # When the model omits ids, bind in the original item order as a safe fallback.
+        if item_id<=0 and idx<len(items):
+            item_id=int(items[idx].get('item_id') or 0)
+            if not item_type:
+                item_type=str(items[idx].get('item_type') or '').strip().casefold()
+        key=(item_type,item_id)
+        if key not in source_by_key or key in generated_keys:
+            continue
+
+        question=str(q.get('question') or '').strip()
+        opts=q.get('options') if isinstance(q.get('options'),list) else []
+        raw_map=q.get('option_letters') if isinstance(q.get('option_letters'),dict) else {}
+        option_map={}
+        if raw_map:
+            for letter in ('A','B','C','D'):
+                val=str(raw_map.get(letter) or '').strip()
+                if val: option_map[letter]=val
+        if len(option_map)!=4:
+            option_map={}
+            for x in opts:
+                m=re.match(r'^\s*([A-D])[.)\-:]\s*(.*?)\s*$',str(x or '').strip(),flags=re.I)
+                if m and m.group(2).strip():
+                    option_map[m.group(1).upper()]=m.group(2).strip()
+        if len(option_map)!=4 or any(not option_map.get(k) for k in 'ABCD') or not question:
+            print(f'[REVIEW SIMILAR GENAI] rejected item_id={item_id} reason=invalid_mcq4')
+            continue
+
+        answer=str(q.get('answer') or '').strip().upper()
+        answer_text=str(q.get('answer_text') or '').strip()
+        if answer not in {'A','B','C','D'} and answer_text:
+            norm=lambda x: re.sub(r'\s+',' ',str(x or '').strip().casefold())
+            aa=norm(answer_text)
+            for letter,val in option_map.items():
+                if norm(val)==aa or aa in norm(val) or norm(val) in aa:
+                    answer=letter
+                    break
+        if answer not in {'A','B','C','D'}:
+            print(f'[REVIEW SIMILAR GENAI] rejected item_id={item_id} reason=invalid_answer')
+            continue
+        if not answer_text:
+            answer_text=option_map[answer]
+
+        src=source_by_key[key]
+        src_q=str(src.get('original_question') or '').strip()
+        # Reject exact-copy only; the learner needs a new question, not the original again.
+        nq=re.sub(r'\s+',' ',question).strip().casefold()
+        oq=re.sub(r'\s+',' ',src_q).strip().casefold()
+        if oq and nq == oq:
+            print(f'[REVIEW SIMILAR GENAI] rejected item_id={item_id} reason=question_not_new')
+            continue
+
+        normalized.append({
+            'item_type':item_type,'item_id':item_id,'question_type':'multiple_choice',
+            'question':question,
+            'options':[f'{k}. {option_map[k]}' for k in 'ABCD'],
+            'option_letters':option_map,'answer':answer,
+            'answer_text':answer_text,
+            'answer_criteria':answer_text,
+            'pattern':str(src.get('pattern') or '').strip(),
+            'meaning':str(src.get('meaning') or '').strip(),
+            'explanation':str(q.get('explanation') or src.get('explanation') or '').strip(),
+            'example':question,
+            'source_lesson':str(src.get('source_lesson') or '').strip(),
+        })
+        generated_keys.add(key)
+
+    # One retry for missing outputs: a single-item prompt still uses only the saved
+    # wrong-answer payload, never curriculum reconstruction.
+    missing=[x for x in items if (x['item_type'],x['item_id']) not in generated_keys]
+    for src in missing:
+        try:
+            single_data={'questions':[]}
+            single_payload={
+                'task':'Tạo 1 câu MCQ4 mới tương tự câu sai đã lưu.',
+                'rules':prompt_data['rules'],
+                'DATA':[src],
+            }
+            reply,_,_=_generate_chat_reply(
+                'Bạn là Doraemon. Tạo đúng 1 câu ôn mới từ dữ liệu đã lưu.\n'+json.dumps(single_payload,ensure_ascii=False,separators=(',',':')),
+                content_type=None,
+                request_id=f'review-similar-one-{int(course_id)}-{int(src["item_id"])}-{int(time.time()*1000)}',
+                gen_started=time.perf_counter(),user_text='',reasoning_profile='low'
+            )
+            parsed=_review_json_from_text(reply)
+            arr=(parsed.get('questions') if isinstance(parsed,dict) else parsed) or []
+            if arr:
+                # Re-run the same normalizer through a tiny local pass by accepting only
+                # the first result for the requested source item.
+                q=arr[0] if isinstance(arr[0],dict) else {}
+                q['item_type']=src['item_type']; q['item_id']=src['item_id']
+                opts=q.get('options') if isinstance(q.get('options'),list) else []
+                option_map={}
+                for x in opts:
+                    m=re.match(r'^\s*([A-D])[.)\-:]\s*(.*?)\s*$',str(x or '').strip(),flags=re.I)
+                    if m and m.group(2).strip(): option_map[m.group(1).upper()]=m.group(2).strip()
+                ans=str(q.get('answer') or '').strip().upper()
+                qq=str(q.get('question') or '').strip()
+                if set(option_map)==set('ABCD') and ans in {'A','B','C','D'} and qq:
+                    normalized.append({
+                        'item_type':src['item_type'],'item_id':src['item_id'],'question_type':'multiple_choice',
+                        'question':qq,'options':[f'{k}. {option_map[k]}' for k in 'ABCD'],'option_letters':option_map,
+                        'answer':ans,'answer_text':str(q.get('answer_text') or option_map[ans]).strip(),
+                        'answer_criteria':str(q.get('answer_text') or option_map[ans]).strip(),
+                        'pattern':src['pattern'],'meaning':src['meaning'],'explanation':str(q.get('explanation') or src['explanation']).strip(),
+                        'example':qq,'source_lesson':str(src.get('source_lesson') or '').strip(),
+                    })
+                    generated_keys.add((src['item_type'],src['item_id']))
+                    print(f'[REVIEW SIMILAR GENAI] item_id={src["item_id"]} recovered=1 source=single_retry')
+        except Exception as exc:
+            print(f'[REVIEW SIMILAR GENAI] item_id={src["item_id"]} single_retry_failed={type(exc).__name__}: {exc}')
+
+    normalized.sort(key=lambda x:(0 if x.get('item_type')=='vocabulary' else 1, int(x.get('item_id') or 0)))
+    print(f'[REVIEW SIMILAR GENAI] course_id={course_id} requested={len(items)} generated={len(normalized)}')
+    return normalized[:max_q]
+
+
 def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=False):
     """Build one-question-at-a-time review specs using only DB-backed lesson items.
 
-    The model is used to generate grammar MCQ/fill-blank wording and vocabulary
-    distractors only. The authoritative vocabulary/grammar item IDs come from DB.
+    For WRONG_ONLY, the model creates NEW MCQ4 questions from the saved wrong-answer
+    snapshot. For legacy/general review paths, the existing DB-backed behavior is retained.
     """
     vocab=list(data.get('vocabulary') or [])
     grammar=list(data.get('grammar') or [])
@@ -11649,49 +11883,20 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             vocab=vocab[:min(9,max_q)]
             grammar=grammar[:max(0,max_q-len(vocab))]
 
-    selected_ids={('vocabulary',int(x.get('id') or 0)) for x in vocab}
-    selected_ids.update({('grammar',int(x.get('id') or 0)) for x in grammar})
+    selected_ids={('vocabulary',int(x.get('id') or x.get('item_id') or 0)) for x in vocab}
+    selected_ids.update({('grammar',int(x.get('id') or x.get('item_id') or 0)) for x in grammar})
     selected_vocab=vocab
     selected_grammar=grammar
 
-    # WRONG_ONLY is a retry queue over durable DB items. Do not call the LLM to
-    # invent/reconstruct these questions. Reuse the original B1 choices directly.
+    # WRONG_ONLY: generate a NEW similar question from the saved wrong-answer snapshot.
+    # Never reconstruct the original question from curriculum/master tables here.
     if only_failed:
-        questions=[]
-        for item in selected_vocab:
-            q=_review_vocab_question(item,selected_vocab,mode='mcq')
-            if q:
-                questions.append(q)
-        for item in selected_grammar:
-            item_id=int(item.get('id') or 0)
-            q=_review_question_from_snapshot(item)
-            source='snapshot' if q else ''
-            if not q:
-                q=_review_grammar_question_from_stored_example(item)
-                source='stored_example' if q else ''
-            if not q:
-                q=_review_grammar_proxy_question_from_published_source(int(course_id),item)
-                source='published_b1' if q else ''
-            if not q:
-                q=_review_grammar_fallback_question(item,selected_grammar,course_id)
-                source='grammar_fallback' if q else ''
-            if q:
-                _save_review_snapshot(user_id,int(course_id),'grammar',item_id,q)
-                questions.append(q)
-                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source={source}")
-            else:
-                print(f"[REVIEW WRONG-ONLY DB FIRST] item_id={item_id} source_unavailable=1 normalized_key={str(item.get('normalized_key') or '')!r} source_lesson={str(item.get('source_lesson') or '')!r} example_chars={len(str(item.get('example') or ''))}")
-
-        # Final deterministic format guarantee.
-        questions=[q for q in questions if isinstance(q,dict)
-                   and str(q.get('question_type') or '')=='multiple_choice'
-                   and isinstance(q.get('options'),list) and len(q.get('options'))==4
-                   and str(q.get('answer') or '').upper() in {'A','B','C','D'}]
-        print(f"[REVIEW WRONG-ONLY DB FIRST] course_id={course_id} selected_vocab={len(selected_vocab)} selected_grammar={len(selected_grammar)} recovered={len(questions)}")
-        return questions[:max_q]
+        return _review_similar_questions_from_saved_wrong_items(
+            int(course_id),selected_vocab,selected_grammar,max_q
+        )
 
     prompt_data={
-        'task':'Tạo câu hỏi ôn tập tiếng Nhật theo kiểu quiz, MỖI LẦN CHỈ 1 CÂU cho người học.',
+        'task':'Tạo câu hỏi ôn tập theo kiểu quiz, MỖI LẦN CHỈ 1 CÂU cho người học.',
         'lesson':str(lesson or ''),
         'rules':[
             'Chỉ sử dụng đúng item_id có trong DATA. Không tạo item_id mới và không dùng kiến thức ngoài DATA.',
@@ -11732,26 +11937,8 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
 
     questions=[]
 
-    # WRONG_ONLY grammar review should be deterministic and DB-first: recover each
-    # failed question from its original published B1 source before accepting any
-    # GenAI-generated grammar question. This prevents a malformed AI response from
-    # turning a 12-item retry batch into zero questions.
-    recovered_wrong_grammar={}
-    if only_failed:
-        for item in selected_grammar:
-            try:
-                rq=_review_grammar_proxy_question_from_published_source(int(course_id),item)
-            except Exception as exc:
-                rq=None
-                print(f"[REVIEW PUBLISHED B1] item_id={int(item.get('id') or 0)} error={type(exc).__name__}: {exc}")
-            if rq:
-                recovered_wrong_grammar[('grammar',int(item.get('id') or 0))]=rq
-                questions.append(rq)
-        if recovered_wrong_grammar:
-            print(f"[REVIEW WRONG-ONLY DB FIRST] course_id={course_id} recovered={len(recovered_wrong_grammar)}")
-
     for item in selected_vocab:
-        item_id=int(item.get('id') or 0)
+        item_id=int(item.get('id') or item.get('item_id') or 0)
         ai_q=by_key.get(('vocabulary',item_id)) or {}
         ai_type=str(ai_q.get('question_type') or '').strip()
         # Vocabulary wording and correct answer remain DB-authoritative.
@@ -11775,9 +11962,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
         questions.append(q)
 
     for item in selected_grammar:
-        item_id=int(item.get('id') or 0)
-        if ('grammar',item_id) in recovered_wrong_grammar:
-            continue
+        item_id=int(item.get('id') or item.get('item_id') or 0)
         ai_q=by_key.get(('grammar',item_id)) or {}
         if ai_q and not _review_grammar_question_is_applied(ai_q):
             print(f"[REVIEW GRAMMAR VALIDATION] rejected theory question item_id={item_id} lesson={lesson!r}")
@@ -12179,10 +12364,14 @@ def _start_review_chat_session(user_id, course_id, course_name, lesson=None, con
     source_questions=None
     if all_failed_due:
         due=_review_due_items(user_id,course_id)
-        data=_review_master_payload(int(course_id),{
-            'vocabulary':[{'item_id':int(x.get('item_id'))} for x in (due.get('vocabulary') or [])],
-            'grammar':[{'item_id':int(x.get('item_id'))} for x in (due.get('grammar') or [])]
-        })
+        # IMPORTANT: keep the durable wrong-answer snapshot with each item.
+        # WRONG_ONLY review questions are generated from what was saved when the
+        # learner answered incorrectly; they must not query curriculum_steps/master
+        # to reconstruct the old question.
+        data={
+            'vocabulary':[dict(x) for x in (due.get('vocabulary') or [])],
+            'grammar':[dict(x) for x in (due.get('grammar') or [])],
+        }
         source_lesson='review_wrong_due'
         if not data['vocabulary'] and not data['grammar']:
             raise HTTPException(404,'Hiện chưa có câu Từ vựng/Ngữ pháp nào đã làm sai và đến lịch làm lại.')
