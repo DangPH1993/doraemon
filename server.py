@@ -7924,6 +7924,14 @@ def proxy_chat(
 
     # Lesson confirmation actions are explicit intent confirmation.
     # They bypass routing/RAG only when YES; NO simply cancels the pending lesson open.
+    #
+    # IMPORTANT: Study Plan scopes can carry a stale/default content_type (for
+    # example, "Giáo trình") while the canonical catalog stores the lesson under
+    # another content type (for example, "Bài tập"). Manual opening works because
+    # the client gets the canonical content_type from /learning/catalog.
+    # Canonicalize the confirmed scope against the catalog before package-gating
+    # or creating the study session, so the Study Plan button opens the exact
+    # same lesson users can open manually.
     lesson_confirmed_scope = None
     if ui_action in {"lesson_confirm_yes", "lesson_confirm_no"} and action_plan_id:
         decoded = _decode_lesson_confirm_scope(action_plan_id)
@@ -7932,8 +7940,52 @@ def proxy_chat(
                 lesson_label = decoded.get("lesson") or "bài này"
                 msg = f"Được nhé! 🤖 Doraemon chưa mở **{lesson_label}**. Cậu có thể nói bài khác mà cậu muốn học."
                 return {"reply":msg,"model":GEMINI_MODEL,"sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-            lesson_confirmed_scope = decoded
+            lesson_confirmed_scope = dict(decoded)
             try:
+                plan_course_id = lesson_confirmed_scope.get("course_id")
+                plan_lesson = str(lesson_confirmed_scope.get("lesson") or "").strip()
+                plan_topic = str(lesson_confirmed_scope.get("topic") or "").strip()
+                supplied_ct = _normalize_content_type(lesson_confirmed_scope.get("content_type")) or str(lesson_confirmed_scope.get("content_type") or "").strip()
+                if plan_course_id not in (None, "") and plan_lesson:
+                    catalog_rows = _catalog_rows_for_courses([int(plan_course_id)])
+                    norm_lesson = re.sub(r"\s+", " ", plan_lesson).casefold()
+                    norm_topic = re.sub(r"\s+", " ", plan_topic).casefold()
+                    exact_topic_rows = [
+                        r for r in catalog_rows
+                        if re.sub(r"\s+", " ", str(r.get("lesson") or "").strip()).casefold() == norm_lesson
+                        and (not norm_topic or re.sub(r"\s+", " ", str(r.get("topic") or "").strip()).casefold() == norm_topic)
+                    ]
+                    supplied_rows = [
+                        r for r in exact_topic_rows
+                        if (_normalize_content_type(r.get("content_type")) or str(r.get("content_type") or "").strip()).casefold() == supplied_ct.casefold()
+                    ]
+                    candidates = supplied_rows or exact_topic_rows
+                    distinct = []
+                    seen = set()
+                    for r in candidates:
+                        ct = _normalize_content_type(r.get("content_type")) or str(r.get("content_type") or "").strip()
+                        lesson_name = str(r.get("lesson") or "").strip()
+                        topic_name = str(r.get("topic") or "").strip()
+                        key = (ct.casefold(), lesson_name.casefold(), topic_name.casefold())
+                        if key not in seen:
+                            seen.add(key); distinct.append((ct, lesson_name, topic_name))
+                    if supplied_rows:
+                        chosen = distinct[0] if distinct else None
+                    elif len(distinct) == 1:
+                        chosen = distinct[0]
+                    else:
+                        chosen = None
+                    if chosen:
+                        canon_ct, canon_lesson, canon_topic = chosen
+                        if canon_ct != supplied_ct or canon_lesson != plan_lesson or (canon_topic and canon_topic != plan_topic):
+                            print(
+                                f"[STUDY PLAN SCOPE CANONICALIZED] user={user['id']} course_id={plan_course_id} "
+                                f"lesson={plan_lesson!r} content_type={supplied_ct!r} -> content_type={canon_ct!r} "
+                                f"topic={canon_topic!r}"
+                            )
+                        lesson_confirmed_scope["content_type"] = canon_ct
+                        lesson_confirmed_scope["lesson"] = canon_lesson
+                        lesson_confirmed_scope["topic"] = canon_topic or None
                 _start_study_session(user["id"], lesson_confirmed_scope, data.chatbox_id)
             except HTTPException as exc:
                 detail=exc.detail if isinstance(exc.detail,dict) else {"message":str(exc.detail)}
