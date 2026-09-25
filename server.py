@@ -1,4 +1,4 @@
-# VERSION: v31.70 — WRONG_ONLY generates a new similar MCQ from the saved wrong-answer snapshot
+# VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
@@ -24,6 +24,9 @@ import urllib.parse
 import html
 import hashlib
 import tempfile
+import secrets
+import urllib.request
+import urllib.error
 from pathlib import Path
 import zipfile
 import mimetypes
@@ -86,6 +89,12 @@ PINECONE_INDEX = os.getenv("PINECONE_INDEX", "doraemon")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_IN_RENDER")
+# Brevo transactional email configuration. Keep secrets in Render environment variables.
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Doraemon").strip() or "Doraemon"
+DORAEMON_WEB_URL = (os.getenv("DORAEMON_WEB_URL", "") or os.getenv("WEB_URL", "")).strip().rstrip("/")
+PASSWORD_RESET_TTL_MINUTES = max(5, min(60, int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "20"))))
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
 # LLM provider for chat generation only. RAG embeddings / PDF vision ingestion remain
@@ -128,7 +137,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.70"
+SERVER_VERSION = "31.71"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -170,10 +179,26 @@ def init_db():
     try:
         with conn.cursor() as cur:
             cur.execute("""CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY, phone VARCHAR(30) UNIQUE NOT NULL,
+                id SERIAL PRIMARY KEY, phone VARCHAR(30) UNIQUE,
                 nickname VARCHAR(100) NOT NULL, password_hash TEXT NOT NULL,
                 status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                email VARCHAR(320), username VARCHAR(100),
+                auth_version INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(320);")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(100);")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE users ALTER COLUMN phone DROP NOT NULL;")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email_lower ON users (LOWER(email)) WHERE email IS NOT NULL;")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_username_lower ON users (LOWER(username)) WHERE username IS NOT NULL;")
+            cur.execute("""CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash VARCHAR(128) NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                used_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_created ON password_reset_tokens(user_id, created_at DESC);")
             cur.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
                 id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 course_id BIGINT,
@@ -618,13 +643,20 @@ def startup():
     print("Gemini model:", GEMINI_MODEL, "thinking_level:", GEMINI_THINKING_LEVEL)
 
 class RegisterRequest(BaseModel):
-    phone: str
-    nickname: str
+    email: str
+    username: str
     password: str
 
 class LoginRequest(BaseModel):
-    phone: str
+    email: str
     password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 class ChatRequest(BaseModel):
     # API mới dùng "message". Giữ "prompt" để tương thích với client cũ.
@@ -688,9 +720,18 @@ def _format_phrasing_history(history) -> str:
 def hash_password(p): return pwd_context.hash(p)
 def verify_password(p, h): return pwd_context.verify(p, h)
 
-def create_token(user_id):
+def create_token(user_id, auth_version=None):
+    if auth_version is None:
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT auth_version FROM users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                auth_version = int(row[0] or 0) if row else 0
+        finally:
+            conn.close()
     exp = datetime.now(timezone.utc) + timedelta(days=30)
-    return jwt.encode({"sub": str(user_id), "exp": exp, "type": "user"},
+    return jwt.encode({"sub": str(user_id), "exp": exp, "type": "user", "av": int(auth_version or 0)},
                       JWT_SECRET, algorithm="HS256")
 
 def bearer(authorization):
@@ -707,12 +748,15 @@ def current_user(token):
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id,phone,nickname,status,created_at FROM users WHERE id=%s", (uid,))
+            cur.execute("SELECT id,phone,nickname,email,username,status,created_at,auth_version FROM users WHERE id=%s", (uid,))
             user = cur.fetchone()
     finally:
         conn.close()
     if not user:
         raise HTTPException(401, "Tài khoản không tồn tại.")
+    token_version = payload.get("av")
+    if token_version is not None and int(token_version or 0) != int(user.get("auth_version") or 0):
+        raise HTTPException(401, "Phiên đăng nhập đã hết hiệu lực. Vui lòng đăng nhập lại.")
     return dict(user)
 
 def _now_local():
@@ -912,54 +956,177 @@ def payment_packages(authorization: Optional[str] = Header(default=None)):
             "price_vnd": int(r.get("price_vnd") or 0),
             "price_display": f"{int(r.get('price_vnd') or 0):,}".replace(",", ".") + " đ" if int(r.get("price_vnd") or 0) > 0 else "Liên hệ Admin",
             "qr_url": b2_url(r.get("qr_key")) if r.get("qr_key") else None,
-            "payment_content": f"{user['phone']}_mua gói {r.get('plan_name') or f'{months} tháng'}"
+            "payment_content": f"{user.get('email') or user.get('phone') or user.get('username') or user['id']}_mua gói {r.get('plan_name') or f'{months} tháng'}"
         })
     return {"timezone":"Asia/Ho_Chi_Minh","packages":out}
 
 
 @app.post("/auth/register")
 def register(data: RegisterRequest):
-    phone, nickname, password = data.phone.strip(), data.nickname.strip(), data.password
-    if not phone or not nickname or not password:
-        raise HTTPException(400, "Vui lòng nhập đầy đủ SĐT, nickname và mật khẩu.")
+    email = str(data.email or '').strip().lower()
+    username = str(data.username or '').strip()
+    password = data.password
+    if not email or not username or not password:
+        raise HTTPException(400, "Vui lòng nhập đầy đủ email, username và mật khẩu.")
     if len(password) < 6:
         raise HTTPException(400, "Mật khẩu phải có ít nhất 6 ký tự.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Email không hợp lệ.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,30}", username):
+        raise HTTPException(400, "Username dài 3–30 ký tự và chỉ gồm chữ, số, dấu . _ -.")
     conn = db()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE phone=%s", (phone,))
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE lower(email)=lower(%s)", (email,))
             if cur.fetchone():
-                raise HTTPException(409, "Số điện thoại đã được đăng ký.")
-            cur.execute("""INSERT INTO users(phone,nickname,password_hash,status)
-                           VALUES(%s,%s,%s,'ACTIVE') RETURNING id""",
-                        (phone, nickname, hash_password(password)))
-            uid = cur.fetchone()[0]
+                raise HTTPException(409, "Email đã được đăng ký.")
+            cur.execute("SELECT id FROM users WHERE lower(username)=lower(%s)", (username,))
+            if cur.fetchone():
+                raise HTTPException(409, "Username đã được sử dụng.")
+            cur.execute("""INSERT INTO users(phone,nickname,email,username,password_hash,status,auth_version)
+                           VALUES(NULL,%s,%s,%s,%s,'ACTIVE',0) RETURNING id,auth_version""",
+                        (username, email, username, hash_password(password)))
+            row = cur.fetchone(); uid = int(row['id']); auth_version = int(row['auth_version'] or 0)
             cur.execute("""INSERT INTO subscriptions(user_id,plan,started_at,expires_at,status)
                            VALUES(%s,'Free',NOW(),NULL,'ACTIVE')""", (uid,))
         conn.commit()
     finally:
         conn.close()
+    token = create_token(uid, auth_version)
     return {"success": True, "user_id": uid, "status": "ACTIVE",
+            "access_token": token,
+            "user": {"id":uid,"email":email,"username":username,"nickname":username,"phone":None,"status":"ACTIVE"},
             "subscription": _package_info(uid),
             "message": "Đăng ký thành công. Bạn đang sử dụng gói Free (5 lượt hỏi/ngày)."}
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
+    identity = str(data.email or '').strip().lower()
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,phone,nickname,password_hash,status FROM users WHERE phone=%s""",
-                        (data.phone.strip(),))
+            cur.execute("""SELECT id,phone,nickname,email,username,password_hash,status,auth_version
+                           FROM users WHERE lower(email)=%s OR lower(COALESCE(phone,''))=%s
+                           ORDER BY CASE WHEN lower(email)=%s THEN 0 ELSE 1 END
+                           LIMIT 1""", (identity, identity, identity))
             user = cur.fetchone()
     finally:
         conn.close()
     if not user or not verify_password(data.password, user["password_hash"]):
-        raise HTTPException(401, "SĐT hoặc mật khẩu không đúng.")
-    token = create_token(user["id"])
+        raise HTTPException(401, "Email hoặc mật khẩu không đúng.")
+    token = create_token(user["id"], int(user.get("auth_version") or 0))
     sub, msg = subscription_status(user["id"])
     return {"success": True, "access_token": token, "token_type": "bearer",
-            "user": {k: user[k] for k in ("id","phone","nickname","status")},
+            "user": {k: user.get(k) for k in ("id","email","username","nickname","phone","status")},
             "subscription": _package_info(user["id"]), "subscription_message": msg}
+
+
+def _brevo_send_email(to_email, to_name, subject, html_content, text_content=None):
+    if not BREVO_API_KEY or not BREVO_SENDER_EMAIL:
+        raise RuntimeError("Brevo chưa được cấu hình: cần BREVO_API_KEY và BREVO_SENDER_EMAIL.")
+    payload = {
+        "sender": {"email": BREVO_SENDER_EMAIL, "name": BREVO_SENDER_NAME},
+        "to": [{"email": to_email, "name": to_name or to_email}],
+        "subject": subject,
+        "htmlContent": html_content,
+    }
+    if text_content:
+        payload["textContent"] = text_content
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"accept":"application/json","api-key":BREVO_API_KEY,"content-type":"application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"Brevo HTTP {exc.code}: {detail}") from exc
+
+@app.post("/auth/forgot-password")
+def forgot_password(data: ForgotPasswordRequest):
+    email = str(data.email or '').strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Email không hợp lệ.")
+
+    generic = "Nếu email này tồn tại trong hệ thống, Doraemon sẽ gửi hướng dẫn đặt lại mật khẩu."
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,email,username,nickname FROM users WHERE lower(email)=lower(%s) LIMIT 1", (email,))
+            user = cur.fetchone()
+            if not user:
+                return {"success": True, "message": generic}
+            # Limit to 3 reset requests/hour/user and invalidate older active tokens.
+            cur.execute("""SELECT COUNT(*) AS n FROM password_reset_tokens
+                           WHERE user_id=%s AND created_at >= NOW() - INTERVAL '1 hour'""", (user['id'],))
+            sent_count = int((cur.fetchone() or {}).get('n') or 0)
+            if sent_count >= 3:
+                return {"success": True, "message": generic}
+            cur.execute("UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=%s AND used_at IS NULL", (user['id'],))
+            raw_token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
+            cur.execute("""INSERT INTO password_reset_tokens(user_id,token_hash,expires_at)
+                           VALUES(%s,%s,NOW() + (%s || ' minutes')::interval)""",
+                        (user['id'],token_hash,PASSWORD_RESET_TTL_MINUTES))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if not DORAEMON_WEB_URL:
+        print(f"[PASSWORD RESET] email={email!r} skipped: DORAEMON_WEB_URL missing")
+        return {"success": True, "message": generic}
+    reset_url = f"{DORAEMON_WEB_URL}/#/reset-password?token={urllib.parse.quote(raw_token, safe='')}"
+    safe_name = html.escape(str(user.get('username') or user.get('nickname') or 'bạn'))
+    safe_url = html.escape(reset_url, quote=True)
+    html_body = f"""<html><body style="font-family:Arial,sans-serif;line-height:1.6;color:#24324a">
+      <h2>Đặt lại mật khẩu Doraemon</h2>
+      <p>Xin chào <b>{safe_name}</b>,</p>
+      <p>Cậu vừa yêu cầu đặt lại mật khẩu cho tài khoản Doraemon.</p>
+      <p><a href="{safe_url}" style="display:inline-block;padding:12px 18px;background:#2563eb;color:#fff;text-decoration:none;border-radius:8px">Đặt lại mật khẩu</a></p>
+      <p>Liên kết có hiệu lực trong {PASSWORD_RESET_TTL_MINUTES} phút và chỉ dùng được một lần.</p>
+      <p>Nếu cậu không yêu cầu thao tác này, có thể bỏ qua email này.</p>
+    </body></html>"""
+    text_body = f"Đặt lại mật khẩu Doraemon: {reset_url}\nLiên kết có hiệu lực trong {PASSWORD_RESET_TTL_MINUTES} phút."
+    try:
+        result = _brevo_send_email(email, str(user.get('username') or user.get('nickname') or email), "Đặt lại mật khẩu Doraemon", html_body, text_body)
+        print(f"[BREVO] password_reset_sent user={user['id']} email={email!r} message_id={result.get('messageId')!r}")
+    except Exception as exc:
+        print(f"[BREVO] password_reset_failed user={user['id']} email={email!r}: {type(exc).__name__}: {exc}")
+    return {"success": True, "message": generic}
+
+@app.post("/auth/reset-password")
+def reset_password(data: ResetPasswordRequest):
+    token = str(data.token or '').strip()
+    new_password = data.new_password or ''
+    if not token:
+        raise HTTPException(400, "Token đặt lại mật khẩu không hợp lệ.")
+    if len(new_password) < 6:
+        raise HTTPException(400, "Mật khẩu mới phải có ít nhất 6 ký tự.")
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT pr.id,pr.user_id,u.email,u.username,u.nickname
+                           FROM password_reset_tokens pr
+                           JOIN users u ON u.id=pr.user_id
+                           WHERE pr.token_hash=%s AND pr.used_at IS NULL AND pr.expires_at > NOW()
+                           LIMIT 1""", (token_hash,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(400, "Link đặt lại mật khẩu đã hết hạn hoặc đã được sử dụng.")
+            cur.execute("""UPDATE users SET password_hash=%s,auth_version=auth_version+1 WHERE id=%s
+                           RETURNING id,email,username,nickname,phone,status,auth_version""",
+                        (hash_password(new_password), row['user_id']))
+            user = cur.fetchone()
+            cur.execute("UPDATE password_reset_tokens SET used_at=NOW() WHERE user_id=%s AND used_at IS NULL", (row['user_id'],))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"success": True, "message": "Đổi mật khẩu thành công. Vui lòng đăng nhập lại bằng mật khẩu mới."}
 
 @app.get("/auth/me")
 def me(authorization: Optional[str] = Header(default=None)):
@@ -18066,7 +18233,7 @@ async function loadUsers(){
       ? `<div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||'')} · tất cả khóa học · 200 request/ngày</div>`
       : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · tất cả khóa học · 5 request/ngày</div>`;
     return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
-      <b>#${u.id} ${esc(u.nickname)}</b> — ${esc(u.phone)}
+      <b>#${u.id} ${esc(u.username||u.nickname||"")}</b> — ${esc(u.email||u.phone||"")}
       ${headerInfo}
       ${courseRows}
       ${grantRow}
@@ -19980,7 +20147,7 @@ def admin_users(password: str):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT u.id,u.phone,u.nickname,u.status,u.created_at,
+            cur.execute("""SELECT u.id,u.phone,u.email,u.username,u.nickname,u.status,u.created_at,
                        s.id subscription_id,s.plan,s.course_id,s.started_at,s.expires_at,s.status subscription_status,
                        COALESCE(dq.question_count,0) AS used_today
                        FROM users u LEFT JOIN LATERAL
@@ -19996,7 +20163,7 @@ def admin_users(password: str):
               and str(r.get('plan') or 'Free').strip().casefold()!='free'
               and r.get('expires_at') is not None and r.get('expires_at')>now)
         plan=str(r.get('plan') or 'Free') if paid else 'Free'; limit=200 if paid else 5
-        out.append({'id':r['id'],'phone':r['phone'],'nickname':r['nickname'],'status':r['status'],'created_at':r['created_at'],
+        out.append({'id':r['id'],'phone':r['phone'],'email':r.get('email'),'username':r.get('username'),'nickname':r['nickname'],'status':r['status'],'created_at':r['created_at'],
                     'subscription':{'id':r['subscription_id'],'plan':plan,'course_id':None,'course_name':'Tất cả khóa học',
                                     'courses':courses,'started_at':r['started_at'] if paid else None,'expires_at':r['expires_at'] if paid else None,
                                     'expires_at_vn':_vn_display(r['expires_at']) if paid else None,'status':'ACTIVE',
