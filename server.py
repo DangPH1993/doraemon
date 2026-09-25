@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.67"
+SERVER_VERSION = "31.68"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5980,10 +5980,40 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
         m=re.match(r'^\s*(?:câu\s*)?(\d{1,3})\s*[.)\-:]\s+',ex,flags=re.I)
         if m: qnum=int(m.group(1))
 
+    # Legacy proxy rows may store the official answer as the full answer text
+    # (for example: "John expects to begin...") rather than only A/B/C/D.
+    # Keep both forms until the published B1 options are parsed, then resolve the
+    # authoritative choice letter from those options.
     am=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*([A-D])\b',meaning,flags=re.I)
-    answer=(am.group(1).upper() if am else str(row.get('answer') or '').strip().upper())
-    if answer not in {'A','B','C','D'}:
-        return None
+    answer_hint=(am.group(1).upper() if am else str(row.get('answer') or '').strip())
+    if not answer_hint:
+        mfull=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*(.+)$',meaning,flags=re.I|re.M)
+        if mfull:
+            answer_hint=mfull.group(1).strip()
+
+    def _resolve_answer_letter(option_map):
+        if answer_hint and re.fullmatch(r'[A-D]',str(answer_hint).strip(),flags=re.I):
+            return str(answer_hint).strip().upper()
+        hint=re.sub(r'[^a-z0-9]+',' ',str(answer_hint or '').casefold()).strip()
+        if not hint:
+            return ''
+        best_letter=''; best_score=-1
+        for letter,val in option_map.items():
+            opt_norm=re.sub(r'[^a-z0-9]+',' ',str(val or '').casefold()).strip()
+            if not opt_norm:
+                continue
+            score=0
+            if hint==opt_norm:
+                score=1000
+            elif hint in opt_norm or opt_norm in hint:
+                score=800 + min(len(opt_norm),200)
+            else:
+                hs=set(hint.split()); os=set(opt_norm.split())
+                if hs and os:
+                    score=int(500*len(hs & os)/max(1,len(hs)))
+            if score>best_score:
+                best_score=score; best_letter=letter
+        return best_letter if best_score>=400 else ''
 
     def fetch_source(lesson_filter=None):
         conn=db()
@@ -6044,6 +6074,9 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
             option_map,question=_review_extract_choice_map(block)
             if set(option_map)!=set('ABCD') or not question:
                 continue
+            resolved_answer=_resolve_answer_letter(option_map)
+            if resolved_answer not in {'A','B','C','D'}:
+                continue
             score=0
             if code=='B1': score+=100
             if lesson and str(r.get('lesson') or '').strip().casefold()==lesson.casefold(): score+=300
@@ -6060,6 +6093,9 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
         return None
 
     _,r,option_letters,question=best
+    answer=_resolve_answer_letter(option_letters)
+    if answer not in {'A','B','C','D'}:
+        return None
     if not re.search(r'_{2,}|\.\.\.|……+',question):
         correct_text=option_letters.get(answer,'')
         if correct_text:
