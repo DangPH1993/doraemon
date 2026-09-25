@@ -128,7 +128,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.68"
+SERVER_VERSION = "31.69"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -5942,6 +5942,114 @@ def _review_grammar_question_from_stored_example(item):
         'example':question,
     }
 
+
+def _review_legacy_grammar_mcq_from_exact_source(course_id, item):
+    """One-time recovery for legacy wrong-review rows that lack A/B/C/D choices.
+
+    Older review rows stored the exact B1 sentence plus the official answer text,
+    but not the four original choices. For those rows only, ask the LLM to supply
+    four answer choices around the exact stored sentence/answer, then immediately
+    persist the resulting snapshot so all later reviews are DB-only.
+    """
+    row=dict(item or {})
+    item_id=int(row.get('id') or 0)
+    source_lesson=str(row.get('source_lesson') or '').strip()
+    example=_review_source_text(row.get('example'))
+    meaning=str(row.get('meaning') or '').strip()
+    if not example:
+        return None
+
+    answer_hint=''
+    m=re.search(r'đáp\s*án\s+đúng\s*[:：]?\s*(.+)$',meaning,flags=re.I|re.M)
+    if m:
+        answer_hint=re.sub(r'\s+',' ',m.group(1)).strip()
+    if not answer_hint:
+        answer_hint=str(row.get('answer') or '').strip()
+    if not answer_hint:
+        return None
+
+    prompt=f"""You are repairing legacy review data for an English grammar learning app.
+Use ONLY the exact source sentence and authoritative correct-answer text below.
+Do not change the sentence meaning and do not add a new grammar point.
+
+SOURCE SENTENCE:
+{example}
+
+AUTHORITATIVE CORRECT ANSWER:
+{answer_hint}
+
+TASK:
+Create exactly one applied grammar multiple-choice question using the SAME source sentence.
+Replace the answer portion with a blank when possible.
+Create exactly four answer choices A, B, C, D around the same grammatical target.
+Exactly one option must be the authoritative correct answer.
+Do not ask about the definition or name of the grammar rule.
+
+Return JSON only:
+{{"question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"answer":"A","answer_text":"..."}}
+"""
+    try:
+        reply,_,_=_generate_chat_reply(
+            'You are Doraemon. Repair one legacy grammar review MCQ using only the supplied source.\n'+prompt,
+            content_type='Ngữ pháp',
+            request_id=f'review-legacy-{int(course_id)}-{item_id}-{int(time.time()*1000)}',
+            gen_started=time.perf_counter(),
+            user_text='',
+            reasoning_profile='low'
+        )
+        parsed=_review_json_from_text(reply)
+        q=parsed if isinstance(parsed,dict) else {}
+    except Exception as exc:
+        print(f"[REVIEW LEGACY MCQ] item_id={item_id} generation_failed={type(exc).__name__}: {exc}")
+        return None
+
+    question=str(q.get('question') or '').strip()
+    opts=q.get('options') if isinstance(q.get('options'),list) else []
+    answer=str(q.get('answer') or '').strip().upper()
+    answer_text=str(q.get('answer_text') or '').strip()
+    option_map={}
+    for x in opts:
+        mopt=re.match(r'^\s*([A-D])[.)]\s*(.+?)\s*$',str(x or '').strip(),flags=re.I)
+        if mopt:
+            letter=mopt.group(1).upper(); val=mopt.group(2).strip()
+            if val and letter not in option_map:
+                option_map[letter]=val
+    if set(option_map)!=set('ABCD'):
+        raw_map=q.get('option_letters') if isinstance(q.get('option_letters'),dict) else {}
+        option_map={k:str(raw_map.get(k) or '').strip() for k in 'ABCD'}
+    if any(not option_map.get(k) for k in 'ABCD') or answer not in set('ABCD') or not question:
+        print(f"[REVIEW LEGACY MCQ] item_id={item_id} invalid_output=1")
+        return None
+    if not answer_text:
+        answer_text=option_map[answer]
+
+    # Keep the learner-facing question grounded in the exact legacy sentence.
+    source_norm=re.sub(r'\s+',' ',example).strip()
+    question_norm=re.sub(r'\s+',' ',question).strip()
+    if source_norm and question_norm and not (
+        source_norm.casefold() in question_norm.casefold() or
+        question_norm.casefold() in source_norm.casefold()
+    ):
+        print(f"[REVIEW LEGACY MCQ] item_id={item_id} rejected=question_changed")
+        return None
+
+    result={
+        'item_type':'grammar','item_id':item_id,'question_type':'multiple_choice',
+        'question':question,
+        'options':[f'{k}. {option_map[k]}' for k in 'ABCD'],
+        'option_letters':option_map,'answer':answer,
+        'answer_text':answer_text,
+        'answer_criteria':answer_text,
+        'pattern':str(row.get('pattern') or '').strip(),
+        'meaning':meaning,
+        'explanation':str(row.get('explanation') or '').strip(),
+        'example':example,
+        'source_lesson':source_lesson,
+    }
+    print(f"[REVIEW LEGACY MCQ] item_id={item_id} recovered=1 source=exact_legacy_sentence")
+    return result
+
+
 def _review_grammar_proxy_question_from_published_source(course_id, item):
     """Recover the original grammar question from any DB-backed B1 source."""
     row=dict(item or {})
@@ -6089,6 +6197,12 @@ def _review_grammar_proxy_question_from_published_source(course_id, item):
             if best is None or score>best[0]:
                 best=best_candidate
     if not best:
+        # Legacy rows may still have the exact sentence + correct answer but the
+        # original four choices were never persisted. Repair those rows once from
+        # the exact stored source, then the resulting snapshot is durable.
+        legacy=_review_legacy_grammar_mcq_from_exact_source(int(course_id),row)
+        if legacy:
+            return legacy
         print(f'[REVIEW PUBLISHED B1] item_id={item_id} source_rows={len(rows)} parsed=0 course_id={course_id}')
         return None
 
