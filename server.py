@@ -1,4 +1,4 @@
-# VERSION: v31.77 — robust admin user deletion + delegated delete handler
+# VERSION: v31.78 — split admin into User Management and Content Management tabs
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
@@ -17329,6 +17329,7 @@ button.gray{background:#666}button.red{background:#d93025}
 .user{padding:11px 12px;border-bottom:1px solid #eee;cursor:pointer;position:relative}.user:last-child{border-bottom:0}.user:hover{background:#f5f8ff}
 .user.sel{background:#e8f1ff}.status-ACTIVE{color:#16803c}.status-PENDING{color:#b76b00}.status-LOCKED{color:#c00}
 .user-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.user-identity{min-width:0;flex:1}.user-actions{display:flex;gap:6px;align-items:center;flex:0 0 auto}.user-unread{display:inline-flex;align-items:center;gap:4px;background:#fff0f0;color:#c00;border:1px solid #ffc7c7;border-radius:999px;padding:3px 7px;font-size:12px;font-weight:700}.user-unread-dot{width:7px;height:7px;border-radius:50%;background:#d93025;display:inline-block}.user-delete{background:#d93025!important;padding:6px 9px!important}.user-search-row{display:flex;gap:8px;align-items:center;margin:10px 0}.user-search-row input{flex:1;min-width:0}.user-search-row button{flex:0 0 auto}.user-list-note{font-size:12px;color:#667085;margin:-3px 0 10px}
+.admin-tabs{display:flex;gap:8px;margin:0 0 16px;padding:4px;background:#eaf0f8;border-radius:12px;position:sticky;top:0;z-index:5}.admin-tab{flex:1;background:transparent;color:#44546a;border:1px solid transparent;font-weight:700;padding:11px 14px;border-radius:9px}.admin-tab:hover{background:#fff;color:#1677ff}.admin-tab.active{background:#1677ff;color:#fff;box-shadow:0 2px 8px #1677ff33}.admin-tab-panel{min-width:0}.admin-tab-panel>.card:last-child{margin-bottom:0}
 #users{max-height:560px;overflow:auto;border:1px solid #e5e7eb;border-radius:10px;background:#fff}.chat{display:flex;flex-direction:column;height:610px}
 #messages{flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
 .msg{margin:7px 0;padding:8px 10px;border-radius:10px;max-width:82%;white-space:pre-wrap}
@@ -17350,26 +17351,38 @@ button.gray{background:#666}button.red{background:#d93025}
 </div>
 
 <div id="panel" style="display:none">
-<div id="adminUserInbox" class="layout" style="margin-bottom:18px">
-<div class="card">
-<h3>👥 Tài khoản <span id="count" class="small"></span></h3>
-<div class="user-search-row">
-  <input id="userSearch" type="search" placeholder="Tìm theo username hoặc email..." onkeydown="if(event.key==='Enter')loadUsers()">
-  <button type="button" onclick="loadUsers()">🔎 Tìm</button>
-  <button type="button" class="gray" onclick="document.getElementById('userSearch').value='';loadUsers()">Xóa</button>
+<div class="admin-tabs" role="tablist" aria-label="Quản lý Admin">
+  <button type="button" class="admin-tab active" data-admin-tab="users" role="tab" aria-selected="true">👥 Quản lý user</button>
+  <button type="button" class="admin-tab" data-admin-tab="content" role="tab" aria-selected="false">📚 Quản lý nội dung</button>
 </div>
-<div class="user-list-note">Hiển thị user vừa chat gần đây trước; cuộn để xem các user còn lại. 🔔 = có tin nhắn mới chưa đọc.</div>
-<div id="users"></div>
+<div id="adminTabUsers" class="admin-tab-panel" data-admin-panel="users">
+  <div id="adminUserInbox" class="layout" style="margin-bottom:18px">
+    <div class="card">
+      <h3>👥 Tài khoản <span id="count" class="small"></span></h3>
+      <div class="user-search-row">
+        <input id="userSearch" type="search" placeholder="Tìm theo username hoặc email..." onkeydown="if(event.key==='Enter')loadUsers()">
+        <button type="button" onclick="loadUsers()">🔎 Tìm</button>
+        <button type="button" class="gray" onclick="document.getElementById('userSearch').value='';loadUsers()">Xóa</button>
+      </div>
+      <div class="user-list-note">Hiển thị user vừa chat gần đây trước; cuộn để xem các user còn lại. 🔔 = có tin nhắn mới chưa đọc.</div>
+      <div id="users"></div>
+    </div>
+    <div class="card chat">
+      <h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
+      <div id="messages"></div>
+      <div class="chatbar">
+        <input id="chatInput" placeholder="Nhập tin nhắn..." disabled onkeydown="if(event.key==='Enter')sendAdminMessage()">
+        <button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <button type="button" onclick="loadUsers()">🔄 Làm mới danh sách user</button>
+    <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
+  </div>
 </div>
-<div class="card chat">
-<h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
-<div id="messages"></div>
-<div class="chatbar">
-<input id="chatInput" placeholder="Nhập tin nhắn..." disabled onkeydown="if(event.key==='Enter')sendAdminMessage()">
-<button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
-</div>
-</div>
-</div>
+<div id="adminTabContent" class="admin-tab-panel" data-admin-panel="content" style="display:none">
+<div id="contentManagementTab">
 <div class="card">
 <h3>📚 Danh mục khóa học</h3>
 <div class="small" style="margin-bottom:10px">Khóa học là danh mục chuẩn dùng cho toàn bộ tài liệu. Upload PDF không nhập tên khóa học tự do.</div>
@@ -17461,9 +17474,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 <div id="paymentPackagesAdmin"></div>
 </div>
 
-<div class="card">
-<button onclick="loadUsers()">🔄 Làm mới</button>
-<span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
+</div>
 </div>
 </div>
 </main>
@@ -17471,9 +17482,23 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 <script>
 let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pollTimer=null, pollBusy=false, lastChatId=0, adminCourses=[];
 
+function initAdminTabs(){
+  const tabs=[...document.querySelectorAll("[data-admin-tab]")];
+  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent")};
+  if(!tabs.length || !panels.users || !panels.content) return;
+  const activate=(name)=>{
+    tabs.forEach(btn=>{const active=btn.dataset.adminTab===name;btn.classList.toggle("active",active);btn.setAttribute("aria-selected",String(active));});
+    Object.entries(panels).forEach(([key,panel])=>{panel.style.display=key===name?"block":"none";});
+    sessionStorage.setItem("doraemon_admin_tab",name);
+  };
+  tabs.forEach(btn=>btn.addEventListener("click",()=>activate(btn.dataset.adminTab)));
+  activate(sessionStorage.getItem("doraemon_admin_tab")==="content"?"content":"users");
+}
+
 function ensureVocabularyAdminSection(){
-  const panel=document.getElementById("panel"); if(!panel || document.getElementById("vocabularyAdminCard")) return;
-  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="vocabularyAdminCard">
+  const panel=document.getElementById("panel"); const host=document.getElementById("contentManagementTab")||panel;
+  if(!host || document.getElementById("vocabularyAdminCard")) return;
+  host.insertAdjacentHTML("afterbegin", `<div class="card" id="vocabularyAdminCard">
     <h3>📚 Từ vựng</h3>
     <div class="small" style="margin-bottom:10px">Upload <b>.docx</b> theo cấu trúc <b>Từ vựng / Phiên âm / Nghĩa / Ví dụ / Ảnh minh hoạ</b>. Server đọc trực tiếp DOCX, <b>không OCR, không GenAI</b>.</div>
     <div style="display:grid;grid-template-columns:240px 1fr;gap:8px;margin-bottom:10px">
@@ -17541,8 +17566,9 @@ async function saveVocabulary(id){
 }
 
 function ensureCollocationAdminSection(){
-  const panel=document.getElementById("panel"); if(!panel || document.getElementById("collocationAdminCard")) return;
-  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="collocationAdminCard">
+  const panel=document.getElementById("panel"); const host=document.getElementById("contentManagementTab")||panel;
+  if(!host || document.getElementById("collocationAdminCard")) return;
+  host.insertAdjacentHTML("afterbegin", `<div class="card" id="collocationAdminCard">
     <h3>💡 Collocation</h3>
     <div class="small" style="margin-bottom:10px">Upload .docx danh sách Collocation → bóc tách trực tiếp bằng DOCX, không dùng GenAI. Mỗi Collocation gồm cụm từ, nghĩa, ví dụ và ảnh minh họa.</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
@@ -17568,8 +17594,9 @@ function ensureCollocationAdminSection(){
   ensurePhrasalVerbAdminSection();
 }
 function ensurePhrasalVerbAdminSection(){
-  const panel=document.getElementById("panel"); if(!panel || document.getElementById("phrasalVerbAdminCard")) return;
-  panel.insertAdjacentHTML("afterbegin", `<div class="card" id="phrasalVerbAdminCard">
+  const panel=document.getElementById("panel"); const host=document.getElementById("contentManagementTab")||panel;
+  if(!host || document.getElementById("phrasalVerbAdminCard")) return;
+  host.insertAdjacentHTML("afterbegin", `<div class="card" id="phrasalVerbAdminCard">
     <h3>🔗 Phrasal verb</h3>
     <div class="small" style="margin-bottom:10px">Upload .docx danh sách Phrasal verb → bóc tách trực tiếp bằng DOCX, không dùng GenAI. Mỗi Phrasal verb gồm cụm động từ, nghĩa, ví dụ và ảnh minh họa.</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
@@ -17724,6 +17751,7 @@ async function login(){
     await api("/admin/api/users?password="+encodeURIComponent(pw));
     document.getElementById("login").style.display="none";
     document.getElementById("panel").style.display="block";
+    initAdminTabs();
     document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
     await loadCourses();
     ensureVocabularyAdminSection();
