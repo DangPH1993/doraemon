@@ -1146,15 +1146,19 @@ def learning_select_course(payload: dict, authorization: Optional[str] = Header(
     return {"success":True,"course_id":cid,"course_name":name}
 
 @app.get("/admin-chat/history")
-def history(limit: int = 100, authorization: Optional[str] = Header(default=None)):
+def history(limit: int = 100, mark_read: bool = False, authorization: Optional[str] = Header(default=None)):
     user = current_user(bearer(authorization))
     limit = max(1, min(limit, 500))
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if mark_read:
+                cur.execute("""UPDATE admin_messages SET is_read=TRUE
+                               WHERE user_id=%s AND sender='admin' AND COALESCE(is_read,FALSE)=FALSE""", (user["id"],))
             cur.execute("""SELECT id,sender,message,created_at,is_read FROM admin_messages
                            WHERE user_id=%s ORDER BY id DESC LIMIT %s""", (user["id"], limit))
             rows = list(reversed(cur.fetchall()))
+        conn.commit()
     finally:
         conn.close()
     return {"messages": rows}
