@@ -1,3 +1,4 @@
+# VERSION: v31.77 — robust admin user deletion + delegated delete handler
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
@@ -18328,7 +18329,7 @@ async function loadUsers(){
       return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname||u.username||'User')}')">
         <div class="user-head">
           <div class="user-identity"><b>#${u.id} ${esc(u.username||u.nickname||"")}</b> · ${esc(u.email||u.phone||"")}<div class="small">💬 Lần chat gần nhất: ${esc(lastChat)}</div></div>
-          <div class="user-actions">${unread>0?`<span class="user-unread" title="Có tin nhắn mới từ user"><span class="user-unread-dot"></span>🔔 ${unread}</span>`:''}<button class="user-delete" onclick="event.stopPropagation();deleteUser(${u.id},${JSON.stringify(u.username||u.email||u.nickname||('User #'+u.id))})">🗑️ Xoá</button></div>
+          <div class="user-actions">${unread>0?`<span class="user-unread" title="Có tin nhắn mới từ user"><span class="user-unread-dot"></span>🔔 ${unread}</span>`:''}<button class="user-delete" type="button" data-delete-user="1" data-user-id="${Number(u.id)}" data-user-label="${esc(u.username||u.email||u.nickname||('User #'+u.id))}">🗑️ Xoá tài khoản</button></div>
         </div>
         ${headerInfo}
         ${courseRows}
@@ -18343,13 +18344,31 @@ async function loadUsers(){
 function startUserInboxPolling(){if(userListTimer)clearInterval(userListTimer);userListTimer=setInterval(()=>loadUsers().catch(()=>{}),5000);}
 function stopUserInboxPolling(){if(userListTimer){clearInterval(userListTimer);userListTimer=null;}}
 async function deleteUser(id,label){
-  if(!confirm(`Xóa user "${label}" (#${id})?\n\nToàn bộ tài khoản, gói học, tiến độ và lịch sử chat của user này sẽ bị xóa và không thể hoàn tác.`))return;
+  const uid=Number(id||0); if(!uid)return;
+  if(!confirm(`Xóa user "${label}" (#${uid})?\n\nToàn bộ tài khoản, gói học, tiến độ và lịch sử chat của user này sẽ bị xóa và không thể hoàn tác.`))return;
+  const buttons=[...document.querySelectorAll('[data-delete-user]')];
+  buttons.filter(b=>Number(b.dataset.userId||0)===uid).forEach(b=>{b.disabled=true;b.dataset.prevText=b.textContent;b.textContent='⏳ Đang xoá...';});
   try{
-    await api('/admin/api/users/'+id+'/delete',{method:'POST',body:JSON.stringify({password:pw})});
-    if(Number(selectedUser)===Number(id)){selectedUser=null;lastChatId=0;seenMessageIds=new Set();document.getElementById('chatTitle').textContent='💬 Chọn một khách hàng để chat';document.getElementById('messages').innerHTML='';document.getElementById('chatInput').value='';document.getElementById('chatInput').disabled=true;document.getElementById('sendBtn').disabled=true;}
-    await loadUsers(); alert('✅ Đã xoá user.');
-  }catch(e){alert('❌ Xoá user thất bại: '+e.message);}
+    console.log('[ADMIN USER DELETE] request', {user_id:uid});
+    const d=await api('/admin/api/users/'+uid+'/delete?password='+encodeURIComponent(pw),{method:'POST',body:'{}'});
+    console.log('[ADMIN USER DELETE] response', d);
+    if(Number(selectedUser)===uid){selectedUser=null;lastChatId=0;seenMessageIds=new Set();document.getElementById('chatTitle').textContent='💬 Chọn một khách hàng để chat';document.getElementById('messages').innerHTML='';document.getElementById('chatInput').value='';document.getElementById('chatInput').disabled=true;document.getElementById('sendBtn').disabled=true;}
+    await loadUsers(); alert('✅ Đã xoá tài khoản.');
+  }catch(e){
+    console.error('[ADMIN USER DELETE] failed', e);
+    alert('❌ Xoá tài khoản thất bại: '+e.message);
+  }finally{
+    buttons.filter(b=>Number(b.dataset.userId||0)===uid).forEach(b=>{b.disabled=false;b.textContent=b.dataset.prevText||'🗑️ Xoá tài khoản';});
+  }
 }
+document.addEventListener('click',(event)=>{
+  const btn=event.target.closest('[data-delete-user]');
+  if(!btn)return;
+  event.preventDefault();
+  event.stopPropagation();
+  if(btn.disabled)return;
+  deleteUser(Number(btn.dataset.userId||0),btn.dataset.userLabel||('User #'+btn.dataset.userId));
+});
 
 async function selectUser(id,nickname){
   selectedUser=id; lastChatId=0; seenMessageIds=new Set();
@@ -20292,21 +20311,54 @@ def admin_users(password: str, q: str = ""):
     return {'users':out}
 
 @app.post("/admin/api/users/{user_id}/delete")
-def admin_delete_user(user_id:int,data:dict):
-    """Delete a user; related records reference users with ON DELETE CASCADE."""
-    check_admin(str(data.get('password','')))
+def admin_delete_user(user_id:int, password: str = "", data: Optional[dict] = None):
+    """Delete one user and clean legacy user_id rows that predate FK cascades."""
+    body_password = str((data or {}).get('password','')).strip()
+    check_admin(str(password or body_password).strip())
+    uid=int(user_id)
     conn=db()
     try:
         with conn.cursor() as cur:
-            cur.execute('SELECT id FROM users WHERE id=%s',(user_id,))
-            if not cur.fetchone(): raise HTTPException(404,'Không tìm thấy user.')
-            cur.execute('DELETE FROM users WHERE id=%s',(user_id,))
-            if cur.rowcount != 1: raise HTTPException(404,'Không tìm thấy user.')
+            cur.execute('SELECT id,username,email,nickname FROM users WHERE id=%s',(uid,))
+            existing=cur.fetchone()
+            if not existing:
+                raise HTTPException(404,'Không tìm thấy user.')
+
+            # These legacy tables intentionally do not have a FK to users. Clean them
+            # explicitly so deleting the account also removes orphaned user/chat state.
+            legacy_tables = [
+                ('admin_message_dedup','user_id'),
+                ('learner_weakness_notes','user_id'),
+                ('free_chat_tutor_sessions','user_id'),
+            ]
+            cleaned=[]
+            for table,col in legacy_tables:
+                try:
+                    cur.execute(f'DELETE FROM "{table}" WHERE "{col}"=%s',(uid,))
+                    if cur.rowcount:
+                        cleaned.append(f'{table}:{cur.rowcount}')
+                except Exception as exc:
+                    # A missing legacy table/column should not block account deletion.
+                    print(f'[ADMIN USER DELETE] legacy cleanup skipped table={table}: {type(exc).__name__}: {exc}')
+                    conn.rollback()
+                    # Re-open transaction after a failed statement so the main delete
+                    # can still proceed safely.
+                    cur.execute('SELECT 1')
+
+            cur.execute('DELETE FROM users WHERE id=%s',(uid,))
+            if cur.rowcount != 1:
+                raise HTTPException(404,'Không tìm thấy user.')
         conn.commit()
-    except Exception:
+        print(f'[ADMIN USER DELETE] success user_id={uid} legacy_cleaned={",".join(cleaned) if cleaned else "none"}')
+    except HTTPException:
         conn.rollback(); raise
-    finally: conn.close()
-    return {'success':True,'user_id':user_id,'message':'Đã xoá user và dữ liệu liên quan.'}
+    except Exception as exc:
+        conn.rollback()
+        print(f'[ADMIN USER DELETE] failed user_id={uid}: {type(exc).__name__}: {exc}')
+        raise HTTPException(500, f'Xoá tài khoản thất bại: {type(exc).__name__}: {exc}')
+    finally:
+        conn.close()
+    return {'success':True,'user_id':uid,'message':'Đã xoá tài khoản và dữ liệu liên quan.'}
 
 @app.post("/admin/api/users/{user_id}/activate")
 def admin_activate(user_id:int,data:dict):
