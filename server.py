@@ -137,7 +137,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.71"
+SERVER_VERSION = "31.76"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -17325,9 +17325,10 @@ input,button{padding:9px;border-radius:7px;border:1px solid #ccc}
 button{background:#1677ff;color:#fff;border:0;cursor:pointer}
 button.gray{background:#666}button.red{background:#d93025}
 #login{max-width:420px;margin:60px auto}.layout{display:grid;grid-template-columns:52% 48%;gap:18px}
-.user{padding:10px;border-bottom:1px solid #eee;cursor:pointer}.user:hover{background:#f5f8ff}
+.user{padding:11px 12px;border-bottom:1px solid #eee;cursor:pointer;position:relative}.user:last-child{border-bottom:0}.user:hover{background:#f5f8ff}
 .user.sel{background:#e8f1ff}.status-ACTIVE{color:#16803c}.status-PENDING{color:#b76b00}.status-LOCKED{color:#c00}
-#users{max-height:610px;overflow:auto}.chat{display:flex;flex-direction:column;height:610px}
+.user-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.user-identity{min-width:0;flex:1}.user-actions{display:flex;gap:6px;align-items:center;flex:0 0 auto}.user-unread{display:inline-flex;align-items:center;gap:4px;background:#fff0f0;color:#c00;border:1px solid #ffc7c7;border-radius:999px;padding:3px 7px;font-size:12px;font-weight:700}.user-unread-dot{width:7px;height:7px;border-radius:50%;background:#d93025;display:inline-block}.user-delete{background:#d93025!important;padding:6px 9px!important}.user-search-row{display:flex;gap:8px;align-items:center;margin:10px 0}.user-search-row input{flex:1;min-width:0}.user-search-row button{flex:0 0 auto}.user-list-note{font-size:12px;color:#667085;margin:-3px 0 10px}
+#users{max-height:560px;overflow:auto;border:1px solid #e5e7eb;border-radius:10px;background:#fff}.chat{display:flex;flex-direction:column;height:610px}
 #messages{flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
 .msg{margin:7px 0;padding:8px 10px;border-radius:10px;max-width:82%;white-space:pre-wrap}
 .msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
@@ -17348,6 +17349,26 @@ button.gray{background:#666}button.red{background:#d93025}
 </div>
 
 <div id="panel" style="display:none">
+<div id="adminUserInbox" class="layout" style="margin-bottom:18px">
+<div class="card">
+<h3>👥 Tài khoản <span id="count" class="small"></span></h3>
+<div class="user-search-row">
+  <input id="userSearch" type="search" placeholder="Tìm theo username hoặc email..." onkeydown="if(event.key==='Enter')loadUsers()">
+  <button type="button" onclick="loadUsers()">🔎 Tìm</button>
+  <button type="button" class="gray" onclick="document.getElementById('userSearch').value='';loadUsers()">Xóa</button>
+</div>
+<div class="user-list-note">Hiển thị user vừa chat gần đây trước; cuộn để xem các user còn lại. 🔔 = có tin nhắn mới chưa đọc.</div>
+<div id="users"></div>
+</div>
+<div class="card chat">
+<h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
+<div id="messages"></div>
+<div class="chatbar">
+<input id="chatInput" placeholder="Nhập tin nhắn..." disabled onkeydown="if(event.key==='Enter')sendAdminMessage()">
+<button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
+</div>
+</div>
+</div>
 <div class="card">
 <h3>📚 Danh mục khóa học</h3>
 <div class="small" style="margin-bottom:10px">Khóa học là danh mục chuẩn dùng cho toàn bộ tài liệu. Upload PDF không nhập tên khóa học tự do.</div>
@@ -17441,23 +17462,7 @@ Upload PDF vào Knowledge Base · chọn khóa học từ danh mục · Gemini E
 
 <div class="card">
 <button onclick="loadUsers()">🔄 Làm mới</button>
-<span id="count" class="small"></span>
 <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
-</div>
-<div class="layout">
-<div class="card">
-<h3>👥 Tài khoản</h3>
-<div id="users"></div>
-</div>
-<div class="card chat">
-<h3 id="chatTitle">💬 Chọn một khách hàng để chat</h3>
-<div id="messages"></div>
-<div class="chatbar">
-<input id="chatInput" placeholder="Nhập tin nhắn..." disabled
-       onkeydown="if(event.key==='Enter')sendAdminMessage()">
-<button id="sendBtn" onclick="sendAdminMessage()" disabled>Gửi</button>
-</div>
-</div>
 </div>
 </div>
 </main>
@@ -17727,6 +17732,7 @@ async function login(){
     ensurePhrasalVerbAdminSection();
     await loadPhrasalVerbsAdmin();
     await loadUsers();
+    startUserInboxPolling();
     await loadPaymentPackages();
     await loadKnowledgeCatalog();
     await loadCurriculumDrafts();
@@ -18291,44 +18297,67 @@ async function savePaymentPackage(months){
   }catch(e){alert("Không lưu được: "+e.message);}
 }
 
+let userListTimer=null;
 async function loadUsers(){
-  const d=await api("/admin/api/users?password="+encodeURIComponent(pw));
-  document.getElementById("count").textContent="  Tổng: "+d.users.length;
-  document.getElementById("users").innerHTML=d.users.map(u=>{
-    const s=u.subscription||{}, st=u.status||"PENDING", courses=Array.isArray(s.courses)?s.courses:[];
-    const isPaid=String(s.plan||'Free').trim().toLowerCase()!=='free' && Number(s.daily_limit||0)===200;
-    const courseRows=isPaid ? `<div style="margin-top:7px;padding:8px 10px;background:#f7f9fc;border:1px solid #dfe5ee;border-radius:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+  const box=document.getElementById("users");
+  if(!box)return;
+  const q=(document.getElementById("userSearch")?.value||"").trim();
+  try{
+    const d=await api("/admin/api/users?password="+encodeURIComponent(pw)+(q?"&q="+encodeURIComponent(q):"")+"&t="+Date.now());
+    const users=Array.isArray(d.users)?d.users:[];
+    const count=document.getElementById("count");
+    if(count) count.textContent=" · "+(q?`Kết quả: ${users.length}`:`Tổng: ${users.length}`);
+    if(!users.length){box.innerHTML='<div class="small" style="padding:16px">'+(q?'Không tìm thấy user phù hợp.':'Chưa có user.')+'</div>';return;}
+    box.innerHTML=users.map(u=>{
+      const s=u.subscription||{}, st=u.status||"PENDING", unread=Number(u.unread_count||0), lastChat=u.last_chat_at_vn||"Chưa chat";
+      const isPaid=String(s.plan||'Free').trim().toLowerCase()!=='free' && Number(s.daily_limit||0)===200;
+      const courseRows=isPaid ? `<div style="margin-top:7px;padding:8px 10px;background:#f7f9fc;border:1px solid #dfe5ee;border-radius:7px;display:flex;gap:8px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
         <div style="min-width:250px;flex:1"><b>🎓 Tất cả khóa học</b><br><span class="small">Gói: <b>${esc(s.plan||'')}</b> · hết hạn: <b>${esc(s.expires_at_vn||'-')}</b> · ${Number(s.used_today||0)}/200 request hôm nay</span></div>
         <button onclick="event.stopPropagation();renewCourse(${u.id},1)">1 tháng</button>
         <button onclick="event.stopPropagation();renewCourse(${u.id},3)">3 tháng</button>
         <button onclick="event.stopPropagation();renewCourse(${u.id},6)">6 tháng</button>
       </div>` : `<div class="small" style="margin-top:7px;color:#667085">Gói Free · tất cả khóa học · ${Number(s.used_today||0)}/5 request hôm nay.</div>`;
-    const grantRow=`<div style="margin-top:9px;padding-top:8px;border-top:1px dashed #cfd7e3;display:flex;gap:6px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
-      <span class="small" style="color:#475467">Kích hoạt cho <b>tất cả khóa học</b>:</span>
-      <button onclick="event.stopPropagation();act(${u.id},1)">+ 1 tháng</button>
-      <button onclick="event.stopPropagation();act(${u.id},3)">+ 3 tháng</button>
-      <button onclick="event.stopPropagation();act(${u.id},6)">+ 6 tháng</button>
-      ${isPaid ? `<button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Về Free</button>` : ''}
-    </div>`;
-    const headerInfo=isPaid
-      ? `<div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||'')} · tất cả khóa học · 200 request/ngày</div>`
-      : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · tất cả khóa học · 5 request/ngày</div>`;
-    return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname)}')">
-      <b>#${u.id} ${esc(u.username||u.nickname||"")}</b> — ${esc(u.email||u.phone||"")}
-      ${headerInfo}
-      ${courseRows}
-      ${grantRow}
-      <div style="margin-top:7px" class="small">Bấm để xem lịch sử và chat</div>
-    </div>`;
-  }).join("");
+      const grantRow=`<div style="margin-top:9px;padding-top:8px;border-top:1px dashed #cfd7e3;display:flex;gap:6px;align-items:center;flex-wrap:wrap" onclick="event.stopPropagation()">
+        <span class="small" style="color:#475467">Kích hoạt cho <b>tất cả khóa học</b>:</span>
+        <button onclick="event.stopPropagation();act(${u.id},1)">+ 1 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},3)">+ 3 tháng</button>
+        <button onclick="event.stopPropagation();act(${u.id},6)">+ 6 tháng</button>
+        ${isPaid ? `<button class="gray" onclick="event.stopPropagation();resetFree(${u.id})">Về Free</button>` : ''}
+      </div>`;
+      const headerInfo=isPaid ? `<div><span class="status-${st}"><b>${st}</b></span> · ${esc(s.plan||'')} · tất cả khóa học · 200 request/ngày</div>` : `<div><span class="status-${st}"><b>${st}</b></span> · Gói: <b>Free</b> · tất cả khóa học · 5 request/ngày</div>`;
+      return `<div class="user ${selectedUser===u.id?'sel':''}" onclick="selectUser(${u.id},'${esc(u.nickname||u.username||'User')}')">
+        <div class="user-head">
+          <div class="user-identity"><b>#${u.id} ${esc(u.username||u.nickname||"")}</b> · ${esc(u.email||u.phone||"")}<div class="small">💬 Lần chat gần nhất: ${esc(lastChat)}</div></div>
+          <div class="user-actions">${unread>0?`<span class="user-unread" title="Có tin nhắn mới từ user"><span class="user-unread-dot"></span>🔔 ${unread}</span>`:''}<button class="user-delete" onclick="event.stopPropagation();deleteUser(${u.id},${JSON.stringify(u.username||u.email||u.nickname||('User #'+u.id))})">🗑️ Xoá</button></div>
+        </div>
+        ${headerInfo}
+        ${courseRows}
+        ${grantRow}
+        <div style="margin-top:7px" class="small">${u.has_chat?'Nhấn để xem lịch sử chat':'Chưa có lịch sử chat'}</div>
+      </div>`;
+    }).join("");
+  }catch(e){
+    box.innerHTML='<span style="color:#c00;display:block;padding:12px">❌ Không tải được danh sách user: '+esc(e.message)+'</span>';
+  }
 }
+function startUserInboxPolling(){if(userListTimer)clearInterval(userListTimer);userListTimer=setInterval(()=>loadUsers().catch(()=>{}),5000);}
+function stopUserInboxPolling(){if(userListTimer){clearInterval(userListTimer);userListTimer=null;}}
+async function deleteUser(id,label){
+  if(!confirm(`Xóa user "${label}" (#${id})?\n\nToàn bộ tài khoản, gói học, tiến độ và lịch sử chat của user này sẽ bị xóa và không thể hoàn tác.`))return;
+  try{
+    await api('/admin/api/users/'+id+'/delete',{method:'POST',body:JSON.stringify({password:pw})});
+    if(Number(selectedUser)===Number(id)){selectedUser=null;lastChatId=0;seenMessageIds=new Set();document.getElementById('chatTitle').textContent='💬 Chọn một khách hàng để chat';document.getElementById('messages').innerHTML='';document.getElementById('chatInput').value='';document.getElementById('chatInput').disabled=true;document.getElementById('sendBtn').disabled=true;}
+    await loadUsers(); alert('✅ Đã xoá user.');
+  }catch(e){alert('❌ Xoá user thất bại: '+e.message);}
+}
+
 async function selectUser(id,nickname){
   selectedUser=id; lastChatId=0; seenMessageIds=new Set();
   document.getElementById("chatTitle").textContent="💬 Chat với "+nickname+" (#"+id+")";
   document.getElementById("chatInput").disabled=false; document.getElementById("sendBtn").disabled=false;
   document.getElementById("messages").innerHTML="";
-  await loadUsers();
   await pollSelectedChat(true);
+  await loadUsers();
 }
 function addMessage(m){
   if(m && m.id!=null){const id=String(m.id); if(seenMessageIds.has(id))return; seenMessageIds.add(id); lastChatId=Math.max(lastChatId,Number(m.id)||0);}
@@ -20223,33 +20252,61 @@ async def admin_payment_package(months: int, password: str = Form(...), price_vn
 
 
 @app.get("/admin/api/users")
-def admin_users(password: str):
+def admin_users(password: str, q: str = ""):
+    """Return admin users ordered by latest chat, with unread message counts."""
     check_admin(password)
+    q=(q or '').strip()
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT u.id,u.phone,u.email,u.username,u.nickname,u.status,u.created_at,
+            params=[_now_local().date()]
+            where=""
+            if q:
+                where="WHERE COALESCE(u.username,'') ILIKE %s OR COALESCE(u.email,'') ILIKE %s"
+                like=f"%{q}%"; params.extend([like,like])
+            cur.execute(f"""SELECT u.id,u.phone,u.email,u.username,u.nickname,u.status,u.created_at,
                        s.id subscription_id,s.plan,s.course_id,s.started_at,s.expires_at,s.status subscription_status,
-                       COALESCE(dq.question_count,0) AS used_today
+                       COALESCE(dq.question_count,0) AS used_today, ch.last_chat_at, COALESCE(ch.unread_count,0) AS unread_count
                        FROM users u LEFT JOIN LATERAL
                        (SELECT * FROM subscriptions WHERE user_id=u.id ORDER BY id DESC LIMIT 1) s ON TRUE
                        LEFT JOIN daily_question_usage dq ON dq.user_id=u.id AND dq.usage_date=%s
-                       ORDER BY u.id DESC""",(_now_local().date(),))
+                       LEFT JOIN LATERAL
+                       (SELECT MAX(am.created_at) AS last_chat_at,
+                               COUNT(*) FILTER (WHERE am.sender='user' AND COALESCE(am.is_read,FALSE)=FALSE) AS unread_count
+                          FROM admin_messages am WHERE am.user_id=u.id) ch ON TRUE
+                       {where}
+                       ORDER BY ch.last_chat_at DESC NULLS LAST, u.id DESC""",params)
             rows=cur.fetchall()
     finally: conn.close()
     now=_now_local(); out=[]
     for r in rows:
         courses=_authorized_courses(r['id'])
-        paid=(str(r.get('subscription_status') or '').upper()=='ACTIVE'
-              and str(r.get('plan') or 'Free').strip().casefold()!='free'
-              and r.get('expires_at') is not None and r.get('expires_at')>now)
+        paid=(str(r.get('subscription_status') or '').upper()=='ACTIVE' and str(r.get('plan') or 'Free').strip().casefold()!='free' and r.get('expires_at') is not None and r.get('expires_at')>now)
         plan=str(r.get('plan') or 'Free') if paid else 'Free'; limit=200 if paid else 5
         out.append({'id':r['id'],'phone':r['phone'],'email':r.get('email'),'username':r.get('username'),'nickname':r['nickname'],'status':r['status'],'created_at':r['created_at'],
-                    'subscription':{'id':r['subscription_id'],'plan':plan,'course_id':None,'course_name':'Tất cả khóa học',
-                                    'courses':courses,'started_at':r['started_at'] if paid else None,'expires_at':r['expires_at'] if paid else None,
-                                    'expires_at_vn':_vn_display(r['expires_at']) if paid else None,'status':'ACTIVE',
-                                    'used_today':int(r['used_today'] or 0),'daily_limit':limit,'all_courses':True}})
+                    'last_chat_at':r.get('last_chat_at'),'last_chat_at_vn':_vn_display(r.get('last_chat_at')) if r.get('last_chat_at') else None,
+                    'unread_count':int(r.get('unread_count') or 0),'has_chat':r.get('last_chat_at') is not None,
+                    'subscription':{'id':r['subscription_id'],'plan':plan,'course_id':None,'course_name':'Tất cả khóa học','courses':courses,
+                                    'started_at':r['started_at'] if paid else None,'expires_at':r['expires_at'] if paid else None,'expires_at_vn':_vn_display(r['expires_at']) if paid else None,
+                                    'status':'ACTIVE','used_today':int(r['used_today'] or 0),'daily_limit':limit,'all_courses':True}})
     return {'users':out}
+
+@app.post("/admin/api/users/{user_id}/delete")
+def admin_delete_user(user_id:int,data:dict):
+    """Delete a user; related records reference users with ON DELETE CASCADE."""
+    check_admin(str(data.get('password','')))
+    conn=db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM users WHERE id=%s',(user_id,))
+            if not cur.fetchone(): raise HTTPException(404,'Không tìm thấy user.')
+            cur.execute('DELETE FROM users WHERE id=%s',(user_id,))
+            if cur.rowcount != 1: raise HTTPException(404,'Không tìm thấy user.')
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+    return {'success':True,'user_id':user_id,'message':'Đã xoá user và dữ liệu liên quan.'}
 
 @app.post("/admin/api/users/{user_id}/activate")
 def admin_activate(user_id:int,data:dict):
