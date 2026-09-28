@@ -1,7 +1,7 @@
 # VERSION: v31.78 — split admin into User Management and Content Management tabs
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v4-evidence-vocab-grammar-focus-v31.52"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -5389,6 +5389,17 @@ def _course_language_info(course_id):
 
 
 def _free_chat_tutor_prompt(note, history_text, query_text, is_session_start=False, course_info=None):
+    # From the second user message onward, keep the Free Chat Tutor prompt
+    # intentionally minimal. The current user message is included as the last
+    # entry of history_text by the caller so the prompt itself needs only the
+    # tutor role rule + the latest 10 exchanges.
+    if not is_session_start:
+        return f"""Bạn là gia sư tận tình đang hướng dẫn người học cải thiện điểm yếu. Nếu user có ý định trò chuyện toàn bộ bằng tiếng Anh thì hãy nói tiếng Anh.
+
+Lịch sử 10 lượt chat gần nhất của phiên Free Chat Tutor này:
+{history_text or '(chưa có lịch sử)'}
+"""
+
     note_text=str((note or {}).get('weakness_note') or '').strip()
     note_lesson=str((note or {}).get('lesson') or '').strip()
     note_type=str((note or {}).get('content_type') or '').strip()
@@ -7780,8 +7791,15 @@ def proxy_chat(
     if data.free_chat_tutor and not data.action:
         tutor_note=_get_free_chat_tutor_note(user["id"], selected_course_id, data.chatbox_id)
         tutor_history=plan_recent_history[-20:]
-        tutor_history_text="\n".join(f"{h.get('role')}: {str(h.get('text') or '')[-1200:]}" for h in tutor_history)
         tutor_is_start = not tutor_history
+        # Keep the prompt to the requested two blocks after the opening turn.
+        # Include the current user message as the latest history entry so the
+        # compact prompt still contains the message that needs a response.
+        if tutor_is_start:
+            tutor_prompt_history=tutor_history
+        else:
+            tutor_prompt_history=(tutor_history + [{"role":"user","text":query_text}])[-20:]
+        tutor_history_text="\n".join(f"{h.get('role')}: {str(h.get('text') or '')[-1200:]}" for h in tutor_prompt_history)
         tutor_course_info=_course_language_info(selected_course_id)
         tutor_prompt=_free_chat_tutor_prompt(tutor_note, tutor_history_text, query_text, is_session_start=tutor_is_start, course_info=tutor_course_info)
         gen_started=time.perf_counter()
