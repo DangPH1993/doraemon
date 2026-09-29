@@ -12018,6 +12018,7 @@ def _review_similar_questions_from_saved_wrong_items(course_id, selected_vocab, 
             'Câu mới phải TƯƠNG TỰ về kiến thức/mục tiêu với câu sai đã lưu nhưng KHÔNG được chép nguyên câu cũ.',
             'Mỗi câu phải là multiple_choice với đúng 4 lựa chọn A/B/C/D.',
             'answer chỉ là A/B/C/D và phải khớp đúng một lựa chọn.',
+            'Đáp án đúng phải được phân bố ngẫu nhiên và tương đối đều giữa A/B/C/D; tuyệt đối không để đáp án đúng mặc định là A cho hầu hết hoặc toàn bộ câu hỏi. Với nhiều câu, cố gắng chia đều số lượng đáp án đúng giữa 4 vị trí.',
             'Grammar: kiểm tra lại chính điểm ngữ pháp mà câu sai đã kiểm tra; tạo một câu mới tương đương về kỹ năng áp dụng.',
             'Vocabulary: kiểm tra lại chính từ/cụm từ đã sai; có thể tạo ngữ cảnh/câu mới nhưng vẫn phải kiểm tra cùng từ/cụm từ.',
             'Ưu tiên dùng thông tin đã lưu trong original_question, original_answer, original_options, pattern, meaning và wrong_answer.',
@@ -12220,6 +12221,7 @@ def _review_genai_one_call(course_id, data, max_q, lesson=None, only_failed=Fals
             'Mỗi item chỉ dùng một lần trong phiên.',
             'Mỗi câu CHỈ được dùng question_type=multiple_choice.',
             'Mỗi câu phải có đúng 4 lựa chọn A, B, C, D; answer phải là đúng một chữ cái A/B/C/D.',
+            'Đáp án đúng phải được phân bố ngẫu nhiên và tương đối đều giữa A/B/C/D; tuyệt đối không để đáp án đúng mặc định là A cho hầu hết hoặc toàn bộ câu hỏi. Với nhiều câu, cố gắng chia đều số lượng đáp án đúng giữa 4 vị trí.',
             'Tuyệt đối không tạo fill_blank hay câu hỏi tự luận.',
             'Vocabulary: chỉ tạo multiple_choice. Câu hỏi phải tự đủ ngữ cảnh',
             'Grammar: bắt buộc là bài tập áp dụng vào câu. Ưu tiên điền từ/cụm từ, chọn dạng đúng của động từ, hoàn thành câu, chọn câu đúng hoặc sửa câu. Tuyệt đối không hỏi định nghĩa, ý nghĩa, tên cấu trúc hoặc hỏi cấu trúc này được dùng như thế nào.',
@@ -12596,6 +12598,7 @@ NGUYÊN TẮC BẮT BUỘC:
 - Tạo tối đa {n} câu trắc nghiệm, mỗi câu có đúng 4 lựa chọn A/B/C/D.
 - Câu hỏi phải là bài tập áp dụng trực tiếp nội dung/ngữ pháp vào câu: điền từ/cụm từ, chọn dạng đúng, hoàn thành câu, chọn câu đúng hoặc sửa câu. Không hỏi định nghĩa/ý nghĩa/tên cấu trúc hay 'cấu trúc này được dùng như thế nào'.
 - answer chỉ là một trong A/B/C/D; answer_text là nội dung đáp án đúng.
+- Đáp án đúng phải được phân bố ngẫu nhiên và tương đối đều giữa A/B/C/D; tuyệt đối không để đáp án đúng mặc định là A cho hầu hết hoặc toàn bộ câu hỏi. Với nhiều câu, cố gắng chia đều số lượng đáp án đúng giữa 4 vị trí.
 - Không hiển thị đáp án đúng trong phần question.
 - Trả JSON duy nhất dạng {{"questions":[{{"question_type":"multiple_choice","question":"...","options":["A. ...","B. ...","C. ...","D. ..."],"option_letters":{{"A":"...","B":"...","C":"...","D":"..."}},"answer":"A","answer_text":"..."}}]}}
 
