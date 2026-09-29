@@ -7090,8 +7090,10 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
 
     parts=[]
     # Structured action metadata for the learner UI.  The text briefing remains
-    # unchanged, but each plan lesson is accompanied by a direct button that
-    # opens that exact lesson instead of asking the learner to type its name.
+    # unchanged, but when multiple plan lessons are shown we expose ONE direct
+    # CTA immediately after the plan list; that CTA opens the first lesson in
+    # today's sequence.  Additional study-plan buttons are intentionally not
+    # rendered so the briefing stays compact.
     plan_action_items=[]
     if intent=='LEARN_RECOMMENDATION':
         parts.append('👋 Chào cậu! Doraemon đã xem lịch học và phần câu sai cần làm lại hôm nay.')
@@ -7148,31 +7150,75 @@ def _build_learning_discovery_blocks(user_id, course_id, course_name, intent='LE
         parts.append('✅ Hiện chưa có câu từ vựng/ngữ pháp nào đã làm sai và đến lịch làm lại.')
 
     if intent=='LEARN_RECOMMENDATION' and today_plan_items:
-        parts.append('👉 Cậu chỉ cần **gõ tên bài muốn học** (ví dụ: `dã ngoại` hoặc `danh từ`), Doraemon sẽ mở đúng nội dung theo lộ trình.')
+        # This legacy instruction is intentionally kept out of the rendered
+        # discovery text because the direct CTA below is now the primary action.
+        pass
 
     if wrong_count:
         parts.append('Cậu muốn làm lại phần sai trước chứ?')
 
-    msg='\n\n'.join(parts)
-    blocks=[{'type':'text','text':msg}]
-    # Render one direct CTA for every plan lesson mentioned in the briefing.
-    # The client uses these metadata fields to call the same exact lesson-opening
-    # flow as clicking the lesson in the curriculum list.
-    for item in plan_action_items:
-        if item.get('lesson'):
+    # Keep the plan briefing and review briefing as separate text blocks so the
+    # single plan CTA appears directly after the lesson list, instead of being
+    # pushed below unrelated review text.
+    if intent=='LEARN_RECOMMENDATION' and today_plan_items:
+        plan_text_parts=[]
+        # Rebuild only the greeting + plan section that was already composed
+        # above.  This preserves the existing wording/content while allowing
+        # the CTA to sit immediately after the list.
+        greeting='👋 Chào cậu! Doraemon đã xem lịch học và phần câu sai cần làm lại hôm nay.'
+        plan_text_parts.append(greeting)
+        plan_text_parts.append(f'🎯 Hôm nay cậu có **{len(today_plan_items)} nội dung học theo lộ trình**:')
+        for item in today_plan_items[:12]:
+            ct=str(item.get('content_type') or 'Giáo trình')
+            lesson=str(item.get('lesson') or '').strip()
+            plan_date=item.get('plan_date')
+            date_text=''
+            if plan_date:
+                try:
+                    date_text=f' ({plan_date.strftime("%d/%m/%Y") if hasattr(plan_date,"strftime") else str(plan_date)})'
+                except Exception:
+                    date_text=f' ({plan_date})'
+            target_text=str(item.get('target') or '').strip()
+            plan_text_parts.append(f'• **{lesson}** ({ct}){date_text}{(" – "+target_text) if target_text else ""}')
+        plan_msg='\n\n'.join(plan_text_parts)
+        review_parts=[]
+        # Preserve any review/status lines after the plan CTA.
+        for part in parts:
+            if part not in plan_text_parts:
+                review_parts.append(part)
+        review_msg='\n\n'.join(review_parts).strip()
+        blocks=[{'type':'text','text':plan_msg}]
+        first_plan=plan_action_items[0] if plan_action_items else None
+        if first_plan and first_plan.get('lesson'):
             blocks.append({
                 'type':'study_plan_lesson',
-                'course_id':item.get('course_id'),
-                'content_type':item.get('content_type') or 'Giáo trình',
-                'lesson':item.get('lesson'),
-                'topic':item.get('topic'),
+                'course_id':first_plan.get('course_id'),
+                'content_type':first_plan.get('content_type') or 'Giáo trình',
+                'lesson':first_plan.get('lesson'),
+                'topic':first_plan.get('topic'),
                 'label':'Học theo lộ trình',
             })
+        if review_msg:
+            blocks.append({'type':'text','text':review_msg})
+    else:
+        msg='\n\n'.join(parts)
+        blocks=[{'type':'text','text':msg}]
+        first_plan=plan_action_items[0] if plan_action_items else None
+        if first_plan and first_plan.get('lesson'):
+            blocks.append({
+                'type':'study_plan_lesson',
+                'course_id':first_plan.get('course_id'),
+                'content_type':first_plan.get('content_type') or 'Giáo trình',
+                'lesson':first_plan.get('lesson'),
+                'topic':first_plan.get('topic'),
+                'label':'Học theo lộ trình',
+            })
+
     if wrong_count:
         blocks.append({'type':'choice','id':'learning_discovery_selection','options':[
             {'label':f'Làm lại phần sai ({wrong_count})','action':'review_wrong_due'}
         ]})
-    return msg,blocks,bool(wrong_count)
+    return '\n\n'.join(parts),blocks,bool(wrong_count)
 
 
 
