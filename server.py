@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.82"
+SERVER_VERSION = "31.83"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15303,9 +15303,12 @@ class _CurriculumRichTextSanitizer(HTMLParser):
             self.out.append(f'<img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}">')
             return
         if norm in ('p','div'):
-            if self.out and not str(self.out[-1]).endswith(('\n','<br>')):
-                self.out.append('\n')
-        self.out.append(f'<{norm}>')
+            # Block elements already provide their own line/paragraph semantics.
+            # Do not inject literal newline text around them: with the Admin
+            # editor's whitespace handling those characters become blank lines
+            # and can multiply after save -> reopen cycles.
+            self.out.append(f'<{norm}>')
+            return
     def handle_endtag(self, tag):
         tag=str(tag or '').lower()
         if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
@@ -15314,8 +15317,6 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         if norm in ('br','img'):
             return
         self.out.append(f'</{norm}>')
-        if norm in ('p','div'):
-            self.out.append('\n')
     def handle_data(self, data):
         self.out.append(data)
 
@@ -15338,7 +15339,14 @@ def sanitize_curriculum_rich_text(value):
         parser=_CurriculumRichTextSanitizer()
         parser.feed(text)
         parser.close()
-        return ''.join(parser.out)
+        cleaned=''.join(parser.out)
+        # Remove only whitespace that sits between block elements. Keep normal
+        # spaces/newlines inside actual text content untouched. This also cleans
+        # rich-text already persisted by v31.82 when it is edited again.
+        cleaned=re.sub(r'(</(?:p|div)>)\s+(?=<(?:p|div)\b)', r'\1', cleaned, flags=re.I)
+        cleaned=re.sub(r'^\s+(?=<(?:p|div)\b)', '', cleaned, flags=re.I)
+        cleaned=re.sub(r'(</(?:p|div)>)\s+$', r'\1', cleaned, flags=re.I)
+        return cleaned
     except Exception:
         return re.sub(r'<[^>]+>', '', text)
 
@@ -18142,8 +18150,17 @@ function _sanitizeCurriculumRichHtml(value){
   let src=_decodeCurriculumRichEntities(value);
   if(!src)return '';
   const box=document.createElement('div');
-  if(/<\\s*(?:b|strong|i|em|u|br|p|div|span|img)\\b/i.test(src)){ box.innerHTML=src; }
-  else { box.textContent=src; }
+  if(/<\\s*(?:b|strong|i|em|u|br|p|div|span|img)\\b/i.test(src)){
+    box.innerHTML=src;
+  }else{
+    // Plain-text paste: make source newlines explicit so switching the editor to
+    // normal whitespace does not collapse them into spaces.
+    const lines=src.replace(/\\r\\n?/g,'\\n').split('\\n');
+    lines.forEach((line,idx)=>{
+      if(idx)box.appendChild(document.createElement('br'));
+      box.appendChild(document.createTextNode(line));
+    });
+  }
 
   // Legacy/paste-safe fallback: older saves may contain literal IMG markup as
   // plain text nodes. Convert every literal <img ...> occurrence into a real
@@ -18185,7 +18202,12 @@ function _sanitizeCurriculumRichHtml(value){
     if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); el.replaceWith(b);}
     else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); el.replaceWith(i);}
   });
-  return box.innerHTML;
+  // Remove only serializer whitespace between block elements. Those hidden text
+  // nodes were the main reason blank lines appeared after each save/reopen cycle.
+  let normalized=box.innerHTML;
+  normalized=normalized.replace(/(<\\/(?:p|div)>)\\s+(?=<(?:p|div)\\b)/gi,'$1');
+  normalized=normalized.replace(/^\\s+|\\s+$/g,'');
+  return normalized;
 }
 function _curriculumRichEditor(code, value){
   const safe=_sanitizeCurriculumRichHtml(value);
@@ -18199,7 +18221,8 @@ function _curriculumRichEditor(code, value){
       `<input id="${fileId}" type="file" accept="image/*" style="display:none" onchange="uploadCurriculumImageFile(this,${JSON.stringify(String(code))})">`+
       `<span class="small" style="margin-left:5px;color:#64748b">Có thể upload ảnh hoặc paste ảnh trực tiếp vào ô nội dung</span>`+
     `</div>`+
-    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:pre-wrap;line-height:1.55">${safe}</div>`+
+    `<style>.cur-rich{white-space:normal;line-height:1.55}.cur-rich p,.cur-rich div{margin:0;padding:0}.cur-rich img{max-width:100%;height:auto;display:block}</style>`+
+    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none">${safe}</div>`+
   `</div>`;
 }
 window._curriculumImageSelection={};
