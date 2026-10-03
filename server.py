@@ -1,7 +1,7 @@
-# VERSION: v31.82 — exercise OCR resilient retry on empty Gemini response
+# VERSION: v31.78 — split admin into User Management and Content Management tabs
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.84"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.83"
+SERVER_VERSION = "31.84"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15278,11 +15278,56 @@ def _normalize_curriculum_steps(content_type, steps, source_digest):
         found['code']=code; found.setdefault('title',rule['title']); found.setdefault('type',rule['type']); out.append(found)
     return out
 
-_ALLOWED_CURRICULUM_RICH_TAGS = {"b", "strong", "i", "em", "u", "br", "p", "div", "span", "img"}
-_RICH_TAG_NORMALIZE = {"strong":"b", "em":"i"}
+_ALLOWED_CURRICULUM_RICH_TAGS = {
+    "b", "strong", "i", "em", "u", "s", "strike", "br",
+    "p", "div", "span", "center", "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li", "img"
+}
+_RICH_TAG_NORMALIZE = {"strong":"b", "em":"i", "strike":"s", "center":"div"}
+_RICH_SAFE_STYLE_PROPS = {"text-align", "font-weight", "font-style", "text-decoration"}
+_RICH_SAFE_ALIGN = {"left", "right", "center", "justify"}
+_RICH_SAFE_WEIGHT = {"normal", "bold", "bolder", "lighter", "100", "200", "300", "400", "500", "600", "700", "800", "900"}
+_RICH_SAFE_TEXT_DECORATION = {"none", "underline", "overline", "line-through"}
+
+
+def _sanitize_rich_style(style_value: str) -> str:
+    """Keep only presentation-only CSS needed by the curriculum editor.
+
+    In particular this preserves the two formatting properties lost by the old
+    sanitizer: text-align (centered headings/labels) and font-weight (bold spans
+    produced by browsers or paste operations). No positioning, URL, behavior,
+    expression, or arbitrary CSS is accepted.
+    """
+    raw = str(style_value or "")
+    if not raw:
+        return ""
+    out=[]
+    for decl in raw.split(';'):
+        if ':' not in decl:
+            continue
+        prop,val = decl.split(':',1)
+        prop=prop.strip().lower()
+        val=val.strip().lower()
+        if prop not in _RICH_SAFE_STYLE_PROPS:
+            continue
+        if any(ch in val for ch in '<>\"\'`'):
+            continue
+        if prop == 'text-align' and val not in _RICH_SAFE_ALIGN:
+            continue
+        if prop == 'font-weight' and val not in _RICH_SAFE_WEIGHT:
+            continue
+        if prop == 'font-style' and val not in {'normal','italic','oblique'}:
+            continue
+        if prop == 'text-decoration':
+            tokens={x.strip() for x in val.split() if x.strip()}
+            if tokens and not tokens.issubset(_RICH_SAFE_TEXT_DECORATION):
+                continue
+        out.append(f'{prop}:{val}')
+    return ';'.join(out)
+
 
 class _CurriculumRichTextSanitizer(HTMLParser):
-    """Allow harmless formatting plus uploaded HTTP(S) images in Admin rich text."""
+    """Allow harmless formatting, alignment, lists, and uploaded HTTP(S) images."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.out=[]
@@ -15291,24 +15336,25 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
             return
         norm=_RICH_TAG_NORMALIZE.get(tag, tag)
+        attr_map={str(k or '').lower():str(v or '').strip() for k,v in attrs}
         if norm == 'br':
             self.out.append('<br>')
             return
         if norm == 'img':
-            attr_map={str(k or '').lower():str(v or '').strip() for k,v in attrs}
             src=attr_map.get('src','')
             alt=attr_map.get('alt','')
             if not re.match(r'^(?:https?://|/)', src, flags=re.I):
                 return
             self.out.append(f'<img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}">')
             return
-        if norm in ('p','div'):
-            # Block elements already provide their own line/paragraph semantics.
-            # Do not inject literal newline text around them: with the Admin
-            # editor's whitespace handling those characters become blank lines
-            # and can multiply after save -> reopen cycles.
-            self.out.append(f'<{norm}>')
-            return
+
+        style=_sanitize_rich_style(attr_map.get('style',''))
+        align=str(attr_map.get('align') or '').strip().lower()
+        if align in _RICH_SAFE_ALIGN and 'text-align:' not in style:
+            style = f'text-align:{align}' + (f';{style}' if style else '')
+
+        attrs_out=f' style="{html.escape(style, quote=True)}"' if style else ''
+        self.out.append(f'<{norm}{attrs_out}>')
     def handle_endtag(self, tag):
         tag=str(tag or '').lower()
         if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
@@ -15320,36 +15366,27 @@ class _CurriculumRichTextSanitizer(HTMLParser):
     def handle_data(self, data):
         self.out.append(data)
 
-def sanitize_curriculum_rich_text(value):
-    """Store safe rich text, decoding one HTML-entity layer before sanitizing.
 
-    This fixes content that was previously persisted as ``&lt;b&gt;...`` /
-    ``&lt;p&gt;...`` and therefore appeared literally in the Admin editor and
-    could lose paragraph structure in the learner UI.
+def sanitize_curriculum_rich_text(value):
+    """Sanitize curriculum rich text while preserving editor formatting.
+
+    Deliberately does NOT insert literal newline characters around <p>/<div>.
+    The previous implementation did that and the editor used white-space:pre-wrap,
+    so every save/reopen could accumulate visible blank lines and unexpected wraps.
     """
     text=str(value or '')
     if not text:
         return ''
-    # Decode all legacy entity layers first. The HTMLParser then decides which tags
-    # are actually allowed, so encoded <script> etc. cannot bypass sanitization.
     text=_decode_curriculum_html_entities(text)
-    if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span|img)\b', text, flags=re.I):
+    if not re.search(r'<\s*(?:b|strong|i|em|u|s|strike|br|p|div|span|center|h[1-6]|ul|ol|li|img)\b', text, flags=re.I):
         return text
     try:
         parser=_CurriculumRichTextSanitizer()
         parser.feed(text)
         parser.close()
-        cleaned=''.join(parser.out)
-        # Remove only whitespace that sits between block elements. Keep normal
-        # spaces/newlines inside actual text content untouched. This also cleans
-        # rich-text already persisted by v31.82 when it is edited again.
-        cleaned=re.sub(r'(</(?:p|div)>)\s+(?=<(?:p|div)\b)', r'\1', cleaned, flags=re.I)
-        cleaned=re.sub(r'^\s+(?=<(?:p|div)\b)', '', cleaned, flags=re.I)
-        cleaned=re.sub(r'(</(?:p|div)>)\s+$', r'\1', cleaned, flags=re.I)
-        return cleaned
+        return ''.join(parser.out)
     except Exception:
         return re.sub(r'<[^>]+>', '', text)
-
 
 def _normalize_curriculum_content_for_admin(content):
     """Normalize legacy rich-text so edit Drafts receive real <img> tags, not literal markup."""
@@ -16408,8 +16445,6 @@ async def admin_curriculum_draft_upload(
             spg=str(cfg.get('suggestion_pages') or '').strip()
             normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg,'suggestion_pages':spg})
         configs=normalized
-    if any(str(cfg.get('content_type') or '').strip() == 'Bài tập' for cfg in configs) and not gemini:
-        raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình; Bài tập dùng Gemini OCR theo exercise upload flow.')
     if any(str(cfg.get('content_type') or '').strip() == 'Từ vựng' for cfg in configs):
         raise HTTPException(400,'Từ vựng không upload qua PDF/Curriculum Studio. Hãy dùng Upload Từ vựng bằng DOCX.')
 
@@ -18150,25 +18185,18 @@ function _sanitizeCurriculumRichHtml(value){
   let src=_decodeCurriculumRichEntities(value);
   if(!src)return '';
   const box=document.createElement('div');
-  if(/<\\s*(?:b|strong|i|em|u|br|p|div|span|img)\\b/i.test(src)){
-    box.innerHTML=src;
-  }else{
-    // Plain-text paste: make source newlines explicit so switching the editor to
-    // normal whitespace does not collapse them into spaces.
-    const lines=src.replace(/\\r\\n?/g,'\\n').split('\\n');
-    lines.forEach((line,idx)=>{
-      if(idx)box.appendChild(document.createElement('br'));
-      box.appendChild(document.createTextNode(line));
-    });
+  const hasMarkup=/<\\s*(?:b|strong|i|em|u|s|strike|br|p|div|span|center|h[1-6]|ul|ol|li|img)\\b/i.test(src);
+  if(hasMarkup) box.innerHTML=src;
+  else {
+    // Plain OCR text: preserve explicit newlines as <br> so the editor can use
+    // normal HTML whitespace instead of relying on white-space:pre-wrap.
+    box.innerHTML=String(src).replace(/\r\n?/g,'\n').split('\n').map(escapeHtml).join('<br>');
   }
 
-  // Legacy/paste-safe fallback: older saves may contain literal IMG markup as
-  // plain text nodes. Convert every literal <img ...> occurrence into a real
-  // DOM image before the final allow-list pass.
-  const literalImgRe=/<img\\s+[^>]*src=[\"']([^\"']+)[\"'][^>]*>/ig;
+  const literalImgRe=/<img\\s+[^>]*src=["']([^"']+)["'][^>]*>/ig;
   const walker=document.createTreeWalker(box,NodeFilter.SHOW_TEXT);
   const textNodes=[]; let n;
-  while((n=walker.nextNode())){ if(literalImgRe.test(n.nodeValue||'')){ literalImgRe.lastIndex=0; textNodes.push(n); } }
+  while((n=walker.nextNode())){ literalImgRe.lastIndex=0; if(literalImgRe.test(n.nodeValue||'')){ literalImgRe.lastIndex=0; textNodes.push(n); } }
   textNodes.forEach(node=>{
     const text=String(node.nodeValue||'');
     let last=0; let match; const frag=document.createDocumentFragment(); literalImgRe.lastIndex=0;
@@ -18177,38 +18205,55 @@ function _sanitizeCurriculumRichHtml(value){
       const rawSrc=String(match[1]||'').trim();
       if(/^(?:https?:\\/\\/|\\/)/i.test(rawSrc)){
         const img=document.createElement('img'); img.setAttribute('src',rawSrc); img.setAttribute('alt','Hình minh họa'); frag.appendChild(img);
-      }else{ frag.appendChild(document.createTextNode(match[0])); }
+      }else frag.appendChild(document.createTextNode(match[0]));
       last=match.index+match[0].length;
     }
     if(last<text.length)frag.appendChild(document.createTextNode(text.slice(last)));
     node.replaceWith(frag);
   });
 
-  box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
+  box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(el=>el.remove());
+  const allowed=new Set(['b','strong','i','em','u','s','strike','br','p','div','span','center','h1','h2','h3','h4','h5','h6','ul','ol','li','img']);
+  const safeAlign=new Set(['left','right','center','justify']);
+  const safeWeights=new Set(['normal','bold','bolder','lighter','100','200','300','400','500','600','700','800','900']);
+  const safeStyles=(style)=>{
+    const out=[]; String(style||'').split(';').forEach(decl=>{
+      const idx=decl.indexOf(':'); if(idx<0)return;
+      const prop=decl.slice(0,idx).trim().toLowerCase(); const val=decl.slice(idx+1).trim().toLowerCase();
+      if(!['text-align','font-weight','font-style','text-decoration'].includes(prop))return;
+      if(/[<>"'`]/.test(val))return;
+      if(prop==='text-align' && !safeAlign.has(val))return;
+      if(prop==='font-weight' && !safeWeights.has(val))return;
+      if(prop==='font-style' && !['normal','italic','oblique'].includes(val))return;
+      if(prop==='text-decoration' && val.split(/\\s+/).some(x=>x && !['none','underline','overline','line-through'].includes(x)))return;
+      out.push(prop+':'+val);
+    }); return out.join(';');
+  };
+
   box.querySelectorAll('*').forEach(el=>{
     const tag=el.tagName.toLowerCase();
     if(tag==='img'){
       const src=String(el.getAttribute('src')||'').trim();
-      if(!/^(?:https?:\\/\\/|\\/)/i.test(src)){ el.remove(); return; }
+      if(!/^(?:https?:\\/\\/|\\/)/i.test(src)){el.remove();return;}
       const alt=String(el.getAttribute('alt')||'').trim();
       [...el.attributes].forEach(a=>el.removeAttribute(a.name));
-      el.setAttribute('src',src); if(alt)el.setAttribute('alt',alt);
-      return;
+      el.setAttribute('src',src); if(alt)el.setAttribute('alt',alt); return;
     }
-    if(!['b','strong','i','em','u','br','p','div','span'].includes(tag)){
+    if(!allowed.has(tag)){
       const frag=document.createDocumentFragment(); while(el.firstChild)frag.appendChild(el.firstChild); el.replaceWith(frag); return;
     }
+    const originalStyle=el.getAttribute('style')||''; const originalAlign=(el.getAttribute('align')||'').trim().toLowerCase();
     [...el.attributes].forEach(a=>el.removeAttribute(a.name));
-    if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); el.replaceWith(b);}
-    else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); el.replaceWith(i);}
+    let style=safeStyles(originalStyle);
+    if(safeAlign.has(originalAlign) && !/text-align:/.test(style)) style='text-align:'+originalAlign+(style?';'+style:'');
+    if(style)el.setAttribute('style',style);
+    if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); if(style)b.setAttribute('style',style); el.replaceWith(b);}
+    else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); if(style)i.setAttribute('style',style); el.replaceWith(i);}
+    else if(tag==='center'){const div=document.createElement('div'); while(el.firstChild)div.appendChild(el.firstChild); div.setAttribute('style','text-align:center'+(style&&style!=='text-align:center'?';'+style:'')); el.replaceWith(div);}
   });
-  // Remove only serializer whitespace between block elements. Those hidden text
-  // nodes were the main reason blank lines appeared after each save/reopen cycle.
-  let normalized=box.innerHTML;
-  normalized=normalized.replace(/(<\\/(?:p|div)>)\\s+(?=<(?:p|div)\\b)/gi,'$1');
-  normalized=normalized.replace(/^\\s+|\\s+$/g,'');
-  return normalized;
+  return box.innerHTML;
 }
+
 function _curriculumRichEditor(code, value){
   const safe=_sanitizeCurriculumRichHtml(value);
   const fileId=`cur-img-file-${encodeURIComponent(String(code))}`;
@@ -18221,8 +18266,7 @@ function _curriculumRichEditor(code, value){
       `<input id="${fileId}" type="file" accept="image/*" style="display:none" onchange="uploadCurriculumImageFile(this,${JSON.stringify(String(code))})">`+
       `<span class="small" style="margin-left:5px;color:#64748b">Có thể upload ảnh hoặc paste ảnh trực tiếp vào ô nội dung</span>`+
     `</div>`+
-    `<style>.cur-rich{white-space:normal;line-height:1.55}.cur-rich p,.cur-rich div{margin:0;padding:0}.cur-rich img{max-width:100%;height:auto;display:block}</style>`+
-    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none">${safe}</div>`+
+    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:normal;line-height:1.55">${safe}</div>`+
   `</div>`;
 }
 window._curriculumImageSelection={};
@@ -19572,64 +19616,18 @@ def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = 
     return str(response.text or '').strip()
 
 
-def _gemini_exercise_plain_ocr_retry(page_png: bytes, page_no: int, source_file: str = ""):
-    """Second-pass OCR-only fallback for Exercise pages when structured Vision OCR returns empty.
-
-    Exercise pages only need faithful source text here; images are stored as whole source pages by
-    _store_exercise_source_page, so the retry deliberately avoids JSON/image detection. This keeps
-    the retry independent from the generic page/image Vision pipeline.
-    """
-    if not gemini:
-        return ""
-    prompt = f"""OCR ONLY trang {page_no} của file {source_file}.
-
-Yêu cầu bắt buộc:
-- Chép lại TOÀN BỘ chữ nhìn thấy trên trang.
-- Giữ nguyên nguyên văn tiếng Anh, số câu, chữ cái A/B/C/D, dấu câu và ký hiệu.
-- Không giải bài, không chọn đáp án, không dịch, không tóm tắt, không giải thích.
-- Không mô tả hình ảnh.
-- Có thể xuống dòng theo bố cục trang để dễ đọc.
-- Chỉ trả về văn bản OCR thuần túy, không JSON, không Markdown.
-- Nếu một đoạn không chắc, vẫn chép phần nhìn thấy được thay vì trả về rỗng.
-"""
-    try:
-        part=types.Part.from_bytes(data=page_png,mime_type='image/png')
-        response=gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[part,prompt],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                thinking_config=types.ThinkingConfig(thinking_level='minimal'),
-                response_mime_type='text/plain',
-            ),
-        )
-        _log_gemini_usage(response, operation=f"exercise_vision_ocr_retry:{source_file}:page_{page_no}")
-        text=str(getattr(response,'text','') or '').strip()
-        if text:
-            return text
-        # Some SDK responses expose text only in candidates/parts even when .text is empty.
-        candidates=getattr(response,'candidates',None) or []
-        chunks=[]
-        for cand in candidates:
-            content=getattr(cand,'content',None)
-            parts=getattr(content,'parts',None) or [] if content is not None else []
-            for part_obj in parts:
-                part_text=getattr(part_obj,'text',None)
-                if part_text:
-                    chunks.append(str(part_text))
-        return '\n'.join(chunks).strip()
-    except Exception as exc:
-        print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
-        return ""
-
-
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """OCR + source-page storage for explicitly configured Exercise pages.
+    """Extract only configured exercise/answer pages.
 
-    Proven path: direct Gemini page OCR, matching the supplied server that successfully
-    uploaded Exercise PDFs. If Gemini returns an empty structured response for one page,
-    retry that page once with a plain-text OCR-only prompt. Only this Exercise path is
-    changed; the rest of the latest server remains untouched.
+    Flow per configured page:
+      1) local PDF text extraction (zero token);
+      2) if needed, one RapidOCR pass;
+      3) only when local OCR returns no text, one Gemini Vision OCR fallback.
+
+    The winning extracted text is cached in page_texts and reused for the whole
+    draft pipeline. A page is never OCR'd twice and Vision is never called when
+    local OCR already returned usable text. Vision is OCR/extraction only; it is
+    not asked to invent or rewrite exercise content.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -19637,62 +19635,75 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
     qset=set(q_pages)
     if not selected:
         raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
-
     page_texts={}; page_images={}; page_units={}
-    for page_no in selected:
-        tag='question' if page_no in qset else 'answer'
-        # Keep the known-good reference behavior: direct Gemini page OCR at 140 DPI.
-        png=render_pdf_page(pdf_source,page_no,dpi=140)
-        retry_used=False
+    fitz_doc=None
+    if fitz is not None:
         try:
-            ocr_text, _detected = gemini_ocr_page(png,page_no,source_file=source_file)
-            ocr_text=str(ocr_text or '').strip()
+            fitz_doc=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
         except Exception as exc:
-            ocr_text=''
-            print(f'[EXERCISE OCR/VISION] page={page_no} direct_gemini_failed={type(exc).__name__}: {exc}')
+            print(f'[EXERCISE FITZ OPEN] failed: {type(exc).__name__}: {exc}')
+    try:
+        for page_no in selected:
+            tag='question' if page_no in qset else 'answer'
+            extracted=''
+            page_obj=None
+            # Prefer PyMuPDF; avoids pypdf broken-object warnings for damaged PDFs.
+            if fitz_doc is not None:
+                try:
+                    extracted=(fitz_doc.load_page(page_no-1).get_text('text') or '').strip()
+                except Exception as exc:
+                    print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
+            # Secondary native text path. Still zero tokens.
+            if len(re.sub(r'\\s+','',extracted)) < 20:
+                try:
+                    page_obj=reader.pages[page_no-1]
+                    pypdf_text=(page_obj.extract_text() or '').strip()
+                    if len(re.sub(r'\\s+','',pypdf_text)) >= 20:
+                        extracted=pypdf_text
+                except Exception as exc:
+                    print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
+            text_len=len(re.sub(r'\\s+','',extracted))
+            png=None
+            if text_len >= 20:
+                ocr_text=extracted
+                print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
+            else:
+                png=render_pdf_page(pdf_source,page_no,dpi=300)
+                ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
+                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
 
-        if not ocr_text:
-            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} reason=empty_direct_gemini')
-            # Retry at a slightly higher DPI and with plain text output, avoiding the
-            # structured JSON/image-detection contract that produced empty output on page 3.
-            retry_png=render_pdf_page(pdf_source,page_no,dpi=220)
-            ocr_text=_gemini_exercise_plain_ocr_retry(retry_png,page_no,source_file=source_file)
-            retry_used=True
-            if retry_png is not png:
-                try: del retry_png
-                except Exception: pass
-            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} chars={len(ocr_text)} retry=plain_text_220dpi')
+                # Only when local OCR truly returns no text, use ONE Gemini Vision
+                # call as an OCR fallback for scanned/complex pages. This is not
+                # content generation: the Vision prompt returns the page text only.
+                if not ocr_text and gemini is not None:
+                    try:
+                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
+                        ocr_text=str(vision_text or '').strip()
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
+                    except Exception as exc:
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
 
-        if not ocr_text:
-            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}) sau Direct Gemini OCR + plain-text OCR retry.')
-
-        page_texts[page_no]=ocr_text
-        units=[{
-            'type':'normal',
-            'unit_id':f'exercise:{tag}:page:{page_no}:text',
-            'text':ocr_text,
-            'image_keys':[],
-        }]
-
-        # Store the original source page exactly once. Image storage is auxiliary;
-        # it must never turn a successful OCR into a failed upload.
-        stored=[]
-        try:
+            if not ocr_text:
+                raise ValueError(
+                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
+                )
+            page_texts[page_no]=ocr_text
+            units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
+            if png is None:
+                png=render_pdf_page(pdf_source,page_no,dpi=150)
+            # Storage only; never Vision-analyze exercise images/tables.
+            stored=[]
             base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
             if base_stored:
                 stored.append(base_stored)
-        except Exception as exc:
-            print(f'[EXERCISE SOURCE IMAGE] page={page_no} storage warning: {type(exc).__name__}: {exc}')
-
-        if stored:
             page_images[page_no]=stored
             units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
-        page_units[page_no]=units
-        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(ocr_text)} direct_gemini=1 retry_used={int(retry_used)}')
-        try: del png
-        except Exception: pass
-        gc.collect()
-
+            page_units[page_no]=units
+            print(f'[EXERCISE OCR CACHE] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} source_cached=1')
+    finally:
+        if fitz_doc is not None:
+            try: fitz_doc.close()
+            except Exception: pass
     return page_texts,page_images,page_units
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
