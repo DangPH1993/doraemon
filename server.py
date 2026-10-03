@@ -1,4 +1,4 @@
-# VERSION: v31.78 — split admin into User Management and Content Management tabs
+# VERSION: v31.80 — restore proven synchronous Bài tập upload path only
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
@@ -16383,6 +16383,312 @@ def _execute_curriculum_upload_job(job_id, temp_pdf_path, source_file, password,
             pass
 
 
+async def _admin_curriculum_draft_upload_exercise_legacy(
+    password: str = Form(''),
+    file: UploadFile = File(...),
+    course_id: int = Form(...),
+    content_type: str = Form(''),
+    lesson: str = Form(''),
+    metadata_json: str = Form('[]'),
+    articles_json: str = Form('[]'),
+):
+    """Legacy-proven Bài tập-only upload path restored from the working server build.
+
+    This helper intentionally keeps the old request lifecycle for exercise uploads.
+    Other curriculum upload types continue through the current upload implementation.
+
+    Original documentation: Create one or many AI curriculum drafts from selected page ranges only.
+
+    A single PDF can define multiple lessons, each with its own page range. Pages
+    not belonging to any configured lesson are never processed by OCR/Vision,
+    never saved to B2, and never included in the AI source digest.
+    """
+    check_admin(password)
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(400,'Vui lòng chọn file PDF.')
+    # Bài tập không cần GenAI. Các loại curriculum khác vẫn dùng Gemini.
+    if str(content_type or '').strip() != 'Bài tập' and not gemini:
+        raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
+    if not b2_ready():
+        raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
+    course_id=int(course_id)
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,name,status FROM courses WHERE id=%s",(course_id,))
+            course=cur.fetchone()
+    finally:
+        conn.close()
+    if not course:
+        raise HTTPException(400,'Khóa học không tồn tại.')
+    if str(course.get('status') or '').upper() != 'ACTIVE':
+        raise HTTPException(400,'Khóa học đang tắt và không thể tạo Draft.')
+    subject=str(course['name']).strip()
+
+    # Backward compatible single-lesson configuration.
+    configs=[]
+    try:
+        parsed=json.loads(articles_json or '[]')
+        if isinstance(parsed,list):
+            configs=[x for x in parsed if isinstance(x,dict)]
+    except Exception:
+        configs=[]
+    if not configs:
+        content_type=_normalize_content_type(content_type)
+        single_lesson=str(lesson or '').strip()
+        if not single_lesson:
+            raise HTTPException(400,'Tên bài học là bắt buộc.')
+        configs=[{'content_type':content_type,'lesson':single_lesson,'pages':str('') if False else ''}]
+    else:
+        normalized=[]
+        for idx,cfg in enumerate(configs,1):
+            ct=_normalize_content_type(cfg.get('content_type'))
+            ls=str(cfg.get('lesson') or '').strip()
+            pg=str(cfg.get('pages') or cfg.get('page_ranges') or '').strip()
+            if not ls:
+                raise HTTPException(400,f'Bài #{idx}: Tên bài học là bắt buộc.')
+            qpg=str(cfg.get('question_pages') or '').strip()
+            apg=str(cfg.get('answer_pages') or '').strip()
+            normalized.append({'content_type':ct,'lesson':ls,'pages':pg,'question_pages':qpg,'answer_pages':apg})
+        configs=normalized
+
+    source_file=os.path.basename(file.filename)
+    temp_pdf_path=None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='doraemon_curriculum_',suffix='.pdf',delete=False) as tf:
+            temp_pdf_path=tf.name
+            while True:
+                chunk=await file.read(1024*1024)
+                if not chunk: break
+                tf.write(chunk)
+        reader=PdfReader(temp_pdf_path)
+        total_pages=len(reader.pages)
+        if total_pages<=0:
+            raise HTTPException(400,'PDF không có trang.')
+
+        # Parse page ranges before touching OCR/Vision. Exercise lessons use
+        # separate question/answer scopes; every other content type keeps the
+        # historical single 'pages' scope.
+        for idx,cfg in enumerate(configs,1):
+            ct=str(cfg.get('content_type') or '').strip()
+            lesson_name=str(cfg.get('lesson') or '').strip()
+            if ct == 'Bài tập':
+                qraw=str(cfg.get('question_pages') or '').strip()
+                araw=str(cfg.get('answer_pages') or '').strip()
+                if not qraw:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Bài tập cần nhập Trang bài tập, ví dụ 7-8.')
+                if not araw:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Bài tập cần nhập Trang đáp án, ví dụ 20-21.')
+                try:
+                    cfg['question_selected_pages']=_parse_curriculum_page_ranges(qraw,total_pages)
+                    cfg['answer_selected_pages']=_parse_curriculum_page_ranges(araw,total_pages)
+                except ValueError as exc:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): {exc}')
+                overlap=sorted(set(cfg['question_selected_pages']) & set(cfg['answer_selected_pages']))
+                if overlap:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): Trang bài tập và Trang đáp án bị chồng lấn: {", ".join(map(str,overlap))}.')
+                cfg['selected_pages']=sorted(set(cfg['question_selected_pages']) | set(cfg['answer_selected_pages']))
+                cfg['question_pages_label']=_curriculum_page_range_label(cfg['question_selected_pages'])
+                cfg['answer_pages_label']=_curriculum_page_range_label(cfg['answer_selected_pages'])
+                cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+            else:
+                if not str(cfg.get('pages') or '').strip():
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): phải nhập số trang, ví dụ 7-8.')
+                try:
+                    cfg['selected_pages']=_parse_curriculum_page_ranges(cfg['pages'], total_pages)
+                except ValueError as exc:
+                    raise HTTPException(400,f'Bài #{idx} ({lesson_name}): {exc}')
+                cfg['pages_label']=_curriculum_page_range_label(cfg['selected_pages'])
+
+        # Do not allow overlapping configured pages. One PDF page should have one
+        # curriculum owner, otherwise B2/image provenance would become ambiguous.
+        owners={}
+        overlaps=[]
+        for idx,cfg in enumerate(configs,1):
+            for pg in cfg['selected_pages']:
+                if pg in owners:
+                    overlaps.append(f"trang {pg} (bài #{owners[pg]} và #{idx})")
+                else:
+                    owners[pg]=idx
+        if overlaps:
+            raise HTTPException(400,'Phạm vi trang bị chồng lấn: '+', '.join(overlaps)+'. Hãy tách trang cho từng bài.')
+
+        records_meta=normalize_kb_records(metadata_json,total_pages)
+        results=[]
+        for idx,cfg in enumerate(configs,1):
+            ct=str(cfg['content_type']).strip()
+            ls=str(cfg['lesson']).strip()
+            selected_pages=cfg['selected_pages']
+            if ct == 'Bài tập':
+                page_texts,page_images,page_units=process_exercise_pdf_pages(
+                    temp_pdf_path, reader, source_file, subject, ls,
+                    question_pages=cfg.get('question_selected_pages'),
+                    answer_pages=cfg.get('answer_selected_pages'),
+                )
+            else:
+                page_texts,page_images,page_units=process_pdf_pages(
+                    temp_pdf_path, reader, records_meta, source_file, subject, selected_pages=selected_pages
+                )
+            pages=[]
+            selected_set=set(int(x) for x in selected_pages)
+            for page_no in selected_pages:
+                imgs=[]
+                for img in page_images.get(page_no,[]) or []:
+                    vision={k:v for k,v in img.items() if k not in {'key','url','image_url'}}
+                    key=str(img.get('key') or '')
+                    if not key: continue
+                    imgs.append({'image_key':key,'image_url':b2_url(key),'vision':vision})
+                pages.append({'page':page_no,'text':page_texts.get(page_no,'')[:12000],'images':imgs})
+            # Hard invariant: the AI Draft payload may contain ONLY configured pages.
+            page_keys={int(pg.get('page')) for pg in pages if str(pg.get('page')).isdigit()}
+            if page_keys != selected_set:
+                raise HTTPException(500, f'Page-scope lỗi cho bài {ls}: expected={sorted(selected_set)} actual={sorted(page_keys)}')
+
+            digest=_curriculum_source_digest(pages)
+            normalized_steps=[]
+            _, grammar_reference = _get_course_curriculum_knowledge(course_id, digest)
+            if ct == 'Bài tập':
+                selected_by_page={int(pg.get('page')):pg for pg in pages if str(pg.get('page')).isdigit()}
+                question_pages=[selected_by_page[p] for p in cfg.get('question_selected_pages',[]) if p in selected_by_page]
+                answer_pages=[selected_by_page[p] for p in cfg.get('answer_selected_pages',[]) if p in selected_by_page]
+                generated=_curriculum_generate_all_steps(
+                    ct,ls,digest,grammar_reference,
+                    exercise_question_pages=question_pages,
+                    exercise_answer_pages=answer_pages,
+                )
+                for st in generated:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content, pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print(f'[CURRICULUM EXERCISE DRAFT] lesson={ls!r} question_pages={cfg.get("question_pages_label","")} answer_pages={cfg.get("answer_pages_label","")} source_only=1')
+            elif ct == 'Truyện đọc':
+                # B0 stays deterministic from source; B1-B3 are generated together in ONE call.
+                story_text = "\n\n".join(
+                    str(pg.get('text') or '').strip()
+                    for pg in pages
+                    if str(pg.get('text') or '').strip()
+                ).strip()
+                story_b0 = {
+                    'title': 'Nội dung truyện',
+                    'content': story_text,
+                    'source_refs': [
+                        {'page': pg.get('page'), 'reason': 'Văn bản truyện gốc từ OCR/text nguồn'}
+                        for pg in pages if pg.get('text')
+                    ],
+                    'images': [],
+                    'items': [],
+                }
+                story_b0 = _resolve_curriculum_step_images(story_b0, pages)
+                normalized_steps.append({'code':'B0','title':'Nội dung truyện','type':'story','content':story_b0})
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                if ct == 'Truyện đọc':
+                    # Apply the course master gate only to vocabulary/grammar items in the generated story steps.
+                    generated = _filter_generated_course_knowledge(generated, course_id)
+                story_map={'B1':('Bản dịch tiếng Việt','translation'),'B2':('Từ vựng','vocabulary'),'B3':('Ngữ pháp','grammar')}
+                for st in generated:
+                    code=str(st.get('code') or '').strip().upper()
+                    if code not in story_map: continue
+                    title,step_type=story_map[code]
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content,pages)
+                    normalized_steps.append({'code':code,'title':str(st.get('title') or title),'type':str(st.get('type') or step_type),'content':content})
+                print('[CURRICULUM ONE-CALL] type=Truyện đọc vision_first=1 genai_calls=1 total_steps=%s' % len(normalized_steps))
+            else:
+                generated=_curriculum_generate_all_steps(ct,ls,digest,grammar_reference)
+                if ct == 'Giáo trình':
+                    generated = _filter_generated_course_knowledge(generated, course_id)
+                plan=_normalize_curriculum_steps(ct,generated,digest)
+                for st in plan:
+                    code=str(st.get('code') or '').strip(); title=str(st.get('title') or '').strip()
+                    if not code or not title: continue
+                    content=st.get('content') if isinstance(st.get('content'),dict) else st
+                    content=_resolve_curriculum_step_images(content,pages)
+                    normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
+                print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s course_master=1 grammar_reference=%s' % (ct,len(normalized_steps),bool(grammar_reference)))
+
+            # Exercise drafts are source-only OCR and have no vocabulary/grammar
+            # master mapping requirement. Skipping this also keeps exercise upload
+            # completely independent from optional curriculum mapping helpers.
+            if course_id and ct != 'Bài tập':
+                try:
+                    normalized_steps=_map_curriculum_steps_to_master(course_id, None, ls, normalized_steps)
+                except Exception as exc:
+                    print(f'[CURRICULUM ITEM MAP] pre-publish draft mapping warning: {type(exc).__name__}: {exc}')
+            if ct == 'Bài tập':
+                draft_codes=[str(st.get('code') or '').strip().upper() for st in normalized_steps]
+                if draft_codes != ['B1','B2']:
+                    raise HTTPException(500, f'Bài tập {ls}: Draft phải tạo đủ B1 và B2, hiện có {draft_codes}.')
+                b2_payload=next((st for st in normalized_steps if str(st.get('code') or '').strip().upper()=='B2'), None)
+                b2_content=((b2_payload or {}).get('content') or {}) if isinstance((b2_payload or {}).get('content'),dict) else {}
+                if not str(b2_content.get('content') or '').strip():
+                    raise HTTPException(500, f'Bài tập {ls}: bước B2 chưa có nội dung đáp án.')
+                print(f'[CURRICULUM EXERCISE DRAFT VALIDATE] lesson={ls!r} B1=1 B2=1 B2_chars={len(str(b2_content.get("content") or ""))}')
+            for _st in normalized_steps:
+                _ctn=_st.get('content') if isinstance(_st,dict) else None
+                if isinstance(_ctn,dict) and 'content' in _ctn:
+                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
+            payload={
+                'source_file':source_file,
+                'course_id':course_id,
+                'subject':subject,
+                'content_type':ct,
+                'lesson':ls,
+                'page_ranges':cfg['pages_label'],
+                'question_pages':cfg.get('question_pages_label',''),
+                'answer_pages':cfg.get('answer_pages_label',''),
+                'steps':normalized_steps,
+            }
+            if ct == 'Bài tập':
+                payload['selected_page_count']=len(selected_pages)
+            else:
+                payload['selected_pages']=selected_pages
+                payload['page_count']=len(pages)
+                payload['pages']=pages
+            conn=db()
+            try:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",(source_file,ct,ls))
+                    version=int(cur.fetchone()['next_version'])
+                    cur.execute("INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json) VALUES(%s,%s,%s,%s,'AI_DRAFT',%s,%s::jsonb) RETURNING id",(source_file,subject,ct,ls,version,json.dumps(payload,ensure_ascii=False)))
+                    draft_id=int(cur.fetchone()['id'])
+                conn.commit()
+            finally:
+                conn.close()
+            result_item={
+                'draft_id':draft_id,'status':'AI_DRAFT','version':version,
+                'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
+                'page_ranges':cfg['pages_label'],'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
+                'selected_page_count':len(selected_pages),
+                'steps':normalized_steps,
+            }
+            if ct != 'Bài tập':
+                result_item['selected_pages']=selected_pages
+                result_item['pages']=pages
+                result_item['page_count']=len(pages)
+            results.append(result_item)
+
+        return {
+            'success':True,
+            'source_file':source_file,
+            'subject':subject,
+            'pdf_page_count':total_pages,
+            'configured_articles':len(results),
+            'selected_page_count':sum(int(x.get('selected_page_count') or 0) for x in results),
+            'drafts':results,
+            # Backward compatible single-result keys.
+            **(results[0] if len(results)==1 else {'draft_id':results[0]['draft_id'] if results else None}),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500,f'Không tạo được AI Draft: {type(exc).__name__}: {exc}')
+    finally:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+
+
 @app.post('/admin/api/curriculum/draft-upload')
 async def admin_curriculum_draft_upload(
     background_tasks: BackgroundTasks,
@@ -16403,6 +16709,37 @@ async def admin_curriculum_draft_upload(
     source_file = os.path.basename(getattr(file, 'filename', '') or '')
     print(f"[CURRICULUM DRAFT UPLOAD ACCEPT] filename={source_file!r} course_id={course_id} content_type={content_type!r}")
     check_admin(password)
+    # IMPORTANT: route Bài tập through the known-good synchronous implementation.
+    # This is intentionally isolated; other curriculum upload types keep the current flow.
+    _is_top_level_exercise = _normalize_content_type(content_type) == 'Bài tập'
+    _exercise_articles_only = False
+    try:
+        _raw_articles = json.loads(articles_json or '[]')
+        if isinstance(_raw_articles, list) and _raw_articles:
+            _exercise_articles_only = all(
+                isinstance(_a, dict) and _normalize_content_type(_a.get('content_type')) == 'Bài tập'
+                for _a in _raw_articles
+            )
+        elif _is_top_level_exercise:
+            _exercise_articles_only = True
+    except Exception:
+        _exercise_articles_only = _is_top_level_exercise
+
+    if _is_top_level_exercise or _exercise_articles_only:
+        print(
+            f"[CURRICULUM EXERCISE LEGACY ROUTE] filename={os.path.basename(getattr(file, 'filename', '') or '')!r} "
+            f"preserving proven exercise upload path"
+        )
+        return await _admin_curriculum_draft_upload_exercise_legacy(
+            password=password,
+            file=file,
+            course_id=course_id,
+            content_type=content_type,
+            lesson=lesson,
+            metadata_json=metadata_json,
+            articles_json=articles_json,
+        )
+
     if not source_file or not source_file.lower().endswith('.pdf'):
         raise HTTPException(400, 'Vui lòng chọn file PDF.')
     if str(content_type or '').strip() == 'Từ vựng':
@@ -19640,45 +19977,39 @@ def _get_rapid_ocr():
 
 
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """Local OCR chain for an exercise/answer page: RapidOCR -> Tesseract.
+    """Single-pass local OCR for an exercise/answer page using RapidOCR.
 
-    Neither backend calls GenAI. This function deliberately returns an empty string
-    only when every available local OCR backend fails or is unavailable.
+    RapidOCR is fed a real image array (not encoded PNG bytes) because different
+    rapidocr_onnxruntime releases handle byte input inconsistently. The page is
+    rendered once and OCR is called exactly once. No Vision/GenAI fallback.
     """
     global rapid_ocr
-    if not png or Image is None:
-        print(f'[EXERCISE OCR] page={page_no} failed: image/OCR prerequisites unavailable')
+    if not png or Image is None or np is None or rapid_ocr is None:
+        print(f'[EXERCISE OCR] page={page_no} failed: OCR engine unavailable')
         return ""
+    try:
+        im = Image.open(io.BytesIO(png)).convert('RGB')
+        # Keep the source page intact for OCR. Only enlarge modestly; do not
+        # threshold aggressively because anti-aliased IELTS text can disappear.
+        im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
+        arr = np.asarray(im)
 
-    rapid = _get_rapid_ocr() if np is not None else None
-    if rapid is not None and np is not None:
-        try:
-            im = Image.open(io.BytesIO(png)).convert('RGB')
-            im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
-            arr = np.asarray(im)
-            result, _ = rapid(arr)
-            texts = []
-            if isinstance(result, (list, tuple)):
-                for item in result:
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        txt = str(item[1] or '').strip()
-                        if txt:
-                            texts.append(txt)
-            text = '\n'.join(texts).strip()
-            print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
-            if len(re.sub(r'\s+', '', text)) >= 20:
-                return text
-        except Exception as exc:
-            print(f'[EXERCISE RAPIDOCR] page={page_no} failed: {type(exc).__name__}: {exc}')
-    else:
-        print(f'[EXERCISE RAPIDOCR] page={page_no} unavailable (package={RapidOCR is not None}, ready={rapid is not None}, numpy={np is not None})')
+        result, _ = rapid_ocr(arr)
+        texts = []
+        if isinstance(result, (list, tuple)):
+            for item in result:
+                # rapidocr_onnxruntime commonly returns [box, text, score].
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    txt = str(item[1] or '').strip()
+                    if txt:
+                        texts.append(txt)
 
-    # Rendered PDF pages on Render commonly have Tesseract available even when
-    # rapidocr_onnxruntime is not installed. Use it before paying for Vision OCR.
-    tesseract_text = _exercise_tesseract_ocr_page(png, page_no, source_file=source_file)
-    if len(re.sub(r'\s+', '', tesseract_text)) >= 20:
-        return tesseract_text
-    return ""
+        text = '\n'.join(texts).strip()
+        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
+        return text
+    except Exception as exc:
+        print(f'[EXERCISE OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return ""
 
 def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
     """Persist the original configured page as a single source image.
@@ -19780,53 +20111,35 @@ def _extract_gemini_text_response(response):
         return ''
 
 
-def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = "", scope: str = "question", attempt: int = 1):
-    """OCR-only Vision fallback with a second, answer-sheet-safe retry when needed.
+def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = ""):
+    """One-shot OCR-only Vision fallback for Exercise pages.
 
-    Vision is used strictly as extraction. It must not solve or regenerate the exercise.
+    This path is intentionally minimal: no image detection, no table analysis, no
+    solving, no summarization, no function calling, and minimal thinking. It returns
+    only the visible text because the exercise pipeline already stores the source page
+    and does not need any Vision-derived image knowledge.
     """
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
-    if int(attempt or 1) <= 1:
-        prompt = (
-            f"Đây là trang {page_no} của {scope} trong một bộ đề bài tập. "
-            "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
-            "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
-            "không suy luận, không giải bài, không mô tả hình ảnh. "
-            "Nếu đây là trang đáp án, vẫn phải đọc cả các đáp án ngắn như A/B/C/D, số, từ đơn và dấu câu. "
-            "Nếu có bảng, giữ thứ tự đọc của chữ trong bảng. Không trả JSON và không gọi công cụ."
-        )
-    else:
-        prompt = (
-            f"OCR RETRY — trang {page_no}, phạm vi {scope}. "
-            "Hãy đọc trực tiếp mọi ký tự nhìn thấy trên ảnh, kể cả các dòng rất ngắn, "
-            "chữ cái đáp án, số câu, dấu gạch, từ đơn hoặc câu trả lời trong ô/bảng. "
-            "Không giải bài và không suy luận đáp án. Không được bỏ qua trang chỉ vì bố cục giống answer key. "
-            "Chỉ xuất văn bản đã nhìn thấy; không markdown, không JSON, không giải thích."
-        )
-    part = types.Part.from_bytes(data=page_png, mime_type='image/png')
-    response = gemini.models.generate_content(
+    prompt = (
+        f"Đây là trang {page_no} của đề bài/đáp án. "
+        "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
+        "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
+        "không suy luận, không giải bài, không mô tả hình ảnh. "
+        "Chỉ trả về phần văn bản đã đọc; nếu có bảng, giữ thứ tự đọc của chữ trong bảng. "
+        "Không trả JSON và không gọi công cụ."
+    )
+    part=types.Part.from_bytes(data=page_png,mime_type='image/png')
+    response=gemini.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[part, prompt],
+        contents=[part,prompt],
         config=types.GenerateContentConfig(
             temperature=0.0,
             thinking_config=types.ThinkingConfig(thinking_level='minimal'),
-            max_output_tokens=1800,
         ),
     )
-    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}:attempt_{attempt}")
-    text = _extract_gemini_text_response(response)
-    if not text:
-        try:
-            finish_reasons = []
-            for c in getattr(response, 'candidates', None) or []:
-                reason = getattr(c, 'finish_reason', None)
-                if reason is not None:
-                    finish_reasons.append(str(reason))
-            print(f'[EXERCISE VISION OCR EMPTY] page={page_no} scope={scope} attempt={attempt} finish_reasons={finish_reasons}')
-        except Exception:
-            pass
-    return text
+    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}")
+    return str(response.text or '').strip()
 
 
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
@@ -19867,62 +20180,38 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 except Exception as exc:
                     print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
             # Secondary native text path. Still zero tokens.
-            if len(re.sub(r'\\s+','',extracted)) < 20:
+            if len(re.sub(r'\s+','',extracted)) < 20:
                 try:
                     page_obj=reader.pages[page_no-1]
                     pypdf_text=(page_obj.extract_text() or '').strip()
-                    if len(re.sub(r'\\s+','',pypdf_text)) >= 20:
+                    if len(re.sub(r'\s+','',pypdf_text)) >= 20:
                         extracted=pypdf_text
                 except Exception as exc:
                     print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            text_len=len(re.sub(r'\\s+','',extracted))
+            text_len=len(re.sub(r'\s+','',extracted))
             png=None
             if text_len >= 20:
                 ocr_text=extracted
                 print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
             else:
-                # Render at a reasonably high resolution for local OCR. If every
-                # local OCR backend is unavailable or returns no usable text, Vision
-                # is the last resort. A blank Vision response gets ONE retry using a
-                # stricter OCR prompt and higher-DPI rendering.
                 png=render_pdf_page(pdf_source,page_no,dpi=300)
                 ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-                print(f'[EXERCISE LOCAL OCR RESULT] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
+                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
 
+                # Only when local OCR truly returns no text, use ONE Gemini Vision
+                # call as an OCR fallback for scanned/complex pages. This is not
+                # content generation: the Vision prompt returns the page text only.
                 if not ocr_text and gemini is not None:
                     try:
-                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file, scope=tag, attempt=1)
+                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
                         ocr_text=str(vision_text or '').strip()
                         print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
                     except Exception as exc:
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} attempt=1 failed: {type(exc).__name__}: {exc}')
-
-                # Rare but important: Gemini can return an empty text candidate for
-                # a difficult answer sheet even though the page is readable. Retry
-                # once at higher DPI with a dedicated answer-sheet OCR instruction.
-                if not ocr_text and gemini is not None:
-                    try:
-                        retry_png = render_pdf_page(pdf_source,page_no,dpi=420)
-                        retry_text = _gemini_exercise_ocr_only(retry_png, page_no, source_file=source_file, scope=tag, attempt=2)
-                        ocr_text=str(retry_text or '').strip()
-                        print(f'[EXERCISE VISION OCR RETRY] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 retry=1 dpi=420')
-                        try: del retry_png
-                        except Exception: pass
-                    except Exception as exc:
-                        print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
 
             if not ocr_text:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        'error': 'exercise_ocr_failed',
-                        'page': int(page_no),
-                        'scope': tag,
-                        'message': (
-                            f'Không OCR/trích xuất được trang {page_no} ({tag}). '
-                            'Đã thử PDF text, RapidOCR/Tesseract và tối đa 2 lần Gemini Vision OCR.'
-                        ),
-                    },
+                raise ValueError(
+                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
                 )
             page_texts[page_no]=ocr_text
             units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
