@@ -1,7 +1,7 @@
 # VERSION: v31.78 — split admin into User Management and Content Management tabs
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
-SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.84"
+SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.85"
 SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
@@ -17461,10 +17461,14 @@ button.gray{background:#666}button.red{background:#d93025}
 <main>
 <div class="card" id="login">
 <h3>Đăng nhập Admin</h3>
-<input id="pw" type="password" placeholder="Mật khẩu Admin" style="width:70%">
-<button onclick="login()">Đăng nhập</button>
-<div id="err" style="color:#c00;margin-top:8px"></div>
+<form onsubmit="event.preventDefault();login();" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<input id="pw" type="password" placeholder="Mật khẩu Admin" autocomplete="current-password" style="width:min(70%,420px)">
+<button type="submit">Đăng nhập</button>
+</form>
+<div id="err" role="alert" aria-live="polite" style="color:#c00;font-weight:600;margin-top:8px;min-height:20px"></div>
 </div>
+
+<div id="adminInitNotice" role="status" aria-live="polite" style="display:none;color:#8a4b00;background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:9px 12px;margin-bottom:12px"></div>
 
 <div id="panel" style="display:none">
 <div class="admin-tabs" role="tablist" aria-label="Quản lý Admin">
@@ -17862,27 +17866,64 @@ async function api(u,o={}) {
   return d;
 }
 async function login(){
-  pw=document.getElementById("pw").value;
+  const input=document.getElementById("pw");
+  const err=document.getElementById("err");
+  const loginBox=document.getElementById("login");
+  const panel=document.getElementById("panel");
+  pw=(input?.value||"").trim();
+  if(err) err.textContent="";
+  if(!pw){ if(err) err.textContent="Vui lòng nhập mật khẩu Admin."; input?.focus(); return; }
+  const btn=document.querySelector('#login button[onclick="login()"]');
+  if(btn){btn.disabled=true;btn.textContent="Đang đăng nhập…";}
   try{
+    // Authentication is deliberately isolated from panel initialization.
+    // A failure in an optional Admin module must never look like a failed login.
     await api("/admin/api/users?password="+encodeURIComponent(pw));
-    document.getElementById("login").style.display="none";
-    document.getElementById("panel").style.display="block";
+
+    loginBox.style.display="none";
+    panel.style.display="block";
     initAdminTabs();
-    document.getElementById("wsState").textContent="● Đồng bộ tin nhắn tự động";
-    await loadCourses();
+    document.getElementById("wsState").textContent="● Đã đăng nhập Admin";
+
+    const initStep=async(label,fn)=>{
+      try{ await fn(); }
+      catch(e){
+        console.error('[ADMIN INIT]',label,e);
+        const state=document.getElementById("wsState");
+        if(state) state.textContent=`● Admin đã đăng nhập · ${label} lỗi`;
+        const notice=document.getElementById("adminInitNotice");
+        if(notice){
+          notice.style.display="block";
+          notice.textContent=`⚠️ ${label}: ${e?.message||e}`;
+        }
+      }
+    };
+
+    await initStep("Tải khóa học",loadCourses);
     ensureVocabularyAdminSection();
-    await loadVocabulariesAdmin();
+    await initStep("Tải Từ vựng",loadVocabulariesAdmin);
     ensureCollocationAdminSection();
-    await loadCollocationsAdmin();
+    await initStep("Tải Collocation",loadCollocationsAdmin);
     ensurePhrasalVerbAdminSection();
-    await loadPhrasalVerbsAdmin();
-    await loadUsers();
+    await initStep("Tải Phrasal verb",loadPhrasalVerbsAdmin);
+    await initStep("Tải user",loadUsers);
     startUserInboxPolling();
-    await loadPaymentPackages();
-    await loadKnowledgeCatalog();
-    await loadCurriculumDrafts();
+    await initStep("Tải gói học",loadPaymentPackages);
+    await initStep("Tải Knowledge",loadKnowledgeCatalog);
+    await initStep("Tải Draft",loadCurriculumDrafts);
     startChatPolling();
-  }catch(e){document.getElementById("err").textContent=e.message}
+  }catch(e){
+    // Only this outer catch represents an authentication/network failure.
+    loginBox.style.display="block";
+    panel.style.display="none";
+    const msg=e?.message||String(e)||"Không thể đăng nhập Admin.";
+    if(err){
+      err.textContent=`❌ ${msg}`;
+      err.setAttribute("role","alert");
+    }
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent="Đăng nhập";}
+  }
 }
 async function loadCourses(){
   try{
