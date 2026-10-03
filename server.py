@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.88"
+SERVER_VERSION = "31.89"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -18247,7 +18247,7 @@ function _sanitizeCurriculumRichHtml(value){
   else {
     // Plain OCR text: preserve explicit newlines as <br> so the editor can use
     // normal HTML whitespace instead of relying on white-space:pre-wrap.
-    box.innerHTML=String(src).replace(/\\r\\n?/g,'\\n').split('\\n').map(escapeHtml).join('<br>');
+    box.innerHTML=String(src).replace(/\\r\\n?/g,'\\n').split('\\n').map(esc).join('<br>');
   }
 
   const literalImgRe=/<img\\s+[^>]*src=["']([^"']+)["'][^>]*>/ig;
