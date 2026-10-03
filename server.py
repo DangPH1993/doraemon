@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.87"
+SERVER_VERSION = "31.88"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -19678,18 +19678,73 @@ def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = 
     return str(response.text or '').strip()
 
 
+
+
+def _gemini_exercise_plain_ocr_retry(page_png: bytes, page_no: int, source_file: str = ""):
+    """Second-pass OCR-only fallback for Exercise pages when structured Vision OCR is empty.
+
+    Exercise pages only need faithful source text. Images are stored as whole source pages,
+    so this retry intentionally avoids JSON/image detection and asks Gemini for plain text.
+    This is the proven v31.82 Exercise upload fallback.
+    """
+    if not gemini:
+        return ""
+    prompt = f"""OCR ONLY trang {page_no} của file {source_file}.
+
+Yêu cầu bắt buộc:
+- Chép lại TOÀN BỘ chữ nhìn thấy trên trang.
+- Giữ nguyên nguyên văn tiếng Anh, số câu, chữ cái A/B/C/D, dấu câu và ký hiệu.
+- Không giải bài, không chọn đáp án, không dịch, không tóm tắt, không giải thích.
+- Không mô tả hình ảnh.
+- Có thể xuống dòng theo bố cục trang để dễ đọc.
+- Chỉ trả về văn bản OCR thuần túy, không JSON, không Markdown.
+- Nếu một đoạn không chắc, vẫn chép phần nhìn thấy được thay vì trả về rỗng.
+"""
+    try:
+        part=types.Part.from_bytes(data=page_png,mime_type='image/png')
+        response=gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[part,prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_level='minimal'),
+                response_mime_type='text/plain',
+            ),
+        )
+        _log_gemini_usage(response, operation=f"exercise_vision_ocr_retry:{source_file}:page_{page_no}")
+        text=str(getattr(response,'text','') or '').strip()
+        if text:
+            return text
+        candidates=getattr(response,'candidates',None) or []
+        chunks=[]
+        for cand in candidates:
+            content=getattr(cand,'content',None)
+            parts=getattr(content,'parts',None) or [] if content is not None else []
+            for part_obj in parts:
+                part_text=getattr(part_obj,'text',None)
+                if part_text:
+                    chunks.append(str(part_text))
+        return '\n'.join(chunks).strip()
+    except Exception as exc:
+        print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return ""
+
+
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """Extract only configured exercise/answer pages.
+    """OCR + source-page storage for explicitly configured Exercise pages.
 
-    Flow per configured page:
-      1) local PDF text extraction (zero token);
-      2) if needed, one RapidOCR pass;
-      3) only when local OCR returns no text, one Gemini Vision OCR fallback.
+    IMPORTANT: this keeps the proven v31.82 Exercise upload path. Only the
+    explicitly configured question/answer pages are rendered and OCR'd.
 
-    The winning extracted text is cached in page_texts and reused for the whole
-    draft pipeline. A page is never OCR'd twice and Vision is never called when
-    local OCR already returned usable text. Vision is OCR/extraction only; it is
-    not asked to invent or rewrite exercise content.
+    Flow per page:
+      1) Direct Gemini Vision OCR at 140 DPI.
+      2) If structured Vision OCR is empty, retry once at 220 DPI with a plain-text
+         OCR-only prompt.
+      3) Store the original source page.
+
+    No local RapidOCR/PDF-text shortcut is used here. That shortcut was introduced
+    later and caused the upload regression seen in v31.87. Other content types and
+    other server functions remain unchanged.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -19697,75 +19752,57 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
     qset=set(q_pages)
     if not selected:
         raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
+
     page_texts={}; page_images={}; page_units={}
-    fitz_doc=None
-    if fitz is not None:
+    for page_no in selected:
+        tag='question' if page_no in qset else 'answer'
+        png=render_pdf_page(pdf_source,page_no,dpi=140)
+        retry_used=False
         try:
-            fitz_doc=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
+            ocr_text, _detected = gemini_ocr_page(png,page_no,source_file=source_file)
+            ocr_text=str(ocr_text or '').strip()
         except Exception as exc:
-            print(f'[EXERCISE FITZ OPEN] failed: {type(exc).__name__}: {exc}')
-    try:
-        for page_no in selected:
-            tag='question' if page_no in qset else 'answer'
-            extracted=''
-            page_obj=None
-            # Prefer PyMuPDF; avoids pypdf broken-object warnings for damaged PDFs.
-            if fitz_doc is not None:
-                try:
-                    extracted=(fitz_doc.load_page(page_no-1).get_text('text') or '').strip()
-                except Exception as exc:
-                    print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            # Secondary native text path. Still zero tokens.
-            if len(re.sub(r'\\s+','',extracted)) < 20:
-                try:
-                    page_obj=reader.pages[page_no-1]
-                    pypdf_text=(page_obj.extract_text() or '').strip()
-                    if len(re.sub(r'\\s+','',pypdf_text)) >= 20:
-                        extracted=pypdf_text
-                except Exception as exc:
-                    print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            text_len=len(re.sub(r'\\s+','',extracted))
-            png=None
-            if text_len >= 20:
-                ocr_text=extracted
-                print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
-            else:
-                png=render_pdf_page(pdf_source,page_no,dpi=300)
-                ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
+            ocr_text=''
+            print(f'[EXERCISE OCR/VISION] page={page_no} direct_gemini_failed={type(exc).__name__}: {exc}')
 
-                # Only when local OCR truly returns no text, use ONE Gemini Vision
-                # call as an OCR fallback for scanned/complex pages. This is not
-                # content generation: the Vision prompt returns the page text only.
-                if not ocr_text and gemini is not None:
-                    try:
-                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
-                        ocr_text=str(vision_text or '').strip()
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
-                    except Exception as exc:
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
+        if not ocr_text:
+            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} reason=empty_direct_gemini')
+            retry_png=render_pdf_page(pdf_source,page_no,dpi=220)
+            ocr_text=_gemini_exercise_plain_ocr_retry(retry_png,page_no,source_file=source_file)
+            retry_used=True
+            if retry_png is not png:
+                try: del retry_png
+                except Exception: pass
+            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} chars={len(ocr_text)} retry=plain_text_220dpi')
 
-            if not ocr_text:
-                raise ValueError(
-                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
-                )
-            page_texts[page_no]=ocr_text
-            units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
-            if png is None:
-                png=render_pdf_page(pdf_source,page_no,dpi=150)
-            # Storage only; never Vision-analyze exercise images/tables.
-            stored=[]
+        if not ocr_text:
+            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}) sau Direct Gemini OCR + plain-text OCR retry.')
+
+        page_texts[page_no]=ocr_text
+        units=[{
+            'type':'normal',
+            'unit_id':f'exercise:{tag}:page:{page_no}:text',
+            'text':ocr_text,
+            'image_keys':[],
+        }]
+
+        stored=[]
+        try:
             base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
             if base_stored:
                 stored.append(base_stored)
+        except Exception as exc:
+            print(f'[EXERCISE SOURCE IMAGE] page={page_no} storage warning: {type(exc).__name__}: {exc}')
+
+        if stored:
             page_images[page_no]=stored
             units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
-            page_units[page_no]=units
-            print(f'[EXERCISE OCR CACHE] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} source_cached=1')
-    finally:
-        if fitz_doc is not None:
-            try: fitz_doc.close()
-            except Exception: pass
+        page_units[page_no]=units
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(ocr_text)} direct_gemini=1 retry_used={int(retry_used)}')
+        try: del png
+        except Exception: pass
+        gc.collect()
+
     return page_texts,page_images,page_units
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
