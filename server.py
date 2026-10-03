@@ -1,10 +1,9 @@
-# VERSION: v19_109 — richtext entity double-decode fix for exercise rendering
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix"
+# VERSION: v19_106 — typed A/B/C/D quiz + fill-blank + wrong-only lesson review
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
 # VERSION: v19_64 — DB-direct vocabulary factual follow-up + pronunciation flow
-BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct-exercise-ocr-v19"
+BASELINE_VERSION = "19.129-followup-history-lightweight-answer-direct"
 import os
 import ast
 import io
@@ -19,10 +18,8 @@ import json
 import base64
 import calendar
 import urllib.parse
-import html
 import hashlib
 import tempfile
-from html.parser import HTMLParser
 import gc
 from zoneinfo import ZoneInfo
 
@@ -53,21 +50,6 @@ try:
     from PIL import Image
 except Exception:
     Image = None
-
-try:
-    import numpy as np
-except Exception:
-    np = None
-
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
-
-try:
-    from rapidocr_onnxruntime import RapidOCR
-except Exception:
-    RapidOCR = None
 
 try:
     import boto3
@@ -123,13 +105,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.127-followup-one-history-gated-context")
-SERVER_VERSION = "2026-09-11-v30-welcome-nameerror-fix"
+SERVER_VERSION = "2026-09-07-v19_127_followup_one_history_gated_context"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
 gemini = None
 openai_client = None
-rapid_ocr = None
 connected_users = {}
 admin_connections = set()
 
@@ -521,7 +502,7 @@ def init_db():
 
 @app.on_event("startup")
 def startup():
-    global pc, index, gemini, openai_client, b2, rapid_ocr
+    global pc, index, gemini, openai_client, b2
     if PINECONE_API_KEY:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         index = pc.Index(PINECONE_INDEX)
@@ -529,15 +510,6 @@ def startup():
         gemini = genai.Client(api_key=GEMINI_API_KEY)
     if OPENAI_API_KEY and OpenAI is not None:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    if RapidOCR is not None:
-        try:
-            rapid_ocr = RapidOCR()
-            print("RapidOCR: OK")
-        except Exception as exc:
-            rapid_ocr = None
-            print("WARNING: RapidOCR init failed:", type(exc).__name__, str(exc))
-    else:
-        print("WARNING: rapidocr_onnxruntime chưa được cài; exercise OCR fallback unavailable.")
     if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
         b2 = boto3.client(
             "s3",
@@ -1302,10 +1274,19 @@ def _normalize_content_type(value):
 
 
 def _review_days(content_type, score=None, status="in_progress"):
-    """Review schedule: exercises do not use a total score; other learning keeps the existing schedule."""
+    """Review schedule: exercises use score; non-scored learning uses a gentle revisit schedule."""
     if content_type == "Truyện đọc":
         return None
-    # Bài tập intentionally has no score-based review schedule.
+    if content_type == "Bài tập" and score is not None:
+        try:
+            sc = float(score)
+        except Exception:
+            sc = None
+        if sc is not None:
+            if sc < 60: return 1
+            if sc < 80: return 3
+            if sc < 90: return 7
+            return 14
     if status == "completed":
         return 7 if content_type in {"Từ vựng", "Ngữ pháp"} else None
     return 3 if content_type in {"Từ vựng", "Ngữ pháp"} else None
@@ -1342,10 +1323,12 @@ def record_learning_event(user_id, event):
     correct_count = max(0, int(event.get("correct_count") or 0))
     wrong_count = max(0, int(event.get("wrong_count") or 0))
 
-    # Bài tập không chấm điểm tổng. Keep legacy score columns for compatibility,
-    # but never calculate or persist a new total score from correct/wrong counts.
-    if content_type == "Bài tập":
-        score = None
+    # Exercise scoring: correct+wrong is the source of truth when supplied.
+    total = correct_count + wrong_count
+    if content_type == "Bài tập" and total > 0 and score is None:
+        score = round(correct_count * 100 / total)
+    if content_type == "Bài tập" and total > 0 and status == "in_progress":
+        status = "completed" if wrong_count == 0 else "needs_review"
     if content_type != "Bài tập" and event.get("completed") is True:
         status = "completed"
 
@@ -1362,33 +1345,18 @@ def record_learning_event(user_id, event):
                            ORDER BY id DESC LIMIT 1""",
                         (user_id, content_type, course_id, content_id))
             old = cur.fetchone()
-            if not old:
-                # Exercise finish/re-open must update the same learning row even when
-                # an older event used a different content_id. Prefer the exact course,
-                # then fall back to legacy rows that have no course_id.
-                if course_id is not None:
-                    cur.execute(
-                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
-                           WHERE user_id=%s AND content_type=%s
-                             AND course_id=%s
-                             AND lower(coalesce(lesson,''))=lower(%s)
-                             AND lower(coalesce(topic,''))=lower(%s)
-                           ORDER BY id DESC LIMIT 1""",
-                        (user_id, content_type, course_id, lesson or "", topic or ""),
-                    )
-                    old = cur.fetchone()
-                if not old:
-                    cur.execute(
-                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
-                           WHERE user_id=%s AND content_type=%s AND course_id IS NULL
-                             AND lower(coalesce(lesson,''))=lower(%s)
-                             AND lower(coalesce(topic,''))=lower(%s)
-                           ORDER BY id DESC LIMIT 1""",
-                        (user_id, content_type, lesson or "", topic or ""),
-                    )
-                    old = cur.fetchone()
-                    if old and course_id is not None:
-                        cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
+            if not old and course_id is not None:
+                cur.execute(
+                    """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                       WHERE user_id=%s AND content_type=%s AND course_id IS NULL
+                         AND lower(coalesce(lesson,''))=lower(%s)
+                         AND lower(coalesce(topic,''))=lower(%s)
+                       ORDER BY id DESC LIMIT 1""",
+                    (user_id, content_type, lesson or "", topic or ""),
+                )
+                old = cur.fetchone()
+                if old:
+                    cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
             if old:
                 if content_type == "Bài tập":
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
@@ -1410,7 +1378,7 @@ def record_learning_event(user_id, event):
                     (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempt_count,correct_count,wrong_count,
                      last_studied_at,next_review_at,completed_at)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                     RETURNING *""",
                     (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
@@ -3183,36 +3151,19 @@ def _canonical_lesson_key(value: str) -> str:
     return s
 
 
-def _decode_curriculum_html_entities(value, max_rounds=4):
-    """Decode repeatedly-escaped HTML entities without altering ordinary plain text."""
-    text=str(value or "")
-    if not text:
-        return ""
-    # Older Admin/client versions could escape rich text more than once, producing
-    # strings such as &amp;amp;lt;b&amp;amp;gt;... . Decode a bounded number of
-    # entity layers until stable so runtime receives the intended rich-text markup.
-    for _ in range(max(1, int(max_rounds))):
-        decoded=html.unescape(text)
-        if decoded == text:
-            break
-        text=decoded
-    return text
-
-
 def _published_curriculum_step_text(content):
     content = content if isinstance(content, dict) else {}
     parts=[]
     main=content.get("content")
-    if isinstance(main,str) and main.strip():
-        parts.append(_decode_curriculum_html_entities(main).strip())
+    if isinstance(main,str) and main.strip(): parts.append(main.strip())
     elif main not in (None,"",[],{}): parts.append(json.dumps(main,ensure_ascii=False,indent=2))
     items=content.get("items")
     if isinstance(items,list) and items:
         lines=[]
         for i,item in enumerate(items,1):
             if isinstance(item,dict):
-                title=_decode_curriculum_html_entities(str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or item.get("structure") or item.get("grammar") or "")).strip()
-                body=_decode_curriculum_html_entities(str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("explanation") or item.get("example") or "")).strip()
+                title=str(item.get("title") or item.get("question") or item.get("word") or item.get("pattern") or item.get("structure") or item.get("grammar") or "").strip()
+                body=str(item.get("content") or item.get("answer") or item.get("meaning") or item.get("explanation") or item.get("example") or "").strip()
                 if title and body: lines.append(f"{i}. {title}\n{body}")
                 elif title: lines.append(f"{i}. {title}")
                 elif body: lines.append(f"{i}. {body}")
@@ -3245,24 +3196,10 @@ def _published_curriculum_images(content, pages=None):
     return out
 
 
-def _exercise_source_step_rows_from_runtime(lesson_row, step_rows):
-    """Return the published curriculum steps exactly as stored after Admin edit.
-
-    Exercise OCR is transient during upload. After publish, runtime must use only
-    curriculum_steps.content_json saved from the Admin editor. It must never
-    reconstruct B1/B2 from raw OCR/source pages.
-    """
-    return [dict(r) for r in (step_rows or [])]
-
-
 def _published_curriculum_runtime_payload(lesson_row, step_rows):
-    step_rows=_exercise_source_step_rows_from_runtime(lesson_row, step_rows)
-    if str(lesson_row.get('content_type') or '').strip() == 'Bài tập':
-        pages=[]
-    else:
-        raw_source=lesson_row.get('raw_source_json') or {}
-        pages=raw_source.get('pages') if isinstance(raw_source,dict) else []
-        pages=pages if isinstance(pages,list) else []
+    raw_source=lesson_row.get("raw_source_json") or {}
+    pages=raw_source.get("pages") if isinstance(raw_source,dict) else []
+    pages=pages if isinstance(pages,list) else []
     sections=[]; images=[]
     for order,row in enumerate(step_rows):
         content=row.get("content_json") or {}
@@ -3277,20 +3214,14 @@ def _published_curriculum_runtime_payload(lesson_row, step_rows):
         if isinstance(refs,list) and refs and isinstance(refs[0],dict): page=refs[0].get("page")
         code=str(row.get("step_code") or "").upper()
         stype=str(row.get("step_type") or "").strip().casefold()
-        ct_norm=str(lesson_row.get("content_type") or "").strip()
-        if ct_norm == "Từ vựng" and (code == "B0" or stype == "vocabulary"):
-            text=_published_curriculum_vocabulary_text({"content":content}) or _published_curriculum_step_text(content) or str(row.get("title") or "").strip()
-        elif ct_norm == "Ngữ pháp" and (code == "B0" or stype == "grammar"):
-            text=_published_curriculum_grammar_text({"content":content}) or _published_curriculum_step_text(content) or str(row.get("title") or "").strip()
+        if code == "B1" or stype == "vocabulary":
+            text=_published_curriculum_vocabulary_text({"content":content}) or str(row.get("title") or "").strip()
+        elif code == "B2" or stype == "grammar":
+            text=_published_curriculum_grammar_text({"content":content}) or str(row.get("title") or "").strip()
         else:
             text=_published_curriculum_step_text(content) or str(row.get("title") or "").strip()
         sections.append({"chunk_index":order,"page":page or order+1,"content_unit_id":f"curriculum:{row.get('step_code')}","step_code":str(row.get("step_code") or ""),"step_title":str(row.get("title") or ""),"step_type":str(row.get("step_type") or "lesson"),"text":text,"content":content,"image_keys":keys})
-    payload={"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
-    if str(lesson_row.get("content_type") or "").strip()=="Bài tập":
-        audit=[(str(x.get("step_code") or ""),len(str(x.get("text") or ""))) for x in sections]
-        entity_hits=sum(str(x.get("text") or "").count("&amp;") for x in sections)
-        print(f"[CURRICULUM EXERCISE RUNTIME PAYLOAD] lesson_id={lesson_row.get('id')} steps={audit} richtext_entity_hits={entity_hits}")
-    return payload
+    return {"version":int(lesson_row.get("version") or 1),"source_file":lesson_row.get("source_file"),"content_hash":None,"subject":lesson_row.get("subject"),"content_type":lesson_row.get("content_type"),"lesson":lesson_row.get("lesson"),"topic":None,"overview":" ".join(x["text"] for x in sections[:2])[:2400],"sections":sections,"images":images,"published_curriculum":True,"lesson_id":int(lesson_row.get("id"))}
 
 
 def _published_curriculum_step(cache,index):
@@ -3488,96 +3419,6 @@ def _vocab_direct_answer_from_cache(cache, current_step, question_text):
             return ans
     return None
 
-def _exercise_answer_map_from_text(text):
-    """Parse numbered answers from published B2 text deterministically."""
-    raw=_decode_curriculum_html_entities(str(text or '')).replace('\r\n','\n').replace('\r','\n').strip()
-    if not raw:
-        return {}
-    mapping={}
-    compact_pat=re.compile(
-        r"(?:^|[;,|\n])\s*(?:C(?:â|a|ă)u\s*)?(\d+)\s*[.)\-:]\s*(NOT\s+GIVEN|[A-Za-z]+(?:\s+[A-Za-z]+){0,3})\s*(?=,|;|\||\n|$)",
-        flags=re.I
-    )
-    for m in compact_pat.finditer(raw):
-        try:
-            n=int(m.group(1))
-        except Exception:
-            continue
-        ans=re.sub(r"\s+"," ",m.group(2)).strip()
-        if ans:
-            mapping[n]=ans
-    for line in raw.split('\n'):
-        line=re.sub(r"[ \t]+"," ",line).strip()
-        if not line:
-            continue
-        m=re.match(r"^(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(.+?)\s*$", line, flags=re.I)
-        if not m:
-            m=re.match(r"^(\d+)\s+(.+?)\s*$", line)
-        if not m:
-            continue
-        try:
-            n=int(m.group(1))
-        except Exception:
-            continue
-        ans=m.group(2).strip()
-        if ans and n not in mapping:
-            mapping[n]=ans
-    return mapping
-
-def _exercise_student_answer_map_from_text(text):
-    """Parse a learner's numbered answers for deterministic display/comparison.
-
-    Supports common forms such as:
-      1. TRUE
-      2 - FALSE
-      3: NOT GIVEN
-      4 A
-      5-F
-    Also accepts comma/semicolon/pipe separated compact answers.
-    """
-    raw=str(text or '').replace('\r\n','\n').replace('\r','\n').strip()
-    if not raw:
-        return {}
-    mapping={}
-    compact_pat=re.compile(
-        r"(?:^|[;,|\n])\s*(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(NOT\s+GIVEN|[A-Za-z]+(?:\s+[A-Za-z]+){0,3})\s*(?=,|;|\||\n|$)",
-        flags=re.I
-    )
-    for m in compact_pat.finditer(raw):
-        try:
-            n=int(m.group(1))
-        except Exception:
-            continue
-        ans=re.sub(r"\s+"," ",m.group(2)).strip()
-        if ans:
-            mapping[n]=ans
-    for line in raw.split('\n'):
-        line=re.sub(r"[ \t]+"," ",line).strip()
-        if not line:
-            continue
-        m=re.match(r"^(?:C(?:â|a|ă)u\s*)?(\d+)\s*(?:[.)\-:]|\s+-\s+)\s*(.+?)\s*$", line, flags=re.I)
-        if not m:
-            m=re.match(r"^(\d+)\s+(.+?)\s*$", line)
-        if not m:
-            continue
-        try:
-            n=int(m.group(1))
-        except Exception:
-            continue
-        ans=re.sub(r"\s+"," ",m.group(2)).strip()
-        if ans and n not in mapping:
-            mapping[n]=ans
-    return mapping
-
-
-def _normalize_exercise_answer(value):
-    """Normalize an answer only for deterministic learner-vs-DB comparison/display."""
-    s=str(value or '').strip().casefold()
-    s=re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", s)
-    s=re.sub(r"\s+", " ", s)
-    return s
-
-
 def _published_curriculum_answer_step(cache):
     sections=list((cache or {}).get("sections") or [])
     for idx,sec in enumerate(sections):
@@ -3742,8 +3583,7 @@ def _published_curriculum_non_giao_trinh_blocks(step, cache, content_type, *, an
 
     if step.get("is_final"):
         blocks.extend(_curriculum_final_blocks())
-    elif not (is_exercise and is_question_step and not answered):
-        # B1 must wait for the learner's answer; do not offer "Tiếp theo" yet.
+    else:
         blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
         blocks.extend(_curriculum_continue_blocks(int(step.get("index") or 0)))
     return blocks
@@ -3805,7 +3645,7 @@ def _load_runtime_lesson_cache(content_type, lesson, topic=None, *, course_id=No
                 step_rows=cur.fetchall() or []
                 if step_rows:
                     payload=_published_curriculum_runtime_payload(curriculum_row,step_rows)
-                    print(f"[CURRICULUM DB RUNTIME HIT] request={request_id} lesson={ls!r} lesson_id={curriculum_row['id']} steps={len(payload.get('sections') or [])}")
+                    print(f"[CURRICULUM DB RUNTIME HIT] request={request_id} lesson={ls!r} lesson_id={curriculum_row['id']} steps={len(step_rows)}")
                     return payload
 
             cur.execute(
@@ -4328,17 +4168,6 @@ def _curriculum_final_blocks():
     ]}]
 
 
-def _exercise_finish_blocks():
-    """Ask explicitly whether the learner has finished the exercise lesson."""
-    return [
-        {"type":"text","text":"Bạn đã hoàn thành bài học này?"},
-        {"type":"choice","id":"exercise_finish","options":[
-            {"label":"Có","display_label":"Có — hoàn thành bài học","action":"exercise_finish_yes"},
-            {"label":"Chưa","display_label":"Chưa — học lại sau","action":"exercise_finish_no"},
-        ]}
-    ]
-
-
 def _is_study_followup(text):
     """Cheap deterministic classifier used ONLY while a study session is active.
 
@@ -4367,54 +4196,10 @@ def _is_study_followup(text):
 
 
 
-
-def _is_exercise_no_answer(text):
-    q = re.sub(r"\s+", " ", str(text or "").strip().casefold())
-    if not q:
-        return False
-    markers = (
-        "mình không biết", "tôi không biết", "tớ không biết", "không biết",
-        "chưa biết", "không làm được", "mình chịu", "chịu rồi", "bó tay",
-    )
-    return any(m in q for m in markers)
-
-
-def _exercise_question_numbers_from_text(text):
-    """Extract the full numbered question set from B1, including ranges such as 1–7 and 8–13."""
-    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    nums = set()
-    for m in re.finditer(r"\b(?:questions?|câu)\s*(\d+)\s*[–—-]\s*(\d+)\b", raw, flags=re.I):
-        a, b = int(m.group(1)), int(m.group(2))
-        if b >= a and b - a <= 100:
-            nums.update(range(a, b + 1))
-    # Also catch standalone numbered questions such as "1 People..." or "8 ...."
-    for line in raw.split("\n"):
-        m = re.match(r"^\s*(\d{1,3})\s+(?!19\d\d\b|20\d\d\b)(?=\S)", line)
-        if m:
-            n = int(m.group(1))
-            if 1 <= n <= 100:
-                nums.add(n)
-    return sorted(nums)
-
-
-def _exercise_strip_total_score(text):
-    """Remove legacy total-score lines from exercise feedback."""
-    raw = str(text or "")
-    lines = []
-    for line in raw.splitlines():
-        if re.match(r"^\s*(?:Điểm|Tổng điểm|Score|Total score)\s*[:：]", line, flags=re.I):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
 def _exercise_simple_direct_answer(query_text, step, cache=None, current_step=None):
     """Deterministic no-LLM handling for casual/simple exercise-session turns."""
     q=str(query_text or '').strip().casefold()
     if not q or not isinstance(step, dict):
-        return None
-    # "Mình không biết" is an exercise submission, not casual chat.
-    if _is_exercise_no_answer(q):
         return None
 
     # Off-topic/casual chat while the learner is inside an exercise session.
@@ -5232,24 +5017,22 @@ def _build_welcome_for_user(user, mark_seen: bool = False, selected_course_id=No
         ]}]
         return {"success":True,"mode":"plan_choice","message":msg,"content_blocks":blocks,"learning_history":unfinished_rows,"course_guides":[]}
 
-    selected_course_name = None
-    if selected_course_id is not None:
-        try:
-            _, selected_course_name, _ = _resolve_request_course(user["id"], selected_course_id)
-        except Exception as exc:
-            print(f"[WELCOME COURSE NAME] resolve skipped: {type(exc).__name__}: {exc}")
-
-    course_display = selected_course_name or "khóa học này"
     curriculum = (
-        f"🤖 Doraemon là gia sư đồng hành cùng cậu trong **{course_display}**. "
-        "Tớ sẽ giúp cậu học nội dung, giải thích bài, luyện tập và theo dõi tiến độ theo đúng khóa học đang chọn."
+        "📚 Doraemon hỗ trợ 5 loại nội dung:\n"
+        "1. Giáo trình\n"
+        "2. Ngữ pháp\n"
+        "3. Bài tập\n"
+        "4. Từ vựng\n"
+        "   • Kanji và Bộ thủ là các lesson bên trong Từ vựng\n"
+        "5. Truyện đọc"
     )
 
     if is_new:
         message = (
-            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư đồng hành cùng bạn chinh phục khóa học này. 🤖\n\n"
-            "Tớ sẽ đồng hành cùng bạn trong từng bài học, giải thích nội dung, đặt câu hỏi và hỗ trợ bạn luyện tập theo đúng khóa học đang chọn.\n\n"
-            "Cậu muốn bắt đầu học phần nào? Nếu chưa biết nên bắt đầu từ đâu, tớ có thể gợi ý lộ trình cho cậu nhé! 😊"
+            f"Chào {nickname}! 👋 Tớ là Doraemon, gia sư tiếng Nhật của cậu. 🤖\n\n"
+            f"{curriculum}\n\n"
+            "Cậu muốn bắt đầu học phần nào? Nếu chưa biết nên bắt đầu từ đâu, "
+            "tớ có thể gợi ý lộ trình cho cậu nhé! 😊"
         )
         return {
             "success": True,
@@ -5725,7 +5508,6 @@ def _generate_chat_reply(
     gen_started: float,
     user_text: str = "",
     reasoning_profile: str = "low",
-    max_output_tokens: Optional[int] = None,
 ):
     """
     Provider-neutral chat adapter.
@@ -5766,14 +5548,13 @@ def _generate_chat_reply(
         }
         if model.startswith("gpt-5"):
             # GPT-5-family models require a supported reasoning effort.
+            # Ordinary chat uses minimal; only explicit evaluation uses medium.
             reasoning_effort = (
                 OPENAI_REASONING_MEDIUM
                 if effective_profile == "medium"
                 else OPENAI_REASONING_LOW
             )
             kwargs["reasoning"] = {"effort": reasoning_effort}
-        if max_output_tokens is not None:
-            kwargs["max_output_tokens"] = max(64, int(max_output_tokens))
         response = openai_client.responses.create(**kwargs)
         _log_openai_usage(response, operation="chat_generation", request_id=request_id)
         reply = getattr(response, "output_text", "") or ""
@@ -5798,15 +5579,12 @@ def _generate_chat_reply(
         f"[CHAT THINKING] request={request_id} provider='gemini' "
         f"content_type={content_type!r} level={thinking_level!r}"
     )
-    gen_cfg_kwargs={
-        "thinking_config": types.ThinkingConfig(thinking_level=thinking_level)
-    }
-    if max_output_tokens is not None:
-        gen_cfg_kwargs["max_output_tokens"] = max(64, int(max_output_tokens))
     response = gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(**gen_cfg_kwargs),
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level)
+        ),
     )
     _log_gemini_usage(response, operation="chat_generation", request_id=request_id)
     reply = response.text or ""
@@ -6118,47 +5896,6 @@ def proxy_chat(
     action_plan_id = (ui_action_raw.split(":",1)[1] if ui_action_raw and ":" in ui_action_raw else None)
     if ui_action:
         print(f"[STUDY PLAN ACTION] user={user['id']} action={ui_action} plan_id={action_plan_id or '-'}")
-
-    # Exercise completion is decided explicitly after the full B1/B2 grading result.
-    if ui_action in {"exercise_finish_yes", "exercise_finish_no"} and study_session:
-        lesson_label=(study_session or {}).get("lesson") or "bài học này"
-        content_type=_normalize_content_type((study_session or {}).get("content_type"))
-        if content_type != "Bài tập":
-            # Fail closed: the dedicated exercise completion action must never mark another content type.
-            return {"reply":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ.","model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":"⚠️ Trạng thái hoàn thành bài tập không hợp lệ."}],"learning_progress":None}
-        target_status = "completed" if ui_action == "exercise_finish_yes" else "in_progress"
-        print(f"[EXERCISE FINISH] persist target_status={target_status} lesson={lesson_label!r} course_id={(study_session or {}).get('course_id')}")
-        try:
-            progress_row = record_learning_event(
-                user["id"],
-                {
-                    "content_type": "Bài tập",
-                    "course_id": (study_session or {}).get("course_id"),
-                    "subject": str((study_session or {}).get("course") or (study_session or {}).get("subject") or "Tiếng Anh IELTS"),
-                    "lesson": lesson_label,
-                    "topic": (study_session or {}).get("topic") or "",
-                    "item_key": lesson_label,
-                    "content_id": (study_session or {}).get("content_id") or "",
-                    "status": target_status,
-                    "completed": ui_action == "exercise_finish_yes",
-                    "current_position": int((study_session or {}).get("curriculum_step") or 0),
-                },
-            )
-            print(f"[EXERCISE FINISH] status={target_status} lesson={lesson_label!r} progress_id={progress_row.get('id') if progress_row else None}")
-        except Exception as exc:
-            print(f"[EXERCISE FINISH] progress save failed: {type(exc).__name__}: {exc}")
-            progress_row = None
-        if ui_action == "exercise_finish_yes":
-            try:
-                _sync_active_plan_completion(user["id"], {"status":"completed","lesson":lesson_label,"content_type":"Bài tập"})
-            except Exception as exc:
-                print(f"[EXERCISE FINISH] plan completion sync skipped: {type(exc).__name__}: {exc}")
-            _finish_study_session(user["id"])
-            msg=f"✅ Tuyệt vời! Doraemon đã ghi nhận cậu **hoàn thành bài học {lesson_label}**. Hẹn gặp cậu ở bài tiếp theo nhé! 🤖"
-        else:
-            _finish_study_session(user["id"])
-            msg=f"Được nhé! 🤖 Vậy mình học lại **{lesson_label}** sau nhé. Trạng thái bài hiện tại là **Đang học**."
-        return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":{"status":target_status,"lesson":lesson_label,"content_type":"Bài tập"}}
 
     # Curriculum finish actions apply to ALL structured curriculum content types.
     if ui_action in {"curriculum_finish_yes", "curriculum_finish_no"} and study_session:
@@ -7290,9 +7027,13 @@ Tin nhắn hiện tại:
         print("[CHAT ROUTING] recommendation-only request: ignore current thread/active lesson")
     if recommendation_only_request and not ambiguous_study_request:
         msg = (
-            "🤖 Tớ là Doraemon, gia sư đồng hành cùng bạn chinh phục khóa học này.\n\n"
-            "Tớ có thể hướng dẫn bạn học đúng nội dung của khóa học, giải thích bài, luyện tập và phản hồi theo tiến độ học của bạn.\n\n"
-            "Cậu muốn bắt đầu từ bài nào? Có thể nói luôn tên bài hoặc nội dung cậu muốn học nhé! 😊"
+            "📚 Doraemon có thể đồng hành cùng cậu ở 5 loại nội dung:\n\n"
+            "1. **Giáo trình** – học bài theo đúng giáo trình, giải thích từng phần.\n"
+            "2. **Ngữ pháp** – học các mẫu câu và điểm ngữ pháp.\n"
+            "3. **Bài tập** – làm bài, Doraemon ra đề, gợi ý, chấm và giải chi tiết.\n"
+            "4. **Từ vựng** – học từ vựng theo chủ đề, bao gồm **Kanji** và **Bộ thủ**.\n"
+            "5. **Truyện đọc** – luyện đọc hiểu qua các bài/truyện tiếng Nhật.\n\n"
+            "Cậu muốn học loại nào? Có thể nói luôn tên bài, ví dụ: **Bài 3 giáo trình** hoặc **Bài 3 bài tập** nhé. 😊"
         )
         print("[CHAT ROUTING] recommendation-only request: no RAG/images")
         return {
@@ -7535,10 +7276,7 @@ Tin nhắn hiện tại:
                     print(f"[CURRICULUM DB-FIRST FLOW] request={request_id} type={requested_content_type} advance={current_step}")
 
             # Text 'tiếp' is also a pure DB navigation turn.
-            elif (not data.action
-                  and not (requested_content_type == "Bài tập" and waiting == "exercise_answer")
-                  and _is_continue_confirmation(query_text)
-                  and current_step < len(sections)-1):
+            elif not data.action and _is_continue_confirmation(query_text) and current_step < len(sections)-1:
                 current_step += 1
                 answered=False
                 waiting="continue"
@@ -7551,7 +7289,7 @@ Tin nhắn hiện tại:
             step=_published_curriculum_step(runtime_lesson_cache,current_step)
 
             # Deterministic simple/casual exercise turns must not invoke GenAI.
-            if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip() and not _is_exercise_no_answer(query_text):
+            if requested_content_type == "Bài tập" and not data.action and str(query_text or "").strip():
                 direct_ex = _exercise_simple_direct_answer(query_text.strip(), step, runtime_lesson_cache, current_step)
                 if direct_ex:
                     mode, msg = direct_ex
@@ -7571,90 +7309,53 @@ Tin nhắn hiện tại:
             # official answer shown to the learner always comes verbatim from DB.
             if requested_content_type == "Bài tập" and waiting == "exercise_answer" and not data.action and str(query_text or "").strip():
                 question_step=step if str(step.get('code') or '').upper() == 'B1' else None
-                exercise_text=str((question_step or {}).get("text") or step.get("text") or "").strip()
                 answer_step=_published_curriculum_answer_step(runtime_lesson_cache)
-                official_answer=str((answer_step or {}).get("text") or "").strip()
-                if not exercise_text:
-                    msg="⚠️ Chưa tìm thấy nội dung bài tập đã publish ở bước B1. Vui lòng kiểm tra lại nội dung B1 trong CMS."
-                    return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-                if not answer_step or not official_answer:
-                    msg="⚠️ Bài tập này chưa có bước đáp án B2 đã publish nên chưa thể chấm bài. Hãy kiểm tra và publish lại bước đáp án."
-                    return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-                answer_map=_exercise_answer_map_from_text(official_answer)
-                question_numbers=_exercise_question_numbers_from_text(exercise_text)
-                expected_numbers=sorted(set(question_numbers) | set(answer_map.keys()))
-                expected_text=", ".join(str(n) for n in expected_numbers)
-                no_answer=_is_exercise_no_answer(query_text)
-                answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
-                student_submission = "Học sinh không biết / không trả lời. Hãy giải đủ toàn bộ các câu." if no_answer else query_text.strip()
-                student_answer_map=_exercise_student_answer_map_from_text(query_text if not no_answer else '')
-                student_answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(student_answer_map.items()))
-                q_prompt=f"""Bạn là Doraemon, giải và nhận xét bài tập theo TỪNG CÂU. Chỉ dùng đề bài và đáp án đã cung cấp.
+                exercise_text=str((question_step or {}).get('text') or '').strip()
+                official_answer=str((answer_step or {}).get('text') or '').strip()
+                q_prompt=f"""Bạn là Doraemon, gia sư tiếng Nhật. Hãy chấm bài làm của học sinh dựa HOÀN TOÀN vào nội dung bài tập và đáp án OCR dưới đây.
 
-ĐỀ BÀI (chỉ dùng để tìm đáp án và bằng chứng, KHÔNG chép lại toàn bộ):
+=== B1 · ĐỀ BÀI NGUYÊN VĂN (OCR) ===
 {exercise_text}
 
-ĐÁP ÁN ĐÚNG THEO TỪNG CÂU, lấy nguyên văn từ bước B2 đã edit/publish:
-{answer_map_text or official_answer}
+=== B2 · ĐÁP ÁN CHÍNH THỨC (OCR) ===
+{official_answer}
 
-CÂU BẮT BUỘC PHẢI XỬ LÝ ĐẦY ĐỦ:
-{expected_text or '(không xác định được; hãy xử lý toàn bộ câu có đánh số trong đề)'}
+=== BÀI LÀM CỦA HỌC SINH ===
+{query_text.strip()}
 
-ĐÁP ÁN HỌC SINH ĐÃ NHẬP (nếu không có thì coi là chưa trả lời):
-{student_answer_map_text or '(không có đáp án; học sinh nói mình không biết)'}
+YÊU CẦU CHẤM:
+- So sánh bài làm với B2. Không được tự tạo đáp án khác hoặc thay đổi đáp án chính thức.
+- Cho điểm từ 0 đến 10; nếu bài có nhiều ý/câu, chấm theo mức độ hoàn thành chung.
+- Nêu rõ phần đúng.
+- Nêu rõ lỗi/sai ở đâu và cách sửa.
+- Nêu 1-3 điểm người học cần cải thiện dựa trên lỗi thực tế.
+- Nếu bài làm chưa đủ thông tin để chấm toàn bộ, nói rõ phần nào còn thiếu và chấm theo phần đã có.
+- Trả lời bằng tiếng Việt, dễ hiểu, có cấu trúc rõ ràng:
+  **Điểm: x/10**
+  **Nhận xét:** ...
+  **Điểm cần cải thiện:** ...
 
-QUAN TRỌNG:
-- Mỗi câu trong danh sách bắt buộc phải xuất hiện đúng 1 lần. Không được bỏ sót câu nào, không được gộp nhiều câu.
-- Với Câu N, đáp án đúng bắt buộc lấy từ đúng Câu N trong B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán.
-- "Đáp án của bạn" phải lấy nguyên văn từ phần ĐÁP ÁN HỌC SINH ĐÃ NHẬP; nếu không có thì ghi `Không trả lời`.
-- KHÔNG dùng dấu ✅ hoặc ❌ để đánh giá đúng/sai.
-- BÀI TẬP KHÔNG CHẤM ĐIỂM TỔNG. Tuyệt đối không tạo điểm, tỷ lệ %, x/y hoặc tổng số câu đúng.
-
-BÀI LÀM GỐC CỦA HỌC SINH:
-{student_submission}
-
-YÊU CẦU OUTPUT BẮT BUỘC:
-- Giải đủ TẤT CẢ các câu bắt buộc, theo đúng thứ tự tăng dần.
-- Với mỗi câu, đúng cấu trúc 4 dòng:
-  `Câu N:`
-  `Đáp án của bạn: <đáp án học sinh>; nếu không có: Không trả lời`
-  `Đáp án đúng: <trích nguyên văn đáp án của đúng Câu N>`
-  `Diễn giải: <giải thích ngắn>; Bằng chứng trong bài: <trích nguyên văn câu/đoạn chứng minh>`
-- Nếu NOT GIVEN hoặc không có bằng chứng trực tiếp: `Bằng chứng trong bài: Không có thông tin trực tiếp.`
-- Không dùng kiến thức ngoài đề.
-- Không paste lại toàn bộ đề, toàn bộ đáp án hoặc toàn bộ bài làm.
-- Diễn giải tối đa 20 từ/câu.
-- Không thêm phần kết luận, tổng kết điểm hoặc nhận xét chung ở cuối.
-"""
+ĐÁP ÁN CHÍNH THỨC PHẢI ĐƯỢC GIỮ NGUYÊN KHI HIỂN THỊ Ở PHẦN SAU."""
                 print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
                     q_prompt,
-                    content_type=None,
+                    content_type=requested_content_type,
                     request_id=request_id,
                     gen_started=gen_started,
                     user_text=query_text.strip(),
-                    reasoning_profile="low",
-                    max_output_tokens=4000,
+                    reasoning_profile="medium",
                 )
-                evaluation=_exercise_strip_total_score(evaluation)
-                # Never expose legacy correctness icons or score totals in Bài tập.
-                evaluation=re.sub(r'(^|\n)\s*Câu\s+(\d+)\s*:\s*(?:✅|❌)\s*', r'\1Câu \2:\n', evaluation, flags=re.I)
-                evaluation=re.sub(r'(?im)^\s*(?:Điểm|Score|Tổng điểm|Kết quả)\s*:\s*.*$', '', evaluation)
-                evaluation=re.sub(r'(?im)^\s*[-•]?\s*(?:Đáp án)\s*:\s*', 'Đáp án đúng: ', evaluation)
                 answered=True
                 waiting="continue"
-                answer_index=int((answer_step or {}).get("index") if (answer_step or {}).get("index") is not None else current_step)
-                current_step=answer_index
                 _set_curriculum_flow(user["id"],step=current_step,waiting=waiting,exercise_answered=True)
-                study_session["curriculum_step"]=current_step
-                study_session["curriculum_waiting"]=waiting
                 study_session["curriculum_exercise_answered"]=True
                 blocks=[{"type":"text","text":evaluation or ""}]
-                blocks.extend(_exercise_finish_blocks())
-                # Do not paste the full B2 answer block. The evaluation already quotes
-                # only the per-question official answer text requested for feedback.
-                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1 next_step=B2 answer_render=deferred finish_prompt=1")
+                if official_answer:
+                    blocks.append({"type":"text","text":"📘 **Đáp án chính thức trong DB:**\n\n"+official_answer})
+                blocks.append({"type":"text","text":"Cậu muốn sang phần tiếp theo chứ? 😊"})
+                blocks.extend(_curriculum_continue_blocks(current_step))
+                print(f"[CURRICULUM DB-FIRST ANSWER] request={request_id} answer_source=curriculum_steps.content_json genai=1")
                 return {"reply":"\n\n".join(str(b.get("text") or "") for b in blocks if b.get("type")=="text"),"model":response_model,"sources":[],"images":[{"key":b.get("key"),"url":b.get("url")} for b in blocks if b.get("type")=="image"],"content_blocks":blocks,"learning_progress":None}
 
             # Cheap DB-only factual vocabulary questions must never spend LLM tokens.
@@ -11654,62 +11355,6 @@ def _normalize_curriculum_steps(content_type, steps, source_digest):
         found['code']=code; found.setdefault('title',rule['title']); found.setdefault('type',rule['type']); out.append(found)
     return out
 
-_ALLOWED_CURRICULUM_RICH_TAGS = {"b", "strong", "i", "em", "u", "br", "p", "div", "span"}
-_RICH_TAG_NORMALIZE = {"strong":"b", "em":"i"}
-
-class _CurriculumRichTextSanitizer(HTMLParser):
-    """Allow only harmless inline formatting tags used by the Admin editor."""
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.out=[]
-    def handle_starttag(self, tag, attrs):
-        tag=str(tag or '').lower()
-        if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
-            return
-        norm=_RICH_TAG_NORMALIZE.get(tag, tag)
-        if norm == 'br':
-            self.out.append('<br>')
-            return
-        if norm in ('p','div'):
-            if self.out and not str(self.out[-1]).endswith(('\n','<br>')):
-                self.out.append('\n')
-        self.out.append(f'<{norm}>')
-    def handle_endtag(self, tag):
-        tag=str(tag or '').lower()
-        if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
-            return
-        norm=_RICH_TAG_NORMALIZE.get(tag, tag)
-        if norm == 'br':
-            return
-        self.out.append(f'</{norm}>')
-        if norm in ('p','div'):
-            self.out.append('\n')
-    def handle_data(self, data):
-        self.out.append(data)
-
-def sanitize_curriculum_rich_text(value):
-    """Store safe rich text, decoding one HTML-entity layer before sanitizing.
-
-    This fixes content that was previously persisted as ``&lt;b&gt;...`` /
-    ``&lt;p&gt;...`` and therefore appeared literally in the Admin editor and
-    could lose paragraph structure in the learner UI.
-    """
-    text=str(value or '')
-    if not text:
-        return ''
-    # Decode all legacy entity layers first. The HTMLParser then decides which tags
-    # are actually allowed, so encoded <script> etc. cannot bypass sanitization.
-    text=_decode_curriculum_html_entities(text)
-    if not re.search(r'<\s*(?:b|strong|i|em|u|br|p|div|span)\b', text, flags=re.I):
-        return text
-    try:
-        parser=_CurriculumRichTextSanitizer()
-        parser.feed(text)
-        parser.close()
-        return ''.join(parser.out)
-    except Exception:
-        return re.sub(r'<[^>]+>', '', text)
-
 def reindex_curriculum_draft_steps_safe(content_type, steps):
     """Reindex draft step codes without touching any published lesson.
 
@@ -12433,8 +12078,7 @@ async def admin_curriculum_draft_upload(
     check_admin(password)
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400,'Vui lòng chọn file PDF.')
-    # Bài tập không cần GenAI. Các loại curriculum khác vẫn dùng Gemini.
-    if str(content_type or '').strip() != 'Bài tập' and not gemini:
+    if not gemini:
         raise HTTPException(500,'GEMINI_API_KEY chưa được cấu hình.')
     if not b2_ready():
         raise HTTPException(500,'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
@@ -12634,27 +12278,11 @@ async def admin_curriculum_draft_upload(
                     normalized_steps.append({'code':code,'title':title,'type':st.get('type') or 'lesson','content':content})
                 print('[CURRICULUM ONE-CALL] type=%s vision_first=1 genai_calls=1 total_steps=%s course_master=1 grammar_reference=%s' % (ct,len(normalized_steps),bool(grammar_reference)))
 
-            # Exercise drafts are source-only OCR and have no vocabulary/grammar
-            # master mapping requirement. Skipping this also keeps exercise upload
-            # completely independent from optional curriculum mapping helpers.
-            if course_id and ct != 'Bài tập':
+            if course_id:
                 try:
                     normalized_steps=_map_curriculum_steps_to_master(course_id, None, ls, normalized_steps)
                 except Exception as exc:
                     print(f'[CURRICULUM ITEM MAP] pre-publish draft mapping warning: {type(exc).__name__}: {exc}')
-            if ct == 'Bài tập':
-                draft_codes=[str(st.get('code') or '').strip().upper() for st in normalized_steps]
-                if draft_codes != ['B1','B2']:
-                    raise HTTPException(500, f'Bài tập {ls}: Draft phải tạo đủ B1 và B2, hiện có {draft_codes}.')
-                b2_payload=next((st for st in normalized_steps if str(st.get('code') or '').strip().upper()=='B2'), None)
-                b2_content=((b2_payload or {}).get('content') or {}) if isinstance((b2_payload or {}).get('content'),dict) else {}
-                if not str(b2_content.get('content') or '').strip():
-                    raise HTTPException(500, f'Bài tập {ls}: bước B2 chưa có nội dung đáp án.')
-                print(f'[CURRICULUM EXERCISE DRAFT VALIDATE] lesson={ls!r} B1=1 B2=1 B2_chars={len(str(b2_content.get("content") or ""))}')
-            for _st in normalized_steps:
-                _ctn=_st.get('content') if isinstance(_st,dict) else None
-                if isinstance(_ctn,dict) and 'content' in _ctn:
-                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
             payload={
                 'source_file':source_file,
                 'course_id':course_id,
@@ -12662,16 +12290,13 @@ async def admin_curriculum_draft_upload(
                 'content_type':ct,
                 'lesson':ls,
                 'page_ranges':cfg['pages_label'],
+                'selected_pages':selected_pages,
                 'question_pages':cfg.get('question_pages_label',''),
                 'answer_pages':cfg.get('answer_pages_label',''),
+                'page_count':len(pages),
+                'pages':pages,
                 'steps':normalized_steps,
             }
-            if ct == 'Bài tập':
-                payload['selected_page_count']=len(selected_pages)
-            else:
-                payload['selected_pages']=selected_pages
-                payload['page_count']=len(pages)
-                payload['pages']=pages
             conn=db()
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -12682,18 +12307,14 @@ async def admin_curriculum_draft_upload(
                 conn.commit()
             finally:
                 conn.close()
-            result_item={
+            results.append({
                 'draft_id':draft_id,'status':'AI_DRAFT','version':version,
                 'source_file':source_file,'subject':subject,'content_type':ct,'lesson':ls,
-                'page_ranges':cfg['pages_label'],'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
+                'page_ranges':cfg['pages_label'],'selected_pages':selected_pages,
+                'question_pages':cfg.get('question_pages_label',''),'answer_pages':cfg.get('answer_pages_label',''),
                 'selected_page_count':len(selected_pages),
-                'steps':normalized_steps,
-            }
-            if ct != 'Bài tập':
-                result_item['selected_pages']=selected_pages
-                result_item['pages']=pages
-                result_item['page_count']=len(pages)
-            results.append(result_item)
+                'steps':normalized_steps,'pages':pages,'page_count':len(pages),
+            })
 
         return {
             'success':True,
@@ -12814,10 +12435,7 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 }
 
             raw_source=lesson.get('raw_source_json') if isinstance(lesson.get('raw_source_json'),dict) else {}
-            is_exercise_edit=str(lesson.get('content_type') or '').strip() == 'Bài tập'
-            # For exercises, do not hydrate an edit Draft with original OCR/source pages.
-            # For other content types retain the existing source-page editor behavior.
-            pages=[] if is_exercise_edit else (raw_source.get('pages') if isinstance(raw_source,dict) else [])
+            pages=raw_source.get('pages') if isinstance(raw_source,dict) else []
             pages=pages if isinstance(pages,list) else []
             steps=[]
             cur.execute("""
@@ -12837,14 +12455,12 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
             if not steps:
                 raise HTTPException(409,'Bài học đã publish nhưng chưa có các bước để chỉnh sửa.')
 
-            selected_pages=raw_source.get('selected_pages') or [] if isinstance(raw_source,dict) else []
-            if is_exercise_edit:
-                q_edit=str(raw_source.get('question_pages') or '').strip()
-                a_edit=str(raw_source.get('answer_pages') or '').strip()
-                page_ranges=', '.join([x for x in (q_edit,a_edit) if x])
-            else:
-                page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
-
+            selected_pages=[]
+            if isinstance(raw_source,dict):
+                selected_pages=raw_source.get('selected_pages') or []
+            if not selected_pages:
+                selected_pages=sorted({int(pg.get('page')) for pg in pages if isinstance(pg,dict) and str(pg.get('page')).isdigit()})
+            page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
 
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",
                         (lesson['source_file'], lesson['content_type'], lesson['lesson']))
@@ -12856,8 +12472,11 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
                 'content_type':str(lesson['content_type'] or ''),
                 'lesson':str(lesson['lesson'] or ''),
                 'page_ranges':page_ranges,
+                'selected_pages':selected_pages,
                 'question_pages':raw_source.get('question_pages') if isinstance(raw_source,dict) else '',
                 'answer_pages':raw_source.get('answer_pages') if isinstance(raw_source,dict) else '',
+                'page_count':len(pages),
+                'pages':pages,
                 'steps':steps,
                 'edit_of_lesson_id':int(lesson_id),
                 'edit_of_version':int(lesson.get('version') or 1),
@@ -12903,60 +12522,10 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
     conn=db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute('SELECT content_type,draft_json FROM curriculum_drafts WHERE id=%s FOR UPDATE',(draft_id,)); row=cur.fetchone()
+            cur.execute('SELECT content_type FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
             if not row: raise HTTPException(404,'Draft không tồn tại.')
             ct=str(draft.get('content_type') or row.get('content_type') or '').strip()
-
-            # Bài tập MUST always keep both B1 (exercise) and B2 (answer).
-            # Some Admin editor save requests only send the currently visible step;
-            # never let such a partial payload erase the already-persisted B2 answer.
-            if ct == 'Bài tập':
-                incoming=[dict(x) for x in (draft.get('steps') or []) if isinstance(x,dict)]
-                existing_obj=row.get('draft_json') if isinstance(row.get('draft_json'),dict) else {}
-                existing=[dict(x) for x in (existing_obj.get('steps') or []) if isinstance(x,dict)]
-                by_code={str(x.get('code') or '').strip().upper(): x for x in existing}
-                incoming_by_code={str(x.get('code') or '').strip().upper(): x for x in incoming}
-                # Preserve a previously saved answer step when the client omits it
-                # OR sends an empty/placeholder B2. This prevents the Admin editor from
-                # accidentally erasing the official answer when it only saves the
-                # currently visible B1 fields.
-                saved_b2=by_code.get('B2') or by_code.get('ANSWER')
-                incoming_b2=incoming_by_code.get('B2') or incoming_by_code.get('ANSWER')
-                incoming_b2_content = ''
-                if isinstance(incoming_b2, dict):
-                    c=incoming_b2.get('content')
-                    if isinstance(c, dict):
-                        incoming_b2_content=str(c.get('content') or '').strip()
-                    else:
-                        incoming_b2_content=str(c or '').strip()
-                saved_b2_content = ''
-                if isinstance(saved_b2, dict):
-                    c=saved_b2.get('content')
-                    if isinstance(c, dict):
-                        saved_b2_content=str(c.get('content') or '').strip()
-                    else:
-                        saved_b2_content=str(c or '').strip()
-                if saved_b2 is not None and (incoming_b2 is None or (not incoming_b2_content and saved_b2_content)):
-                    incoming=[x for x in incoming if str(x.get('code') or '').strip().upper() not in {'B2','ANSWER'}]
-                    incoming.append(saved_b2)
-                    print(f'[CURRICULUM DRAFT SAVE] preserved_B2_content draft_id={draft_id} reason=missing_or_empty')
-                # Likewise preserve B1 if a partial editor payload only contains the answer.
-                if 'B1' not in incoming_by_code and 'B0' not in incoming_by_code:
-                    saved_b1=by_code.get('B1') or by_code.get('B0')
-                    if saved_b1 is not None:
-                        incoming.insert(0,saved_b1)
-                        print(f'[CURRICULUM DRAFT SAVE] preserved_missing_B1 draft_id={draft_id}')
-                draft['steps']=reindex_curriculum_draft_steps_safe(ct,incoming)
-                codes=[str(x.get('code') or '') for x in draft.get('steps') or []]
-                if 'B1' not in codes or 'B2' not in codes:
-                    raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
-            else:
-                draft['steps']=reindex_curriculum_draft_steps_safe(ct,draft.get('steps') or [])
-            # Persist only the supported rich-text marks from the Admin editor.
-            for _st in draft.get('steps') or []:
-                _ctn=_st.get('content') if isinstance(_st,dict) else None
-                if isinstance(_ctn,dict) and 'content' in _ctn:
-                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
+            draft['steps']=reindex_curriculum_draft_steps_safe(ct,draft.get('steps') or [])
             draft_json_text=json.dumps(draft,ensure_ascii=False)
             print(f"[CURRICULUM DRAFT SAVE] draft_id={draft_id} steps={len(draft.get('steps') or [])} chars={len(draft_json_text)} content_fields={[str((st.get('content') or {}).get('content') or '')[:80] for st in (draft.get('steps') or [])]}")
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(draft_json_text,draft_id))
@@ -13007,8 +12576,6 @@ def admin_curriculum_delete_step(draft_id:int,payload:dict):
             if target is None: raise HTTPException(404,f'Không tìm thấy bước {step_code}.')
             if ct == 'Giáo trình' and step_code in {'B0','B1','FINAL','SUMMARY'}:
                 raise HTTPException(400,f'{step_code} là bước cấu trúc bắt buộc của Giáo trình, không thể xóa.')
-            if ct == 'Bài tập' and step_code in {'B1','B2','ANSWER','B0'}:
-                raise HTTPException(400,'Bài tập phải luôn giữ đủ B1 (Bài tập) và B2 (Đáp án), không thể xóa bước này.')
             steps=[x for x in steps if str(x.get('code') or '').strip().upper()!=step_code]
             draft['steps']=reindex_curriculum_draft_steps_safe(ct,steps)
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
@@ -13027,8 +12594,6 @@ def admin_curriculum_regenerate_step(draft_id:int,payload:dict):
         if not row: raise HTTPException(404,'Draft không tồn tại.')
         draft=dict(row['draft_json'] or {}); step=next((s for s in draft.get('steps',[]) if str(s.get('code'))==step_code),None)
         if not step: raise HTTPException(404,'Step không tồn tại.')
-        if str(draft.get('content_type') or '').strip() == 'Bài tập':
-            raise HTTPException(400,'Bài tập dùng nội dung nguồn + chỉnh sửa trực tiếp. Không lưu OCR gốc nên không hỗ trợ Regenerate Step sau khi Draft đã tạo.')
         digest=_curriculum_source_digest(draft.get('pages') or [])
         _, grammar_reference = _get_course_curriculum_knowledge(draft.get('course_id'), digest)
         new_content=_curriculum_generate_step(str(draft.get('content_type') or ''),str(draft.get('lesson') or ''),step,digest,previous_digest=grammar_reference)
@@ -13061,45 +12626,8 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             draft = dict(client_draft) if isinstance(client_draft, dict) else dict(dr.get('draft_json') or {})
             ct = str(draft.get('content_type') or dr.get('content_type') or '').strip()
             steps = draft.get('steps') or []
-            if ct == 'Bài tập':
-                incoming=[dict(x) for x in steps if isinstance(x,dict)]
-                stored_obj=dr.get('draft_json') if isinstance(dr.get('draft_json'),dict) else {}
-                stored=[dict(x) for x in (stored_obj.get('steps') or []) if isinstance(x,dict)]
-                incoming_codes={str(x.get('code') or '').strip().upper() for x in incoming}
-                stored_by_code={str(x.get('code') or '').strip().upper(): x for x in stored}
-                # Never allow Publish to erase the official answer because the client
-                # omitted B2 or sent an empty B2 placeholder. Prefer the last saved B2.
-                saved_b2=stored_by_code.get('B2') or stored_by_code.get('ANSWER')
-                incoming_b2=next((x for x in incoming if str(x.get('code') or '').strip().upper() in {'B2','ANSWER'}), None)
-                incoming_b2_content=''
-                if isinstance(incoming_b2,dict):
-                    c=incoming_b2.get('content')
-                    incoming_b2_content=str((c.get('content') if isinstance(c,dict) else c) or '').strip()
-                saved_b2_content=''
-                if isinstance(saved_b2,dict):
-                    c=saved_b2.get('content')
-                    saved_b2_content=str((c.get('content') if isinstance(c,dict) else c) or '').strip()
-                if saved_b2 is not None and (incoming_b2 is None or (not incoming_b2_content and saved_b2_content)):
-                    incoming=[x for x in incoming if str(x.get('code') or '').strip().upper() not in {'B2','ANSWER'}]
-                    incoming.append(saved_b2)
-                    print(f'[CURRICULUM PUBLISH] preserved_B2_content draft_id={draft_id} reason=missing_or_empty')
-                if 'B1' not in incoming_codes and 'B0' not in incoming_codes:
-                    saved_b1=stored_by_code.get('B1') or stored_by_code.get('B0')
-                    if saved_b1 is not None:
-                        incoming.insert(0,saved_b1)
-                        print(f'[CURRICULUM PUBLISH] preserved_missing_B1 draft_id={draft_id}')
-                draft['steps'] = reindex_curriculum_draft_steps_safe(ct, incoming)
-                codes=[str(x.get('code') or '') for x in draft.get('steps') or []]
-                if 'B1' not in codes or 'B2' not in codes:
-                    raise HTTPException(400,'Bài tập phải luôn có đủ 2 bước B1 (Bài tập) và B2 (Đáp án).')
-            else:
-                draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
-            # Publish the sanitized rich-text exactly as entered in the Admin editor.
-            for _st in draft.get('steps') or []:
-                _ctn=_st.get('content') if isinstance(_st,dict) else None
-                if isinstance(_ctn,dict) and 'content' in _ctn:
-                    _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
-            print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]} raw_source_persisted={'0' if ct == 'Bài tập' else '1'}")
+            draft['steps'] = reindex_curriculum_draft_steps_safe(ct, steps)
+            print(f"[CURRICULUM PUBLISH INPUT] draft_id={draft_id} steps={len(draft.get('steps') or [])} content_fields={[str((st.get('content') or {}).get('content') or '')[:120] for st in (draft.get('steps') or [])]}")
             source_file=str(draft.get('source_file') or dr['source_file']).strip()
             lesson=str(draft.get('lesson') or dr['lesson']).strip()
             subject=str(draft.get('subject') or dr['subject']).strip()
@@ -13148,22 +12676,7 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
             cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
             cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
-            if ct == 'Bài tập':
-                publish_meta={
-                    'course_id':draft.get('course_id'),
-                    'course_name':course_name,
-                    'question_pages':draft.get('question_pages',''),
-                    'answer_pages':draft.get('answer_pages',''),
-                }
-            else:
-                publish_meta={
-                    'pages':draft.get('pages') or [],
-                    'course_id':draft.get('course_id'),
-                    'course_name':course_name,
-                    'question_pages':draft.get('question_pages',''),
-                    'answer_pages':draft.get('answer_pages',''),
-                }
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps(publish_meta,ensure_ascii=False)))
+            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps({'pages':draft.get('pages') or [],'course_id':draft.get('course_id'),'course_name':course_name},ensure_ascii=False)))
             lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
@@ -13773,44 +13286,8 @@ function curriculumImageGallery(step,pages){
   return `<div id="cur-gallery-${encodeURIComponent(code)}" style="margin-top:10px"><b>🖼️ Ảnh của bước</b>${selectedHtml?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${selectedHtml}</div>`:`<div class="small" style="margin-top:6px;color:#b76b00">⚠️ Chưa chọn ảnh</div>`}<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">＋ Thêm ảnh từ nguồn (${remaining.length})</summary>${remaining.length?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px">${remaining.map((im,i)=>card(im,i,false)).join('')}</div>`:`<div class="small" style="padding:7px">Không còn ảnh nguồn khác.</div>`}</details></div>`;
 }
 function _findCurriculumJsonTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-json'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
-function _findCurriculumTextTextarea(code){const wanted=String(code||'');for(const el of document.querySelectorAll('#curSteps .cur-rich'))if(String(el.getAttribute('data-code')||'')===wanted)return el;return null;}
+function _findCurriculumTextTextarea(code){const wanted=String(code||'');for(const ta of document.querySelectorAll('#curSteps .cur-text'))if(String(ta.getAttribute('data-code')||'')===wanted)return ta;return null;}
 function _findCurriculumTextarea(code){return _findCurriculumJsonTextarea(code);}
-function _sanitizeCurriculumRichHtml(value){
-  const src=String(value??'');
-  if(!src)return '';
-  const box=document.createElement('div');
-  if(/<\s*(?:b|strong|i|em|u|br|p|div|span)\b/i.test(src)){ box.innerHTML=src; }
-  else { box.textContent=src; }
-  box.querySelectorAll('script,style,iframe,object,embed,link,meta').forEach(n=>n.remove());
-  box.querySelectorAll('*').forEach(el=>{
-    const tag=el.tagName.toLowerCase();
-    if(!['b','strong','i','em','u','br','p','div','span'].includes(tag)){
-      const frag=document.createDocumentFragment(); while(el.firstChild)frag.appendChild(el.firstChild); el.replaceWith(frag); return;
-    }
-    [...el.attributes].forEach(a=>el.removeAttribute(a.name));
-    if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); el.replaceWith(b);}
-    else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); el.replaceWith(i);}
-  });
-  return box.innerHTML;
-}
-function _curriculumRichEditor(code, value){
-  const safe=_sanitizeCurriculumRichHtml(value);
-  return `<div class="cur-rich-wrap" style="margin-top:5px;border:1px solid #cfd8e3;border-radius:9px;background:#fff;overflow:hidden">`+
-    `<div class="cur-rich-toolbar" style="display:flex;gap:4px;align-items:center;padding:6px 7px;border-bottom:1px solid #e5e7eb;background:#f8fafc;flex-wrap:wrap">`+
-      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('bold',this)"><b>B</b></button>`+
-      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('italic',this)"><i>I</i></button>`+
-      `<button type="button" class="gray cur-fmt-btn" onmousedown="event.preventDefault();formatCurriculumText('underline',this)"><u>U</u></button>`+
-      `<span class="small" style="margin-left:5px;color:#64748b">Bôi đen chữ rồi chọn B / I / U</span>`+
-    `</div>`+
-    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:pre-wrap;line-height:1.55">${safe}</div>`+
-  `</div>`;
-}
-function formatCurriculumText(command){
-  const sel=window.getSelection(); const anchor=sel?.anchorNode;
-  const editor=anchor?.nodeType===3?anchor.parentElement?.closest('.cur-rich'):anchor?.closest?.('.cur-rich');
-  if(!editor)return; editor.focus();
-  document.execCommand(command,false,null);
-}
 function changeCurriculumImage(code,key,add){
   const wanted=String(code||'').trim(), k=String(key||'').trim(); if(!wanted||!k)return false;
   let c=_curriculumGetStepState(wanted,{}); const ta=_findCurriculumTextarea(wanted);
@@ -13840,12 +13317,12 @@ function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
-  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
+  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label><textarea class="cur-text" data-code="${esc(code)}" style="width:100%;min-height:150px;margin-top:5px">${esc((s.content&&typeof s.content==='object')?String(s.content.content||''):'')}</textarea><details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
-function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}if(ct==='Bài tập'){const b1=raw.find(x=>['B1','B0'].includes(String(x.code||'').toUpperCase()));const b2=raw.find(x=>['B2','ANSWER'].includes(String(x.code||'').toUpperCase()));const out=[];if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
-async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:_sanitizeCurriculumRichHtml(String(textTa.innerHTML||''))};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
+function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:String(textTa.value||'')};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
-async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.innerHTML=_sanitizeCurriculumRichHtml(String((d.step.content||{}).content||''));_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
+async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.value=String((d.step.content||{}).content||'');_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
 async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;const draft=await collectCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw,draft})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}catch(e){alert('❌ '+e.message);}}
 
 function toggleKbSection(id,btn){
@@ -14862,242 +14339,80 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
         doc.close()
     return stored
 
-def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """Single-pass local OCR for an exercise/answer page using RapidOCR.
-
-    RapidOCR is fed a real image array (not encoded PNG bytes) because different
-    rapidocr_onnxruntime releases handle byte input inconsistently. The page is
-    rendered once and OCR is called exactly once. No Vision/GenAI fallback.
-    """
-    global rapid_ocr
-    if not png or Image is None or np is None or rapid_ocr is None:
-        print(f'[EXERCISE OCR] page={page_no} failed: OCR engine unavailable')
-        return ""
-    try:
-        im = Image.open(io.BytesIO(png)).convert('RGB')
-        # Keep the source page intact for OCR. Only enlarge modestly; do not
-        # threshold aggressively because anti-aliased IELTS text can disappear.
-        im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
-        arr = np.asarray(im)
-
-        result, _ = rapid_ocr(arr)
-        texts = []
-        if isinstance(result, (list, tuple)):
-            for item in result:
-                # rapidocr_onnxruntime commonly returns [box, text, score].
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    txt = str(item[1] or '').strip()
-                    if txt:
-                        texts.append(txt)
-
-        text = '\n'.join(texts).strip()
-        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
-        return text
-    except Exception as exc:
-        print(f'[EXERCISE OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
-        return ""
-
-def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
-    """Persist the original configured page as a single source image.
-
-    This is storage only. No Vision analysis or GenAI is performed.
-    """
-    try:
-        key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/source_{scope}.jpg"
-        image_bytes=png
-        if Image is not None:
-            try:
-                im=Image.open(io.BytesIO(png)).convert('RGB')
-                out=io.BytesIO(); im.save(out,format='JPEG',quality=88,optimize=True)
-                image_bytes=out.getvalue()
-                width,height=im.size
-            except Exception:
-                width=height=None
-        else:
-            width=height=None
-        b2_put_bytes(key,image_bytes,'image/jpeg')
-        conn=db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""INSERT INTO knowledge_images
-                    (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,associated_text,width,height)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),f'Original {scope} exercise page',ocr_text,width,height))
-            conn.commit()
-        finally:
-            conn.close()
-        return {'key':key,'description':f'Original {scope} exercise page','associated_text':ocr_text,'page':page_no,'image_url':b2_url(key),'vision':{}}
-    except Exception as exc:
-        print(f'[EXERCISE SOURCE PAGE STORE] page={page_no} failed: {type(exc).__name__}: {exc}')
-        return None
-
-
-def _exercise_page_has_embedded_images(pdf_path, page_no):
-    """Cheap structural image check; no AI and no OCR."""
-    try:
-        if fitz is None:
-            return False
-        doc=fitz.open(pdf_path)
-        try:
-            page=doc.load_page(int(page_no)-1)
-            return bool(page.get_images(full=True))
-        finally:
-            doc.close()
-    except Exception:
-        return False
-
-
-def _exercise_store_vision_image_records(png, detected, source_file, subject, lesson, page_no, ocr_text):
-    """Store detected image knowledge from one exercise Vision call."""
-    results=[]
-    for idx,item in enumerate(detected or [],1):
-        cropped=crop_image_from_page(png,item.get('box'))
-        if not cropped:
-            continue
-        image_bytes,(width,height)=cropped
-        safe_source=re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)
-        key=f"images/{safe_source}/exercise_page_{page_no:04d}/img_{idx:02d}.jpg"
-        b2_put_bytes(key,image_bytes,'image/jpeg')
-        description=str(item.get('description') or '').strip()
-        term=str(item.get('term') or '').strip()
-        reading=str(item.get('reading') or '').strip()
-        meaning=str(item.get('meaning') or '').strip()
-        associated_text=str(item.get('associated_text') or '').strip()
-        bbox=json.dumps(item.get('box'),ensure_ascii=False) if isinstance(item.get('box'),(list,tuple)) else ''
-        conn=db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""INSERT INTO knowledge_images
-                    (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),description,term,reading,meaning,associated_text,bbox,width,height))
-            conn.commit()
-        finally:
-            conn.close()
-        results.append({'key':key,'description':description,'term':term,'reading':reading,'meaning':meaning,'associated_text':associated_text,'page':page_no,'image_url':b2_url(key),'vision':item})
-    return results
-
-
-def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = ""):
-    """One-shot OCR-only Vision fallback for Exercise pages.
-
-    This path is intentionally minimal: no image detection, no table analysis, no
-    solving, no summarization, no function calling, and minimal thinking. It returns
-    only the visible text because the exercise pipeline already stores the source page
-    and does not need any Vision-derived image knowledge.
-    """
-    if not gemini:
-        raise RuntimeError("Gemini chưa được khởi tạo.")
-    prompt = (
-        f"Đây là trang {page_no} của đề bài/đáp án. "
-        "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
-        "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
-        "không suy luận, không giải bài, không mô tả hình ảnh. "
-        "Chỉ trả về phần văn bản đã đọc; nếu có bảng, giữ thứ tự đọc của chữ trong bảng. "
-        "Không trả JSON và không gọi công cụ."
-    )
-    part=types.Part.from_bytes(data=page_png,mime_type='image/png')
-    response=gemini.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[part,prompt],
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            thinking_config=types.ThinkingConfig(thinking_level='minimal'),
-        ),
-    )
-    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}")
-    return str(response.text or '').strip()
-
-
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """Extract only configured exercise/answer pages.
+    """OCR + Vision ONLY the explicitly configured exercise/answer pages.
 
-    Flow per configured page:
-      1) local PDF text extraction (zero token);
-      2) if needed, one RapidOCR pass;
-      3) only when local OCR returns no text, one Gemini Vision OCR fallback.
-
-    The winning extracted text is cached in page_texts and reused for the whole
-    draft pipeline. A page is never OCR'd twice and Vision is never called when
-    local OCR already returned usable text. Vision is OCR/extraction only; it is
-    not asked to invent or rewrite exercise content.
+    Every selected page is sent through Gemini page OCR so text is authoritative
+    and every meaningful image can be converted into a persisted knowledge image.
+    No page outside question_pages/answer_pages is rendered, OCRed, or sent to
+    Vision. Exercise page handling intentionally avoids the generic table pipeline
+    because the user wants the original exercise and original answer verbatim.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
     selected=sorted(set(q_pages)|set(a_pages))
     qset=set(q_pages)
+    aset=set(a_pages)
     if not selected:
         raise ValueError('Không có trang bài tập/đáp án được cấu hình.')
+
     page_texts={}; page_images={}; page_units={}
-    fitz_doc=None
-    if fitz is not None:
-        try:
-            fitz_doc=fitz.open(pdf_source) if isinstance(pdf_source,(str,os.PathLike)) else fitz.open(stream=pdf_source,filetype='pdf')
-        except Exception as exc:
-            print(f'[EXERCISE FITZ OPEN] failed: {type(exc).__name__}: {exc}')
-    try:
-        for page_no in selected:
-            tag='question' if page_no in qset else 'answer'
-            extracted=''
-            page_obj=None
-            # Prefer PyMuPDF; avoids pypdf broken-object warnings for damaged PDFs.
-            if fitz_doc is not None:
-                try:
-                    extracted=(fitz_doc.load_page(page_no-1).get_text('text') or '').strip()
-                except Exception as exc:
-                    print(f'[EXERCISE FITZ TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            # Secondary native text path. Still zero tokens.
-            if len(re.sub(r'\s+','',extracted)) < 20:
-                try:
-                    page_obj=reader.pages[page_no-1]
-                    pypdf_text=(page_obj.extract_text() or '').strip()
-                    if len(re.sub(r'\s+','',pypdf_text)) >= 20:
-                        extracted=pypdf_text
-                except Exception as exc:
-                    print(f'[EXERCISE PYPDF TEXT] page={page_no} failed: {type(exc).__name__}: {exc}')
-            text_len=len(re.sub(r'\s+','',extracted))
-            png=None
-            if text_len >= 20:
-                ocr_text=extracted
-                print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
-            else:
-                png=render_pdf_page(pdf_source,page_no,dpi=300)
-                ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
-
-                # Only when local OCR truly returns no text, use ONE Gemini Vision
-                # call as an OCR fallback for scanned/complex pages. This is not
-                # content generation: the Vision prompt returns the page text only.
-                if not ocr_text and gemini is not None:
-                    try:
-                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
-                        ocr_text=str(vision_text or '').strip()
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
-                    except Exception as exc:
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
-
-            if not ocr_text:
-                raise ValueError(
-                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
-                )
-            page_texts[page_no]=ocr_text
-            units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
-            if png is None:
-                png=render_pdf_page(pdf_source,page_no,dpi=150)
-            # Storage only; never Vision-analyze exercise images/tables.
-            stored=[]
-            base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
-            if base_stored:
-                stored.append(base_stored)
+    for page_no in selected:
+        tag='question' if page_no in qset else 'answer'
+        png=render_pdf_page(pdf_source,page_no,dpi=140)
+        ocr_text, detected=gemini_ocr_page(png,page_no,source_file=source_file)
+        ocr_text=str(ocr_text or '').strip()
+        page_texts[page_no]=ocr_text
+        units=[]
+        if ocr_text:
+            units.append({
+                'type':'normal',
+                'unit_id':f'exercise:{tag}:page:{page_no}:text',
+                'text':ocr_text,
+                'image_keys':[],
+            })
+        stored=[]
+        for img_idx,item in enumerate(detected or [],1):
+            if not isinstance(item,dict):
+                continue
+            cropped=crop_image_from_page(png,item.get('box'))
+            if not cropped:
+                continue
+            image_bytes,(width,height)=cropped
+            key=f"images/{re.sub(r'[^A-Za-z0-9_.-]+','_',source_file)}/page_{page_no:04d}/img_{img_idx:02d}.jpg"
+            b2_put_bytes(key,image_bytes,'image/jpeg')
+            description=str(item.get('description') or '').strip()
+            term=str(item.get('term') or '').strip()
+            reading=str(item.get('reading') or '').strip()
+            meaning=str(item.get('meaning') or '').strip()
+            associated_text=str(item.get('associated_text') or '').strip()
+            bbox=json.dumps(item.get('box'),ensure_ascii=False) if isinstance(item.get('box'),(list,tuple)) else ''
+            conn=db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""INSERT INTO knowledge_images
+                        (source_file,subject,content_type,lesson,topic,page,image_key,image_url,description,term,reading,meaning,associated_text,bbox,width,height)
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (source_file,subject,'Bài tập',lesson,None,page_no,key,b2_url(key),description,term,reading,meaning,associated_text,bbox,width,height))
+                conn.commit()
+            finally:
+                conn.close()
+            stored.append({
+                'key':key,'description':description,'term':term,'reading':reading,
+                'meaning':meaning,'associated_text':associated_text,'bbox':bbox,'page':page_no,
+                'vision':dict(item),
+            })
+        if stored:
             page_images[page_no]=stored
-            units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
-            page_units[page_no]=units
-            print(f'[EXERCISE OCR CACHE] page={page_no} scope={tag} text_chars={len(page_texts[page_no])} source_cached=1')
-    finally:
-        if fitz_doc is not None:
-            try: fitz_doc.close()
-            except Exception: pass
+            if units:
+                units[0]['image_keys']=[str(x.get('key')) for x in stored if x.get('key')]
+        page_units[page_no]=units
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} detected_images={len(stored)} text_chars={len(ocr_text)}')
+        try: del png
+        except Exception: pass
+        gc.collect()
     return page_texts,page_images,page_units
+
 
 def process_pdf_pages(pdf_source, reader, records_meta, source_file: str, subject: str, selected_pages=None):
     """Extract text/images using the V16 baseline, plus semantic Vision text for table pages.
