@@ -2,7 +2,7 @@
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v15-robust-local-ocr-gemini-retry-precise-error-v31.77"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v16-lazy-ocr-init-render-safe-v31.78"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -139,7 +139,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.77"
+SERVER_VERSION = "31.78"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -592,16 +592,16 @@ def startup():
         gemini = genai.Client(api_key=GEMINI_API_KEY)
     if OPENAI_API_KEY and OpenAI is not None:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    # Do not load the RapidOCR ONNX model during Render startup. On small
+    # instances this can consume enough memory/time to leave the service
+    # unavailable and surface as HTTP 502 before any FastAPI request is logged.
+    # The model is initialized lazily on the first exercise OCR page instead.
+    rapid_ocr = None
     if RapidOCR is not None:
-        try:
-            rapid_ocr = RapidOCR()
-            print("RapidOCR: OK")
-        except Exception as exc:
-            rapid_ocr = None
-            print("WARNING: RapidOCR init failed:", type(exc).__name__, str(exc))
+        print("RapidOCR package detected; model initialization deferred until first OCR page.")
     else:
         print("WARNING: rapidocr_onnxruntime chưa được cài; using Tesseract/Gemini OCR fallbacks.")
-    print(f"Exercise OCR backends: rapidocr={rapid_ocr is not None} tesseract={_tesseract_available()}")
+    print(f"Exercise OCR backends: rapidocr_package={RapidOCR is not None} rapidocr_ready={rapid_ocr is not None} tesseract={_tesseract_available()}")
     if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
         b2 = boto3.client(
             "s3",
@@ -16351,6 +16351,7 @@ async def admin_curriculum_draft_upload(
     not belonging to any configured lesson are never processed by OCR/Vision,
     never saved to B2, and never included in the AI source digest.
     """
+    print(f"[CURRICULUM DRAFT UPLOAD] start filename={getattr(file, 'filename', '')!r} course_id={course_id} content_type={content_type!r} lesson={lesson!r}")
     check_admin(password)
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400,'Vui lòng chọn file PDF.')
@@ -19448,6 +19449,32 @@ def _exercise_tesseract_ocr_page(png: bytes, page_no: int, source_file: str = ""
         return ""
 
 
+_rapid_ocr_init_lock = threading.Lock()
+_rapid_ocr_init_attempted = False
+
+def _get_rapid_ocr():
+    """Lazy, process-local RapidOCR initialization; never block service startup."""
+    global rapid_ocr, _rapid_ocr_init_attempted
+    if rapid_ocr is not None:
+        return rapid_ocr
+    if RapidOCR is None or _rapid_ocr_init_attempted:
+        return None
+    with _rapid_ocr_init_lock:
+        if rapid_ocr is not None:
+            return rapid_ocr
+        if _rapid_ocr_init_attempted:
+            return None
+        _rapid_ocr_init_attempted = True
+        try:
+            rapid_ocr = RapidOCR()
+            print("RapidOCR lazy init: OK")
+            return rapid_ocr
+        except Exception as exc:
+            rapid_ocr = None
+            print("WARNING: RapidOCR lazy init failed:", type(exc).__name__, str(exc))
+            return None
+
+
 def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
     """Local OCR chain for an exercise/answer page: RapidOCR -> Tesseract.
 
@@ -19459,12 +19486,13 @@ def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
         print(f'[EXERCISE OCR] page={page_no} failed: image/OCR prerequisites unavailable')
         return ""
 
-    if rapid_ocr is not None and np is not None:
+    rapid = _get_rapid_ocr() if np is not None else None
+    if rapid is not None and np is not None:
         try:
             im = Image.open(io.BytesIO(png)).convert('RGB')
             im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
             arr = np.asarray(im)
-            result, _ = rapid_ocr(arr)
+            result, _ = rapid(arr)
             texts = []
             if isinstance(result, (list, tuple)):
                 for item in result:
@@ -19479,7 +19507,7 @@ def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
         except Exception as exc:
             print(f'[EXERCISE RAPIDOCR] page={page_no} failed: {type(exc).__name__}: {exc}')
     else:
-        print(f'[EXERCISE RAPIDOCR] page={page_no} unavailable (rapid_ocr={rapid_ocr is not None}, numpy={np is not None})')
+        print(f'[EXERCISE RAPIDOCR] page={page_no} unavailable (package={RapidOCR is not None}, ready={rapid is not None}, numpy={np is not None})')
 
     # Rendered PDF pages on Render commonly have Tesseract available even when
     # rapidocr_onnxruntime is not installed. Use it before paying for Vision OCR.
@@ -19720,9 +19748,17 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                         print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
 
             if not ocr_text:
-                raise ValueError(
-                    f'Không OCR/trích xuất được trang {page_no} ({tag}). ' 
-                    f'Đã thử PDF text, RapidOCR/Tesseract và tối đa 2 lần Gemini Vision OCR.'
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        'error': 'exercise_ocr_failed',
+                        'page': int(page_no),
+                        'scope': tag,
+                        'message': (
+                            f'Không OCR/trích xuất được trang {page_no} ({tag}). '
+                            'Đã thử PDF text, RapidOCR/Tesseract và tối đa 2 lần Gemini Vision OCR.'
+                        ),
+                    },
                 )
             page_texts[page_no]=ocr_text
             units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
