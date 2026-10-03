@@ -2,7 +2,7 @@
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
-SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v14-exercise-answer-syntax-b2-editor-persist-richtext-entity-fix-writing-v31.11-free-tutor-weakness-vocab-grammar-note"
+SERVER_EXERCISE_FLOW_VERSION = "exercise-flow-v15-robust-local-ocr-gemini-retry-precise-error-v31.77"
 # VERSION: v19_104 — review schedule schema migration + manual review urllib fix
 # VERSION: v19_95 — canonical curriculum progress upsert + course-scoped status
 # VERSION: v19_66 — strict whole-message Japanese response language fix
@@ -33,6 +33,7 @@ import zipfile
 import mimetypes
 from html.parser import HTMLParser
 import gc
+import shutil
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -138,7 +139,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.76"
+SERVER_VERSION = "31.77"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -599,7 +600,8 @@ def startup():
             rapid_ocr = None
             print("WARNING: RapidOCR init failed:", type(exc).__name__, str(exc))
     else:
-        print("WARNING: rapidocr_onnxruntime chưa được cài; exercise OCR fallback unavailable.")
+        print("WARNING: rapidocr_onnxruntime chưa được cài; using Tesseract/Gemini OCR fallbacks.")
+    print(f"Exercise OCR backends: rapidocr={rapid_ocr is not None} tesseract={_tesseract_available()}")
     if B2_ENDPOINT and B2_KEY_ID and B2_APPLICATION_KEY and B2_BUCKET and boto3:
         b2 = boto3.client(
             "s3",
@@ -19400,40 +19402,91 @@ def extract_lesson_images(pdf_source, page_no: int, source_file: str, subject: s
         doc.close()
     return stored
 
-def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
-    """Single-pass local OCR for an exercise/answer page using RapidOCR.
+def _tesseract_available():
+    """Return whether the Tesseract binary is actually callable on this host."""
+    if pytesseract is None:
+        return False
+    try:
+        cmd = shutil.which("tesseract")
+        if not cmd:
+            return False
+        # Do not run a full OCR here; version probing is cheap and deterministic.
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
 
-    RapidOCR is fed a real image array (not encoded PNG bytes) because different
-    rapidocr_onnxruntime releases handle byte input inconsistently. The page is
-    rendered once and OCR is called exactly once. No Vision/GenAI fallback.
-    """
-    global rapid_ocr
-    if not png or Image is None or np is None or rapid_ocr is None:
-        print(f'[EXERCISE OCR] page={page_no} failed: OCR engine unavailable')
+
+def _exercise_tesseract_ocr_page(png: bytes, page_no: int, source_file: str = ""):
+    """Fallback local OCR using the installed Tesseract executable, when present."""
+    if not png or Image is None or not _tesseract_available():
+        print(f'[EXERCISE TESSERACT] page={page_no} unavailable')
         return ""
     try:
         im = Image.open(io.BytesIO(png)).convert('RGB')
-        # Keep the source page intact for OCR. Only enlarge modestly; do not
-        # threshold aggressively because anti-aliased IELTS text can disappear.
         im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
-        arr = np.asarray(im)
-
-        result, _ = rapid_ocr(arr)
-        texts = []
-        if isinstance(result, (list, tuple)):
-            for item in result:
-                # rapidocr_onnxruntime commonly returns [box, text, score].
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    txt = str(item[1] or '').strip()
-                    if txt:
-                        texts.append(txt)
-
-        text = '\n'.join(texts).strip()
-        print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
+        text = ""
+        # PSM 6 handles dense text blocks; PSM 3 is a useful fallback for answer sheets
+        # where the layout is more fragmented. These are local OCR passes (no GenAI).
+        for psm in (6, 3):
+            try:
+                candidate = pytesseract.image_to_string(im, lang='eng', config=f'--psm {psm}') or ''
+            except Exception:
+                try:
+                    candidate = pytesseract.image_to_string(im, config=f'--psm {psm}') or ''
+                except Exception:
+                    candidate = ''
+            candidate = str(candidate).strip()
+            if len(candidate) > len(text):
+                text = candidate
+            if len(re.sub(r'\s+', '', text)) >= 20:
+                break
+        print(f'[EXERCISE TESSERACT] page={page_no} chars={len(text)} source={source_file}')
         return text
     except Exception as exc:
-        print(f'[EXERCISE OCR] page={page_no} failed: {type(exc).__name__}: {exc}')
+        print(f'[EXERCISE TESSERACT] page={page_no} failed: {type(exc).__name__}: {exc}')
         return ""
+
+
+def _exercise_local_ocr_page(png: bytes, page_no: int, source_file: str = ""):
+    """Local OCR chain for an exercise/answer page: RapidOCR -> Tesseract.
+
+    Neither backend calls GenAI. This function deliberately returns an empty string
+    only when every available local OCR backend fails or is unavailable.
+    """
+    global rapid_ocr
+    if not png or Image is None:
+        print(f'[EXERCISE OCR] page={page_no} failed: image/OCR prerequisites unavailable')
+        return ""
+
+    if rapid_ocr is not None and np is not None:
+        try:
+            im = Image.open(io.BytesIO(png)).convert('RGB')
+            im = im.resize((max(1, int(im.width * 1.75)), max(1, int(im.height * 1.75))), Image.Resampling.LANCZOS)
+            arr = np.asarray(im)
+            result, _ = rapid_ocr(arr)
+            texts = []
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        txt = str(item[1] or '').strip()
+                        if txt:
+                            texts.append(txt)
+            text = '\n'.join(texts).strip()
+            print(f'[EXERCISE RAPIDOCR] page={page_no} chars={len(text)} source={source_file} input=array single_pass=1')
+            if len(re.sub(r'\s+', '', text)) >= 20:
+                return text
+        except Exception as exc:
+            print(f'[EXERCISE RAPIDOCR] page={page_no} failed: {type(exc).__name__}: {exc}')
+    else:
+        print(f'[EXERCISE RAPIDOCR] page={page_no} unavailable (rapid_ocr={rapid_ocr is not None}, numpy={np is not None})')
+
+    # Rendered PDF pages on Render commonly have Tesseract available even when
+    # rapidocr_onnxruntime is not installed. Use it before paying for Vision OCR.
+    tesseract_text = _exercise_tesseract_ocr_page(png, page_no, source_file=source_file)
+    if len(re.sub(r'\s+', '', tesseract_text)) >= 20:
+        return tesseract_text
+    return ""
 
 def _store_exercise_source_page(png: bytes, source_file: str, subject: str, lesson: str, page_no: int, scope: str, ocr_text: str):
     """Persist the original configured page as a single source image.
@@ -19516,35 +19569,72 @@ def _exercise_store_vision_image_records(png, detected, source_file, subject, le
     return results
 
 
-def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = ""):
-    """One-shot OCR-only Vision fallback for Exercise pages.
+def _extract_gemini_text_response(response):
+    """Read text from Gemini response even when the convenience .text is empty."""
+    text = str(getattr(response, 'text', '') or '').strip()
+    if text:
+        return text
+    try:
+        candidates = getattr(response, 'candidates', None) or []
+        parts_text = []
+        for candidate in candidates:
+            content = getattr(candidate, 'content', None)
+            for part in (getattr(content, 'parts', None) or []):
+                part_text = str(getattr(part, 'text', '') or '').strip()
+                if part_text:
+                    parts_text.append(part_text)
+        return '\n'.join(parts_text).strip()
+    except Exception:
+        return ''
 
-    This path is intentionally minimal: no image detection, no table analysis, no
-    solving, no summarization, no function calling, and minimal thinking. It returns
-    only the visible text because the exercise pipeline already stores the source page
-    and does not need any Vision-derived image knowledge.
+
+def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = "", scope: str = "question", attempt: int = 1):
+    """OCR-only Vision fallback with a second, answer-sheet-safe retry when needed.
+
+    Vision is used strictly as extraction. It must not solve or regenerate the exercise.
     """
     if not gemini:
         raise RuntimeError("Gemini chưa được khởi tạo.")
-    prompt = (
-        f"Đây là trang {page_no} của đề bài/đáp án. "
-        "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
-        "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
-        "không suy luận, không giải bài, không mô tả hình ảnh. "
-        "Chỉ trả về phần văn bản đã đọc; nếu có bảng, giữ thứ tự đọc của chữ trong bảng. "
-        "Không trả JSON và không gọi công cụ."
-    )
-    part=types.Part.from_bytes(data=page_png,mime_type='image/png')
-    response=gemini.models.generate_content(
+    if int(attempt or 1) <= 1:
+        prompt = (
+            f"Đây là trang {page_no} của {scope} trong một bộ đề bài tập. "
+            "Chỉ OCR toàn bộ chữ nhìn thấy trên trang. "
+            "Giữ nguyên nguyên văn, không giải thích, không dịch, không tóm tắt, "
+            "không suy luận, không giải bài, không mô tả hình ảnh. "
+            "Nếu đây là trang đáp án, vẫn phải đọc cả các đáp án ngắn như A/B/C/D, số, từ đơn và dấu câu. "
+            "Nếu có bảng, giữ thứ tự đọc của chữ trong bảng. Không trả JSON và không gọi công cụ."
+        )
+    else:
+        prompt = (
+            f"OCR RETRY — trang {page_no}, phạm vi {scope}. "
+            "Hãy đọc trực tiếp mọi ký tự nhìn thấy trên ảnh, kể cả các dòng rất ngắn, "
+            "chữ cái đáp án, số câu, dấu gạch, từ đơn hoặc câu trả lời trong ô/bảng. "
+            "Không giải bài và không suy luận đáp án. Không được bỏ qua trang chỉ vì bố cục giống answer key. "
+            "Chỉ xuất văn bản đã nhìn thấy; không markdown, không JSON, không giải thích."
+        )
+    part = types.Part.from_bytes(data=page_png, mime_type='image/png')
+    response = gemini.models.generate_content(
         model=GEMINI_MODEL,
-        contents=[part,prompt],
+        contents=[part, prompt],
         config=types.GenerateContentConfig(
             temperature=0.0,
             thinking_config=types.ThinkingConfig(thinking_level='minimal'),
+            max_output_tokens=1800,
         ),
     )
-    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}")
-    return str(response.text or '').strip()
+    _log_gemini_usage(response, operation=f"exercise_vision_ocr_only:{source_file}:page_{page_no}:attempt_{attempt}")
+    text = _extract_gemini_text_response(response)
+    if not text:
+        try:
+            finish_reasons = []
+            for c in getattr(response, 'candidates', None) or []:
+                reason = getattr(c, 'finish_reason', None)
+                if reason is not None:
+                    finish_reasons.append(str(reason))
+            print(f'[EXERCISE VISION OCR EMPTY] page={page_no} scope={scope} attempt={attempt} finish_reasons={finish_reasons}')
+        except Exception:
+            pass
+    return text
 
 
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
@@ -19599,24 +19689,40 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
                 ocr_text=extracted
                 print(f'[EXERCISE TEXT EXTRACT] page={page_no} scope={tag} chars={len(ocr_text)} genai=0')
             else:
+                # Render at a reasonably high resolution for local OCR. If every
+                # local OCR backend is unavailable or returns no usable text, Vision
+                # is the last resort. A blank Vision response gets ONE retry using a
+                # stricter OCR prompt and higher-DPI rendering.
                 png=render_pdf_page(pdf_source,page_no,dpi=300)
                 ocr_text=_exercise_local_ocr_page(png,page_no,source_file=source_file)
-                print(f'[EXERCISE RAPIDOCR] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0 single_pass=1')
+                print(f'[EXERCISE LOCAL OCR RESULT] page={page_no} scope={tag} chars={len(ocr_text or "")} genai=0')
 
-                # Only when local OCR truly returns no text, use ONE Gemini Vision
-                # call as an OCR fallback for scanned/complex pages. This is not
-                # content generation: the Vision prompt returns the page text only.
                 if not ocr_text and gemini is not None:
                     try:
-                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file)
+                        vision_text = _gemini_exercise_ocr_only(png, page_no, source_file=source_file, scope=tag, attempt=1)
                         ocr_text=str(vision_text or '').strip()
                         print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 local_ocr_failed=1 vision_passes=1')
                     except Exception as exc:
-                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} failed: {type(exc).__name__}: {exc}')
+                        print(f'[EXERCISE VISION OCR FALLBACK] page={page_no} attempt=1 failed: {type(exc).__name__}: {exc}')
+
+                # Rare but important: Gemini can return an empty text candidate for
+                # a difficult answer sheet even though the page is readable. Retry
+                # once at higher DPI with a dedicated answer-sheet OCR instruction.
+                if not ocr_text and gemini is not None:
+                    try:
+                        retry_png = render_pdf_page(pdf_source,page_no,dpi=420)
+                        retry_text = _gemini_exercise_ocr_only(retry_png, page_no, source_file=source_file, scope=tag, attempt=2)
+                        ocr_text=str(retry_text or '').strip()
+                        print(f'[EXERCISE VISION OCR RETRY] page={page_no} scope={tag} chars={len(ocr_text)} genai=1 retry=1 dpi=420')
+                        try: del retry_png
+                        except Exception: pass
+                    except Exception as exc:
+                        print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
 
             if not ocr_text:
                 raise ValueError(
-                    f'Không OCR/trích xuất được trang {page_no} ({tag}) sau PDF text + RapidOCR + Vision OCR fallback.'
+                    f'Không OCR/trích xuất được trang {page_no} ({tag}). ' 
+                    f'Đã thử PDF text, RapidOCR/Tesseract và tối đa 2 lần Gemini Vision OCR.'
                 )
             page_texts[page_no]=ocr_text
             units=[{'type':'normal','unit_id':f'exercise:{tag}:page:{page_no}:text','text':ocr_text,'image_keys':[]}]
@@ -20644,6 +20750,11 @@ def health():
         "llm_provider": LLM_PROVIDER,
         "database": bool(DATABASE_URL),
         "learning_engine": True,
+        "exercise_ocr": {
+            "rapidocr": rapid_ocr is not None,
+            "tesseract": _tesseract_available(),
+            "gemini_fallback": gemini is not None,
+        },
         "content_types": sorted(CONTENT_TYPES),
         "gemini_model": GEMINI_MODEL,
         "openai_model_low": OPENAI_MODEL_LOW,
