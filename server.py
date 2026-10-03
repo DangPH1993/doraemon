@@ -139,7 +139,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.78"
+SERVER_VERSION = "31.79"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -16335,8 +16335,57 @@ def _curriculum_generate_step(content_type, lesson, step, source_digest, previou
     data.setdefault('images', [])
     return data
 
+
+# Curriculum Studio upload jobs run asynchronously so the browser/proxy does not
+# have to keep a multipart request open while OCR/Vision and draft persistence run.
+_curriculum_upload_jobs = {}
+_curriculum_upload_jobs_lock = threading.Lock()
+
+
+def _curriculum_job_update(job_id, **changes):
+    with _curriculum_upload_jobs_lock:
+        job = _curriculum_upload_jobs.get(job_id)
+        if job is None:
+            return
+        job.update(changes)
+        job['updated_at'] = time.time()
+
+
+def _curriculum_job_error_detail(exc):
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, (dict, list, str, int, float, bool)):
+            return detail
+    return f'{type(exc).__name__}: {exc}'
+
+
+def _execute_curriculum_upload_job(job_id, temp_pdf_path, source_file, password, course_id, content_type, lesson, metadata_json, articles_json):
+    _curriculum_job_update(job_id, status='running', message='Đang OCR/Vision và tạo Draft…')
+    try:
+        result = _run_curriculum_draft_upload_sync(
+            temp_pdf_path=temp_pdf_path,
+            source_file=source_file,
+            password=password,
+            course_id=course_id,
+            content_type=content_type,
+            lesson=lesson,
+            metadata_json=metadata_json,
+            articles_json=articles_json,
+        )
+        _curriculum_job_update(job_id, status='done', message='Đã tạo Draft.', result=result)
+    except Exception as exc:
+        print(f'[CURRICULUM DRAFT JOB] job={job_id} failed: {type(exc).__name__}: {exc}')
+        _curriculum_job_update(job_id, status='failed', message='Không tạo được Draft.', error=_curriculum_job_error_detail(exc))
+        try:
+            if temp_pdf_path:
+                os.unlink(temp_pdf_path)
+        except Exception:
+            pass
+
+
 @app.post('/admin/api/curriculum/draft-upload')
 async def admin_curriculum_draft_upload(
+    background_tasks: BackgroundTasks,
     password: str = Form(''),
     file: UploadFile = File(...),
     course_id: int = Form(...),
@@ -16345,15 +16394,113 @@ async def admin_curriculum_draft_upload(
     metadata_json: str = Form('[]'),
     articles_json: str = Form('[]'),
 ):
-    """Create one or many AI curriculum drafts from selected page ranges only.
+    """Accept the PDF quickly and process the actual Draft in a background worker.
 
-    A single PDF can define multiple lessons, each with its own page range. Pages
-    not belonging to any configured lesson are never processed by OCR/Vision,
-    never saved to B2, and never included in the AI source digest.
+    This avoids Render/HTTP proxy 502s caused by keeping a multipart request open
+    for the entire OCR/Vision pipeline. The client polls the returned job_id.
     """
-    print(f"[CURRICULUM DRAFT UPLOAD] start filename={getattr(file, 'filename', '')!r} course_id={course_id} content_type={content_type!r} lesson={lesson!r}")
+    started = time.time()
+    source_file = os.path.basename(getattr(file, 'filename', '') or '')
+    print(f"[CURRICULUM DRAFT UPLOAD ACCEPT] filename={source_file!r} course_id={course_id} content_type={content_type!r}")
     check_admin(password)
-    if not file.filename or not file.filename.lower().endswith('.pdf'):
+    if not source_file or not source_file.lower().endswith('.pdf'):
+        raise HTTPException(400, 'Vui lòng chọn file PDF.')
+    if str(content_type or '').strip() == 'Từ vựng':
+        raise HTTPException(400, 'Từ vựng không còn upload qua Curriculum Studio/PDF. Hãy dùng mục Upload Từ vựng bằng DOCX: bóc tách trực tiếp, không OCR/GenAI.')
+    # Validate cheap prerequisites synchronously; do not start a job that can only fail immediately.
+    if str(content_type or '').strip() != 'Bài tập' and not gemini:
+        raise HTTPException(500, 'GEMINI_API_KEY chưa được cấu hình.')
+    if not b2_ready():
+        raise HTTPException(500, 'Backblaze B2 chưa được cấu hình. AI Curriculum Studio cần B2 để lưu ảnh nguồn.')
+    course_id = int(course_id)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT id,name,status FROM courses WHERE id=%s', (course_id,))
+            course = cur.fetchone()
+    finally:
+        conn.close()
+    if not course:
+        raise HTTPException(400, 'Khóa học không tồn tại.')
+    if str(course.get('status') or '').upper() != 'ACTIVE':
+        raise HTTPException(400, 'Khóa học đang tắt và không thể tạo Draft.')
+
+    # Persist the upload before returning. The background worker never depends on the request body.
+    temp_pdf_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='doraemon_curriculum_job_', suffix='.pdf', delete=False) as tf:
+            temp_pdf_path = tf.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tf.write(chunk)
+        await file.close()
+    except Exception:
+        if temp_pdf_path:
+            try: os.unlink(temp_pdf_path)
+            except Exception: pass
+        raise
+
+    job_id = uuid.uuid4().hex
+    now_ts = time.time()
+    with _curriculum_upload_jobs_lock:
+        # Keep at most 6 hours of completed/failed job metadata in memory.
+        cutoff = now_ts - 6 * 60 * 60
+        for old_id, old_job in list(_curriculum_upload_jobs.items()):
+            if float(old_job.get('updated_at') or old_job.get('created_at') or 0) < cutoff and old_job.get('status') in {'done','failed'}:
+                _curriculum_upload_jobs.pop(old_id, None)
+        _curriculum_upload_jobs[job_id] = {
+            'job_id': job_id,
+            'status': 'queued',
+            'message': 'Đã nhận PDF. Đang xếp hàng xử lý…',
+            'source_file': source_file,
+            'course_id': course_id,
+            'created_at': started,
+            'updated_at': started,
+        }
+    background_tasks.add_task(
+        _execute_curriculum_upload_job,
+        job_id, temp_pdf_path, source_file, password, course_id,
+        content_type, lesson, metadata_json, articles_json,
+    )
+    return {
+        'success': True,
+        'queued': True,
+        'job_id': job_id,
+        'source_file': source_file,
+        'message': 'Đã nhận PDF. Đang xử lý ở nền; không cần giữ request upload mở.',
+    }
+
+
+@app.get('/admin/api/curriculum/draft-upload/status/{job_id}')
+def admin_curriculum_draft_upload_status(job_id: str, password: str = ''):
+    check_admin(password)
+    with _curriculum_upload_jobs_lock:
+        job = dict(_curriculum_upload_jobs.get(str(job_id))) if str(job_id) in _curriculum_upload_jobs else None
+    if job is None:
+        raise HTTPException(404, 'Không tìm thấy phiên upload hoặc phiên đã hết hạn.')
+    return {'success': True, **job}
+
+
+def _run_curriculum_draft_upload_sync(
+    temp_pdf_path: str,
+    source_file: str,
+    password: str,
+    course_id: int,
+    content_type: str = '',
+    lesson: str = '',
+    metadata_json: str = '[]',
+    articles_json: str = '[]',
+):
+    """Synchronous worker for one saved Curriculum Studio PDF.
+
+    The HTTP route deliberately returns before this function runs, because OCR/Vision
+    and draft construction can take longer than Render's request proxy window.
+    """
+    print(f"[CURRICULUM DRAFT UPLOAD] start filename={source_file!r} course_id={course_id} content_type={content_type!r} lesson={lesson!r}")
+    check_admin(password)
+    if not source_file or not source_file.lower().endswith('.pdf'):
         raise HTTPException(400,'Vui lòng chọn file PDF.')
     if str(content_type or '').strip() == 'Từ vựng':
         raise HTTPException(400,'Từ vựng không còn upload qua Curriculum Studio/PDF. Hãy dùng mục Upload Từ vựng bằng DOCX: bóc tách trực tiếp, không OCR/GenAI.')
@@ -16406,15 +16553,9 @@ async def admin_curriculum_draft_upload(
     if any(str(cfg.get('content_type') or '').strip() == 'Từ vựng' for cfg in configs):
         raise HTTPException(400,'Từ vựng không upload qua PDF/Curriculum Studio. Hãy dùng Upload Từ vựng bằng DOCX.')
 
-    source_file=os.path.basename(file.filename)
-    temp_pdf_path=None
+    source_file=os.path.basename(source_file)
+    temp_pdf_path=str(temp_pdf_path)
     try:
-        with tempfile.NamedTemporaryFile(prefix='doraemon_curriculum_',suffix='.pdf',delete=False) as tf:
-            temp_pdf_path=tf.name
-            while True:
-                chunk=await file.read(1024*1024)
-                if not chunk: break
-                tf.write(chunk)
         reader=PdfReader(temp_pdf_path)
         total_pages=len(reader.pages)
         if total_pages<=0:
@@ -18038,12 +18179,35 @@ async function createCurriculumDraft(event){
  try{
    const fd=new FormData(); fd.append('password',pw); fd.append('file',file); fd.append('course_id',document.getElementById('curCourse').value); fd.append('articles_json',JSON.stringify(rows)); fd.append('metadata_json','[]');
    const r=await fetch('/admin/api/curriculum/draft-upload',{method:'POST',body:fd});
-   const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(d.detail||('HTTP '+r.status));
-   const drafts=Array.isArray(d.drafts)?d.drafts:[];
-   st.textContent=`✅ Đã tạo ${drafts.length} Draft. PDF có ${d.pdf_page_count||'?'} trang; chỉ các trang đã cấu hình được OCR/Vision và lưu vào Draft.`;
-   await loadCurriculumDrafts();
-   if(drafts.length===1){await openCurriculumDraft(drafts[0].draft_id);}
-   else if(drafts.length){document.getElementById('curStatus').textContent += ` · ${drafts.length} bài đang chờ duyệt.`;}
+   const t=await r.text(); let d={}; try{d=JSON.parse(t)}catch{d={detail:t}} if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:JSON.stringify(d.detail||('HTTP '+r.status)));
+   if(d.queued && d.job_id){
+     st.textContent='⏳ Đã nhận PDF. Doraemon đang OCR/Vision và tạo Draft ở nền…';
+     const pollStarted=Date.now();
+     while(true){
+       await new Promise(resolve=>setTimeout(resolve,1200));
+       const sr=await fetch('/admin/api/curriculum/draft-upload/status/'+encodeURIComponent(d.job_id)+'?password='+encodeURIComponent(pw),{cache:'no-store'});
+       const sd=await sr.json().catch(()=>({}));
+       if(!sr.ok)throw Error(typeof sd.detail==='string'?sd.detail:JSON.stringify(sd.detail||('HTTP '+sr.status)));
+       if(sd.status==='queued'){st.textContent='⏳ Đã nhận PDF. Đang chờ worker…';continue;}
+       if(sd.status==='running'){st.textContent='⏳ Đang OCR/Vision và tạo Draft…';continue;}
+       if(sd.status==='failed'){throw Error(typeof sd.error==='string'?sd.error:JSON.stringify(sd.error||'Xử lý Draft thất bại.'));}
+       if(sd.status==='done'){
+         const result=sd.result||{};
+         const drafts=Array.isArray(result.drafts)?result.drafts:[];
+         st.textContent=`✅ Đã tạo ${drafts.length} Draft. PDF có ${result.pdf_page_count||'?'} trang; chỉ các trang đã cấu hình được OCR/Vision và lưu vào Draft.`;
+         await loadCurriculumDrafts();
+         if(drafts.length===1){await openCurriculumDraft(drafts[0].draft_id);}
+         else if(drafts.length){document.getElementById('curStatus').textContent += ` · ${drafts.length} bài đang chờ duyệt.`;}
+         break;
+       }
+       if(Date.now()-pollStarted>30*60*1000)throw Error('Xử lý Draft quá lâu (>30 phút). Hãy kiểm tra log Render.');
+     }
+   }else{
+     const drafts=Array.isArray(d.drafts)?d.drafts:[];
+     st.textContent=`✅ Đã tạo ${drafts.length} Draft.`;
+     await loadCurriculumDrafts();
+     if(drafts.length===1){await openCurriculumDraft(drafts[0].draft_id);}
+   }
  }catch(e){st.textContent='❌ '+e.message;} finally{btn.disabled=false;}
 }
 async function loadCurriculumDrafts(){
@@ -20786,6 +20950,7 @@ def health():
         "llm_provider": LLM_PROVIDER,
         "database": bool(DATABASE_URL),
         "learning_engine": True,
+        "curriculum_upload_async": True,
         "exercise_ocr": {
             "rapidocr": rapid_ocr is not None,
             "tesseract": _tesseract_available(),
