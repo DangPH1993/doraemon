@@ -1,4 +1,4 @@
-# VERSION: v31.81 — exercise upload direct Gemini OCR fix
+# VERSION: v31.82 — exercise OCR resilient retry on empty Gemini response
 # VERSION: v31.71 — Email/username registration + Brevo password reset
 # VERSION: v31.48 — completion state + review schedule for vocabulary/grammar
 SERVER_FREE_CHAT_TUTOR_VERSION = "free-chat-tutor-v5-compact-followup-prompt-v31.83"
@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.81"
+SERVER_VERSION = "31.82"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -19549,17 +19549,64 @@ def _gemini_exercise_ocr_only(page_png: bytes, page_no: int, source_file: str = 
     return str(response.text or '').strip()
 
 
+def _gemini_exercise_plain_ocr_retry(page_png: bytes, page_no: int, source_file: str = ""):
+    """Second-pass OCR-only fallback for Exercise pages when structured Vision OCR returns empty.
+
+    Exercise pages only need faithful source text here; images are stored as whole source pages by
+    _store_exercise_source_page, so the retry deliberately avoids JSON/image detection. This keeps
+    the retry independent from the generic page/image Vision pipeline.
+    """
+    if not gemini:
+        return ""
+    prompt = f"""OCR ONLY trang {page_no} của file {source_file}.
+
+Yêu cầu bắt buộc:
+- Chép lại TOÀN BỘ chữ nhìn thấy trên trang.
+- Giữ nguyên nguyên văn tiếng Anh, số câu, chữ cái A/B/C/D, dấu câu và ký hiệu.
+- Không giải bài, không chọn đáp án, không dịch, không tóm tắt, không giải thích.
+- Không mô tả hình ảnh.
+- Có thể xuống dòng theo bố cục trang để dễ đọc.
+- Chỉ trả về văn bản OCR thuần túy, không JSON, không Markdown.
+- Nếu một đoạn không chắc, vẫn chép phần nhìn thấy được thay vì trả về rỗng.
+"""
+    try:
+        part=types.Part.from_bytes(data=page_png,mime_type='image/png')
+        response=gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[part,prompt],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                thinking_config=types.ThinkingConfig(thinking_level='minimal'),
+                response_mime_type='text/plain',
+            ),
+        )
+        _log_gemini_usage(response, operation=f"exercise_vision_ocr_retry:{source_file}:page_{page_no}")
+        text=str(getattr(response,'text','') or '').strip()
+        if text:
+            return text
+        # Some SDK responses expose text only in candidates/parts even when .text is empty.
+        candidates=getattr(response,'candidates',None) or []
+        chunks=[]
+        for cand in candidates:
+            content=getattr(cand,'content',None)
+            parts=getattr(content,'parts',None) or [] if content is not None else []
+            for part_obj in parts:
+                part_text=getattr(part_obj,'text',None)
+                if part_text:
+                    chunks.append(str(part_text))
+        return '\n'.join(chunks).strip()
+    except Exception as exc:
+        print(f'[EXERCISE VISION OCR RETRY] page={page_no} failed: {type(exc).__name__}: {exc}')
+        return ""
+
+
 def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: str, lesson: str, question_pages=None, answer_pages=None):
-    """OCR + Vision ONLY the explicitly configured exercise/answer pages.
+    """OCR + source-page storage for explicitly configured Exercise pages.
 
-    The exercise upload path intentionally follows the proven working direct
-    Gemini OCR implementation from the supplied reference server. The newer
-    optional local OCR path is not used here because it was the source of the
-    Render ``OCR engine unavailable`` failures seen in production.
-
-    The rest of the latest server behavior is preserved: only configured pages
-    are touched, OCR text remains authoritative, and source pages are persisted
-    using the latest storage helper without re-running image analysis.
+    Proven path: direct Gemini page OCR, matching the supplied server that successfully
+    uploaded Exercise PDFs. If Gemini returns an empty structured response for one page,
+    retry that page once with a plain-text OCR-only prompt. Only this Exercise path is
+    changed; the rest of the latest server remains untouched.
     """
     q_pages=[int(x) for x in (question_pages or [])]
     a_pages=[int(x) for x in (answer_pages or [])]
@@ -19571,13 +19618,30 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
     page_texts={}; page_images={}; page_units={}
     for page_no in selected:
         tag='question' if page_no in qset else 'answer'
+        # Keep the known-good reference behavior: direct Gemini page OCR at 140 DPI.
         png=render_pdf_page(pdf_source,page_no,dpi=140)
+        retry_used=False
+        try:
+            ocr_text, _detected = gemini_ocr_page(png,page_no,source_file=source_file)
+            ocr_text=str(ocr_text or '').strip()
+        except Exception as exc:
+            ocr_text=''
+            print(f'[EXERCISE OCR/VISION] page={page_no} direct_gemini_failed={type(exc).__name__}: {exc}')
 
-        # Proven working path: direct Gemini OCR for every configured exercise page.
-        ocr_text, _detected = gemini_ocr_page(png,page_no,source_file=source_file)
-        ocr_text=str(ocr_text or '').strip()
         if not ocr_text:
-            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}).')
+            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} reason=empty_direct_gemini')
+            # Retry at a slightly higher DPI and with plain text output, avoiding the
+            # structured JSON/image-detection contract that produced empty output on page 3.
+            retry_png=render_pdf_page(pdf_source,page_no,dpi=220)
+            ocr_text=_gemini_exercise_plain_ocr_retry(retry_png,page_no,source_file=source_file)
+            retry_used=True
+            if retry_png is not png:
+                try: del retry_png
+                except Exception: pass
+            print(f'[EXERCISE OCR RETRY] page={page_no} scope={tag} chars={len(ocr_text)} retry=plain_text_220dpi')
+
+        if not ocr_text:
+            raise ValueError(f'Không OCR/trích xuất được trang {page_no} ({tag}) sau Direct Gemini OCR + plain-text OCR retry.')
 
         page_texts[page_no]=ocr_text
         units=[{
@@ -19587,24 +19651,21 @@ def process_exercise_pdf_pages(pdf_source, reader, source_file: str, subject: st
             'image_keys':[],
         }]
 
-        # Preserve the latest source-image persistence policy. This stores the
-        # configured source page without a second Vision/image-detection pass.
+        # Store the original source page exactly once. Image storage is auxiliary;
+        # it must never turn a successful OCR into a failed upload.
         stored=[]
         try:
-            base_stored=_store_exercise_source_page(
-                png,source_file,subject,lesson,page_no,tag,ocr_text
-            )
+            base_stored=_store_exercise_source_page(png,source_file,subject,lesson,page_no,tag,ocr_text)
             if base_stored:
                 stored.append(base_stored)
         except Exception as exc:
-            # Image persistence is auxiliary; successful OCR must remain usable.
             print(f'[EXERCISE SOURCE IMAGE] page={page_no} storage warning: {type(exc).__name__}: {exc}')
 
         if stored:
             page_images[page_no]=stored
             units[0]['image_keys']=[x.get('key') for x in stored if x.get('key')]
         page_units[page_no]=units
-        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(ocr_text)} direct_gemini=1')
+        print(f'[EXERCISE OCR/VISION] page={page_no} scope={tag} text_chars={len(ocr_text)} direct_gemini=1 retry_used={int(retry_used)}')
         try: del png
         except Exception: pass
         gc.collect()
