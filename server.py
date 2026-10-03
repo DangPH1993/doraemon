@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.86"
+SERVER_VERSION = "31.87"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15327,10 +15327,12 @@ def _sanitize_rich_style(style_value: str) -> str:
 
 
 class _CurriculumRichTextSanitizer(HTMLParser):
-    """Allow harmless formatting, alignment, lists, and uploaded HTTP(S) images."""
+    """Allow harmless formatting while preventing accidental root-level alignment."""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.out=[]
+        self._depth=0
+        self._root_tag=None
     def handle_starttag(self, tag, attrs):
         tag=str(tag or '').lower()
         if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
@@ -15353,8 +15355,21 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         if align in _RICH_SAFE_ALIGN and 'text-align:' not in style:
             style = f'text-align:{align}' + (f';{style}' if style else '')
 
+        # A browser/editor can wrap an entire contenteditable value in one
+        # generic <div style="text-align:center">. Keeping that alignment makes
+        # every child line appear centered after save/reopen. The alignment of
+        # actual child blocks is preserved below; only the outermost wrapper's
+        # alignment is dropped. This fixes accidental global centering without
+        # removing intentional centered headings/paragraphs.
+        is_root = self._depth == 0
+        if is_root and norm == 'div' and 'text-align:' in style:
+            style=';'.join(x for x in style.split(';') if not x.startswith('text-align:'))
+
         attrs_out=f' style="{html.escape(style, quote=True)}"' if style else ''
         self.out.append(f'<{norm}{attrs_out}>')
+        self._depth += 1
+        if self._root_tag is None:
+            self._root_tag=norm
     def handle_endtag(self, tag):
         tag=str(tag or '').lower()
         if tag not in _ALLOWED_CURRICULUM_RICH_TAGS:
@@ -15363,6 +15378,7 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         if norm in ('br','img'):
             return
         self.out.append(f'</{norm}>')
+        self._depth=max(0,self._depth-1)
     def handle_data(self, data):
         self.out.append(data)
 
@@ -18287,6 +18303,11 @@ function _sanitizeCurriculumRichHtml(value){
     [...el.attributes].forEach(a=>el.removeAttribute(a.name));
     let style=safeStyles(originalStyle);
     if(safeAlign.has(originalAlign) && !/text-align:/.test(style)) style='text-align:'+originalAlign+(style?';'+style:'');
+    // Prevent an accidental browser-generated root wrapper from centering the
+    // entire step. Child elements keep their own text-align.
+    if(el.parentElement===box && tag==='div' && /(?:^|;)text-align:center(?:;|$)/.test(style)) {
+      style=style.split(';').filter(x=>x.trim() && x.trim()!=='text-align:center').join(';');
+    }
     if(style)el.setAttribute('style',style);
     if(tag==='strong'){const b=document.createElement('b'); while(el.firstChild)b.appendChild(el.firstChild); if(style)b.setAttribute('style',style); el.replaceWith(b);}
     else if(tag==='em'){const i=document.createElement('i'); while(el.firstChild)i.appendChild(el.firstChild); if(style)i.setAttribute('style',style); el.replaceWith(i);}
