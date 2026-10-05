@@ -138,7 +138,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v31.91 — Curriculum duplicate action fix + rename without cloning
+# VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
 SERVER_VERSION = "31.91"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
@@ -18414,7 +18414,7 @@ async function loadCurriculumDrafts(){
       const label=status==='ADMIN_REVIEW'?'Đang chỉnh sửa':'AI_DRAFT';
       return `<div class="cur-draft-row" style="display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid #ddd;border-radius:8px;padding:9px;margin-top:7px;background:#fafafa">
         <div><b>Draft #${esc(x.id)}</b> · ${esc(x.content_type)} · ${esc(x.lesson)}<div class="small">${esc(x.source_file||'')} · ${esc(label)} · v${esc(x.version||1)}</div></div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="gray" onclick="duplicateCurriculumDraft(${Number(x.id)},${JSON.stringify(x.lesson||'')});return false;">📄 Nhân bản</button><button type="button" class="red js-delete-draft" data-draft-id="${Number(x.id)}" data-draft-label="${esc(x.lesson||('Draft #'+x.id))}">🗑️ Xóa Draft</button></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="gray js-cur-duplicate-draft" data-draft-id="${Number(x.id)}" data-current-name="${esc(x.lesson||'')}">📄 Nhân bản</button><button type="button" class="red js-delete-draft" data-draft-id="${Number(x.id)}" data-draft-label="${esc(x.lesson||('Draft #'+x.id))}">🗑️ Xóa Draft</button></div>
       </div>`;
     }).join('')}</div>`;
   }catch(e){
@@ -18708,7 +18708,16 @@ async function editPublishedCurriculum(lessonId){
   }catch(e){alert('❌ Không mở được bài để chỉnh sửa: '+e.message);}
 }
 function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(`Xóa bước ${label} khỏi DRAFT? Giáo trình PUBLISHED của Doraemon KHÔNG bị ảnh hưởng cho tới khi bạn Publish lại.`))return;api('/admin/api/curriculum/drafts/'+id+'/delete-step',{method:'POST',body:JSON.stringify({password:pw,step_code:label})}).then(d=>{renderCurriculumDraft(id,d);const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Đã xóa ${label} khỏi Draft. Các bước sau đã được đánh lại.`;}).catch(e=>alert('❌ '+e.message));}
-document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
+document.addEventListener('click',function(ev){
+  const published=ev.target.closest&&ev.target.closest('.js-cur-duplicate-published');
+  if(published){ev.preventDefault();ev.stopPropagation();duplicatePublishedCurriculum(Number(published.getAttribute('data-lesson-id')||0),published.getAttribute('data-current-name')||'');return;}
+  const draft=ev.target.closest&&ev.target.closest('.js-cur-duplicate-draft');
+  if(draft){ev.preventDefault();ev.stopPropagation();duplicateCurriculumDraft(Number(draft.getAttribute('data-draft-id')||0),draft.getAttribute('data-current-name')||'');return;}
+  const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');
+  if(!btn)return;
+  ev.preventDefault();ev.stopPropagation();
+  changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');
+});
 function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
   box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><b>Draft #${id}</b> · ${esc(data.content_type)} <label style="display:flex;align-items:center;gap:6px;margin-left:8px"><b>📘 Tên bài học</b><input id="curLessonName" value="${esc(data.lesson||'')}" maxlength="255" style="min-width:280px;flex:1"></label>${data.page_ranges?`<span>· Trang ${esc(data.page_ranges)}</span>`:''}</div><div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
@@ -18760,7 +18769,7 @@ function renderKnowledgeCatalog(nodes){
                   <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(ls.course_name||doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
                 <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button><button type="button" class="gray" onclick="renamePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">✏️ Đổi tên</button><button type="button" class="gray" onclick="duplicatePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">📄 Nhân bản</button>` : ''}
+                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button><button type="button" class="gray js-cur-duplicate-published" data-lesson-id="${Number(ls.curriculum_lesson_id)}" data-current-name="${esc(ls.lesson||'')}">📄 Nhân bản</button>` : ''}
                   <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
                 </div>
               </div>
