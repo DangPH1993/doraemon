@@ -138,7 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-SERVER_VERSION = "31.89"
+# VERSION: v31.90 — Curriculum duplicate lesson + editable lesson name
+SERVER_VERSION = "31.90"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -16806,6 +16807,116 @@ async def admin_curriculum_draft_remove(draft_id:int, password:str = '', request
             payload = None
     return await admin_curriculum_draft_delete_post(draft_id=draft_id, password=password, payload=payload)
 
+@app.post('/admin/api/curriculum/published/{lesson_id}/duplicate-draft')
+def admin_curriculum_published_duplicate_draft(lesson_id:int, payload:dict):
+    """Duplicate a published Curriculum lesson into a new editable Draft.
+
+    The source published lesson is never modified. The caller must provide a new
+    lesson name; the duplicated Draft keeps the same course/source/content/steps
+    and records duplicate_of_lesson_id for auditability.
+    """
+    check_admin(str(payload.get('password') or ''))
+    new_lesson=str(payload.get('lesson') or '').strip()
+    if not new_lesson:
+        raise HTTPException(400,'Tên bài học mới là bắt buộc.')
+    if len(new_lesson)>255:
+        raise HTTPException(400,'Tên bài học tối đa 255 ký tự.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT cl.*, COALESCE(c.name, cl.subject) AS course_name
+                FROM curriculum_lessons cl
+                LEFT JOIN courses c ON c.id=cl.course_id
+                WHERE cl.id=%s AND cl.status='PUBLISHED'
+            """, (int(lesson_id),))
+            lesson=cur.fetchone()
+            if not lesson:
+                raise HTTPException(404,'Không tìm thấy bài học Curriculum đã publish.')
+
+            cur.execute("""
+                SELECT 1
+                FROM curriculum_lessons
+                WHERE course_id=%s AND content_type=%s AND lesson=%s AND status='PUBLISHED'
+                LIMIT 1
+            """, (lesson.get('course_id'), lesson.get('content_type'), new_lesson))
+            if cur.fetchone():
+                raise HTTPException(409,f'Bài học "{new_lesson}" đã tồn tại ở trạng thái PUBLISHED trong khóa học này.')
+
+            cur.execute("""
+                SELECT id, status, version, draft_json
+                FROM curriculum_drafts
+                WHERE status <> 'PUBLISHED'
+                  AND draft_json->>'duplicate_of_lesson_id'=%s
+                  AND lesson=%s
+                ORDER BY id DESC
+                LIMIT 1
+            """, (str(lesson_id), new_lesson))
+            existing=cur.fetchone()
+            if existing:
+                return {'success':True,'draft_id':int(existing['id']),'status':str(existing.get('status') or ''),'reused':True,
+                        'message':'Đang dùng Draft nhân bản hiện có.'}
+
+            raw_source=lesson.get('raw_source_json') if isinstance(lesson.get('raw_source_json'),dict) else {}
+            is_exercise_edit=str(lesson.get('content_type') or '').strip() in {'Bài tập','Luyện viết'}
+            pages=[] if is_exercise_edit else (raw_source.get('pages') if isinstance(raw_source,dict) else [])
+            pages=pages if isinstance(pages,list) else []
+            steps=[]
+            cur.execute("""
+                SELECT step_code, step_order, title, step_type, content_json
+                FROM curriculum_steps
+                WHERE lesson_id=%s
+                ORDER BY step_order,id
+            """, (int(lesson_id),))
+            for r in cur.fetchall() or []:
+                content=r.get('content_json') if isinstance(r.get('content_json'),dict) else {}
+                content=_normalize_curriculum_content_for_admin(content)
+                steps.append({'code':str(r.get('step_code') or ''),'title':str(r.get('title') or ''),
+                              'type':str(r.get('step_type') or 'lesson'),'content':content})
+            if not steps:
+                raise HTTPException(409,'Bài học đã publish nhưng chưa có các bước để nhân bản.')
+
+            selected_pages=raw_source.get('selected_pages') or [] if isinstance(raw_source,dict) else []
+            if is_exercise_edit:
+                q_edit=str(raw_source.get('question_pages') or '').strip()
+                a_edit=str(raw_source.get('answer_pages') or '').strip()
+                page_ranges=', '.join([x for x in (q_edit,a_edit) if x])
+            else:
+                page_ranges=_curriculum_page_range_label(selected_pages) if selected_pages else ''
+
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",
+                        (lesson['source_file'], lesson['content_type'], new_lesson))
+            version=int(cur.fetchone()['next_version'])
+            draft_json={
+                'source_file':str(lesson['source_file'] or ''),
+                'course_id':int(lesson['course_id']) if lesson.get('course_id') is not None else None,
+                'subject':str(lesson.get('course_name') or lesson.get('subject') or ''),
+                'content_type':str(lesson['content_type'] or ''),
+                'lesson':new_lesson,
+                'page_ranges':page_ranges,
+                'question_pages':raw_source.get('question_pages') if isinstance(raw_source,dict) else '',
+                'answer_pages':raw_source.get('answer_pages') if isinstance(raw_source,dict) else '',
+                'steps':steps,
+                'duplicate_of_lesson_id':int(lesson_id),
+                'duplicate_of_version':int(lesson.get('version') or 1),
+            }
+            cur.execute("""
+                INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json)
+                VALUES(%s,%s,%s,%s,'ADMIN_REVIEW',%s,%s::jsonb)
+                RETURNING id
+            """, (lesson['source_file'],draft_json['subject'],lesson['content_type'],new_lesson,version,json.dumps(draft_json,ensure_ascii=False)))
+            draft_id=int(cur.fetchone()['id'])
+        conn.commit()
+        print(f"[CURRICULUM DUPLICATE DRAFT] source_lesson_id={lesson_id} draft_id={draft_id} new_lesson={new_lesson!r} course_id={lesson.get('course_id')}")
+        return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW','reused':False,
+                'lesson_id':int(lesson_id),'lesson':new_lesson,'source_version':int(lesson.get('version') or 1)}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback(); raise HTTPException(500,f'Không tạo được Draft nhân bản: {type(exc).__name__}: {exc}')
+    finally:
+        conn.close()
+
 @app.post('/admin/api/curriculum/published/{lesson_id}/edit-draft')
 def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
     """Clone a published Curriculum lesson into an editable Admin Draft.
@@ -16921,6 +17032,41 @@ def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
     finally:
         conn.close()
 
+@app.post('/admin/api/curriculum/drafts/{draft_id}/duplicate')
+def admin_curriculum_draft_duplicate(draft_id:int,payload:dict):
+    """Duplicate an existing editable Draft into a new Draft with a new lesson name."""
+    check_admin(str(payload.get('password') or ''))
+    new_lesson=str(payload.get('lesson') or '').strip()
+    if not new_lesson: raise HTTPException(400,'Tên bài học mới là bắt buộc.')
+    if len(new_lesson)>255: raise HTTPException(400,'Tên bài học tối đa 255 ký tự.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute('SELECT * FROM curriculum_drafts WHERE id=%s',(draft_id,)); row=cur.fetchone()
+            if not row: raise HTTPException(404,'Draft không tồn tại.')
+            if str(row.get('status') or '').upper()=='PUBLISHED': raise HTTPException(400,'Draft đã publish, không thể nhân bản.')
+            draft=dict(row.get('draft_json') or {})
+            draft['lesson']=new_lesson
+            draft.pop('edit_of_lesson_id',None)
+            draft.pop('edit_of_version',None)
+            draft['duplicate_of_draft_id']=int(draft_id)
+            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_drafts WHERE source_file=%s AND content_type=%s AND lesson=%s",
+                        (row['source_file'],row['content_type'],new_lesson))
+            version=int(cur.fetchone()['next_version'])
+            cur.execute("""INSERT INTO curriculum_drafts(source_file,subject,content_type,lesson,status,version,draft_json)
+                           VALUES(%s,%s,%s,%s,'ADMIN_REVIEW',%s,%s::jsonb) RETURNING id""",
+                        (row['source_file'],row['subject'],row['content_type'],new_lesson,version,json.dumps(draft,ensure_ascii=False)))
+            new_id=int(cur.fetchone()['id'])
+        conn.commit()
+        print(f"[CURRICULUM DRAFT DUPLICATE] source_draft_id={draft_id} new_draft_id={new_id} new_lesson={new_lesson!r}")
+        return {'success':True,'draft_id':new_id,'lesson':new_lesson,'version':version,'reused':False,'status':'ADMIN_REVIEW'}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback(); raise HTTPException(500,f'Không nhân bản Draft: {type(exc).__name__}: {exc}')
+    finally:
+        conn.close()
+
 @app.get('/admin/api/curriculum/drafts/{draft_id}')
 def admin_curriculum_draft_get(draft_id:int,password:str):
     check_admin(password); conn=db()
@@ -17003,6 +17149,12 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
             cur.execute('SELECT content_type,draft_json FROM curriculum_drafts WHERE id=%s FOR UPDATE',(draft_id,)); row=cur.fetchone()
             if not row: raise HTTPException(404,'Draft không tồn tại.')
             ct=str(draft.get('content_type') or row.get('content_type') or '').strip()
+            lesson_name=str(draft.get('lesson') or '').strip()
+            if not lesson_name:
+                raise HTTPException(400,'Tên bài học không được để trống.')
+            if len(lesson_name)>255:
+                raise HTTPException(400,'Tên bài học tối đa 255 ký tự.')
+            draft['lesson']=lesson_name
 
             # Bài tập MUST always keep both B1 (exercise) and B2 (answer).
             # Some Admin editor save requests only send the currently visible step;
@@ -17056,7 +17208,7 @@ def admin_curriculum_draft_save(draft_id:int,payload:dict):
                     _ctn['content']=sanitize_curriculum_rich_text(_ctn.get('content'))
             draft_json_text=json.dumps(draft,ensure_ascii=False)
             print(f"[CURRICULUM DRAFT SAVE] draft_id={draft_id} steps={len(draft.get('steps') or [])} chars={len(draft_json_text)} content_fields={[str((st.get('content') or {}).get('content') or '')[:80] for st in (draft.get('steps') or [])]}")
-            cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(draft_json_text,draft_id))
+            cur.execute("UPDATE curriculum_drafts SET lesson=%s,draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(lesson_name,draft_json_text,draft_id))
         conn.commit()
     finally: conn.close()
     return {'success':True,'draft_id':draft_id,'status':'ADMIN_REVIEW','steps':draft.get('steps') or []}
@@ -18157,7 +18309,7 @@ async function loadCurriculumDrafts(){
       const label=status==='ADMIN_REVIEW'?'Đang chỉnh sửa':'AI_DRAFT';
       return `<div class="cur-draft-row" style="display:flex;justify-content:space-between;gap:10px;align-items:center;border:1px solid #ddd;border-radius:8px;padding:9px;margin-top:7px;background:#fafafa">
         <div><b>Draft #${esc(x.id)}</b> · ${esc(x.content_type)} · ${esc(x.lesson)}<div class="small">${esc(x.source_file||'')} · ${esc(label)} · v${esc(x.version||1)}</div></div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="red js-delete-draft" data-draft-id="${Number(x.id)}" data-draft-label="${esc(x.lesson||('Draft #'+x.id))}">🗑️ Xóa Draft</button></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" onclick="openCurriculumDraft(${Number(x.id)})">✏️ Mở & sửa</button><button type="button" class="gray" onclick="duplicateCurriculumDraft(${Number(x.id)},${JSON.stringify(x.lesson||'')});return false;">📄 Nhân bản</button><button type="button" class="red js-delete-draft" data-draft-id="${Number(x.id)}" data-draft-label="${esc(x.lesson||('Draft #'+x.id))}">🗑️ Xóa Draft</button></div>
       </div>`;
     }).join('')}</div>`;
   }catch(e){
@@ -18388,6 +18540,41 @@ function changeCurriculumImage(code,key,add){
   _curriculumSetStepState(wanted,c); if(ta){ta.value=JSON.stringify(c,null,2);ta.dispatchEvent(new Event('input',{bubbles:true}));}
   const host=document.getElementById('cur-gallery-'+encodeURIComponent(wanted)); if(host)host.outerHTML=curriculumImageGallery({code:wanted,content:c},pages); return false;
 }
+async function duplicatePublishedCurriculum(lessonId,currentName){
+  try{
+    if(!lessonId)return;
+    const suggested=`${String(currentName||'').trim()} (Bản sao)`.replace(/ +/g,' ').trim();
+    const newName=window.prompt('Nhập tên bài học mới cho bản sao:',suggested);
+    if(newName===null)return;
+    const lesson=String(newName||'').trim();
+    if(!lesson){alert('❌ Tên bài học mới không được để trống.');return;}
+    const d=await api('/admin/api/curriculum/published/'+encodeURIComponent(String(lessonId))+'/duplicate-draft',{method:'POST',body:JSON.stringify({password:pw,lesson})});
+    if(!d.draft_id)throw new Error('Không nhận được Draft nhân bản.');
+    const base=await api('/admin/api/curriculum/drafts/'+d.draft_id+'?password='+encodeURIComponent(pw));
+    const dj=base.draft_json||{};
+    renderCurriculumDraft(d.draft_id,{...dj,draft_id:d.draft_id,status:base.status,version:base.version});
+    const ed=document.getElementById('curDraftEditor');if(ed)ed.scrollIntoView({behavior:'smooth',block:'start'});
+    const st=document.getElementById('curStatus');if(st)st.textContent=d.reused?'📄 Đã mở Draft nhân bản đang có.':'📄 Đã tạo Draft nhân bản. Bạn có thể đổi tên và chỉnh sửa trước khi Publish.';
+    await loadCurriculumDrafts();
+  }catch(e){alert('❌ Không nhân bản được bài học: '+e.message);}
+}
+async function duplicateCurriculumDraft(draftId,currentName){
+  try{
+    if(!draftId)return;
+    const suggested=`${String(currentName||'').trim()} (Bản sao)`.replace(/ +/g,' ').trim();
+    const newName=window.prompt('Nhập tên bài học mới cho bản sao:',suggested);
+    if(newName===null)return;
+    const lesson=String(newName||'').trim();
+    if(!lesson){alert('❌ Tên bài học mới không được để trống.');return;}
+    const d=await api('/admin/api/curriculum/drafts/'+encodeURIComponent(String(draftId))+'/duplicate',{method:'POST',body:JSON.stringify({password:pw,lesson})});
+    const base=await api('/admin/api/curriculum/drafts/'+d.draft_id+'?password='+encodeURIComponent(pw));
+    const dj=base.draft_json||{};renderCurriculumDraft(d.draft_id,{...dj,draft_id:d.draft_id,status:base.status,version:base.version});
+    const ed=document.getElementById('curDraftEditor');if(ed)ed.scrollIntoView({behavior:'smooth',block:'start'});
+    const st=document.getElementById('curStatus');if(st)st.textContent='📄 Đã tạo Draft nhân bản. Bạn có thể tiếp tục chỉnh sửa trước khi Publish.';
+    await loadCurriculumDrafts();
+  }catch(e){alert('❌ Không nhân bản Draft: '+e.message);}
+}
+
 async function editPublishedCurriculum(lessonId){
   try{
     if(!lessonId)return;
@@ -18406,10 +18593,10 @@ function deleteCurriculumStep(id,code){const label=String(code||'');if(!confirm(
 document.addEventListener('click',function(ev){const btn=ev.target.closest&&ev.target.closest('[data-cur-image-action]');if(!btn)return;ev.preventDefault();ev.stopPropagation();changeCurriculumImage(btn.getAttribute('data-code')||'',btn.getAttribute('data-image-key')||'',btn.getAttribute('data-add')==='1');});
 function renderCurriculumDraft(id,data){
   window.currentCurriculumDraftId=id; window.currentCurriculumPages=Array.isArray(data.pages)?data.pages:[]; window.currentCurriculumImageState={}; const box=document.getElementById('curDraftEditor'); const steps=Array.isArray(data.steps)?data.steps:[]; steps.forEach(s=>_curriculumSetStepState(String(s.code||''),s.content||{}));
-  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><b>Draft #${id}</b> · ${esc(data.content_type)} · ${esc(data.lesson)} ${data.page_ranges?`· Trang ${esc(data.page_ranges)}`:''}<div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
+  box.innerHTML=`<div style="border-top:1px solid #ddd;padding-top:12px"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><b>Draft #${id}</b> · ${esc(data.content_type)} <label style="display:flex;align-items:center;gap:6px;margin-left:8px"><b>📘 Tên bài học</b><input id="curLessonName" value="${esc(data.lesson||'')}" maxlength="255" style="min-width:280px;flex:1"></label>${data.page_ranges?`<span>· Trang ${esc(data.page_ranges)}</span>`:''}</div><div id="curSteps">${steps.map((s)=>{const code=String(s.code||'');const required=(data.content_type==='Giáo trình'&&['B0','B1','B2','FINAL'].includes(code));return `<div class="card cur-step-card" data-step-code="${esc(code)}" style="box-shadow:none;border:1px solid #ddd;margin-top:9px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><div style="display:flex;align-items:center;gap:7px"><b>${esc(code)} · </b><input class="cur-title" value="${esc(s.title)}" style="flex:1;min-width:200px"></div><div style="display:flex;gap:6px;align-items:center">${required?`<span class="small" style="color:#888">🔒 Bắt buộc</span>`:`<button class="red" type="button" onclick='deleteCurriculumStep(${id},${JSON.stringify(code)});return false;'>🗑️ Xóa bước</button>`}<button class="gray" type="button" onclick='regenerateCurriculumStep(${id},${JSON.stringify(code)});return false;'>🤖 Gen lại</button></div></div>${curriculumImageGallery(s,data.pages||[])}<label class="small" style="display:block;margin-top:8px"><b>✏️ Nội dung bước (Doraemon sẽ dùng nội dung này)</b></label>${_curriculumRichEditor(code,(s.content&&typeof s.content==='object')?String(s.content.content||''):'')}<details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">⚙️ Dữ liệu JSON nâng cao</summary><textarea class="cur-json" data-code="${esc(code)}" style="width:100%;min-height:180px;margin-top:8px;font-family:monospace">${esc(JSON.stringify(s.content||{},null,2))}</textarea></details></div>`;}).join('')}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button class="gray" onclick="saveCurriculumDraft(${id})">💾 Lưu chỉnh sửa</button><button onclick="publishCurriculumDraft(${id})">✅ Duyệt & Publish</button></div></div>`;
 }
 function reindexCurriculumDraftStepsClient(contentType,steps){const raw=(Array.isArray(steps)?steps:[]).filter(x=>x&&typeof x==='object').map(x=>({...x}));const ct=String(contentType||'').trim();if(ct==='Giáo trình'){const b0=raw.find(x=>String(x.code||'').toUpperCase()==='B0');const b1=raw.find(x=>String(x.code||'').toUpperCase()==='B1');const b2=raw.find(x=>String(x.code||'').toUpperCase()==='B2');const final=raw.find(x=>['FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const sections=raw.filter(x=>!['B0','B1','B2','FINAL','SUMMARY'].includes(String(x.code||'').toUpperCase()));const out=[];if(b0){b0.code='B0';out.push(b0);}if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}sections.forEach((x,i)=>{x.code='B'+(i+3);out.push(x);});if(final){final.code='FINAL';out.push(final);}return out;}if(ct==='Bài tập'){const b1=raw.find(x=>['B1','B0'].includes(String(x.code||'').toUpperCase()));const b2=raw.find(x=>['B2','ANSWER'].includes(String(x.code||'').toUpperCase()));const out=[];if(b1){b1.code='B1';out.push(b1);}if(b2){b2.code='B2';out.push(b2);}return out;}raw.forEach((x,i)=>{x.code='B'+i;});return raw;}
-async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:_sanitizeCurriculumRichHtml(String(textTa.innerHTML||''))};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
+async function collectCurriculumDraft(id){const base=await api('/admin/api/curriculum/drafts/'+id+'?password='+encodeURIComponent(pw));const d=base.draft_json||{};const lessonNameEl=document.getElementById('curLessonName');const lessonName=String(lessonNameEl?.value||d.lesson||base.lesson||'').trim();if(!lessonName)throw new Error('Tên bài học không được để trống.');if(lessonName.length>255)throw new Error('Tên bài học tối đa 255 ký tự.');d.lesson=lessonName;d.steps=(d.steps||[]).map(s=>{const code=String(s.code||'');const jsonTa=_findCurriculumJsonTextarea(code);const textTa=_findCurriculumTextTextarea(code);const titleEl=textTa?.closest('.cur-step-card')?.querySelector('.cur-title');let content=_curriculumGetStepState(code,s.content||{});if(jsonTa){try{content=JSON.parse(jsonTa.value||JSON.stringify(content));}catch(e){throw new Error(`Bước ${code}: JSON nâng cao không hợp lệ. Hãy sửa JSON hoặc để nguyên phần nâng cao.`);}}if(textTa){content={...(content||{}),content:_sanitizeCurriculumRichHtml(String(textTa.innerHTML||''))};}if(!Array.isArray(content.images))content.images=[];content.images=content.images.map(im=>({...im,image_key:String(im?.image_key||im?.key||'').trim()})).filter(im=>im.image_key);_curriculumSetStepState(code,content);return {...s,title:titleEl?.value||s.title,content};});d.steps=reindexCurriculumDraftStepsClient(String(d.content_type||''),d.steps||[]);return d;}
 async function saveCurriculumDraft(id){try{const draft=await collectCurriculumDraft(id);const saved=await api('/admin/api/curriculum/drafts/'+id,{method:'POST',body:JSON.stringify({password:pw,draft})});const merged={...draft,...saved,steps:saved.steps||draft.steps};renderCurriculumDraft(id,merged);await loadCurriculumDrafts();alert('✅ Đã lưu chỉnh sửa.');}catch(e){alert('❌ '+e.message);}}
 async function regenerateCurriculumStep(id,code){try{const d=await api('/admin/api/curriculum/drafts/'+id+'/regenerate-step',{method:'POST',body:JSON.stringify({password:pw,step_code:code})});const jsonTa=_findCurriculumJsonTextarea(String(code));const textTa=_findCurriculumTextTextarea(String(code));if(jsonTa)jsonTa.value=JSON.stringify(d.step.content||{},null,2);if(textTa)textTa.innerHTML=_sanitizeCurriculumRichHtml(String((d.step.content||{}).content||''));_curriculumSetStepState(String(code),d.step.content||{});const host=document.getElementById('cur-gallery-'+encodeURIComponent(String(code)));if(host)host.outerHTML=curriculumImageGallery({code,content:d.step.content||{}},Array.isArray(window.currentCurriculumPages)?window.currentCurriculumPages:[]);alert('✅ Đã gen lại '+code);}catch(e){alert('❌ '+e.message);}}
 async function publishCurriculumDraft(id){try{if(!confirm('Publish giáo trình này? Sau khi publish Doraemon mới được phép dùng nội dung này.'))return;const draft=await collectCurriculumDraft(id);const d=await api('/admin/api/curriculum/drafts/'+id+'/publish',{method:'POST',body:JSON.stringify({password:pw,draft})});alert(`✅ Published lesson #${d.lesson_id}, version ${d.version}.`);await loadCurriculumDrafts();await loadKnowledgeCatalog();const st=document.getElementById('curStatus');if(st)st.textContent=`✅ Published lesson #${d.lesson_id}, version ${d.version}. Draft này đã được ẩn; các Draft chưa publish vẫn được giữ.`;const ed=document.getElementById('curDraftEditor');if(ed)ed.innerHTML='';window.currentCurriculumDraftId=null;}catch(e){alert('❌ '+e.message);}}
@@ -18455,7 +18642,7 @@ function renderKnowledgeCatalog(nodes){
                   <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(ls.course_name||doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
                 <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button>` : ''}
+                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button><button type="button" class="gray" onclick="duplicatePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">📄 Nhân bản</button>` : ''}
                   <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
                 </div>
               </div>
