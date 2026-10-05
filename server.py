@@ -138,8 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v31.90 — Curriculum duplicate lesson + editable lesson name
-SERVER_VERSION = "31.90"
+# VERSION: v31.91 — Curriculum duplicate action fix + rename without cloning
+SERVER_VERSION = "31.91"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -16917,6 +16917,78 @@ def admin_curriculum_published_duplicate_draft(lesson_id:int, payload:dict):
     finally:
         conn.close()
 
+@app.post('/admin/api/curriculum/published/{lesson_id}/rename')
+def admin_curriculum_published_rename(lesson_id:int, payload:dict):
+    """Rename one published Curriculum lesson in place; never clone it."""
+    check_admin(str(payload.get('password') or ''))
+    new_lesson=str(payload.get('lesson') or '').strip()
+    if not new_lesson:
+        raise HTTPException(400,'Tên bài học mới là bắt buộc.')
+    if len(new_lesson)>255:
+        raise HTTPException(400,'Tên bài học tối đa 255 ký tự.')
+    conn=db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,course_id,content_type,lesson,status,version,raw_source_json FROM curriculum_lessons WHERE id=%s FOR UPDATE", (int(lesson_id),))
+            row=cur.fetchone()
+            if not row or str(row.get('status') or '').upper()!='PUBLISHED':
+                raise HTTPException(404,'Không tìm thấy bài học Curriculum đang publish.')
+            old_lesson=str(row.get('lesson') or '').strip()
+            if new_lesson == old_lesson:
+                return {'success':True,'lesson_id':int(lesson_id),'old_lesson':old_lesson,'lesson':new_lesson,'renamed':False,'message':'Tên bài học không thay đổi.'}
+            cur.execute("""
+                SELECT id FROM curriculum_lessons
+                WHERE id<>%s AND status='PUBLISHED' AND course_id=%s AND content_type=%s AND lesson=%s
+                LIMIT 1
+            """, (int(lesson_id), row.get('course_id'), row.get('content_type'), new_lesson))
+            if cur.fetchone():
+                raise HTTPException(409,f'Bài học "{new_lesson}" đã tồn tại trong khóa học này.')
+            raw=row.get('raw_source_json') if isinstance(row.get('raw_source_json'),dict) else {}
+            if isinstance(raw,dict):
+                raw=dict(raw)
+                raw['lesson']=new_lesson
+            cur.execute("""
+                UPDATE curriculum_lessons
+                SET lesson=%s, version=version+1, raw_source_json=%s::jsonb, updated_at=NOW()
+                WHERE id=%s
+                RETURNING id,course_id,content_type,lesson,status,version
+            """, (new_lesson, json.dumps(raw,ensure_ascii=False), int(lesson_id)))
+            updated=dict(cur.fetchone())
+        conn.commit()
+        print(f"[CURRICULUM RENAME] lesson_id={lesson_id} old={old_lesson!r} new={new_lesson!r}")
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as exc:
+        conn.rollback(); raise HTTPException(500,f'Không đổi tên bài học: {type(exc).__name__}: {exc}')
+    finally:
+        conn.close()
+    _invalidate_catalog_cache()
+    try:
+        cid=updated.get('course_id')
+        if cid:
+            _rebuild_course_curriculum_knowledge_master(int(cid))
+    except Exception as exc:
+        print('[CURRICULUM RENAME] knowledge master rebuild skipped:',type(exc).__name__,str(exc))
+    # Keep Pinecone metadata in sync without changing deterministic vector IDs.
+    if index:
+        try:
+            conn2=db()
+            try:
+                with conn2.cursor() as cur2:
+                    cur2.execute("SELECT step_code FROM curriculum_steps WHERE lesson_id=%s",(int(lesson_id),))
+                    step_codes=[str(r[0] or '') for r in cur2.fetchall() if str(r[0] or '')]
+            finally:
+                conn2.close()
+            for code in step_codes:
+                try:
+                    index.update(id=f'curriculum:{int(lesson_id)}:{code}', namespace='__default__', set_metadata={'lesson':new_lesson})
+                except Exception as exc:
+                    print('[CURRICULUM RENAME] Pinecone metadata update skipped:',type(exc).__name__,str(exc))
+        except Exception as exc:
+            print('[CURRICULUM RENAME] Pinecone sync skipped:',type(exc).__name__,str(exc))
+    return {'success':True,'lesson_id':int(updated['id']),'old_lesson':old_lesson,'lesson':str(updated['lesson']),
+            'version':int(updated.get('version') or 1),'renamed':True,'status':'PUBLISHED'}
+
 @app.post('/admin/api/curriculum/published/{lesson_id}/edit-draft')
 def admin_curriculum_published_edit_draft(lesson_id:int, payload:dict):
     """Clone a published Curriculum lesson into an editable Admin Draft.
@@ -17409,25 +17481,47 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
                     raise HTTPException(400, 'Bài học phải thuộc một khóa học trong Danh mục khóa học.')
             draft['source_file']=source_file; draft['lesson']=lesson; draft['subject']=course_name; draft['content_type']=ct; draft['course_id']=course_id_val
 
-            # Capture the currently published versions before archiving them. Their
-            # deterministic Pinecone IDs will be removed only AFTER the new vectors
-            # are successfully upserted and verified.
-            cur.execute("""
-                SELECT id
-                FROM curriculum_lessons
-                WHERE source_file=%s AND content_type=%s AND lesson=%s
-                  AND status='PUBLISHED'
-                  AND course_id=%s
-                ORDER BY id DESC
-            """, (source_file, ct, lesson, course_id_val))
-            old_curriculum_versions = [int(r['id']) for r in cur.fetchall()]
+            # A draft created by "Edit Curriculum" carries edit_of_lesson_id.
+            # Publishing such a draft MUST update that existing lesson in place,
+            # including when the lesson name has changed. This preserves the lesson_id
+            # and prevents a rename from creating a second published lesson.
+            edit_of_lesson_id = draft.get('edit_of_lesson_id')
+            if edit_of_lesson_id not in (None, ''):
+                try:
+                    edit_of_lesson_id=int(edit_of_lesson_id)
+                except Exception:
+                    raise HTTPException(400,'edit_of_lesson_id không hợp lệ.')
+                cur.execute("""
+                    SELECT id,course_id,content_type,lesson,status,version
+                    FROM curriculum_lessons WHERE id=%s FOR UPDATE
+                """, (edit_of_lesson_id,))
+                original=cur.fetchone()
+                if not original or str(original.get('status') or '').upper()!='PUBLISHED':
+                    raise HTTPException(409,'Bài học gốc để chỉnh sửa không còn ở trạng thái PUBLISHED.')
+                if int(original.get('course_id') or 0) != int(course_id_val or 0) or str(original.get('content_type') or '') != ct:
+                    raise HTTPException(409,'Draft chỉnh sửa không còn khớp khóa học/loại nội dung của bài gốc.')
+                if lesson != str(original.get('lesson') or ''):
+                    cur.execute("""
+                        SELECT id FROM curriculum_lessons
+                        WHERE id<>%s AND status='PUBLISHED' AND course_id=%s AND content_type=%s AND lesson=%s
+                        LIMIT 1
+                    """, (edit_of_lesson_id, course_id_val, ct, lesson))
+                    if cur.fetchone():
+                        raise HTTPException(409,f'Bài học "{lesson}" đã tồn tại trong khóa học này.')
+                old_curriculum_versions=[int(edit_of_lesson_id)]
+            else:
+                cur.execute("""
+                    SELECT id
+                    FROM curriculum_lessons
+                    WHERE source_file=%s AND content_type=%s AND lesson=%s
+                      AND status='PUBLISHED'
+                      AND course_id=%s
+                    ORDER BY id DESC
+                """, (source_file, ct, lesson, course_id_val))
+                old_curriculum_versions = [int(r['id']) for r in cur.fetchall()]
 
-            # Persist the exact edited draft first. Publish and DB step insertion happen
-            # in the same transaction, so the published content is byte-for-byte sourced
-            # from this normalized draft snapshot.
+            # Persist the exact edited draft first.
             cur.execute("UPDATE curriculum_drafts SET draft_json=%s::jsonb,status='ADMIN_REVIEW',updated_at=NOW() WHERE id=%s",(json.dumps(draft,ensure_ascii=False),draft_id))
-            cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
-            cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
             if ct == 'Bài tập':
                 publish_meta={
                     'course_id':draft.get('course_id'),
@@ -17443,12 +17537,23 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
                     'question_pages':draft.get('question_pages',''),
                     'answer_pages':draft.get('answer_pages',''),
                 }
-            cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps(publish_meta,ensure_ascii=False)))
-            lesson_id=int(cur.fetchone()['id'])
+            if edit_of_lesson_id is not None:
+                version=int(original.get('version') or 1)+1
+                cur.execute("""
+                    UPDATE curriculum_lessons
+                    SET draft_id=%s, source_file=%s, course_id=%s, subject=%s, content_type=%s, lesson=%s,
+                        status='PUBLISHED', version=%s, raw_source_json=%s::jsonb, updated_at=NOW()
+                    WHERE id=%s
+                """, (draft_id,source_file,course_id_val,course_name,ct,lesson,version,json.dumps(publish_meta,ensure_ascii=False),edit_of_lesson_id))
+                lesson_id=int(edit_of_lesson_id)
+                cur.execute("DELETE FROM curriculum_steps WHERE lesson_id=%s",(lesson_id,))
+            else:
+                cur.execute("UPDATE curriculum_lessons SET status='ARCHIVED' WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s AND status='PUBLISHED'",(source_file,ct,lesson,course_id_val))
+                cur.execute("SELECT COALESCE(MAX(version),0)+1 AS next_version FROM curriculum_lessons WHERE source_file=%s AND content_type=%s AND lesson=%s AND course_id=%s",(source_file,ct,lesson,course_id_val)); version=int(cur.fetchone()['next_version'])
+                cur.execute("INSERT INTO curriculum_lessons(draft_id,source_file,course_id,subject,content_type,lesson,status,version,raw_source_json) VALUES(%s,%s,%s,%s,%s,%s,'PUBLISHED',%s,%s::jsonb) RETURNING id",(draft_id,source_file,int(draft.get('course_id') or 0) or None,course_name,ct,lesson,version,json.dumps(publish_meta,ensure_ascii=False)))
+                lesson_id=int(cur.fetchone()['id'])
             for order,step in enumerate(draft.get('steps') or [],1):
                 content=dict(step.get('content') or {})
-                # Keep the editable text/content exactly as saved by Admin. Do not
-                # regenerate or reconstruct it from source pages during publish.
                 cur.execute("INSERT INTO curriculum_steps(lesson_id,step_code,step_order,title,step_type,content_json) VALUES(%s,%s,%s,%s,%s,%s::jsonb)",(lesson_id,str(step.get('code') or f'B{order-1}'),order,str(step.get('title') or content.get('title') or ''),str(step.get('type') or 'lesson'),json.dumps(content,ensure_ascii=False)))
             cur.execute("UPDATE curriculum_drafts SET status='PUBLISHED',updated_at=NOW() WHERE id=%s",(draft_id,))
         conn.commit()
@@ -18540,6 +18645,19 @@ function changeCurriculumImage(code,key,add){
   _curriculumSetStepState(wanted,c); if(ta){ta.value=JSON.stringify(c,null,2);ta.dispatchEvent(new Event('input',{bubbles:true}));}
   const host=document.getElementById('cur-gallery-'+encodeURIComponent(wanted)); if(host)host.outerHTML=curriculumImageGallery({code:wanted,content:c},pages); return false;
 }
+async function renamePublishedCurriculum(lessonId,currentName){
+  try{
+    if(!lessonId)return;
+    const newName=window.prompt('Nhập tên mới cho bài học:',String(currentName||'').trim());
+    if(newName===null)return;
+    const lesson=String(newName||'').trim();
+    if(!lesson){alert('❌ Tên bài học không được để trống.');return;}
+    if(lesson===String(currentName||'').trim()){return;}
+    const d=await api('/admin/api/curriculum/published/'+encodeURIComponent(String(lessonId))+'/rename',{method:'POST',body:JSON.stringify({password:pw,lesson})});
+    alert('✅ Đã đổi tên bài học thành: '+d.lesson);
+    await loadKnowledgeCatalog();
+  }catch(e){alert('❌ Không đổi tên bài học: '+e.message);}
+}
 async function duplicatePublishedCurriculum(lessonId,currentName){
   try{
     if(!lessonId)return;
@@ -18642,7 +18760,7 @@ function renderKnowledgeCatalog(nodes){
                   <div><b>📘 Bài học:</b> ${esc(ls.lesson)}${ls.lesson_pages?` <span class='small'>[${esc(ls.lesson_pages)}]</span>`:""} <span class="small" style="margin-left:8px">🎓 ${esc(ls.course_name||doc.course_name||doc.subject||"Chưa xác định")}</span></div>
                 </div>
                 <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button><button type="button" class="gray" onclick="duplicatePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">📄 Nhân bản</button>` : ''}
+                  ${ls.is_curriculum && ls.curriculum_lesson_id ? `<button type="button" class="gray" onclick="editPublishedCurriculum(${Number(ls.curriculum_lesson_id)});return false;">✏️ Edit Curriculum</button><button type="button" class="gray" onclick="renamePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">✏️ Đổi tên</button><button type="button" class="gray" onclick="duplicatePublishedCurriculum(${Number(ls.curriculum_lesson_id)},${JSON.stringify(ls.lesson||'')});return false;">📄 Nhân bản</button>` : ''}
                   <button class="red" onclick='deleteKnowledgeScope(${JSON.stringify({source_file:doc.source_file,content_type:ct.content_type,lesson:ls.lesson})})'>Xóa bài</button>
                 </div>
               </div>
