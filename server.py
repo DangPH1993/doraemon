@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.96"
+SERVER_VERSION = "31.97"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15386,55 +15386,121 @@ class _CurriculumRichTextSanitizer(HTMLParser):
 
 
 def _normalize_curriculum_bullet_chars(value):
-    """Normalize all common PDF/Office bullet artifacts at block starts.
+    """Normalize bullet glyphs that arrive from Word/PDF/Symbol fonts.
 
-    Clipboard text from Word/PDF can contain Wingdings/Symbol private-use
-    characters, replacement boxes, or legacy mojibake. These glyphs are not
-    portable across browsers/fonts. Only a marker at the beginning of a text
-    line/HTML block is normalized; ordinary prose is left untouched.
+    This is intentionally structural rather than regex-only: OCR/clipboard content can
+    put a bullet inside <span>/<strong> wrappers or use characters such as U+00BE (¾),
+    U+25A1 (□), U+FFFD, or Wingdings private-use glyphs. We normalize only when the
+    glyph is the first meaningful character of a text block/line, so ordinary fractions
+    such as ``¾ cup`` remain unchanged.
     """
     text=str(value or '')
     if not text:
         return ''
 
-    # `>` matches the end of an opening/closing HTML tag, so bullets inside
-    # <p>, <div>, <span>, <br>, etc. are also recognized. Newlines cover plain text.
-    prefix=r'(^|>|\n|\r)([ \t]*)'
-
-    # Exact private-use characters commonly emitted by Wingdings/Symbol fonts.
-    mappings = {
-        '\uf0b7': '•', '\uf0d8': '➢', '\uf0d9': '➢', '\uf0da': '➢', '\uf0db': '➢',
-        '\uf0a7': '•', '\uf076': '•', '\uf0fc': '✓', '\uf0d0': '•',
-        '\uf0a8': '•', '\uf0a9': '•', '\uf0aa': '•', '\uf0ab': '•',
-        '\uf0b0': '•', '\uf0b1': '•', '\uf0b2': '•', '\uf0b3': '•',
-        '\uf0b4': '•', '\uf0b5': '•', '\uf0b6': '•', '\uf0b8': '•',
-        '\uf0b9': '•', '\uf0ba': '•', '\uf0bb': '•', '\uf0bc': '•',
-        '\uf0bd': '•', '\uf0be': '•', '\uf0bf': '•', '\uf0c0': '•',
-        '\uf0c1': '•', '\uf0c2': '•', '\uf0c3': '•', '\uf0c4': '•',
-        '\uf0e0': '•', '\uf0e5': '•', '\uf0e6': '•', '\uf0e7': '•',
-    }
-    for src, dst in mappings.items():
-        text=re.sub(prefix + re.escape(src) + r'(?=[ \t])', lambda m, d=dst: m.group(1)+m.group(2)+d, text)
-
-    # Generic fallback for a still-unknown Private Use Area bullet at block start.
-    text=re.sub(prefix + r'[\ue000-\uf8ff](?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
-
-    # Placeholder square glyphs: use the universally portable bullet instead of
-    # another symbol that may itself render as an empty square on a user's PC.
-    text=re.sub(prefix + r'[□▫▪◻◽◾◼■](?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
-    text=re.sub(prefix + r'�(?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
-
-    # Common legacy corruption where a bullet becomes `¾` at line/block start.
-    # Do not touch legitimate fractions such as `¾ cup`.
-    text=re.sub(prefix + r'¾(?=[ \t]+(?!cup\b|cups\b|lb\b|lbs\b|oz\b)[A-ZÀ-ỴĐ])', lambda m: m.group(1)+m.group(2)+'➢', text)
-
-    # Common UTF-8 mojibake forms.
+    # Handle common UTF-8 mojibake forms first, but only at the start of a block/line.
     mojibake={
-        'â€¢':'•', 'â–º':'➢', 'âž¢':'➢', 'â—†':'•', 'â˜…':'•', 'Â·':'•', 'Â»':'•',
+        'â€¢':'•', 'â–º':'➢', 'âž¢':'➢', 'â—†':'•', 'â˜…':'•',
+        'Â·':'•', 'Â»':'•',
     }
-    for src,dst in mojibake.items():
-        text=re.sub(prefix + re.escape(src) + r'(?=[ \t])', lambda m,d=dst: m.group(1)+m.group(2)+d, text)
-    return text
+    pua_map={
+        '\uf0b7':'•','\uf0d8':'➢','\uf0d9':'➢','\uf0da':'➢','\uf0db':'➢',
+        '\uf0a7':'•','\uf076':'•','\uf0fc':'✓','\uf0d0':'•',
+        '\uf0a8':'•','\uf0a9':'•','\uf0aa':'•','\uf0ab':'•',
+        '\uf0b0':'•','\uf0b1':'•','\uf0b2':'•','\uf0b3':'•','\uf0b4':'•',
+        '\uf0b5':'•','\uf0b6':'•','\uf0b8':'•','\uf0b9':'•','\uf0ba':'•',
+        '\uf0bb':'•','\uf0bc':'•','\uf0bd':'•','\uf0be':'•','\uf0bf':'•',
+        '\uf0c0':'•','\uf0c1':'•','\uf0c2':'•','\uf0c3':'•','\uf0c4':'•',
+        '\uf0e0':'•','\uf0e5':'•','\uf0e6':'•','\uf0e7':'•',
+    }
+
+    out=[]
+    i=0
+    at_block_start=True
+    n=len(text)
+    block_tags={'p','div','br','li','h1','h2','h3','h4','h5','h6','ul','ol'}
+
+    def after_fraction_is_real_fraction(pos_after_marker):
+        # Skip ordinary spaces/NBSP. A number or a common unit strongly indicates that
+        # ¾ is a legitimate fraction rather than a mangled bullet.
+        j=pos_after_marker
+        while j<n and text[j] in ' \t\u00a0':
+            j+=1
+        if j>=n:
+            return True
+        rest=text[j:]
+        if rest[:1].isdigit():
+            return True
+        m=re.match(r'(?i)(?:cup|cups|lb|lbs|oz|kg|g|ml|l|inch|inches|cm|mm)\b', rest)
+        return bool(m)
+
+    while i<n:
+        ch=text[i]
+
+        # HTML tags are kept verbatim, and block tags reset the "first meaningful
+        # character" state so bullets inside nested inline markup are still caught.
+        if ch=='<':
+            j=text.find('>', i+1)
+            if j==-1:
+                out.append(text[i:])
+                break
+            tag_text=text[i:j+1]
+            out.append(tag_text)
+            m=re.match(r'<\s*(/?)\s*([A-Za-z][A-Za-z0-9]*)', tag_text)
+            if m and m.group(2).lower() in block_tags:
+                if m.group(1):
+                    at_block_start=True
+                else:
+                    at_block_start=True
+            i=j+1
+            continue
+
+        if ch in '\r\n':
+            out.append(ch)
+            at_block_start=True
+            i+=1
+            continue
+
+        if at_block_start:
+            # Preserve indentation/whitespace, but remain at block start.
+            if ch in ' \t\u00a0':
+                out.append(ch)
+                i+=1
+                continue
+
+            replacement=None
+            # Long-form mojibake sequences.
+            for src,dst in mojibake.items():
+                if text.startswith(src, i):
+                    replacement=dst
+                    i += len(src)
+                    break
+            if replacement is None:
+                replacement=pua_map.get(ch)
+                if replacement is not None:
+                    i+=1
+            if replacement is None and ('\ue000' <= ch <= '\uf8ff'):
+                replacement='•'
+                i+=1
+            if replacement is None and ch in '□▫▪◻◽◾◼■�':
+                replacement='•'
+                i+=1
+            if replacement is None and ch=='¾' and not after_fraction_is_real_fraction(i+1):
+                replacement='➢'
+                i+=1
+
+            if replacement is not None:
+                out.append(replacement)
+                # A bullet is no longer the "first meaningful" character, but any
+                # following content on the same line should remain untouched.
+                at_block_start=False
+                continue
+
+        out.append(ch)
+        at_block_start=False
+        i+=1
+
+    return ''.join(out)
 
 def sanitize_curriculum_rich_text(value):
     """Sanitize curriculum rich text while preserving editor formatting.
