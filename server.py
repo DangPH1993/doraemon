@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.99"
+SERVER_VERSION = "32.00"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -472,6 +472,24 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(user_id, chatbox_id)
             );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS chat_now_user_knowledge (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                knowledge TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS chat_now_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                chatbox_id TEXT NOT NULL,
+                course_id BIGINT NULL,
+                history_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ended_at TIMESTAMPTZ NULL,
+                UNIQUE(user_id, chatbox_id)
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_now_sessions_user_status ON chat_now_sessions(user_id,status,updated_at DESC);")
             cur.execute("""CREATE TABLE IF NOT EXISTS payment_packages (
                 months INTEGER PRIMARY KEY,
                 plan_name VARCHAR(50) NOT NULL,
@@ -677,6 +695,7 @@ class ChatRequest(BaseModel):
     action: str | None = None
     course_id: int | None = None
     free_chat_tutor: bool = False
+    chat_now: bool = False
 
     @property
     def text(self) -> str:
@@ -5372,6 +5391,175 @@ def _get_free_chat_tutor_note(user_id, course_id, chatbox_id):
         conn.close()
 
 
+
+def _chat_now_get_knowledge(user_id):
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT knowledge,updated_at FROM chat_now_user_knowledge WHERE user_id=%s", (int(user_id),))
+            row = cur.fetchone()
+            return dict(row) if row else {"knowledge":"", "updated_at":None}
+    finally:
+        conn.close()
+
+
+def _chat_now_ensure_session(user_id, chatbox_id, course_id=None):
+    chatbox_id = str(chatbox_id or '').strip()
+    if not chatbox_id:
+        raise HTTPException(400, "Chat Now cần chatbox_id.")
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO chat_now_sessions(user_id,chatbox_id,course_id,status)
+                           VALUES(%s,%s,%s,'OPEN')
+                           ON CONFLICT(user_id,chatbox_id) DO UPDATE SET
+                               course_id=COALESCE(EXCLUDED.course_id,chat_now_sessions.course_id),
+                               status='OPEN', updated_at=NOW(), ended_at=NULL
+                           RETURNING id,user_id,chatbox_id,course_id,history_json,status""",
+                        (int(user_id), chatbox_id, int(course_id) if course_id is not None else None))
+            row = dict(cur.fetchone())
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _chat_now_get_session(user_id, chatbox_id):
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,user_id,chatbox_id,course_id,history_json,status,started_at,updated_at,ended_at FROM chat_now_sessions WHERE user_id=%s AND chatbox_id=%s LIMIT 1",
+                        (int(user_id), str(chatbox_id or '').strip()))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _chat_now_append_history(user_id, chatbox_id, entries):
+    session = _chat_now_get_session(user_id, chatbox_id) or _chat_now_ensure_session(user_id, chatbox_id)
+    old = session.get('history_json') or []
+    if not isinstance(old, list):
+        old = []
+    merged = old + [dict(x) for x in entries if isinstance(x, dict)]
+    merged = merged[-20:]  # 10 user/model exchanges maximum.
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE chat_now_sessions SET history_json=%s::jsonb,updated_at=NOW(),status='OPEN',ended_at=NULL WHERE user_id=%s AND chatbox_id=%s",
+                        (json.dumps(merged, ensure_ascii=False), int(user_id), str(chatbox_id)))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return merged
+
+
+def _chat_now_extract_and_store_knowledge(user_id, history, course_info=None):
+    history = history if isinstance(history, list) else []
+    if not history:
+        return False
+    existing = str((_chat_now_get_knowledge(user_id) or {}).get('knowledge') or '').strip()
+    course_info = course_info or {}
+    language = str(course_info.get('language') or 'en').strip() or 'en'
+    history_text = "\n".join(
+        f"{str(h.get('role') or 'user').upper()}: {str(h.get('text') or '')[:1500]}"
+        for h in history[-20:] if isinstance(h, dict) and str(h.get('text') or '').strip()
+    )
+    prompt = f"""Bạn là bộ nhớ cá nhân của Doraemon.\n\nNHIỆM VỤ: đọc đúng lịch sử một phiên Chat Now và cập nhật knowledge về USER.\n\nQUY TẮC CỰC KỲ NGHIÊM NGẶT:\n- Chỉ ghi những thông tin USER tự nói rõ hoặc xác nhận. Không suy luận.\n- Có thể ghi: sở thích, năng lực, mục tiêu, quê quán, nghề nghiệp, thói quen, điều user thích/không thích.\n- Không ghi thông tin của Doraemon hoặc thông tin chỉ do assistant phỏng đoán.\n- Nếu không có thông tin mới, trả {{\"updated\":false,\"knowledge\":\"\"}}.\n- Nếu có thông tin mới, trả knowledge ĐÃ GỘP với knowledge cũ, cô đọng, dễ dùng làm prompt.\n- Knowledge tối đa khoảng 200 từ tiếng Việt/tiếng Anh tùy nội dung. Không vượt quá 200 từ.\n- Không viết thành câu chuyện; dùng các gạch đầu dòng ngắn.\n- Nếu thông tin mới mâu thuẫn rõ với thông tin cũ, ưu tiên thông tin user nói mới hơn.\n\nKNOWLEDGE CŨ:\n{existing or '(trống)'}\n\nLỊCH SỬ PHIÊN CHAT NOW:\n{history_text}\n\nTrả JSON duy nhất:\n{{\"updated\":true|false,\"knowledge\":\"...\"}}"""
+    try:
+        gen_started = time.perf_counter()
+        raw, model_used, _ = _generate_chat_reply(
+            prompt, content_type=None, request_id=f"chatnow-memory-{uuid.uuid4().hex[:8]}",
+            gen_started=gen_started, user_text="memory_extract", reasoning_profile="low", max_output_tokens=700
+        )
+        data = _parse_gemini_json(raw)
+        updated = bool(data.get('updated')) if isinstance(data, dict) else False
+        knowledge = str((data or {}).get('knowledge') or '').strip()
+        if not updated or not knowledge:
+            print(f"[CHAT NOW MEMORY] user={user_id} updated=0")
+            return False
+        existing_norm = re.sub(r"\s+", " ", existing).strip().casefold()
+        knowledge_norm = re.sub(r"\s+", " ", knowledge).strip().casefold()
+        if knowledge_norm == existing_norm:
+            print(f"[CHAT NOW MEMORY] user={user_id} updated=0 reason=no_new_information")
+            return False
+        # Hard cap by words; preserve as much as possible while enforcing ~200 words.
+        words = knowledge.split()
+        if len(words) > 200:
+            knowledge = ' '.join(words[:200]).rstrip(' ,;')
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO chat_now_user_knowledge(user_id,knowledge,updated_at)
+                               VALUES(%s,%s,NOW())
+                               ON CONFLICT(user_id) DO UPDATE SET knowledge=EXCLUDED.knowledge,updated_at=NOW()""",
+                            (int(user_id), knowledge))
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"[CHAT NOW MEMORY] user={user_id} updated=1 words={len(knowledge.split())} model={model_used}")
+        return True
+    except Exception as exc:
+        print(f"[CHAT NOW MEMORY] user={user_id} updated=0 error={type(exc).__name__}: {exc}")
+        return False
+
+
+def _chat_now_close_session(user_id, chatbox_id, course_info=None):
+    session = _chat_now_get_session(user_id, chatbox_id)
+    if not session:
+        return {"closed":False,"knowledge_updated":False}
+    history = session.get('history_json') or []
+    updated = _chat_now_extract_and_store_knowledge(user_id, history, course_info)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE chat_now_sessions SET status='CLOSED',updated_at=NOW(),ended_at=NOW() WHERE user_id=%s AND chatbox_id=%s",
+                        (int(user_id), str(chatbox_id)))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"closed":True,"knowledge_updated":bool(updated)}
+
+
+def _chat_now_close_previous_sessions(user_id, current_chatbox_id, course_info=None):
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT chatbox_id,history_json FROM chat_now_sessions WHERE user_id=%s AND status='OPEN' AND chatbox_id<>%s ORDER BY updated_at ASC",
+                        (int(user_id), str(current_chatbox_id or '')))
+            rows=[dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+    updated=False
+    for row in rows:
+        result=_chat_now_close_session(user_id,row.get('chatbox_id'),course_info)
+        updated = updated or bool(result.get('knowledge_updated'))
+    return updated
+
+
+def _chat_now_end_endpoint(user_id, chatbox_id, course_id=None, chat_history=None):
+    session = _chat_now_get_session(user_id, chatbox_id)
+    # Accept the client history too, so a very latest turn is never lost if the
+    # request arrived immediately before the explicit end action.
+    if session is None:
+        _chat_now_ensure_session(user_id, chatbox_id, course_id)
+        session = _chat_now_get_session(user_id, chatbox_id)
+    client_history = chat_history if isinstance(chat_history, list) else []
+    # Each completed Chat Now turn is persisted server-side before the response
+    # reaches the browser. Only use the client history as a recovery path when
+    # the session still has no stored history; otherwise appending it again would
+    # duplicate the last 10 exchanges.
+    if client_history and not (session.get('history_json') or []):
+        _chat_now_append_history(user_id, chatbox_id, client_history[-20:])
+    info=_course_language_info(course_id) if course_id is not None else {}
+    return _chat_now_close_session(user_id, chatbox_id, info)
+
 def _course_language_info(course_id):
     """Return course name/language for Tutor output and exercise language."""
     if course_id in (None, ""):
@@ -7579,6 +7767,21 @@ QUY TẮC:
     }
 
 
+@app.post("/learning/chat-now/end")
+def chat_now_end(data: dict, authorization: Optional[str] = Header(default=None)):
+    user = require_active_user(authorization)
+    chatbox_id = str(data.get("chatbox_id") or "").strip()
+    if not chatbox_id:
+        raise HTTPException(400, "Thiếu chatbox_id của phiên Chat Now.")
+    course_id = data.get("course_id")
+    try:
+        course_id = int(course_id) if course_id is not None else None
+    except Exception:
+        course_id = None
+    result = _chat_now_end_endpoint(user["id"], chatbox_id, course_id, data.get("chat_history"))
+    return {"success":True, **result}
+
+
 @app.post("/api/proxy-chat")
 def proxy_chat(
     data: ChatRequest,
@@ -7595,6 +7798,37 @@ def proxy_chat(
         raise HTTPException(500, "Gemini chưa được khởi tạo.")
     if not data.text and not data.action:
         raise HTTPException(400, "Tin nhắn không được để trống.")
+
+    # Chat Now is an isolated foreign-friend role-play mode. It deliberately
+    # bypasses Study Plan, lesson router, follow-up router and learning RAG.
+    if data.chat_now and not data.action:
+        enforce_question_limit(user["id"])
+        selected_course_id, selected_course_name, _ = _resolve_request_course(user["id"], data.course_id)
+        tutor_course_info = _course_language_info(selected_course_id)
+        if data.chatbox_new and data.chatbox_id:
+            _chat_now_close_previous_sessions(user["id"], data.chatbox_id, tutor_course_info)
+        session = _chat_now_ensure_session(user["id"], data.chatbox_id or uuid.uuid4().hex, selected_course_id)
+        session_history = session.get("history_json") or []
+        if not isinstance(session_history, list):
+            session_history = []
+        if not session_history and data.chat_history:
+            session_history = _normalize_chat_history(data.chat_history, max_messages=20)
+        memory = _chat_now_get_knowledge(user["id"])
+        memory_text = str(memory.get("knowledge") or "").strip()
+        language = str(tutor_course_info.get("language") or "en").strip().lower() or "en"
+        language_label = {"en":"English","ja":"Japanese","jp":"Japanese","ko":"Korean","zh":"Chinese","fr":"French","de":"German","es":"Spanish"}.get(language, language)
+        scenario_hint = (
+            "Chọn một tình huống role-play nhẹ nhàng, hơi hài hước và thay đổi linh hoạt giữa các phiên "
+            "(ví dụ: quán cà phê, đồng nghiệp, sân bay, hàng xóm, cửa hàng, du lịch, lớp học)."
+        )
+        history_text = "\n".join(f"{str(h.get('role') or 'user').upper()}: {str(h.get('text') or '')[-1400:]}" for h in session_history[-20:] if isinstance(h,dict))
+        prompt = f"""Bạn là một người bạn nước ngoài hư cấu đang trò chuyện với user trong chế độ Chat Now của Doraemon.\n\nMỤC TIÊU: tạo một cuộc hội thoại tự nhiên, vui vẻ, có tính nhập vai. Không dạy theo lesson/curriculum. Không dùng lesson router, không nhắc bài học.\n\n{scenario_hint}\n\nNGÔN NGỮ: hãy chủ yếu trò chuyện bằng {language_label}. Nếu user chủ động chuyển ngôn ngữ thì có thể theo user khi phù hợp.\n\nSỬ DỤNG HIỂU BIẾT VỀ USER:\n{memory_text or '(Chưa có thông tin bền vững về user.)'}\nChỉ dùng những thông tin này như chi tiết hội thoại tự nhiên; không kể lại danh sách hồ sơ.\n\nQUY TẮC SỬA LỖI:\n- Nếu user viết sai ngữ pháp/từ vựng/cách diễn đạt rõ ràng, vẫn tiếp tục trò chuyện tự nhiên nhưng thêm một phần ngắn ở cuối: **Correction** / **Gợi ý sửa**.\n- Nêu câu user viết, câu sửa tự nhiên hơn và giải thích rất ngắn.\n- Không sửa những lỗi đánh máy rất nhỏ nếu không ảnh hưởng nghĩa.\n- Không biến toàn bộ cuộc trò chuyện thành bài giảng.\n\nLỊCH SỬ TỐI ĐA 10 LƯỢT TRAO ĐỔI:\n{history_text or '(Đây là tin nhắn mở đầu.)'}\n\nTIN NHẮN HIỆN TẠI:\n{data.text}\n\nHãy đóng vai một người bạn nước ngoài thật tự nhiên và hóm hỉnh. Hỏi lại user để duy trì cuộc trò chuyện thay vì trả lời một lần rồi kết thúc."""
+        gen_started=time.perf_counter()
+        reply, model_used, _ = _generate_chat_reply(prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=data.text, reasoning_profile="low", max_output_tokens=1400)
+        merged = session_history[-20:] + [{"role":"user","text":data.text},{"role":"model","text":reply or ""}]
+        _chat_now_append_history(user["id"], session["chatbox_id"], merged[-20:])
+        print(f"[CHAT NOW] user={user['id']} chatbox_id={session['chatbox_id']!r} history_messages={len(merged[-20:])} memory_words={len(memory_text.split()) if memory_text else 0}")
+        return {"reply":reply or "", "model":model_used, "sources":[], "images":[], "content_blocks":[{"type":"text","text":reply or ""}], "learning_progress":None, "chat_now":True, "chat_now_history_messages":len(merged[-20:]), "chat_now_memory_words":len(memory_text.split()) if memory_text else 0}
 
     # Count the daily GenAI request quota BEFORE the follow-up classifier because
     # that classifier itself calls GenAI. One normal learner turn = one quota unit.
