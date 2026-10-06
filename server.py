@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.91"
+SERVER_VERSION = "31.94"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -18523,11 +18523,13 @@ function _decodeCurriculumRichEntities(value){
 function _normalizeCurriculumBulletChars(value){
   let text=String(value??"");
   if(!text)return "";
-  const prefix=/(^|>|\n|\r)(\s*)/;
+  // Avoid literal newline escapes in the Python-generated HTML/JS string; use a
+  // multiline regex with correctly escaped backslashes in the generated script.
+  const prefix=/(^|>|\\n|\\r)([ \t]*)/;
   const mappings={"\uF0B7":"•","\uF0D8":"➢","\uF0D9":"➢","\uF0DA":"➢","\uF0DB":"➢","\uF0A7":"❖","\uF076":"❖","\uF0FC":"✓","\uF0D0":"◆"};
-  for(const [src,dst] of Object.entries(mappings)) text=text.replace(new RegExp(prefix.source+src+"(?=\\s)","g"),(_,a,b)=>a+b+dst);
-  text=text.replace(new RegExp(prefix.source+"¾(?=\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"➢");
-  text=text.replace(new RegExp(prefix.source+"□(?=\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"❖");
+  for(const [src,dst] of Object.entries(mappings)) text=text.replace(new RegExp(prefix.source+src+"(?=\\\\s)","g"),(_,a,b)=>a+b+dst);
+  text=text.replace(new RegExp(prefix.source+"¾(?=\\\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"➢");
+  text=text.replace(new RegExp(prefix.source+"□(?=\\\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"❖");
   return text;
 }
 function _sanitizeCurriculumRichHtml(value){
