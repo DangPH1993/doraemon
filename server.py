@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.94"
+SERVER_VERSION = "31.95"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -15386,27 +15386,55 @@ class _CurriculumRichTextSanitizer(HTMLParser):
 
 
 def _normalize_curriculum_bullet_chars(value):
-    """Normalize common PDF/Office bullet glyphs into portable Unicode.
+    """Normalize all common PDF/Office bullet artifacts at block starts.
 
-    Some PDF/Office clipboard sources paste Wingdings/Symbol/private-use glyphs
-    (or visible placeholder glyphs) that are not reliably rendered by browsers.
-    Only normalize when the glyph is acting as a line/block-leading bullet, so
-    ordinary prose such as a fraction ¾ remains unchanged.
+    Clipboard text from Word/PDF can contain Wingdings/Symbol private-use
+    characters, replacement boxes, or legacy mojibake. These glyphs are not
+    portable across browsers/fonts. Only a marker at the beginning of a text
+    line/HTML block is normalized; ordinary prose is left untouched.
     """
     text=str(value or '')
     if not text:
         return ''
-    prefix=r'(^|>|\n|\r)(\s*)'
+
+    # `>` matches the end of an opening/closing HTML tag, so bullets inside
+    # <p>, <div>, <span>, <br>, etc. are also recognized. Newlines cover plain text.
+    prefix=r'(^|>|\n|\r)([ \t]*)'
+
+    # Exact private-use characters commonly emitted by Wingdings/Symbol fonts.
     mappings = {
         '\uf0b7': '•', '\uf0d8': '➢', '\uf0d9': '➢', '\uf0da': '➢', '\uf0db': '➢',
-        '\uf0a7': '❖', '\uf076': '❖', '\uf0fc': '✓', '\uf0d0': '◆',
+        '\uf0a7': '•', '\uf076': '•', '\uf0fc': '✓', '\uf0d0': '•',
+        '\uf0a8': '•', '\uf0a9': '•', '\uf0aa': '•', '\uf0ab': '•',
+        '\uf0b0': '•', '\uf0b1': '•', '\uf0b2': '•', '\uf0b3': '•',
+        '\uf0b4': '•', '\uf0b5': '•', '\uf0b6': '•', '\uf0b8': '•',
+        '\uf0b9': '•', '\uf0ba': '•', '\uf0bb': '•', '\uf0bc': '•',
+        '\uf0bd': '•', '\uf0be': '•', '\uf0bf': '•', '\uf0c0': '•',
+        '\uf0c1': '•', '\uf0c2': '•', '\uf0c3': '•', '\uf0c4': '•',
+        '\uf0e0': '•', '\uf0e5': '•', '\uf0e6': '•', '\uf0e7': '•',
     }
     for src, dst in mappings.items():
-        text=re.sub(prefix + re.escape(src) + r'(?=\s)', lambda m, d=dst: m.group(1)+m.group(2)+d, text)
-    text=re.sub(prefix + r'¾(?=\s+[A-ZÀ-ỴĐ])', r'\1\2➢', text)
-    text=re.sub(prefix + r'□(?=\s+[A-ZÀ-ỴĐ])', r'\1\2❖', text)
-    return text
+        text=re.sub(prefix + re.escape(src) + r'(?=[ \t])', lambda m, d=dst: m.group(1)+m.group(2)+d, text)
 
+    # Generic fallback for a still-unknown Private Use Area bullet at block start.
+    text=re.sub(prefix + r'[\ue000-\uf8ff](?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
+
+    # Placeholder square glyphs: use the universally portable bullet instead of
+    # another symbol that may itself render as an empty square on a user's PC.
+    text=re.sub(prefix + r'[□▫▪◻◽◾◼■](?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
+    text=re.sub(prefix + r'�(?=[ \t])', lambda m: m.group(1)+m.group(2)+'•', text)
+
+    # Common legacy corruption where a bullet becomes `¾` at line/block start.
+    # Do not touch legitimate fractions such as `¾ cup`.
+    text=re.sub(prefix + r'¾(?=[ \t]+(?!cup\b|cups\b|lb\b|lbs\b|oz\b)[A-ZÀ-ỴĐ])', lambda m: m.group(1)+m.group(2)+'➢', text)
+
+    # Common UTF-8 mojibake forms.
+    mojibake={
+        'â€¢':'•', 'â–º':'➢', 'âž¢':'➢', 'â—†':'•', 'â˜…':'•', 'Â·':'•', 'Â»':'•',
+    }
+    for src,dst in mojibake.items():
+        text=re.sub(prefix + re.escape(src) + r'(?=[ \t])', lambda m,d=dst: m.group(1)+m.group(2)+d, text)
+    return text
 
 def sanitize_curriculum_rich_text(value):
     """Sanitize curriculum rich text while preserving editor formatting.
@@ -18523,13 +18551,41 @@ function _decodeCurriculumRichEntities(value){
 function _normalizeCurriculumBulletChars(value){
   let text=String(value??"");
   if(!text)return "";
-  // Avoid literal newline escapes in the Python-generated HTML/JS string; use a
-  // multiline regex with correctly escaped backslashes in the generated script.
-  const prefix=/(^|>|\\n|\\r)([ \t]*)/;
-  const mappings={"\uF0B7":"•","\uF0D8":"➢","\uF0D9":"➢","\uF0DA":"➢","\uF0DB":"➢","\uF0A7":"❖","\uF076":"❖","\uF0FC":"✓","\uF0D0":"◆"};
-  for(const [src,dst] of Object.entries(mappings)) text=text.replace(new RegExp(prefix.source+src+"(?=\\\\s)","g"),(_,a,b)=>a+b+dst);
-  text=text.replace(new RegExp(prefix.source+"¾(?=\\\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"➢");
-  text=text.replace(new RegExp(prefix.source+"□(?=\\\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"❖");
+  const prefix=/(^|>)([ \t]*)/;
+  const mappings={
+    "\uF0B7":"•","\uF0D8":"➢","\uF0D9":"➢","\uF0DA":"➢","\uF0DB":"➢",
+    "\uF0A7":"•","\uF076":"•","\uF0FC":"✓","\uF0D0":"•",
+    "\uF0A8":"•","\uF0A9":"•","\uF0AA":"•","\uF0AB":"•",
+    "\uF0B0":"•","\uF0B1":"•","\uF0B2":"•","\uF0B3":"•",
+    "\uF0B4":"•","\uF0B5":"•","\uF0B6":"•","\uF0B8":"•",
+    "\uF0B9":"•","\uF0BA":"•","\uF0BB":"•","\uF0BC":"•",
+    "\uF0BD":"•","\uF0BE":"•","\uF0BF":"•","\uF0C0":"•",
+    "\uF0C1":"•","\uF0C2":"•","\uF0C3":"•","\uF0C4":"•",
+    "\uF0E0":"•","\uF0E5":"•","\uF0E6":"•","\uF0E7":"•"
+  };
+  for(const [src,dst] of Object.entries(mappings)){
+    text=text.replace(new RegExp(prefix.source+src+"([ \t])","g"),(_,a,b,sp)=>a+b+dst+sp);
+  }
+  const chars=Array.from(text);
+  for(let i=0;i<chars.length;i++){
+    const atBlockStart=i===0 || chars[i-1]==='\n' || chars[i-1]==='\r' || chars[i-1]==='>';
+    if(!atBlockStart)continue;
+    let j=i;
+    while(j<chars.length && (chars[j]===' ' || chars[j]==='\t'))j++;
+    const cp=j<chars.length?chars[j].codePointAt(0):0;
+    if(cp>=0xE000 && cp<=0xF8FF && j+1<chars.length && (chars[j+1]===' ' || chars[j+1]==='\t')){
+      chars[j]='•';
+    }
+    if(j<chars.length && '□▫▪◻◽◾◼■�'.includes(chars[j]) && j+1<chars.length && (chars[j+1]===' ' || chars[j+1]==='\t')){
+      chars[j]='•';
+    }
+  }
+  text=chars.join('');
+  text=text.replace(new RegExp(prefix.source+"¾([ \t]+)(?!cup\\b|cups\\b|lb\\b|lbs\\b|oz\\b)([A-ZÀ-ỴĐ])","g"),(_,a,b,sp,c)=>a+b+"➢"+sp+c);
+  const mojibake={"â€¢":"•","â–º":"➢","âž¢":"➢","â—†":"•","â˜…":"•","Â·":"•","Â»":"•"};
+  for(const [src,dst] of Object.entries(mojibake)){
+    text=text.replace(new RegExp(prefix.source+src+"([ \t])","g"),(_,a,b,sp)=>a+b+dst+sp);
+  }
   return text;
 }
 function _sanitizeCurriculumRichHtml(value){
