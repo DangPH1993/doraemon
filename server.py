@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.95"
+SERVER_VERSION = "31.96"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -18568,7 +18568,8 @@ function _normalizeCurriculumBulletChars(value){
   }
   const chars=Array.from(text);
   for(let i=0;i<chars.length;i++){
-    const atBlockStart=i===0 || chars[i-1]==='\n' || chars[i-1]==='\r' || chars[i-1]==='>';
+    const prev=chars[i-1]||'';
+    const atBlockStart=i===0 || prev==='>' || prev.charCodeAt(0)===10 || prev.charCodeAt(0)===13;
     if(!atBlockStart)continue;
     let j=i;
     while(j<chars.length && (chars[j]===' ' || chars[j]==='\t'))j++;
