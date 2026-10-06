@@ -9541,6 +9541,7 @@ YÊU CẦU OUTPUT:
 - SAU phần nhận xét 6 tiêu chí và 3-5 điểm cần cải thiện, thêm đúng marker `###WEAKNESS_NOTE###` rồi viết đầy đủ các điểm yếu được xác định từ bài, không giới hạn số dòng.
 - NẾU bài essay có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc, BẮT BUỘC ghi rõ các lỗi tiêu biểu trong weakness note. Không được chỉ nói chung chung. Phải ưu tiên ghi cụ thể dạng `Từ vựng: <sai> → <đúng>` hoặc `Grammar/cấu trúc: <lỗi> → <cách đúng>`, có thể trích ngắn câu chứa lỗi.
 - Ưu tiên lưu những lỗi xuất hiện thật trong bài làm của học sinh; không tự suy đoán điểm yếu từ phong cách viết nếu không có ví dụ/bằng chứng cụ thể.
+- Cuối cùng viết mẫu một bài essay theo gợi ý đạt điểm từ 8.0 - 9.0
 """
                     gen_started=time.perf_counter()
                     evaluation,response_model,gen_elapsed=_generate_chat_reply(q_prompt,content_type='Luyện viết',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=2800)
@@ -15384,6 +15385,29 @@ class _CurriculumRichTextSanitizer(HTMLParser):
         self.out.append(data)
 
 
+def _normalize_curriculum_bullet_chars(value):
+    """Normalize common PDF/Office bullet glyphs into portable Unicode.
+
+    Some PDF/Office clipboard sources paste Wingdings/Symbol/private-use glyphs
+    (or visible placeholder glyphs) that are not reliably rendered by browsers.
+    Only normalize when the glyph is acting as a line/block-leading bullet, so
+    ordinary prose such as a fraction ¾ remains unchanged.
+    """
+    text=str(value or '')
+    if not text:
+        return ''
+    prefix=r'(^|>|\n|\r)(\s*)'
+    mappings = {
+        '\uf0b7': '•', '\uf0d8': '➢', '\uf0d9': '➢', '\uf0da': '➢', '\uf0db': '➢',
+        '\uf0a7': '❖', '\uf076': '❖', '\uf0fc': '✓', '\uf0d0': '◆',
+    }
+    for src, dst in mappings.items():
+        text=re.sub(prefix + re.escape(src) + r'(?=\s)', lambda m, d=dst: m.group(1)+m.group(2)+d, text)
+    text=re.sub(prefix + r'¾(?=\s+[A-ZÀ-ỴĐ])', r'\1\2➢', text)
+    text=re.sub(prefix + r'□(?=\s+[A-ZÀ-ỴĐ])', r'\1\2❖', text)
+    return text
+
+
 def sanitize_curriculum_rich_text(value):
     """Sanitize curriculum rich text while preserving editor formatting.
 
@@ -15395,6 +15419,7 @@ def sanitize_curriculum_rich_text(value):
     if not text:
         return ''
     text=_decode_curriculum_html_entities(text)
+    text=_normalize_curriculum_bullet_chars(text)
     if not re.search(r'<\s*(?:b|strong|i|em|u|s|strike|br|p|div|span|center|h[1-6]|ul|ol|li|img)\b', text, flags=re.I):
         return text
     try:
@@ -18495,8 +18520,18 @@ function _decodeCurriculumRichEntities(value){
   }
   return out;
 }
+function _normalizeCurriculumBulletChars(value){
+  let text=String(value??"");
+  if(!text)return "";
+  const prefix=/(^|>|\n|\r)(\s*)/;
+  const mappings={"\uF0B7":"•","\uF0D8":"➢","\uF0D9":"➢","\uF0DA":"➢","\uF0DB":"➢","\uF0A7":"❖","\uF076":"❖","\uF0FC":"✓","\uF0D0":"◆"};
+  for(const [src,dst] of Object.entries(mappings)) text=text.replace(new RegExp(prefix.source+src+"(?=\\s)","g"),(_,a,b)=>a+b+dst);
+  text=text.replace(new RegExp(prefix.source+"¾(?=\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"➢");
+  text=text.replace(new RegExp(prefix.source+"□(?=\\s+[A-ZÀ-ỴĐ])","g"),(_,a,b)=>a+b+"❖");
+  return text;
+}
 function _sanitizeCurriculumRichHtml(value){
-  let src=_decodeCurriculumRichEntities(value);
+  let src=_normalizeCurriculumBulletChars(_decodeCurriculumRichEntities(value));
   if(!src)return '';
   const box=document.createElement('div');
   const hasMarkup=/<\\s*(?:b|strong|i|em|u|s|strike|br|p|div|span|center|h[1-6]|ul|ol|li|img)\\b/i.test(src);
@@ -18585,7 +18620,7 @@ function _curriculumRichEditor(code, value){
       `<input id="${fileId}" type="file" accept="image/*" style="display:none" onchange="uploadCurriculumImageFile(this,${JSON.stringify(String(code))})">`+
       `<span class="small" style="margin-left:5px;color:#64748b">Có thể upload ảnh hoặc paste ảnh trực tiếp vào ô nội dung</span>`+
     `</div>`+
-    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:normal;line-height:1.55">${safe}</div>`+
+    `<div class="cur-rich" data-code="${esc(code)}" contenteditable="true" spellcheck="false" style="min-height:150px;padding:10px 12px;outline:none;white-space:normal;line-height:1.55;font-family:Segoe UI,Segoe UI Symbol,Noto Sans Symbols,Noto Sans Symbols 2,Arial Unicode MS,Arial,sans-serif">${safe}</div>`+
   `</div>`;
 }
 window._curriculumImageSelection={};
@@ -18623,10 +18658,19 @@ function uploadCurriculumImageFile(input,code){const file=input?.files?.[0]; if(
 document.addEventListener('paste',function(ev){
   const editor=ev.target?.closest?.('.cur-rich'); if(!editor)return;
   const imageItem=[...(ev.clipboardData?.items||[])].find(x=>x.kind==='file'&&String(x.type||'').startsWith('image/'));
-  if(!imageItem)return;
-  const blob=imageItem.getAsFile(); if(!blob)return;
-  ev.preventDefault(); saveCurriculumSelectionForImage(editor);
-  uploadCurriculumImageBlob(String(editor.getAttribute('data-code')||''),blob,'pasted-image.png');
+  if(imageItem){
+    const blob=imageItem.getAsFile(); if(!blob)return;
+    ev.preventDefault(); saveCurriculumSelectionForImage(editor);
+    uploadCurriculumImageBlob(String(editor.getAttribute('data-code')||''),blob,'pasted-image.png');
+    return;
+  }
+  const plain=String(ev.clipboardData?.getData('text/plain')||'');
+  const normalized=_normalizeCurriculumBulletChars(plain);
+  if(plain!==normalized){
+    ev.preventDefault();
+    editor.focus();
+    document.execCommand('insertText',false,normalized);
+  }
 });
 function formatCurriculumText(command){
   const sel=window.getSelection(); const anchor=sel?.anchorNode;
