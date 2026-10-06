@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "31.97"
+SERVER_VERSION = "31.99"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7622,6 +7622,12 @@ def proxy_chat(
             print(f"[CHATBOX RESET] new_chatbox=1 legacy session -> closing previous lesson={old_session.get('lesson')!r}")
             _finish_study_session(user["id"])
     study_session = _get_study_session(user["id"], data.chatbox_id)
+    # GENERAL LESSON ROUTING RULE:
+    # A concrete active study lesson owns the current chatbox. Do not use the
+    # catalog lesson router on ordinary messages while that lesson is active;
+    # only an explicit thread switch may re-enable catalog routing.
+    _early_active_session_scope = _active_session_scope(study_session)
+    _lesson_router_enabled = not bool(_early_active_session_scope)
     selected_course_id, selected_course_name, authorized_courses = _resolve_request_course(user["id"], data.course_id)
     print(f"[COURSE SCOPE SELECTED] user={user['id']} course_id={selected_course_id!r} course={selected_course_name!r}")
     if selected_course_id is None and study_session and study_session.get("course"):
@@ -8618,6 +8624,28 @@ Câu hỏi của người dùng:
     # "chuyển sang..." request is the explicit exception that allows switching.
     thread_scope = _extract_thread_scope(recent_history, catalog)
     thread_switch_requested = _is_explicit_thread_switch(query_text)
+    if thread_switch_requested:
+        _lesson_router_enabled = True
+    if _early_active_session_scope and not thread_switch_requested:
+        print(
+            f"[CHAT LESSON ROUTER] disabled active_lesson={_early_active_session_scope.get('lesson')!r} "
+            f"content_type={_early_active_session_scope.get('content_type')!r} reason=active_study_session"
+        )
+    else:
+        print(
+            f"[CHAT LESSON ROUTER] enabled=1 reason={'explicit_switch' if thread_switch_requested else 'new_session'}"
+        )
+
+    # A concrete active lesson owns this chatbox unless the learner explicitly
+    # switches threads. This flag is defined before any lesson-confirmation
+    # routing so all later branches can use the same rule consistently.
+    active_lesson_thread_lock = bool(
+        _early_active_session_scope
+        and not thread_switch_requested
+        and not data.action
+        and not lesson_confirmed_scope
+        and not forced_plan_scope
+    )
     next_lesson_scope = None
 
     # Referential follow-ups and explicit acknowledgements should resolve to the
@@ -8795,9 +8823,11 @@ Tin nhắn hiện tại:
             "learning_progress": None,
         }
 
-    named_lesson_topic = _explicit_lesson_topic(low, catalog)
+    named_lesson_topic = _explicit_lesson_topic(low, catalog) if _lesson_router_enabled else None
 
-    if ambiguous_study_request:
+    if _early_active_session_scope and not thread_switch_requested and not data.action:
+        requested_scope = dict(_early_active_session_scope)
+    elif ambiguous_study_request:
         requested_scope = {"course": None, "content_type": None, "lesson": None, "topic": None}
     elif named_lesson_topic:
         requested_scope = {
@@ -8825,7 +8855,7 @@ Tin nhắn hiện tại:
     # catalog stores lesson="Bộ thủ" but does not store the individual term as
     # topic. The lesson is still authoritative; the actual term is left in the
     # semantic text query so the text chunk is selected inside that lesson.
-    if not named_lesson_topic:
+    if _lesson_router_enabled and not named_lesson_topic:
         if re.search(r"\bbộ\s+[^\s]+", low, flags=re.UNICODE):
             requested_scope["content_type"] = "Từ vựng"
             requested_scope["lesson"] = "Bộ thủ"
@@ -8833,7 +8863,47 @@ Tin nhắn hiện tại:
             requested_scope["content_type"] = "Từ vựng"
             requested_scope["lesson"] = "Kanji"
 
-    requested_content_type = requested_scope.get("content_type")
+    # WRITING THREAD LOCK:
+    # When a learner is in a Luyện viết thread and the previous assistant turn
+    # explicitly asked them to write/submit the essay, the essay itself may contain
+    # ordinary catalog words such as "first" that happen to match another lesson.
+    # In that situation the current submission MUST stay in the writing lesson.
+    # Only an explicit thread switch is allowed to override this lock.
+    _writing_thread_prompt_markers = (
+        "viết bài essay", "viet bai essay", "hãy viết bài", "hay viet bai",
+        "giờ cậu hãy viết", "gio cau hay viet", "gửi cho doraemon",
+        "gui cho doraemon", "write your essay", "write an essay"
+    )
+    _recent_writing_prompt = any(
+        any(marker in str(h.get("text") or "").casefold() for marker in _writing_thread_prompt_markers)
+        for h in recent_history
+        if str(h.get("role") or "").casefold() == "model"
+    )
+    _essay_shape = bool(
+        len(str(query_text or "").strip()) >= 180
+        and ("\n" in str(query_text or "") or len(re.findall(r"[.!?]", str(query_text or ""))) >= 4)
+    )
+    writing_thread_submission = bool(
+        thread_scope
+        and _normalize_content_type(thread_scope.get("content_type")) == "Luyện viết"
+        and not thread_switch_requested
+        and not data.action
+        and _recent_writing_prompt
+        and _essay_shape
+    )
+    if writing_thread_submission:
+        requested_scope = dict(thread_scope)
+        requested_content_type = requested_scope.get("content_type")
+        requested_course = requested_scope.get("course") or selected_course_name
+        requested_lesson = requested_scope.get("lesson")
+        requested_topic = requested_scope.get("topic")
+        print(
+            f"[WRITING THREAD LOCK] request={request_id} lesson={requested_lesson!r} "
+            f"content_type={requested_content_type!r} essay_chars={len(str(query_text or '').strip())} "
+            f"reason=essay_submission_context"
+        )
+    else:
+        requested_content_type = requested_scope.get("content_type")
     requested_course = selected_course_name or requested_scope.get("course")
     requested_course_id = selected_course_id
     requested_scope["course"] = requested_course
@@ -8993,7 +9063,10 @@ Tin nhắn hiện tại:
         }
 
     # Explicit current-message lesson target should be confirmed before RAG.
-    if lesson_confirmation_scope is None and (named_lesson_topic or _is_specific_lesson_request(query_text)) and not forced_plan_scope and not data.action:
+    # Skip lesson confirmation routing while a concrete lesson is active; the
+    # active lesson remains authoritative unless the learner explicitly switches.
+    _allow_lesson_confirmation_router = bool(_lesson_router_enabled and not active_lesson_thread_lock)
+    if lesson_confirmation_scope is None and _allow_lesson_confirmation_router and (named_lesson_topic or _is_specific_lesson_request(query_text)) and not forced_plan_scope and not data.action:
         if named_lesson_topic:
             lesson_confirmation_scope = {
                 "course_id": selected_course_id,
@@ -9100,6 +9173,7 @@ Tin nhắn hiện tại:
     )
     recommendation_only_request = bool(
         wants_recommendation
+        and not _early_active_session_scope
         and not current_message_has_concrete_target
         and not forced_plan_scope
         and not data.action
@@ -9155,6 +9229,20 @@ Tin nhắn hiện tại:
     # the correction sentence (e.g. "Bài 1" appearing in an old reply).
     correction_followup = _is_correction_followup(query_text) and bool(recent_history)
 
+    # General active-lesson lock applies to every content type.
+    if active_lesson_thread_lock:
+        requested_scope = dict(_early_active_session_scope)
+        requested_content_type = requested_scope.get("content_type")
+        requested_course = requested_scope.get("course") or selected_course_name
+        requested_course_id = selected_course_id
+        requested_lesson = requested_scope.get("lesson")
+        requested_topic = requested_scope.get("topic")
+        named_lesson_topic = None
+        print(
+            f"[ACTIVE LESSON LOCK] request={request_id} lesson={requested_lesson!r} "
+            f"content_type={requested_content_type!r} lesson_router=off"
+        )
+
     # Current-thread context wins unless the student explicitly asks to switch
     # to another lesson/section. A correction always wins over any accidental
     # lesson keyword in the current sentence.
@@ -9162,7 +9250,7 @@ Tin nhắn hiện tại:
     # (or when this is an explicit correction follow-up). A NEW_TOPIC must not
     # inherit the previous chat thread context.
     thread_scope_locked = bool(
-        chat_followup_detected
+        (chat_followup_detected or writing_thread_submission or active_lesson_thread_lock)
         and thread_scope
         and not thread_switch_requested
         and not named_lesson_topic
