@@ -95,6 +95,7 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip()
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Doraemon").strip() or "Doraemon"
 DORAEMON_WEB_URL = (os.getenv("DORAEMON_WEB_URL", "") or os.getenv("WEB_URL", "")).strip().rstrip("/")
+APP_DOWNLOAD_URL = (os.getenv("DORAEMON_APP_DOWNLOAD_URL", "") or os.getenv("APP_DOWNLOAD_URL", "")).strip()
 PASSWORD_RESET_TTL_MINUTES = max(5, min(60, int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "20"))))
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
@@ -139,7 +140,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "32.00"
+SERVER_VERSION = "33.01"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -21601,6 +21602,12 @@ def admin_status(user_id:int,data:dict):
         conn.commit()
     finally: conn.close()
     return {"success":True,"status":status}
+
+
+@app.get("/public/config")
+def public_config():
+    """Return non-sensitive public runtime configuration for the static landing page."""
+    return {"app_download_url": APP_DOWNLOAD_URL or None}
 
 
 @app.get("/")
