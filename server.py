@@ -138,8 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v33.03 — Forum UX refresh + Admin Forum management
-SERVER_VERSION = "33.08-forum-pagination"
+# VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
+SERVER_VERSION = "32.00"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -490,40 +490,6 @@ def init_db():
                 UNIQUE(user_id, chatbox_id)
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_now_sessions_user_status ON chat_now_sessions(user_id,status,updated_at DESC);")
-
-            # Lightweight community forum. Text-only by design: no image/blob storage.
-            # User identity is resolved from the existing users.username field.
-            cur.execute("""CREATE TABLE IF NOT EXISTS forum_posts (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                title VARCHAR(180) NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS forum_comments (
-                id BIGSERIAL PRIMARY KEY,
-                post_id BIGINT NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
-                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS forum_notifications (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                post_id BIGINT NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
-                comment_id BIGINT NOT NULL REFERENCES forum_comments(id) ON DELETE CASCADE,
-                notification_type VARCHAR(40) NOT NULL DEFAULT 'post_reply',
-                is_read BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );""")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_posts_created ON forum_posts(created_at DESC, id DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_comments_post_created ON forum_comments(post_id, created_at ASC, id ASC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_read ON forum_notifications(user_id, is_read, created_at DESC);")
-
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_post
-                ON forum_notifications(user_id, post_id, created_at DESC);""")
-
             cur.execute("""CREATE TABLE IF NOT EXISTS payment_packages (
                 months INTEGER PRIMARY KEY,
                 plan_name VARCHAR(50) NOT NULL,
@@ -7816,376 +7782,6 @@ def chat_now_end(data: dict, authorization: Optional[str] = Header(default=None)
     return {"success":True, **result}
 
 
-# -----------------------------------------------------------------------------
-# Forum / community
-# -----------------------------------------------------------------------------
-
-FORUM_POST_TITLE_MAX = 180
-FORUM_POST_CONTENT_MAX = 5000
-FORUM_COMMENT_MAX = 3000
-FORUM_DEFAULT_LIMIT = 12
-FORUM_MAX_LIMIT = 30
-
-
-def _forum_clean_text(value, max_chars):
-    text = str(value or "").replace("\x00", "").strip()
-    if not text:
-        return ""
-    return text[:max_chars]
-
-
-def _forum_user_public_username(user):
-    username = str((user or {}).get("username") or "").strip()
-    if username:
-        return username
-    # Existing accounts created before username was mandatory may still have a
-    # null username. Keep the forum usable without exposing email/phone.
-    nickname = str((user or {}).get("nickname") or "").strip()
-    return nickname or "user"
-
-
-@app.get("/forum/posts")
-def forum_list_posts(
-    authorization: Optional[str] = Header(default=None),
-    limit: int = FORUM_DEFAULT_LIMIT,
-    offset: int = 0,
-):
-    """Return Forum posts in pages for the Web client's lazy loader."""
-    user = require_active_user(authorization)
-    limit = max(1, min(FORUM_MAX_LIMIT, int(limit or FORUM_DEFAULT_LIMIT)))
-    offset = max(0, int(offset or 0))
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """SELECT p.id,p.user_id,p.title,p.content,p.created_at,p.updated_at,
-                          COALESCE(u.username,u.nickname,'user') AS username,
-                          COUNT(c.id)::int AS comment_count
-                     FROM forum_posts p
-                     JOIN users u ON u.id=p.user_id
-                     LEFT JOIN forum_comments c ON c.post_id=p.id
-                    GROUP BY p.id,u.id
-                    ORDER BY p.created_at DESC,p.id DESC
-                    LIMIT %s OFFSET %s""",
-                (limit, offset),
-            )
-            rows = [dict(r) for r in cur.fetchall() or []]
-    finally:
-        conn.close()
-
-    for row in rows:
-        row["is_mine"] = int(row.get("user_id") or 0) == int(user["id"])
-        row["comment_count"] = int(row.get("comment_count") or 0)
-    has_more = len(rows) >= limit
-    return {
-        "posts": rows,
-        "limit": limit,
-        "offset": offset,
-        "next_offset": offset + len(rows),
-        "has_more": has_more,
-    }
-
-
-@app.post("/forum/posts")
-def forum_create_post(
-    data: dict,
-    authorization: Optional[str] = Header(default=None),
-):
-    user = require_active_user(authorization)
-    title = _forum_clean_text(data.get("title"), FORUM_POST_TITLE_MAX)
-    content = _forum_clean_text(data.get("content"), FORUM_POST_CONTENT_MAX)
-    if not title:
-        raise HTTPException(400, "Tiêu đề bài viết không được để trống.")
-    if not content:
-        raise HTTPException(400, "Nội dung bài viết không được để trống.")
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """INSERT INTO forum_posts(user_id,title,content)
-                       VALUES(%s,%s,%s)
-                    RETURNING id,user_id,title,content,created_at,updated_at""",
-                (int(user["id"]), title, content),
-            )
-            row = dict(cur.fetchone())
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    row["username"] = _forum_user_public_username(user)
-    row["comment_count"] = 0
-    row["is_mine"] = True
-    return {"success": True, "post": row}
-
-
-@app.put("/forum/posts/{post_id}")
-@app.post("/forum/posts/{post_id}/edit")
-def forum_update_post(
-    post_id: int,
-    data: dict,
-    authorization: Optional[str] = Header(default=None),
-):
-    """Edit a Forum post. Only the original author can edit it."""
-    user = require_active_user(authorization)
-    title = _forum_clean_text(data.get("title"), FORUM_POST_TITLE_MAX)
-    content = _forum_clean_text(data.get("content"), FORUM_POST_CONTENT_MAX)
-    if not title:
-        raise HTTPException(400, "Tiêu đề bài viết không được để trống.")
-    if not content:
-        raise HTTPException(400, "Nội dung bài viết không được để trống.")
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """UPDATE forum_posts
-                      SET title=%s, content=%s, updated_at=NOW()
-                    WHERE id=%s AND user_id=%s
-                RETURNING id,user_id,title,content,created_at,updated_at""",
-                (title, content, int(post_id), int(user["id"])),
-            )
-            row = cur.fetchone()
-            if not row:
-                cur.execute("SELECT 1 FROM forum_posts WHERE id=%s LIMIT 1", (int(post_id),))
-                if cur.fetchone():
-                    raise HTTPException(403, "Cậu chỉ có thể sửa bài viết của chính mình.")
-                raise HTTPException(404, "Không tìm thấy bài Forum.")
-            row = dict(row)
-            cur.execute("SELECT COUNT(*)::int AS comment_count FROM forum_comments WHERE post_id=%s", (int(post_id),))
-            count_row = cur.fetchone() or {}
-            row["comment_count"] = int(count_row.get("comment_count") or 0)
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    row["username"] = _forum_user_public_username(user)
-    row["is_mine"] = True
-    return {"success": True, "post": row}
-
-
-@app.delete("/forum/posts/{post_id}")
-def forum_delete_post(
-    post_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
-    """Delete a Forum post. Only the original author can delete it."""
-    user = require_active_user(authorization)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM forum_posts WHERE id=%s AND user_id=%s",
-                (int(post_id), int(user["id"])),
-            )
-            deleted = cur.rowcount
-            if deleted != 1:
-                cur.execute("SELECT 1 FROM forum_posts WHERE id=%s LIMIT 1", (int(post_id),))
-                exists = cur.fetchone() is not None
-                if exists:
-                    raise HTTPException(403, "Cậu chỉ có thể xóa bài viết của chính mình.")
-                raise HTTPException(404, "Không tìm thấy bài Forum.")
-        conn.commit()
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return {"success": True, "deleted": 1, "post_id": int(post_id)}
-
-
-@app.get("/forum/posts/{post_id}/comments")
-def forum_list_comments(
-    post_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
-    user = require_active_user(authorization)
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id,user_id,title,content,created_at FROM forum_posts WHERE id=%s LIMIT 1", (post_id,))
-            post = cur.fetchone()
-            if not post:
-                raise HTTPException(404, "Không tìm thấy bài viết.")
-            cur.execute(
-                """SELECT c.id,c.post_id,c.user_id,c.content,c.created_at,
-                          COALESCE(u.username,u.nickname,'user') AS username
-                     FROM forum_comments c
-                     JOIN users u ON u.id=c.user_id
-                    WHERE c.post_id=%s
-                    ORDER BY c.created_at ASC,c.id ASC""",
-                (post_id,),
-            )
-            comments = [dict(r) for r in cur.fetchall() or []]
-    finally:
-        conn.close()
-    for item in comments:
-        item["is_mine"] = int(item.get("user_id") or 0) == int(user["id"])
-    return {"post": dict(post), "comments": comments}
-
-
-@app.post("/forum/posts/{post_id}/comments")
-def forum_create_comment(
-    post_id: int,
-    data: dict,
-    authorization: Optional[str] = Header(default=None),
-):
-    user = require_active_user(authorization)
-    content = _forum_clean_text(data.get("content"), FORUM_COMMENT_MAX)
-    if not content:
-        raise HTTPException(400, "Bình luận không được để trống.")
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id,user_id FROM forum_posts WHERE id=%s LIMIT 1", (post_id,))
-            post = cur.fetchone()
-            if not post:
-                raise HTTPException(404, "Không tìm thấy bài viết.")
-
-            cur.execute(
-                """INSERT INTO forum_comments(post_id,user_id,content)
-                       VALUES(%s,%s,%s)
-                    RETURNING id,post_id,user_id,content,created_at""",
-                (post_id, int(user["id"]), content),
-            )
-            comment = dict(cur.fetchone())
-
-            # Notify only the post owner and never notify a user about their own reply.
-            owner_id = int(post["user_id"])
-            commenter_id = int(user["id"])
-            if owner_id != commenter_id:
-                cur.execute(
-                    """INSERT INTO forum_notifications(user_id,post_id,comment_id,notification_type)
-                           VALUES(%s,%s,%s,'post_reply')
-                        RETURNING id,created_at""",
-                    (owner_id, post_id, int(comment["id"])),
-                )
-                notification = cur.fetchone()
-            else:
-                notification = None
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    comment["username"] = _forum_user_public_username(user)
-    comment["is_mine"] = True
-    return {"success": True, "comment": comment, "notification_created": bool(notification)}
-
-
-@app.get("/forum/notifications")
-def forum_notifications(
-    authorization: Optional[str] = Header(default=None),
-    unread_only: bool = True,
-    limit: int = 20,
-):
-    user = require_active_user(authorization)
-    limit = max(1, min(50, int(limit or 20)))
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            where = "n.user_id=%s"
-            params = [int(user["id"])]
-            if unread_only:
-                where += " AND n.is_read=FALSE"
-            cur.execute(
-                f"""SELECT n.id,n.post_id,n.comment_id,n.notification_type,n.is_read,n.created_at,
-                           p.title,p.user_id AS post_owner_id,
-                           COALESCE(u.username,u.nickname,'user') AS username,
-                           LEFT(c.content,160) AS comment_preview
-                      FROM forum_notifications n
-                      JOIN forum_posts p ON p.id=n.post_id
-                      JOIN forum_comments c ON c.id=n.comment_id
-                      JOIN users u ON u.id=c.user_id
-                     WHERE {where}
-                     ORDER BY n.created_at DESC,n.id DESC
-                     LIMIT %s""",
-                tuple(params + [limit]),
-            )
-            rows = [dict(r) for r in cur.fetchall() or []]
-            cur.execute(
-                "SELECT COUNT(*)::int AS unread_count FROM forum_notifications WHERE user_id=%s AND is_read=FALSE",
-                (int(user["id"]),),
-            )
-            unread_count = int((cur.fetchone() or {}).get("unread_count") or 0)
-    finally:
-        conn.close()
-    return {"notifications": rows, "unread_count": unread_count}
-
-
-@app.post("/forum/notifications/read")
-def forum_notifications_read(
-    data: dict,
-    authorization: Optional[str] = Header(default=None),
-):
-    user = require_active_user(authorization)
-    notification_ids = data.get("notification_ids")
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            if isinstance(notification_ids, list) and notification_ids:
-                ids = []
-                for value in notification_ids[:100]:
-                    try:
-                        ids.append(int(value))
-                    except Exception:
-                        continue
-                if ids:
-                    cur.execute(
-                        "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND id=ANY(%s)",
-                        (int(user["id"]), ids),
-                    )
-            else:
-                cur.execute(
-                    "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND is_read=FALSE",
-                    (int(user["id"]),),
-                )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return {"success": True}
-
-
-@app.post("/forum/notifications/{notification_id}/read")
-def forum_notification_read_one(
-    notification_id: int,
-    authorization: Optional[str] = Header(default=None),
-):
-    user = require_active_user(authorization)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE forum_notifications SET is_read=TRUE WHERE id=%s AND user_id=%s",
-                (notification_id, int(user["id"])),
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return {"success": True}
-
-
 @app.post("/api/proxy-chat")
 def proxy_chat(
     data: ChatRequest,
@@ -8219,14 +7815,58 @@ def proxy_chat(
             session_history = _normalize_chat_history(data.chat_history, max_messages=20)
         memory = _chat_now_get_knowledge(user["id"])
         memory_text = str(memory.get("knowledge") or "").strip()
-        language = str(tutor_course_info.get("language") or "en").strip().lower() or "en"
-        language_label = {"en":"English","ja":"Japanese","jp":"Japanese","ko":"Korean","zh":"Chinese","fr":"French","de":"German","es":"Spanish"}.get(language, language)
+
+        # Deterministic Chat Now prompt contract:
+        # 1) saved user knowledge
+        # 2) latest 10 exchanges / 20 messages
+        # 3) English-only friendly/humorous foreign-friend role-play
+        # 4) brief correction when needed
+        # 5) every Chat Now message is FOLLOW_UP
         scenario_hint = (
-            "Chọn một tình huống role-play nhẹ nhàng, hơi hài hước và thay đổi linh hoạt giữa các phiên "
-            "(ví dụ: quán cà phê, đồng nghiệp, sân bay, hàng xóm, cửa hàng, du lịch, lớp học)."
+            "Use a light, natural role-play situation that can vary between sessions "
+            "(for example: cafe, coworker, airport, neighbor, shop, travel, classroom)."
         )
-        history_text = "\n".join(f"{str(h.get('role') or 'user').upper()}: {str(h.get('text') or '')[-1400:]}" for h in session_history[-20:] if isinstance(h,dict))
-        prompt = f"""Bạn là một người bạn nước ngoài hư cấu đang trò chuyện với user trong chế độ Chat Now của Doraemon.\n\nMỤC TIÊU: tạo một cuộc hội thoại tự nhiên, vui vẻ, có tính nhập vai. Không dạy theo lesson/curriculum. Không dùng lesson router, không nhắc bài học.\n\n{scenario_hint}\n\nNGÔN NGỮ: hãy trò chuyện bằng {language_label}.\n\nSỬ DỤNG HIỂU BIẾT VỀ USER:\n{memory_text or '(Chưa có thông tin bền vững về user.)'}\nChỉ dùng những thông tin này như chi tiết hội thoại tự nhiên; không kể lại danh sách hồ sơ.\n\nQUY TẮC SỬA LỖI:\n- Nếu user viết sai ngữ pháp/từ vựng/cách diễn đạt rõ ràng, vẫn tiếp tục trò chuyện tự nhiên nhưng thêm một phần ngắn ở cuối: **Correction** / **Gợi ý sửa**.\n- Nêu câu user viết, câu sửa tự nhiên hơn và giải thích rất ngắn.\n- Không sửa những lỗi đánh máy rất nhỏ nếu không ảnh hưởng nghĩa.\n- Không biến toàn bộ cuộc trò chuyện thành bài giảng.\n\nLỊCH SỬ TỐI ĐA 10 LƯỢT TRAO ĐỔI:\n{history_text or '(Đây là tin nhắn mở đầu.)'}\n\nTIN NHẮN HIỆN TẠI:\n{data.text}\n\nHãy đóng vai một người bạn nước ngoài thật tự nhiên và hóm hỉnh. Hỏi lại user để duy trì cuộc trò chuyện thay vì trả lời một lần rồi kết thúc."""
+        history_text = "\n".join(
+            f"{str(h.get('role') or 'user').upper()}: {str(h.get('text') or '')[-1400:]}"
+            for h in session_history[-20:]
+            if isinstance(h, dict) and str(h.get('text') or '').strip()
+        )
+
+        prompt = f"""You are a fictional foreign friend chatting with the user in Doraemon's Chat Now mode.
+
+CHAT NOW CONTRACT:
+- Classification: FOLLOW_UP. Treat EVERY Chat Now user message as a continuation of the current conversation.
+- Do NOT run or imitate a lesson router, learning-intent router, lesson selection, Study Plan, RAG, Pinecone, curriculum teaching, or review flow.
+- LANGUAGE: ALWAYS reply in English, regardless of the course language or the language used by the user.
+- PERSONA: be friendly, witty, natural, and conversational, like a close foreign friend.
+- Respond to the current message using the recent conversation context.
+- Keep the conversation moving by asking a natural follow-up when appropriate.
+- Do not turn the conversation into a lesson unless a correction is genuinely useful.
+
+{scenario_hint}
+
+USER KNOWLEDGE:
+{memory_text or "(No saved user knowledge yet.)"}
+Use this only as natural conversational context. Do not expose it as a profile or list.
+
+RECENT CHAT HISTORY — LATEST 10 EXCHANGES (MAX 20 MESSAGES):
+{history_text or "(This is the opening message.)"}
+
+CURRENT USER MESSAGE:
+{data.text}
+
+CORRECTION RULE:
+- If the user's English has a clear grammar, vocabulary, or natural-expression mistake, continue the conversation naturally and add a brief **Correction** section at the end.
+- Show the user's wording, a more natural/correct version, and a very short explanation.
+- Do not correct tiny typos unless they affect meaning.
+- Do not over-explain or turn the reply into a grammar lesson.
+
+IMPORTANT:
+- The current message is ALWAYS FOLLOW_UP.
+- Reply ONLY in English.
+- Use recent history and saved user knowledge together so the reply feels continuous and personal.
+"""
+        print(f"[CHAT NOW FOLLOW-UP] request={request_id} classification=FOLLOW_UP history_messages={len(session_history[-20:])} knowledge_words={len(memory_text.split()) if memory_text else 0}")
         gen_started=time.perf_counter()
         reply, model_used, _ = _generate_chat_reply(prompt, content_type=None, request_id=request_id, gen_started=gen_started, user_text=data.text, reasoning_profile="low", max_output_tokens=1400)
         merged = session_history[-20:] + [{"role":"user","text":data.text},{"role":"model","text":reply or ""}]
@@ -18543,126 +18183,6 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
         'pinecone_old_vectors_cleaned':pinecone_cleanup,
     }
 
-
-# ============================================================
-# Admin Forum management
-# ============================================================
-@app.get("/admin/api/forum/posts")
-def admin_forum_posts(
-    password: str,
-    date_from: str = "",
-    date_to: str = "",
-    q: str = "",
-    limit: int = 200,
-):
-    """Return Forum posts for Admin with optional inclusive date filtering."""
-    check_admin(password)
-    limit = max(1, min(500, int(limit or 200)))
-    date_from = str(date_from or "").strip()
-    date_to = str(date_to or "").strip()
-    q = str(q or "").strip()
-
-    # Validate dates explicitly so malformed filters return a useful 400 instead
-    # of relying on a database cast error.
-    import datetime as _dt
-    for label, value in (("date_from", date_from), ("date_to", date_to)):
-        if value:
-            try:
-                _dt.date.fromisoformat(value)
-            except Exception:
-                raise HTTPException(400, f"{label} phải có dạng YYYY-MM-DD.")
-    if date_from and date_to and date_from > date_to:
-        raise HTTPException(400, "Ngày bắt đầu không được lớn hơn ngày kết thúc.")
-
-    where = []
-    params = []
-    if date_from:
-        where.append("p.created_at >= %s::date")
-        params.append(date_from)
-    if date_to:
-        where.append("p.created_at < (%s::date + INTERVAL '1 day')")
-        params.append(date_to)
-    if q:
-        where.append("(p.title ILIKE %s OR p.content ILIKE %s OR COALESCE(u.username,u.nickname,'') ILIKE %s)")
-        like = f"%{q}%"
-        params.extend([like, like, like])
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
-    conn = db()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                f"""SELECT p.id,p.user_id,p.title,p.content,p.created_at,p.updated_at,
-                           COALESCE(u.username,u.nickname,'user') AS username,
-                           COALESCE(u.email,'') AS email,
-                           COUNT(c.id)::int AS comment_count
-                      FROM forum_posts p
-                      JOIN users u ON u.id=p.user_id
-                      LEFT JOIN forum_comments c ON c.post_id=p.id
-                      {where_sql}
-                     GROUP BY p.id,u.id
-                     ORDER BY p.created_at DESC,p.id DESC
-                     LIMIT %s""",
-                tuple(params + [limit]),
-            )
-            rows = [dict(r) for r in cur.fetchall() or []]
-    finally:
-        conn.close()
-    return {"posts": rows, "count": len(rows), "date_from": date_from or None, "date_to": date_to or None, "query": q}
-
-
-@app.post("/admin/api/forum/posts/{post_id}/delete")
-def admin_forum_delete_post(post_id: int, password: str = ""):
-    """Delete one Forum post and its comments/notifications via FK cascades."""
-    check_admin(password)
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM forum_posts WHERE id=%s", (int(post_id),))
-            deleted = cur.rowcount
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    if deleted != 1:
-        raise HTTPException(404, "Không tìm thấy bài Forum.")
-    return {"success": True, "deleted": 1, "post_id": int(post_id)}
-
-
-@app.post("/admin/api/forum/posts/delete-bulk")
-def admin_forum_delete_bulk(data: dict):
-    """Delete many Forum posts selected by Admin."""
-    check_admin(str(data.get("password") or "").strip())
-    raw_ids = data.get("post_ids")
-    if not isinstance(raw_ids, list):
-        raise HTTPException(400, "post_ids phải là một danh sách.")
-    ids = []
-    for value in raw_ids[:500]:
-        try:
-            n = int(value)
-        except Exception:
-            continue
-        if n > 0 and n not in ids:
-            ids.append(n)
-    if not ids:
-        raise HTTPException(400, "Chưa chọn bài Forum nào để xóa.")
-
-    conn = db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM forum_posts WHERE id=ANY(%s)", (ids,))
-            deleted = cur.rowcount
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-    return {"success": True, "deleted": int(deleted), "requested": len(ids)}
-
-
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
@@ -18690,7 +18210,7 @@ button.gray{background:#666}button.red{background:#d93025}
 .msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
 .meta{font-size:11px;color:#777;margin-top:3px}
 .chatbar{display:flex;gap:7px;margin-top:10px}.chatbar input{flex:1}
-.small{font-size:13px;color:#666}\n.forum-admin-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.forum-admin-toolbar label{font-size:12px;font-weight:700;color:#475467}.forum-admin-toolbar input,.forum-admin-toolbar select{background:#fff}.forum-admin-table-wrap{overflow:auto;border:1px solid #e5e7eb;border-radius:10px}.forum-admin-table{width:100%;border-collapse:collapse;min-width:920px}.forum-admin-table th,.forum-admin-table td{padding:9px 10px;border-bottom:1px solid #eef0f3;text-align:left;vertical-align:top;font-size:12px}.forum-admin-table th{background:#f7f9fc;font-size:11px;color:#475467;position:sticky;top:0}.forum-admin-title{font-weight:800;color:#1f2f46}.forum-admin-content{max-width:520px;white-space:pre-wrap;overflow-wrap:anywhere;color:#475467}.forum-admin-meta{color:#667085;font-size:11px;margin-top:2px}.forum-admin-check{width:18px;height:18px}.forum-admin-actions{display:flex;gap:6px;flex-wrap:wrap}.forum-admin-status{font-size:12px;color:#475467;min-height:18px}.forum-admin-danger{background:#d93025!important}.forum-admin-muted{background:#666!important}.\n.meta-row input{min-width:0}@media(max-width:1000px){.meta-row{grid-template-columns:1fr 1fr 1fr!important}}
+.small{font-size:13px;color:#666}\n.meta-row input{min-width:0}@media(max-width:1000px){.meta-row{grid-template-columns:1fr 1fr 1fr!important}}
 @media(max-width:900px){.layout{grid-template-columns:1fr}}
 </style>
 </head>
@@ -18712,7 +18232,6 @@ button.gray{background:#666}button.red{background:#d93025}
 <div class="admin-tabs" role="tablist" aria-label="Quản lý Admin">
   <button type="button" class="admin-tab active" data-admin-tab="users" role="tab" aria-selected="true">👥 Quản lý user</button>
   <button type="button" class="admin-tab" data-admin-tab="content" role="tab" aria-selected="false">📚 Quản lý nội dung</button>
-  <button type="button" class="admin-tab" data-admin-tab="forum" role="tab" aria-selected="false">💬 Quản lý Forum</button>
 </div>
 <div id="adminTabUsers" class="admin-tab-panel" data-admin-panel="users">
   <div id="adminUserInbox" class="layout" style="margin-bottom:18px">
@@ -18738,38 +18257,6 @@ button.gray{background:#666}button.red{background:#d93025}
   <div class="card">
     <button type="button" onclick="loadUsers()">🔄 Làm mới danh sách user</button>
     <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
-  </div>
-</div>
-<div id="adminTabForum" class="admin-tab-panel" data-admin-panel="forum" style="display:none">
-  <div class="card">
-    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-      <div>
-        <h3 style="margin:0 0 4px">💬 Quản lý Forum</h3>
-        <div class="small">Xem, lọc và xóa bài đăng trên Forum. Xóa bài sẽ đồng thời xóa các bình luận và thông báo liên quan.</div>
-      </div>
-      <button type="button" class="gray" onclick="loadForumAdminPosts()">🔄 Làm mới</button>
-    </div>
-    <div class="forum-admin-toolbar" style="margin-top:14px">
-      <label>Từ ngày <input id="forumAdminDateFrom" type="date"></label>
-      <label>Đến ngày <input id="forumAdminDateTo" type="date"></label>
-      <input id="forumAdminQuery" type="search" placeholder="Tìm tiêu đề, nội dung hoặc username..." style="min-width:280px;flex:1" onkeydown="if(event.key==='Enter')loadForumAdminPosts()">
-      <button type="button" onclick="loadForumAdminPosts()">🔎 Lọc</button>
-      <button type="button" class="forum-admin-muted" onclick="clearForumAdminFilters()">Xóa bộ lọc</button>
-    </div>
-    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin:13px 0 8px">
-      <label style="font-size:12px;font-weight:800"><input type="checkbox" id="forumAdminSelectAll" onchange="toggleForumAdminAll(this.checked)"> Chọn tất cả bài đang hiển thị</label>
-      <div class="forum-admin-actions">
-        <span id="forumAdminCount" class="small"></span>
-        <button type="button" class="forum-admin-danger" onclick="deleteSelectedForumPosts()">🗑️ Xóa các bài đã chọn</button>
-      </div>
-    </div>
-    <div id="forumAdminStatus" class="forum-admin-status"></div>
-    <div class="forum-admin-table-wrap">
-      <table class="forum-admin-table">
-        <thead><tr><th style="width:42px">✓</th><th style="width:65px">ID</th><th style="width:160px">User</th><th style="width:220px">Tiêu đề</th><th>Nội dung</th><th style="width:90px">BL</th><th style="width:145px">Ngày đăng</th><th style="width:85px">Xóa</th></tr></thead>
-        <tbody id="forumAdminPostsBody"><tr><td colspan="8" class="small" style="padding:18px">Đang tải...</td></tr></tbody>
-      </table>
-    </div>
   </div>
 </div>
 <div id="adminTabContent" class="admin-tab-panel" data-admin-panel="content" style="display:none">
@@ -18875,17 +18362,15 @@ let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pol
 
 function initAdminTabs(){
   const tabs=[...document.querySelectorAll("[data-admin-tab]")];
-  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent"),forum:document.getElementById("adminTabForum")};
-  if(!tabs.length || !panels.users || !panels.content || !panels.forum) return;
+  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent")};
+  if(!tabs.length || !panels.users || !panels.content) return;
   const activate=(name)=>{
     tabs.forEach(btn=>{const active=btn.dataset.adminTab===name;btn.classList.toggle("active",active);btn.setAttribute("aria-selected",String(active));});
     Object.entries(panels).forEach(([key,panel])=>{panel.style.display=key===name?"block":"none";});
     sessionStorage.setItem("doraemon_admin_tab",name);
-    if(name==="forum" && pw) loadForumAdminPosts().catch(e=>console.error('[ADMIN FORUM] load failed',e));
   };
   tabs.forEach(btn=>btn.addEventListener("click",()=>activate(btn.dataset.adminTab)));
-  const saved=sessionStorage.getItem("doraemon_admin_tab");
-  activate(saved==="content"?"content":saved==="forum"?"forum":"users");
+  activate(sessionStorage.getItem("doraemon_admin_tab")==="content"?"content":"users");
 }
 
 function ensureVocabularyAdminSection(){
@@ -19132,17 +18617,10 @@ async function deleteAllCollocations(){
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
-  o={...o,headers:{"Content-Type":"application/json",...(o.headers||{})}};
-  if(o.body && typeof o.body === "object" && !(o.body instanceof FormData) && !(o.body instanceof Blob)) {
-    o.body=JSON.stringify(o.body);
-  }
+  o.headers={"Content-Type":"application/json",...(o.headers||{})};
   const r=await fetch(u,o); const t=await r.text(); let d={};
   try{d=JSON.parse(t)}catch{d={detail:t}}
-  if(!r.ok){
-    const detail=d?.detail;
-    const msg=typeof detail === "string" ? detail : (detail?.message || (Array.isArray(detail) ? detail.map(x=>x?.msg||x?.message||String(x)).join("; ") : "HTTP "+r.status));
-    throw Error(msg || ("HTTP "+r.status));
-  }
+  if(!r.ok) throw Error(d.detail||("HTTP "+r.status));
   return d;
 }
 async function login(){
@@ -19187,7 +18665,6 @@ async function login(){
     ensurePhrasalVerbAdminSection();
     await initStep("Tải Phrasal verb",loadPhrasalVerbsAdmin);
     await initStep("Tải user",loadUsers);
-    await initStep("Tải Forum",loadForumAdminPosts);
     startUserInboxPolling();
     await initStep("Tải gói học",loadPaymentPackages);
     await initStep("Tải Knowledge",loadKnowledgeCatalog);
@@ -19901,87 +19378,6 @@ async function savePaymentPackage(months){
 }
 
 let userListTimer=null;
-
-let forumAdminBusy=false;
-let forumAdminRows=[];
-
-function forumAdminDate(value){
-  try{const d=new Date(value);return Number.isNaN(d.getTime())?"":d.toLocaleString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});}catch{return "";}
-}
-function clearForumAdminFilters(){
-  const a=document.getElementById('forumAdminDateFrom'),b=document.getElementById('forumAdminDateTo'),q=document.getElementById('forumAdminQuery');
-  if(a)a.value=''; if(b)b.value=''; if(q)q.value=''; loadForumAdminPosts();
-}
-function toggleForumAdminAll(checked){
-  document.querySelectorAll('#forumAdminPostsBody input[data-forum-admin-select]').forEach(cb=>cb.checked=!!checked);
-}
-function selectedForumAdminIds(){
-  return [...document.querySelectorAll('#forumAdminPostsBody input[data-forum-admin-select]:checked')].map(x=>Number(x.value||0)).filter(Boolean);
-}
-function renderForumAdminRows(){
-  const body=document.getElementById('forumAdminPostsBody');
-  const count=document.getElementById('forumAdminCount');
-  const selectAll=document.getElementById('forumAdminSelectAll');
-  if(!body)return;
-  if(count)count.textContent=`${forumAdminRows.length} bài đang hiển thị`;
-  if(selectAll)selectAll.checked=false;
-  if(!forumAdminRows.length){body.innerHTML='<tr><td colspan="8" class="small" style="padding:18px">Không có bài phù hợp với bộ lọc.</td></tr>';return;}
-  body.innerHTML=forumAdminRows.map(p=>`<tr>
-    <td><input class="forum-admin-check" type="checkbox" data-forum-admin-select value="${Number(p.id)}"></td>
-    <td><b>#${Number(p.id)}</b></td>
-    <td><b>@${esc(p.username||'user')}</b>${p.email?`<div class="forum-admin-meta">${esc(p.email)}</div>`:''}</td>
-    <td><div class="forum-admin-title">${esc(p.title||'')}</div></td>
-    <td><div class="forum-admin-content">${esc(p.content||'')}</div></td>
-    <td>${Number(p.comment_count||0)}</td>
-    <td>${esc(forumAdminDate(p.created_at))}</td>
-    <td><button type="button" class="forum-admin-danger" onclick="deleteForumAdminPost(${Number(p.id)},${JSON.stringify(String(p.title||''))})">🗑️</button></td>
-  </tr>`).join('');
-}
-async function loadForumAdminPosts(){
-  if(!pw)return;
-  const status=document.getElementById('forumAdminStatus');
-  if(forumAdminBusy)return;
-  forumAdminBusy=true;
-  if(status)status.textContent='⏳ Đang tải danh sách Forum...';
-  try{
-    const from=document.getElementById('forumAdminDateFrom')?.value||'';
-    const to=document.getElementById('forumAdminDateTo')?.value||'';
-    const q=(document.getElementById('forumAdminQuery')?.value||'').trim();
-    let url='/admin/api/forum/posts?password='+encodeURIComponent(pw)+'&limit=500';
-    if(from)url+='&date_from='+encodeURIComponent(from);
-    if(to)url+='&date_to='+encodeURIComponent(to);
-    if(q)url+='&q='+encodeURIComponent(q);
-    const d=await api(url);
-    forumAdminRows=Array.isArray(d.posts)?d.posts:[];
-    renderForumAdminRows();
-    if(status)status.textContent=`✅ Đã tải ${forumAdminRows.length} bài.`;
-  }catch(e){
-    forumAdminRows=[]; renderForumAdminRows();
-    if(status)status.textContent='❌ '+e.message;
-  }finally{forumAdminBusy=false;}
-}
-async function deleteForumAdminPost(id,title){
-  const uid=Number(id||0);if(!uid)return;
-  if(!confirm(`Xóa bài Forum #${uid}${title?` "${title}"`:''}?\n\nCác bình luận và thông báo liên quan cũng sẽ bị xóa.`))return;
-  try{
-    await api(`/admin/api/forum/posts/${uid}/delete?password=${encodeURIComponent(pw)}`,{method:'POST'});
-    await loadForumAdminPosts();
-    alert('✅ Đã xóa bài Forum.');
-  }catch(e){alert('❌ Xóa bài thất bại: '+e.message);}
-}
-async function deleteSelectedForumPosts(){
-  const ids=selectedForumAdminIds();
-  if(!ids.length){alert('Hãy tích chọn ít nhất một bài Forum.');return;}
-  if(!confirm(`Xóa ${ids.length} bài Forum đã chọn?\n\nCác bình luận và thông báo liên quan cũng sẽ bị xóa.`))return;
-  const status=document.getElementById('forumAdminStatus');
-  try{
-    if(status)status.textContent=`⏳ Đang xóa ${ids.length} bài...`;
-    const d=await api('/admin/api/forum/posts/delete-bulk',{method:'POST',body:{password:pw,post_ids:ids}});
-    await loadForumAdminPosts();
-    if(status)status.textContent=`✅ Đã xóa ${Number(d.deleted||0)} bài.`;
-  }catch(e){if(status)status.textContent='❌ '+e.message;alert('❌ Xóa hàng loạt thất bại: '+e.message);}
-}
-
 async function loadUsers(){
   const box=document.getElementById("users");
   if(!box)return;
