@@ -5161,6 +5161,35 @@ def _format_reading_feedback_headings(text):
     return "\n".join(normalized).strip()
 
 
+def _extract_exercise_score_marker(raw_text: str, expected_total: int | None = None):
+    """Extract the score explicitly produced by the exercise-grading GenAI prompt.
+
+    The grader is authoritative for exercise correctness. We do not compare the
+    learner answer against the DB answer in Python; the model receives both and
+    returns this machine-readable marker after grading.
+    """
+    text=str(raw_text or "")
+    m=re.search(r"###EXERCISE_SCORE###\s*(?:\n|\r\n)?\s*(?:Correct|CORRECT)\s*[:=]\s*(\d+)\s*(?:\n|\r\n)\s*(?:Total|TOTAL)\s*[:=]\s*(\d+)", text, flags=re.I)
+    if not m:
+        m=re.search(r"###EXERCISE_SCORE###\s*(\d+)\s*/\s*(\d+)", text, flags=re.I)
+    if not m:
+        return None,None,text
+    try:
+        correct=max(0,int(m.group(1)))
+        total=max(0,int(m.group(2)))
+    except Exception:
+        return None,None,text
+    if expected_total is not None and int(expected_total)>0:
+        # The exercise itself defines the denominator. Never allow the model to
+        # invent a larger/smaller total than the published question set.
+        total=int(expected_total)
+        correct=min(correct,total)
+    marker_text=m.group(0)
+    cleaned=(text[:m.start()]+text[m.end():]).strip()
+    cleaned=re.sub(r"\n{3,}","\n\n",cleaned)
+    return correct,total,cleaned
+
+
 def _exercise_strip_total_score(text):
     """Remove legacy total-score lines from exercise feedback."""
     raw = str(text or "")
@@ -10416,62 +10445,52 @@ YÊU CẦU:
                 if not answer_step or not official_answer:
                     msg="⚠️ Bài tập này chưa có bước đáp án B2 đã publish nên chưa thể chấm bài. Hãy kiểm tra và publish lại bước đáp án."
                     return {"reply":msg,"model":"db-direct","sources":[],"images":[],"content_blocks":[{"type":"text","text":msg}],"learning_progress":None}
-                answer_map=_exercise_answer_map_from_text(official_answer)
                 question_numbers=_exercise_question_numbers_from_text(exercise_text)
-                expected_numbers=sorted(set(question_numbers) | set(answer_map.keys()))
+                expected_numbers=sorted(set(question_numbers))
                 expected_text=", ".join(str(n) for n in expected_numbers)
                 no_answer=_is_exercise_no_answer(query_text)
-                answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(answer_map.items()))
-                student_submission = "Học sinh không biết / không trả lời. Hãy giải đủ toàn bộ các câu." if no_answer else query_text.strip()
-                student_answer_map=_exercise_student_answer_map_from_text(query_text if not no_answer else '')
-                student_answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(student_answer_map.items()))
 
-                total_questions=len(expected_numbers)
-                correct_count=sum(
-                    1 for n in expected_numbers
-                    if n in student_answer_map and n in answer_map
-                    and _normalize_exercise_answer(student_answer_map.get(n)) == _normalize_exercise_answer(answer_map.get(n))
-                )
-                wrong_count=max(0, total_questions-correct_count)
-                exercise_score_10=_exercise_total_score_10(correct_count,total_questions)
-
-                try:
-                    _exercise_progress_row=record_learning_event(user["id"],{
-                        "content_type":"Bài tập",
-                        "course_id":selected_course_id,
-                        "subject":str((study_session or {}).get("course") or "Tiếng Anh IELTS"),
-                        "lesson":(study_session or {}).get("lesson") or requested_lesson or "",
-                        "topic":(study_session or {}).get("topic") or "",
-                        "item_key":(study_session or {}).get("lesson") or requested_lesson or "",
-                        "status":"in_progress",
-                        "exercise_score":exercise_score_10,
-                        "correct_count":correct_count,
-                        "wrong_count":wrong_count,
-                    })
-                    print(f"[EXERCISE SCORE] request={request_id} user={user['id']} correct={correct_count}/{total_questions} score={exercise_score_10:.1f}/10 progress_id={(_exercise_progress_row or {}).get('id')}")
-                except Exception as exc:
-                    print(f"[EXERCISE SCORE] persist failed: {type(exc).__name__}: {exc}")
+                # Keep the raw published B2 text. The GenAI grader is explicitly
+                # responsible for aligning and grading the learner answer against
+                # the official answer. Python does NOT map/compare DB answers.
+                user_turns=[]
+                for h in (data.chat_history or []):
+                    if not isinstance(h,dict):
+                        continue
+                    role=str(h.get("role") or "").strip().casefold()
+                    text_h=str(h.get("text") or h.get("content") or "").strip()
+                    if role in {"user","human"} and text_h:
+                        user_turns.append(text_h)
+                user_turns.append(query_text.strip())
+                student_submission="\n".join(user_turns[-20:]).strip()
+                if no_answer and not student_submission:
+                    student_submission="Học sinh không biết / không trả lời."
 
                 q_prompt=f"""Bạn là Doraemon, giải và nhận xét bài tập theo TỪNG CÂU. Chỉ dùng đề bài và đáp án đã cung cấp.
 
 ĐỀ BÀI (chỉ dùng để tìm đáp án và bằng chứng, KHÔNG chép lại toàn bộ):
 {exercise_text}
 
-ĐÁP ÁN ĐÚNG THEO TỪNG CÂU, lấy nguyên văn từ bước B2 đã edit/publish:
-{answer_map_text or official_answer}
+ĐÁP ÁN CHÍNH THỨC TỪ B2 (GIỮ NGUYÊN NGUYÊN VĂN, KHÔNG TỰ SỬA):
+{official_answer}
 
 CÂU BẮT BUỘC PHẢI XỬ LÝ ĐẦY ĐỦ:
 {expected_text or '(không xác định được; hãy xử lý toàn bộ câu có đánh số trong đề)'}
 
-ĐÁP ÁN HỌC SINH ĐÃ NHẬP (nếu không có thì coi là chưa trả lời):
-{student_answer_map_text or '(không có đáp án; học sinh nói mình không biết)'}
+BÀI LÀM CỦA HỌC SINH TRONG PHIÊN HIỆN TẠI (có thể gồm nhiều lượt trả lời):
+{student_submission or '(không có đáp án; học sinh nói mình không biết)'}
 
 QUAN TRỌNG:
 - Mỗi câu trong danh sách bắt buộc phải xuất hiện đúng 1 lần. Không được bỏ sót câu nào, không được gộp nhiều câu.
-- Với Câu N, đáp án đúng bắt buộc lấy từ đúng Câu N trong B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán.
-- "Đáp án của bạn" phải lấy nguyên văn từ phần ĐÁP ÁN HỌC SINH ĐÃ NHẬP; nếu không có thì ghi `Không trả lời`.
-- KHÔNG dùng dấu ✅ hoặc ❌ để đánh giá đúng/sai.
-- Không tự tạo tổng điểm, tỷ lệ %, x/y hoặc tổng số câu đúng trong phần nhận xét; server sẽ bổ sung tổng điểm chính xác ở cuối theo đáp án B2.
+- Với Câu N, hãy xác định đáp án đúng bằng cách đọc chính xác dòng/đoạn đáp án tương ứng của Câu N trong B2. Không lấy nhầm câu khác.
+- "Đáp án của bạn" phải lấy từ BÀI LÀM CỦA HỌC SINH; nếu học sinh không trả lời Câu N thì ghi `Không trả lời`.
+- Bạn là bộ chấm điểm. Hãy tự xác định từng câu là đúng hay sai dựa trên ý nghĩa đáp án, không yêu cầu Python/DB phải map chuỗi đáp án. Các dạng tương đương như `A`, `(A)`, `A.`, `TRUE`, `(TRUE)`, `T`, `NOT GIVEN`, `(NOT GIVEN)` phải được hiểu theo cùng ý nghĩa khi phù hợp.
+- KHÔNG dùng dấu ✅ hoặc ❌ trong từng câu.
+- Cuối output bắt buộc phải có marker máy đọc được:
+  `###EXERCISE_SCORE###`
+  `Correct: <số câu đúng>`
+  `Total: <tổng số câu>`
+  Tổng `Total` phải đúng bằng số câu bắt buộc ở trên. `Correct` phải là số câu mà chính bạn đánh giá đúng.
 
 BÀI LÀM GỐC CỦA HỌC SINH:
 {student_submission}
@@ -10489,7 +10508,11 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Diễn giải tối đa 20 từ/câu.
 - Nếu đây là bài đọc/Reading, SAU phần chấm câu phải có mục `📚 Từ vựng khó & cụm động từ cần lưu ý` gồm các từ/cụm thực sự xuất hiện trong bài đọc/đề, kèm giải thích ngắn gọn; không lấy từ ngoài nguồn. Chỉ chọn các từ/cụm đáng chú ý, không cần liệt kê toàn bộ.
 - Không thêm nhận xét chung ở cuối phần chấm câu ngoài mục từ vựng/cụm động từ nói trên và weakness note.
-- SAU mục từ vựng/cụm động từ, thêm đúng marker `###WEAKNESS_NOTE###` rồi TỔNG HỢP điểm yếu của USER theo các lỗi sai. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
+- SAU phần từ vựng, trước marker weakness, đặt marker điểm số chính xác như sau:
+  `###EXERCISE_SCORE###`
+  `Correct: <số câu đúng>`
+  `Total: <tổng số câu>`
+- SAU marker điểm số mới được thêm `###WEAKNESS_NOTE###` rồi TỔNG HỢP điểm yếu của USER theo các lỗi sai. Không liệt kê lại từng câu sai, không viết theo dạng `Câu N: ...`.
 - Với Bài tập đọc/Reading, BẮT BUỘC phân loại điểm yếu theo đúng các nhóm khi dữ liệu có bằng chứng:
   1) `Từ vựng chưa nắm` — chỉ dùng khi lỗi sai có liên quan trực tiếp đến việc không hiểu từ/cụm từ trong nguồn.
   2) `Ngữ pháp chưa nắm` — chỉ dùng khi có bằng chứng trực tiếp về cấu trúc/ngữ pháp ảnh hưởng đến việc hiểu hoặc câu trả lời của user có lỗi grammar liên quan.
@@ -10503,7 +10526,7 @@ YÊU CẦU OUTPUT BẮT BUỘC:
 - Với nhóm `Ngữ pháp chưa nắm`, nếu bằng chứng chứa cấu trúc như `be regarded as + noun/adjective`, phải nêu rõ cấu trúc và vai trò của nó trong việc hiểu câu.
 - NẾU đáp án/phần trả lời của học sinh có lỗi từ vựng, chính tả, word form hoặc grammar/cấu trúc liên quan trực tiếp tới câu sai, BẮT BUỘC ghi rõ trong đúng nhóm tương ứng; không suy đoán.
 """
-                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=evaluate context={"selected_text" if selected_context else "1_exchange"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
+                print(f"[CURRICULUM DB QUESTION] request={request_id} type=Bài tập mode=genai_grader context={"selected_text" if selected_context else "exercise_session"} prompt_chars={len(q_prompt)} embedding=0 pinecone=0")
                 gen_started=time.perf_counter()
                 evaluation,response_model,gen_elapsed=_generate_chat_reply(
                     q_prompt,
@@ -10514,6 +10537,31 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                     reasoning_profile="low",
                     max_output_tokens=5000,
                 )
+                model_correct, model_total, evaluation=_extract_exercise_score_marker(evaluation, expected_total=len(expected_numbers) if expected_numbers else None)
+                if model_correct is None or model_total is None:
+                    print(f"[EXERCISE SCORE] grader marker missing request={request_id}; using 0/{len(expected_numbers)}")
+                    model_correct=0
+                    model_total=len(expected_numbers)
+                correct_count=int(model_correct)
+                total_questions=int(model_total)
+                wrong_count=max(0,total_questions-correct_count)
+                exercise_score_10=_exercise_total_score_10(correct_count,total_questions)
+                try:
+                    _exercise_progress_row=record_learning_event(user["id"],{
+                        "content_type":"Bài tập",
+                        "course_id":selected_course_id,
+                        "subject":str((study_session or {}).get("course") or "Tiếng Anh IELTS"),
+                        "lesson":(study_session or {}).get("lesson") or requested_lesson or "",
+                        "topic":(study_session or {}).get("topic") or "",
+                        "item_key":(study_session or {}).get("lesson") or requested_lesson or "",
+                        "status":"in_progress",
+                        "exercise_score":exercise_score_10,
+                        "correct_count":correct_count,
+                        "wrong_count":wrong_count,
+                    })
+                    print(f"[EXERCISE SCORE] request={request_id} user={user['id']} source=genai correct={correct_count}/{total_questions} score={exercise_score_10:.1f}/10 progress_id={(_exercise_progress_row or {}).get('id')}")
+                except Exception as exc:
+                    print(f"[EXERCISE SCORE] persist failed: {type(exc).__name__}: {exc}")
                 evaluation, weakness_note = _extract_weakness_note(evaluation)
                 evaluation=_format_reading_feedback_headings(evaluation)
                 evaluation=_exercise_strip_total_score(evaluation)
