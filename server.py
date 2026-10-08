@@ -3968,6 +3968,7 @@ def _normalize_exercise_answer(value):
 
 def _exercise_total_score_10(correct_count, total_count):
     """Return exercise score on a 10-point scale, rounded half-up to 1 decimal."""
+    from decimal import Decimal, ROUND_HALF_UP
     correct=max(0, int(correct_count or 0))
     total=max(0, int(total_count or 0))
     if total <= 0:
