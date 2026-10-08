@@ -3959,11 +3959,29 @@ def _exercise_student_answer_map_from_text(text):
 
 
 def _normalize_exercise_answer(value):
-    """Normalize an answer only for deterministic learner-vs-DB comparison/display."""
+    """Normalize an exercise answer for deterministic learner-vs-DB comparison."""
     s=str(value or '').strip().casefold()
     s=re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", s)
-    s=re.sub(r"\s+", " ", s)
-    return s
+    s=re.sub(r"[\.,;:]+$", "", s).strip()
+
+    # Strip one pair of outer wrappers for answers such as:
+    # (A), [A], {A}, (TRUE), (NOT GIVEN), (A).
+    if len(s)>=2 and ((s[0],s[-1]) in {("(",")"),("[","]"),("{","}")}):
+        s=s[1:-1].strip()
+
+    # Multiple-choice letter wrappers: A, A), A.
+    s=re.sub(r"^([a-z])\s*\)$", r"\1", s)
+    s=re.sub(r"^([a-z])\s*\.$", r"\1", s)
+
+    # Common T/F/NG aliases.
+    s=re.sub(r"\s+", " ", s).strip()
+    aliases={
+        "t":"true","true":"true","đúng":"true",
+        "f":"false","false":"false","sai":"false",
+        "ng":"not given","not given":"not given",
+        "notgiven":"not given","not-given":"not given","not_given":"not given",
+    }
+    return aliases.get(s, s)
 
 
 def _exercise_total_score_10(correct_count, total_count):
