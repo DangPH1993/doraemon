@@ -138,8 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v33.02 — Forum posts/comments/notifications with username + emoji-friendly text UI
-SERVER_VERSION = "33.02"
+# VERSION: v33.03 — Forum UX refresh + Admin Forum management
+SERVER_VERSION = "33.03"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -18449,6 +18449,126 @@ def admin_curriculum_publish(draft_id:int,payload:dict):
         'pinecone_old_vectors_cleaned':pinecone_cleanup,
     }
 
+
+# ============================================================
+# Admin Forum management
+# ============================================================
+@app.get("/admin/api/forum/posts")
+def admin_forum_posts(
+    password: str,
+    date_from: str = "",
+    date_to: str = "",
+    q: str = "",
+    limit: int = 200,
+):
+    """Return Forum posts for Admin with optional inclusive date filtering."""
+    check_admin(password)
+    limit = max(1, min(500, int(limit or 200)))
+    date_from = str(date_from or "").strip()
+    date_to = str(date_to or "").strip()
+    q = str(q or "").strip()
+
+    # Validate dates explicitly so malformed filters return a useful 400 instead
+    # of relying on a database cast error.
+    import datetime as _dt
+    for label, value in (("date_from", date_from), ("date_to", date_to)):
+        if value:
+            try:
+                _dt.date.fromisoformat(value)
+            except Exception:
+                raise HTTPException(400, f"{label} phải có dạng YYYY-MM-DD.")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "Ngày bắt đầu không được lớn hơn ngày kết thúc.")
+
+    where = []
+    params = []
+    if date_from:
+        where.append("p.created_at >= %s::date")
+        params.append(date_from)
+    if date_to:
+        where.append("p.created_at < (%s::date + INTERVAL '1 day')")
+        params.append(date_to)
+    if q:
+        where.append("(p.title ILIKE %s OR p.content ILIKE %s OR COALESCE(u.username,u.nickname,'') ILIKE %s)")
+        like = f"%{q}%"
+        params.extend([like, like, like])
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""SELECT p.id,p.user_id,p.title,p.content,p.created_at,p.updated_at,
+                           COALESCE(u.username,u.nickname,'user') AS username,
+                           COALESCE(u.email,'') AS email,
+                           COUNT(c.id)::int AS comment_count
+                      FROM forum_posts p
+                      JOIN users u ON u.id=p.user_id
+                      LEFT JOIN forum_comments c ON c.post_id=p.id
+                      {where_sql}
+                     GROUP BY p.id,u.id
+                     ORDER BY p.created_at DESC,p.id DESC
+                     LIMIT %s""",
+                tuple(params + [limit]),
+            )
+            rows = [dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+    return {"posts": rows, "count": len(rows), "date_from": date_from or None, "date_to": date_to or None, "query": q}
+
+
+@app.post("/admin/api/forum/posts/{post_id}/delete")
+def admin_forum_delete_post(post_id: int, password: str = ""):
+    """Delete one Forum post and its comments/notifications via FK cascades."""
+    check_admin(password)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM forum_posts WHERE id=%s", (int(post_id),))
+            deleted = cur.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if deleted != 1:
+        raise HTTPException(404, "Không tìm thấy bài Forum.")
+    return {"success": True, "deleted": 1, "post_id": int(post_id)}
+
+
+@app.post("/admin/api/forum/posts/delete-bulk")
+def admin_forum_delete_bulk(data: dict):
+    """Delete many Forum posts selected by Admin."""
+    check_admin(str(data.get("password") or "").strip())
+    raw_ids = data.get("post_ids")
+    if not isinstance(raw_ids, list):
+        raise HTTPException(400, "post_ids phải là một danh sách.")
+    ids = []
+    for value in raw_ids[:500]:
+        try:
+            n = int(value)
+        except Exception:
+            continue
+        if n > 0 and n not in ids:
+            ids.append(n)
+    if not ids:
+        raise HTTPException(400, "Chưa chọn bài Forum nào để xóa.")
+
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM forum_posts WHERE id=ANY(%s)", (ids,))
+            deleted = cur.rowcount
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"success": True, "deleted": int(deleted), "requested": len(ids)}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
@@ -18476,7 +18596,7 @@ button.gray{background:#666}button.red{background:#d93025}
 .msg.user{background:#dff0ff;margin-right:auto}.msg.admin{background:#dff7df;margin-left:auto}
 .meta{font-size:11px;color:#777;margin-top:3px}
 .chatbar{display:flex;gap:7px;margin-top:10px}.chatbar input{flex:1}
-.small{font-size:13px;color:#666}\n.meta-row input{min-width:0}@media(max-width:1000px){.meta-row{grid-template-columns:1fr 1fr 1fr!important}}
+.small{font-size:13px;color:#666}\n.forum-admin-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.forum-admin-toolbar label{font-size:12px;font-weight:700;color:#475467}.forum-admin-toolbar input,.forum-admin-toolbar select{background:#fff}.forum-admin-table-wrap{overflow:auto;border:1px solid #e5e7eb;border-radius:10px}.forum-admin-table{width:100%;border-collapse:collapse;min-width:920px}.forum-admin-table th,.forum-admin-table td{padding:9px 10px;border-bottom:1px solid #eef0f3;text-align:left;vertical-align:top;font-size:12px}.forum-admin-table th{background:#f7f9fc;font-size:11px;color:#475467;position:sticky;top:0}.forum-admin-title{font-weight:800;color:#1f2f46}.forum-admin-content{max-width:520px;white-space:pre-wrap;overflow-wrap:anywhere;color:#475467}.forum-admin-meta{color:#667085;font-size:11px;margin-top:2px}.forum-admin-check{width:18px;height:18px}.forum-admin-actions{display:flex;gap:6px;flex-wrap:wrap}.forum-admin-status{font-size:12px;color:#475467;min-height:18px}.forum-admin-danger{background:#d93025!important}.forum-admin-muted{background:#666!important}.\n.meta-row input{min-width:0}@media(max-width:1000px){.meta-row{grid-template-columns:1fr 1fr 1fr!important}}
 @media(max-width:900px){.layout{grid-template-columns:1fr}}
 </style>
 </head>
@@ -18498,6 +18618,7 @@ button.gray{background:#666}button.red{background:#d93025}
 <div class="admin-tabs" role="tablist" aria-label="Quản lý Admin">
   <button type="button" class="admin-tab active" data-admin-tab="users" role="tab" aria-selected="true">👥 Quản lý user</button>
   <button type="button" class="admin-tab" data-admin-tab="content" role="tab" aria-selected="false">📚 Quản lý nội dung</button>
+  <button type="button" class="admin-tab" data-admin-tab="forum" role="tab" aria-selected="false">💬 Quản lý Forum</button>
 </div>
 <div id="adminTabUsers" class="admin-tab-panel" data-admin-panel="users">
   <div id="adminUserInbox" class="layout" style="margin-bottom:18px">
@@ -18523,6 +18644,38 @@ button.gray{background:#666}button.red{background:#d93025}
   <div class="card">
     <button type="button" onclick="loadUsers()">🔄 Làm mới danh sách user</button>
     <span id="wsState" class="small" style="float:right;color:green">● Đồng bộ realtime: 1 giây</span>
+  </div>
+</div>
+<div id="adminTabForum" class="admin-tab-panel" data-admin-panel="forum" style="display:none">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+      <div>
+        <h3 style="margin:0 0 4px">💬 Quản lý Forum</h3>
+        <div class="small">Xem, lọc và xóa bài đăng trên Forum. Xóa bài sẽ đồng thời xóa các bình luận và thông báo liên quan.</div>
+      </div>
+      <button type="button" class="gray" onclick="loadForumAdminPosts()">🔄 Làm mới</button>
+    </div>
+    <div class="forum-admin-toolbar" style="margin-top:14px">
+      <label>Từ ngày <input id="forumAdminDateFrom" type="date"></label>
+      <label>Đến ngày <input id="forumAdminDateTo" type="date"></label>
+      <input id="forumAdminQuery" type="search" placeholder="Tìm tiêu đề, nội dung hoặc username..." style="min-width:280px;flex:1" onkeydown="if(event.key==='Enter')loadForumAdminPosts()">
+      <button type="button" onclick="loadForumAdminPosts()">🔎 Lọc</button>
+      <button type="button" class="forum-admin-muted" onclick="clearForumAdminFilters()">Xóa bộ lọc</button>
+    </div>
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin:13px 0 8px">
+      <label style="font-size:12px;font-weight:800"><input type="checkbox" id="forumAdminSelectAll" onchange="toggleForumAdminAll(this.checked)"> Chọn tất cả bài đang hiển thị</label>
+      <div class="forum-admin-actions">
+        <span id="forumAdminCount" class="small"></span>
+        <button type="button" class="forum-admin-danger" onclick="deleteSelectedForumPosts()">🗑️ Xóa các bài đã chọn</button>
+      </div>
+    </div>
+    <div id="forumAdminStatus" class="forum-admin-status"></div>
+    <div class="forum-admin-table-wrap">
+      <table class="forum-admin-table">
+        <thead><tr><th style="width:42px">✓</th><th style="width:65px">ID</th><th style="width:160px">User</th><th style="width:220px">Tiêu đề</th><th>Nội dung</th><th style="width:90px">BL</th><th style="width:145px">Ngày đăng</th><th style="width:85px">Xóa</th></tr></thead>
+        <tbody id="forumAdminPostsBody"><tr><td colspan="8" class="small" style="padding:18px">Đang tải...</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </div>
 <div id="adminTabContent" class="admin-tab-panel" data-admin-panel="content" style="display:none">
@@ -18628,15 +18781,17 @@ let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pol
 
 function initAdminTabs(){
   const tabs=[...document.querySelectorAll("[data-admin-tab]")];
-  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent")};
-  if(!tabs.length || !panels.users || !panels.content) return;
+  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent"),forum:document.getElementById("adminTabForum")};
+  if(!tabs.length || !panels.users || !panels.content || !panels.forum) return;
   const activate=(name)=>{
     tabs.forEach(btn=>{const active=btn.dataset.adminTab===name;btn.classList.toggle("active",active);btn.setAttribute("aria-selected",String(active));});
     Object.entries(panels).forEach(([key,panel])=>{panel.style.display=key===name?"block":"none";});
     sessionStorage.setItem("doraemon_admin_tab",name);
+    if(name==="forum" && pw) loadForumAdminPosts().catch(e=>console.error('[ADMIN FORUM] load failed',e));
   };
   tabs.forEach(btn=>btn.addEventListener("click",()=>activate(btn.dataset.adminTab)));
-  activate(sessionStorage.getItem("doraemon_admin_tab")==="content"?"content":"users");
+  const saved=sessionStorage.getItem("doraemon_admin_tab");
+  activate(saved==="content"?"content":saved==="forum"?"forum":"users");
 }
 
 function ensureVocabularyAdminSection(){
@@ -18931,6 +19086,7 @@ async function login(){
     ensurePhrasalVerbAdminSection();
     await initStep("Tải Phrasal verb",loadPhrasalVerbsAdmin);
     await initStep("Tải user",loadUsers);
+    await initStep("Tải Forum",loadForumAdminPosts);
     startUserInboxPolling();
     await initStep("Tải gói học",loadPaymentPackages);
     await initStep("Tải Knowledge",loadKnowledgeCatalog);
@@ -19644,6 +19800,87 @@ async function savePaymentPackage(months){
 }
 
 let userListTimer=null;
+
+let forumAdminBusy=false;
+let forumAdminRows=[];
+
+function forumAdminDate(value){
+  try{const d=new Date(value);return Number.isNaN(d.getTime())?"":d.toLocaleString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});}catch{return "";}
+}
+function clearForumAdminFilters(){
+  const a=document.getElementById('forumAdminDateFrom'),b=document.getElementById('forumAdminDateTo'),q=document.getElementById('forumAdminQuery');
+  if(a)a.value=''; if(b)b.value=''; if(q)q.value=''; loadForumAdminPosts();
+}
+function toggleForumAdminAll(checked){
+  document.querySelectorAll('#forumAdminPostsBody input[data-forum-admin-select]').forEach(cb=>cb.checked=!!checked);
+}
+function selectedForumAdminIds(){
+  return [...document.querySelectorAll('#forumAdminPostsBody input[data-forum-admin-select]:checked')].map(x=>Number(x.value||0)).filter(Boolean);
+}
+function renderForumAdminRows(){
+  const body=document.getElementById('forumAdminPostsBody');
+  const count=document.getElementById('forumAdminCount');
+  const selectAll=document.getElementById('forumAdminSelectAll');
+  if(!body)return;
+  if(count)count.textContent=`${forumAdminRows.length} bài đang hiển thị`;
+  if(selectAll)selectAll.checked=false;
+  if(!forumAdminRows.length){body.innerHTML='<tr><td colspan="8" class="small" style="padding:18px">Không có bài phù hợp với bộ lọc.</td></tr>';return;}
+  body.innerHTML=forumAdminRows.map(p=>`<tr>
+    <td><input class="forum-admin-check" type="checkbox" data-forum-admin-select value="${Number(p.id)}"></td>
+    <td><b>#${Number(p.id)}</b></td>
+    <td><b>@${esc(p.username||'user')}</b>${p.email?`<div class="forum-admin-meta">${esc(p.email)}</div>`:''}</td>
+    <td><div class="forum-admin-title">${esc(p.title||'')}</div></td>
+    <td><div class="forum-admin-content">${esc(p.content||'')}</div></td>
+    <td>${Number(p.comment_count||0)}</td>
+    <td>${esc(forumAdminDate(p.created_at))}</td>
+    <td><button type="button" class="forum-admin-danger" onclick="deleteForumAdminPost(${Number(p.id)},${JSON.stringify(String(p.title||''))})">🗑️</button></td>
+  </tr>`).join('');
+}
+async function loadForumAdminPosts(){
+  if(!pw)return;
+  const status=document.getElementById('forumAdminStatus');
+  if(forumAdminBusy)return;
+  forumAdminBusy=true;
+  if(status)status.textContent='⏳ Đang tải danh sách Forum...';
+  try{
+    const from=document.getElementById('forumAdminDateFrom')?.value||'';
+    const to=document.getElementById('forumAdminDateTo')?.value||'';
+    const q=(document.getElementById('forumAdminQuery')?.value||'').trim();
+    let url='/admin/api/forum/posts?password='+encodeURIComponent(pw)+'&limit=500';
+    if(from)url+='&date_from='+encodeURIComponent(from);
+    if(to)url+='&date_to='+encodeURIComponent(to);
+    if(q)url+='&q='+encodeURIComponent(q);
+    const d=await api(url);
+    forumAdminRows=Array.isArray(d.posts)?d.posts:[];
+    renderForumAdminRows();
+    if(status)status.textContent=`✅ Đã tải ${forumAdminRows.length} bài.`;
+  }catch(e){
+    forumAdminRows=[]; renderForumAdminRows();
+    if(status)status.textContent='❌ '+e.message;
+  }finally{forumAdminBusy=false;}
+}
+async function deleteForumAdminPost(id,title){
+  const uid=Number(id||0);if(!uid)return;
+  if(!confirm(`Xóa bài Forum #${uid}${title?` "${title}"`:''}?\n\nCác bình luận và thông báo liên quan cũng sẽ bị xóa.`))return;
+  try{
+    await api(`/admin/api/forum/posts/${uid}/delete?password=${encodeURIComponent(pw)}`,{method:'POST'});
+    await loadForumAdminPosts();
+    alert('✅ Đã xóa bài Forum.');
+  }catch(e){alert('❌ Xóa bài thất bại: '+e.message);}
+}
+async function deleteSelectedForumPosts(){
+  const ids=selectedForumAdminIds();
+  if(!ids.length){alert('Hãy tích chọn ít nhất một bài Forum.');return;}
+  if(!confirm(`Xóa ${ids.length} bài Forum đã chọn?\n\nCác bình luận và thông báo liên quan cũng sẽ bị xóa.`))return;
+  const status=document.getElementById('forumAdminStatus');
+  try{
+    if(status)status.textContent=`⏳ Đang xóa ${ids.length} bài...`;
+    const d=await api('/admin/api/forum/posts/delete-bulk',{method:'POST',body:{password:pw,post_ids:ids}});
+    await loadForumAdminPosts();
+    if(status)status.textContent=`✅ Đã xóa ${Number(d.deleted||0)} bài.`;
+  }catch(e){if(status)status.textContent='❌ '+e.message;alert('❌ Xóa hàng loạt thất bại: '+e.message);}
+}
+
 async function loadUsers(){
   const box=document.getElementById("users");
   if(!box)return;
