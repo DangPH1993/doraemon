@@ -3959,22 +3959,34 @@ def _exercise_student_answer_map_from_text(text):
 
 
 def _normalize_exercise_answer(value):
-    """Normalize an exercise answer for deterministic learner-vs-DB comparison."""
+    """Normalize exercise answers, including answers followed by explanations."""
     s=str(value or '').strip().casefold()
     s=re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", s)
-    s=re.sub(r"[\.,;:]+$", "", s).strip()
+    s=re.sub(r"\s+", " ", s).strip()
 
-    # Strip one pair of outer wrappers for answers such as:
-    # (A), [A], {A}, (TRUE), (NOT GIVEN), (A).
+    # Many published B2 lines look like:
+    #   194. (A) Explanation...
+    #   195. A - Explanation...
+    # while the learner may submit simply "A".
+    # Normalize the leading answer token before comparing.
+    leading_letter=re.match(r"^[\(\[\{]?\s*([a-d])\s*[\)\]\}]?(?:\s*[\.:\-]\s*|\s+|$)", s, flags=re.I)
+    if leading_letter:
+        return leading_letter.group(1).casefold()
+
+    leading_tf=re.match(r"^[\(\[\{]?\s*(true|false|t|f|đúng|sai)\s*[\)\]\}]?(?:\s*[\.:\-]\s*|\s+|$)", s, flags=re.I)
+    if leading_tf:
+        token=leading_tf.group(1).casefold()
+        return {"t":"true","true":"true","đúng":"true",
+                "f":"false","false":"false","sai":"false"}[token]
+
+    leading_ng=re.match(r"^[\(\[\{]?\s*(not\s+given|notgiven|not-given|not_given|ng)\s*[\)\]\}]?(?:\s*[\.:\-]\s*|\s+|$)", s, flags=re.I)
+    if leading_ng:
+        return "not given"
+
+    s=re.sub(r"^[\.,;:]+|[\.,;:]+$", "", s).strip()
     if len(s)>=2 and ((s[0],s[-1]) in {("(",")"),("[","]"),("{","}")}):
         s=s[1:-1].strip()
 
-    # Multiple-choice letter wrappers: A, A), A.
-    s=re.sub(r"^([a-z])\s*\)$", r"\1", s)
-    s=re.sub(r"^([a-z])\s*\.$", r"\1", s)
-
-    # Common T/F/NG aliases.
-    s=re.sub(r"\s+", " ", s).strip()
     aliases={
         "t":"true","true":"true","đúng":"true",
         "f":"false","false":"false","sai":"false",
