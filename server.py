@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v33.03 — Forum UX refresh + Admin Forum management
-SERVER_VERSION = "33.04"
+SERVER_VERSION = "33.05"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -7910,6 +7910,88 @@ def forum_create_post(
     row["comment_count"] = 0
     row["is_mine"] = True
     return {"success": True, "post": row}
+
+
+@app.put("/forum/posts/{post_id}")
+def forum_update_post(
+    post_id: int,
+    data: dict,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Edit a Forum post. Only the original author can edit it."""
+    user = require_active_user(authorization)
+    title = _forum_clean_text(data.get("title"), FORUM_POST_TITLE_MAX)
+    content = _forum_clean_text(data.get("content"), FORUM_POST_CONTENT_MAX)
+    if not title:
+        raise HTTPException(400, "Tiêu đề bài viết không được để trống.")
+    if not content:
+        raise HTTPException(400, "Nội dung bài viết không được để trống.")
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """UPDATE forum_posts
+                      SET title=%s, content=%s, updated_at=NOW()
+                    WHERE id=%s AND user_id=%s
+                RETURNING id,user_id,title,content,created_at,updated_at""",
+                (title, content, int(post_id), int(user["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute("SELECT 1 FROM forum_posts WHERE id=%s LIMIT 1", (int(post_id),))
+                if cur.fetchone():
+                    raise HTTPException(403, "Cậu chỉ có thể sửa bài viết của chính mình.")
+                raise HTTPException(404, "Không tìm thấy bài Forum.")
+            row = dict(row)
+            cur.execute("SELECT COUNT(*)::int FROM forum_comments WHERE post_id=%s", (int(post_id),))
+            row["comment_count"] = int((cur.fetchone() or [0])[0] or 0)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    row["username"] = _forum_user_public_username(user)
+    row["is_mine"] = True
+    return {"success": True, "post": row}
+
+
+@app.delete("/forum/posts/{post_id}")
+def forum_delete_post(
+    post_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Delete a Forum post. Only the original author can delete it."""
+    user = require_active_user(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM forum_posts WHERE id=%s AND user_id=%s",
+                (int(post_id), int(user["id"])),
+            )
+            deleted = cur.rowcount
+            if deleted != 1:
+                cur.execute("SELECT 1 FROM forum_posts WHERE id=%s LIMIT 1", (int(post_id),))
+                exists = cur.fetchone() is not None
+                if exists:
+                    raise HTTPException(403, "Cậu chỉ có thể xóa bài viết của chính mình.")
+                raise HTTPException(404, "Không tìm thấy bài Forum.")
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"success": True, "deleted": 1, "post_id": int(post_id)}
 
 
 @app.get("/forum/posts/{post_id}/comments")
