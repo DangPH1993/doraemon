@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v33.03 — Forum UX refresh + Admin Forum management
-SERVER_VERSION = "33.05"
+SERVER_VERSION = "33.10"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -220,6 +220,7 @@ def init_db():
                 content_id VARCHAR(255),
                 lesson VARCHAR(255), topic VARCHAR(255), item_key VARCHAR(500),
                 score INTEGER,
+                exercise_score NUMERIC(4,1),
                 status VARCHAR(50) NOT NULL DEFAULT 'in_progress',
                 current_position INTEGER DEFAULT 0,
                 current_page INTEGER,
@@ -547,6 +548,7 @@ def init_db():
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS topic VARCHAR(255);",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS item_key VARCHAR(500);",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS score INTEGER;",
+                "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS exercise_score NUMERIC(4,1);",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'in_progress';",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_position INTEGER DEFAULT 0;",
                 "ALTER TABLE learning_progress ADD COLUMN IF NOT EXISTS current_page INTEGER;",
@@ -1651,13 +1653,24 @@ def record_learning_event(user_id, event):
         current_page = int(current_page) if current_page is not None and str(current_page).strip() != "" else None
     except Exception:
         current_page = None
+    has_attempt_count = "attempt_count" in event
+    has_correct_count = "correct_count" in event
+    has_wrong_count = "wrong_count" in event
+    has_exercise_score = "exercise_score" in event
+
     attempt_count = max(0, int(event.get("attempt_count") or 0))
     correct_count = max(0, int(event.get("correct_count") or 0))
     wrong_count = max(0, int(event.get("wrong_count") or 0))
 
-    # Bài tập không chấm điểm tổng. Keep legacy score columns for compatibility,
-    # but never calculate or persist a new total score from correct/wrong counts.
-    if content_type in {"Bài tập", "Luyện viết"}:
+    exercise_score = event.get("exercise_score")
+    try:
+        exercise_score = float(exercise_score) if exercise_score is not None and str(exercise_score).strip() != "" else None
+    except Exception:
+        exercise_score = None
+    if exercise_score is not None:
+        exercise_score = max(0.0, min(10.0, round(exercise_score, 1)))
+
+    if content_type == "Luyện viết":
         score = None
     if content_type != "Bài tập" and event.get("completed") is True:
         status = "completed"
@@ -1669,7 +1682,7 @@ def record_learning_event(user_id, event):
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""SELECT id,attempt_count,correct_count,wrong_count
+            cur.execute("""SELECT id,attempt_count,correct_count,wrong_count,exercise_score
                            FROM learning_progress
                            WHERE user_id=%s AND content_type=%s AND course_id IS NOT DISTINCT FROM %s AND content_id=%s
                            ORDER BY id DESC LIMIT 1""",
@@ -1681,7 +1694,7 @@ def record_learning_event(user_id, event):
                 # then fall back to legacy rows that have no course_id.
                 if course_id is not None:
                     cur.execute(
-                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                        """SELECT id,attempt_count,correct_count,wrong_count,exercise_score FROM learning_progress
                            WHERE user_id=%s AND content_type=%s
                              AND course_id=%s
                              AND lower(coalesce(lesson,''))=lower(%s)
@@ -1692,7 +1705,7 @@ def record_learning_event(user_id, event):
                     old = cur.fetchone()
                 if not old:
                     cur.execute(
-                        """SELECT id,attempt_count,correct_count,wrong_count FROM learning_progress
+                        """SELECT id,attempt_count,correct_count,wrong_count,exercise_score FROM learning_progress
                            WHERE user_id=%s AND content_type=%s AND course_id IS NULL
                              AND lower(coalesce(lesson,''))=lower(%s)
                              AND lower(coalesce(topic,''))=lower(%s)
@@ -1703,29 +1716,40 @@ def record_learning_event(user_id, event):
                     if old and course_id is not None:
                         cur.execute("UPDATE learning_progress SET course_id=%s WHERE id=%s", (course_id, old["id"]))
             if old:
-                if content_type in {"Bài tập", "Luyện viết"}:
+                is_exercise_attempt = (content_type == "Bài tập" and (has_exercise_score or has_correct_count or has_wrong_count))
+                if content_type == "Bài tập":
+                    attempts = max(int(old.get("attempt_count") or 0), attempt_count) + (1 if is_exercise_attempt else 0)
+                    correct = correct_count if has_correct_count else int(old.get("correct_count") or 0)
+                    wrong = wrong_count if has_wrong_count else int(old.get("wrong_count") or 0)
+                    saved_exercise_score = exercise_score if has_exercise_score else old.get("exercise_score")
+                elif content_type == "Luyện viết":
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count) + 1
+                    correct = 0
+                    wrong = 0
+                    saved_exercise_score = old.get("exercise_score")
                 else:
                     attempts = max(int(old.get("attempt_count") or 0), attempt_count)
-                correct = max(int(old.get("correct_count") or 0), correct_count) if content_type == "Bài tập" else 0
-                wrong = max(int(old.get("wrong_count") or 0), wrong_count) if content_type == "Bài tập" else 0
+                    correct = 0
+                    wrong = 0
+                    saved_exercise_score = old.get("exercise_score")
                 cur.execute("""UPDATE learning_progress SET
-                    subject=%s,lesson=%s,topic=%s,item_key=%s,score=%s,status=%s,
+                    subject=%s,lesson=%s,topic=%s,item_key=%s,score=%s,exercise_score=%s,status=%s,
                     current_position=%s,current_page=%s,attempt_count=%s,correct_count=%s,wrong_count=%s,
                     last_studied_at=NOW(),next_review_at=%s,completed_at=%s
                     WHERE id=%s
                     RETURNING *""",
-                    (subject,lesson,topic,item_key,score,status,current_position,current_page,
+                    (subject,lesson,topic,item_key,score,saved_exercise_score,status,current_position,current_page,
                      attempts,correct,wrong,next_review,completed_at,old["id"]))
             else:
-                attempts = max(1, attempt_count) if content_type == "Bài tập" else 0
+                is_exercise_attempt = (content_type == "Bài tập" and (has_exercise_score or has_correct_count or has_wrong_count))
+                attempts = 1 if content_type == "Luyện viết" or is_exercise_attempt else 0
                 cur.execute("""INSERT INTO learning_progress
-                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,exercise_score,status,
                      current_position,current_page,attempt_count,correct_count,wrong_count,
                      last_studied_at,next_review_at,completed_at)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s)
                     RETURNING *""",
-                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,status,
+                    (user_id,course_id,subject,content_type,content_id,lesson,topic,item_key,score,exercise_score,status,
                      current_position,current_page,attempts,correct_count,wrong_count,next_review,completed_at))
             row = dict(cur.fetchone())
         conn.commit()
@@ -3940,6 +3964,16 @@ def _normalize_exercise_answer(value):
     s=re.sub(r"^[\s\"'`]+|[\s\"'`]+$", "", s)
     s=re.sub(r"\s+", " ", s)
     return s
+
+
+def _exercise_total_score_10(correct_count, total_count):
+    """Return exercise score on a 10-point scale, rounded half-up to 1 decimal."""
+    correct=max(0, int(correct_count or 0))
+    total=max(0, int(total_count or 0))
+    if total <= 0:
+        return 0.0
+    raw=(Decimal(correct) / Decimal(total)) * Decimal("10")
+    return float(raw.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
 
 def _published_curriculum_answer_step(cache):
@@ -9163,7 +9197,7 @@ def proxy_chat(
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.status,
+                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.exercise_score,lp.status,
                        lp.current_position,lp.current_page,lp.attempt_count,lp.correct_count,lp.wrong_count,
                        lp.last_studied_at,lp.next_review_at,lp.completed_at
                 FROM learning_progress lp LEFT JOIN courses c ON c.id=lp.course_id
@@ -10360,6 +10394,33 @@ YÊU CẦU:
                 student_submission = "Học sinh không biết / không trả lời. Hãy giải đủ toàn bộ các câu." if no_answer else query_text.strip()
                 student_answer_map=_exercise_student_answer_map_from_text(query_text if not no_answer else '')
                 student_answer_map_text="\n".join(f"Câu {n}: {a}" for n,a in sorted(student_answer_map.items()))
+
+                total_questions=len(expected_numbers)
+                correct_count=sum(
+                    1 for n in expected_numbers
+                    if n in student_answer_map and n in answer_map
+                    and _normalize_exercise_answer(student_answer_map.get(n)) == _normalize_exercise_answer(answer_map.get(n))
+                )
+                wrong_count=max(0, total_questions-correct_count)
+                exercise_score_10=_exercise_total_score_10(correct_count,total_questions)
+
+                try:
+                    _exercise_progress_row=record_learning_event(user["id"],{
+                        "content_type":"Bài tập",
+                        "course_id":selected_course_id,
+                        "subject":str((study_session or {}).get("course") or "Tiếng Anh IELTS"),
+                        "lesson":(study_session or {}).get("lesson") or requested_lesson or "",
+                        "topic":(study_session or {}).get("topic") or "",
+                        "item_key":(study_session or {}).get("lesson") or requested_lesson or "",
+                        "status":"in_progress",
+                        "exercise_score":exercise_score_10,
+                        "correct_count":correct_count,
+                        "wrong_count":wrong_count,
+                    })
+                    print(f"[EXERCISE SCORE] request={request_id} user={user['id']} correct={correct_count}/{total_questions} score={exercise_score_10:.1f}/10 progress_id={(_exercise_progress_row or {}).get('id')}")
+                except Exception as exc:
+                    print(f"[EXERCISE SCORE] persist failed: {type(exc).__name__}: {exc}")
+
                 q_prompt=f"""Bạn là Doraemon, giải và nhận xét bài tập theo TỪNG CÂU. Chỉ dùng đề bài và đáp án đã cung cấp.
 
 ĐỀ BÀI (chỉ dùng để tìm đáp án và bằng chứng, KHÔNG chép lại toàn bộ):
@@ -10379,7 +10440,7 @@ QUAN TRỌNG:
 - Với Câu N, đáp án đúng bắt buộc lấy từ đúng Câu N trong B2. Không lấy đáp án của câu khác, không tự sửa và không tự đoán.
 - "Đáp án của bạn" phải lấy nguyên văn từ phần ĐÁP ÁN HỌC SINH ĐÃ NHẬP; nếu không có thì ghi `Không trả lời`.
 - KHÔNG dùng dấu ✅ hoặc ❌ để đánh giá đúng/sai.
-- BÀI TẬP KHÔNG CHẤM ĐIỂM TỔNG. Tuyệt đối không tạo điểm, tỷ lệ %, x/y hoặc tổng số câu đúng.
+- Không tự tạo tổng điểm, tỷ lệ %, x/y hoặc tổng số câu đúng trong phần nhận xét; server sẽ bổ sung tổng điểm chính xác ở cuối theo đáp án B2.
 
 BÀI LÀM GỐC CỦA HỌC SINH:
 {student_submission}
@@ -10444,6 +10505,8 @@ YÊU CẦU OUTPUT BẮT BUỘC:
                 blocks=[{"type":"text","text":evaluation or ""}]
                 if weakness_note:
                     blocks.append({"type":"text","text":"\n🎯 **Điểm cần cải thiện**\n\n" + weakness_note})
+                score_text=(f"**Tổng điểm: {correct_count}/{total_questions} × 10 = {exercise_score_10:.1f}/10**" if total_questions>0 else "**Tổng điểm: 0.0/10**")
+                blocks.append({"type":"text","text":score_text})
                 blocks.extend(_exercise_finish_blocks())
                 # Do not paste the full B2 answer block. The evaluation already quotes
                 # only the per-question official answer text requested for feedback.
@@ -11064,6 +11127,7 @@ Trả lời ngắn gọn, đúng trọng tâm. Nếu context không đủ dữ k
             "topic": active_learning.get("topic"),
             "content_id": active_learning.get("content_id"),
             "item_key": active_learning.get("item_key"),
+            "exercise_score": active_learning.get("exercise_score"),
             "status": active_learning.get("status"),
             "current_position": active_learning.get("current_position"),
             "current_page": active_learning.get("current_page"),
@@ -14223,7 +14287,7 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.status,
+                SELECT lp.course_id, COALESCE(c.name, lp.subject) AS course, lp.subject,lp.content_type,lp.content_id,lp.lesson,lp.topic,lp.item_key,lp.score,lp.exercise_score,lp.status,
                        lp.current_position,lp.current_page,lp.attempt_count,lp.correct_count,lp.wrong_count,
                        lp.last_studied_at,lp.next_review_at,lp.completed_at
                 FROM learning_progress lp LEFT JOIN courses c ON c.id=lp.course_id
@@ -14231,7 +14295,25 @@ def learning_summary(authorization: Optional[str] = Header(default=None)):
                 ORDER BY last_studied_at DESC LIMIT 80
             """,(user["id"],))
             rows=[dict(x) for x in cur.fetchall()]
-        return {"success":True,"user_id":user["id"],"learning_history":rows}
+            for row in rows:
+                if row.get("exercise_score") is not None:
+                    row["exercise_score"]=float(row["exercise_score"])
+            cur.execute("""
+                SELECT AVG(CASE
+                    WHEN exercise_score IS NOT NULL THEN exercise_score
+                    WHEN (correct_count + wrong_count) > 0
+                        THEN (correct_count::numeric / NULLIF(correct_count + wrong_count,0)) * 10
+                    ELSE NULL END) AS avg_score
+                FROM learning_progress
+                WHERE user_id=%s AND content_type='Bài tập'
+                  AND LOWER(COALESCE(status,'')) IN ('completed','done')
+            """, (user["id"],))
+            avg_row=cur.fetchone() or {}
+            avg_score=avg_row.get("avg_score")
+            if avg_score is not None:
+                avg_score=round(float(avg_score),1)
+        return {"success":True,"user_id":user["id"],"learning_history":rows,
+                "exercise_average_score_10":avg_score}
     finally:
         conn.close()
 
