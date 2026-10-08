@@ -7913,6 +7913,7 @@ def forum_create_post(
 
 
 @app.put("/forum/posts/{post_id}")
+@app.post("/forum/posts/{post_id}/edit")
 def forum_update_post(
     post_id: int,
     data: dict,
