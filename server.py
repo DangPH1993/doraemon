@@ -139,7 +139,7 @@ app.add_middleware(
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
 # VERSION: v33.03 — Forum UX refresh + Admin Forum management
-SERVER_VERSION = "33.03"
+SERVER_VERSION = "33.04"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -19038,10 +19038,17 @@ async function deleteAllCollocations(){
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
 async function api(u,o={}) {
-  o.headers={"Content-Type":"application/json",...(o.headers||{})};
+  o={...o,headers:{"Content-Type":"application/json",...(o.headers||{})}};
+  if(o.body && typeof o.body === "object" && !(o.body instanceof FormData) && !(o.body instanceof Blob)) {
+    o.body=JSON.stringify(o.body);
+  }
   const r=await fetch(u,o); const t=await r.text(); let d={};
   try{d=JSON.parse(t)}catch{d={detail:t}}
-  if(!r.ok) throw Error(d.detail||("HTTP "+r.status));
+  if(!r.ok){
+    const detail=d?.detail;
+    const msg=typeof detail === "string" ? detail : (detail?.message || (Array.isArray(detail) ? detail.map(x=>x?.msg||x?.message||String(x)).join("; ") : "HTTP "+r.status));
+    throw Error(msg || ("HTTP "+r.status));
+  }
   return d;
 }
 async function login(){
