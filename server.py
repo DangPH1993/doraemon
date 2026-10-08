@@ -95,7 +95,6 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip()
 BREVO_SENDER_NAME = os.getenv("BREVO_SENDER_NAME", "Doraemon").strip() or "Doraemon"
 DORAEMON_WEB_URL = (os.getenv("DORAEMON_WEB_URL", "") or os.getenv("WEB_URL", "")).strip().rstrip("/")
-APP_DOWNLOAD_URL = (os.getenv("DORAEMON_APP_DOWNLOAD_URL", "") or os.getenv("APP_DOWNLOAD_URL", "")).strip()
 PASSWORD_RESET_TTL_MINUTES = max(5, min(60, int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "20"))))
 ADMIN_WS_TOKEN = os.getenv("ADMIN_WS_TOKEN")
 ADMIN_PANEL_PASSWORD = os.getenv("ADMIN_PANEL_PASSWORD", ADMIN_WS_TOKEN)
@@ -139,8 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v31.92 — Curriculum duplicate button wiring + edit-only rename
-SERVER_VERSION = "33.01"
+# VERSION: v33.02 — Forum posts/comments/notifications with username + emoji-friendly text UI
+SERVER_VERSION = "33.02"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -491,6 +490,40 @@ def init_db():
                 UNIQUE(user_id, chatbox_id)
             );""")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_now_sessions_user_status ON chat_now_sessions(user_id,status,updated_at DESC);")
+
+            # Lightweight community forum. Text-only by design: no image/blob storage.
+            # User identity is resolved from the existing users.username field.
+            cur.execute("""CREATE TABLE IF NOT EXISTS forum_posts (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title VARCHAR(180) NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS forum_comments (
+                id BIGSERIAL PRIMARY KEY,
+                post_id BIGINT NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS forum_notifications (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                post_id BIGINT NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
+                comment_id BIGINT NOT NULL REFERENCES forum_comments(id) ON DELETE CASCADE,
+                notification_type VARCHAR(40) NOT NULL DEFAULT 'post_reply',
+                is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_posts_created ON forum_posts(created_at DESC, id DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_comments_post_created ON forum_comments(post_id, created_at ASC, id ASC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_read ON forum_notifications(user_id, is_read, created_at DESC);")
+
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_forum_notifications_user_post
+                ON forum_notifications(user_id, post_id, created_at DESC);""")
+
             cur.execute("""CREATE TABLE IF NOT EXISTS payment_packages (
                 months INTEGER PRIMARY KEY,
                 plan_name VARCHAR(50) NOT NULL,
@@ -7781,6 +7814,282 @@ def chat_now_end(data: dict, authorization: Optional[str] = Header(default=None)
         course_id = None
     result = _chat_now_end_endpoint(user["id"], chatbox_id, course_id, data.get("chat_history"))
     return {"success":True, **result}
+
+
+# -----------------------------------------------------------------------------
+# Forum / community
+# -----------------------------------------------------------------------------
+
+FORUM_POST_TITLE_MAX = 180
+FORUM_POST_CONTENT_MAX = 5000
+FORUM_COMMENT_MAX = 3000
+FORUM_DEFAULT_LIMIT = 12
+FORUM_MAX_LIMIT = 30
+
+
+def _forum_clean_text(value, max_chars):
+    text = str(value or "").replace("\x00", "").strip()
+    if not text:
+        return ""
+    return text[:max_chars]
+
+
+def _forum_user_public_username(user):
+    username = str((user or {}).get("username") or "").strip()
+    if username:
+        return username
+    # Existing accounts created before username was mandatory may still have a
+    # null username. Keep the forum usable without exposing email/phone.
+    nickname = str((user or {}).get("nickname") or "").strip()
+    return nickname or "user"
+
+
+@app.get("/forum/posts")
+def forum_list_posts(
+    authorization: Optional[str] = Header(default=None),
+    limit: int = FORUM_DEFAULT_LIMIT,
+):
+    user = require_active_user(authorization)
+    limit = max(1, min(FORUM_MAX_LIMIT, int(limit or FORUM_DEFAULT_LIMIT)))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """SELECT p.id,p.user_id,p.title,p.content,p.created_at,p.updated_at,
+                          COALESCE(u.username,u.nickname,'user') AS username,
+                          COUNT(c.id)::int AS comment_count
+                     FROM forum_posts p
+                     JOIN users u ON u.id=p.user_id
+                     LEFT JOIN forum_comments c ON c.post_id=p.id
+                    GROUP BY p.id,u.id
+                    ORDER BY p.created_at DESC,p.id DESC
+                    LIMIT %s""",
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+
+    for row in rows:
+        row["is_mine"] = int(row.get("user_id") or 0) == int(user["id"])
+        row["comment_count"] = int(row.get("comment_count") or 0)
+    return {"posts": rows, "limit": limit}
+
+
+@app.post("/forum/posts")
+def forum_create_post(
+    data: dict,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = require_active_user(authorization)
+    title = _forum_clean_text(data.get("title"), FORUM_POST_TITLE_MAX)
+    content = _forum_clean_text(data.get("content"), FORUM_POST_CONTENT_MAX)
+    if not title:
+        raise HTTPException(400, "Tiêu đề bài viết không được để trống.")
+    if not content:
+        raise HTTPException(400, "Nội dung bài viết không được để trống.")
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """INSERT INTO forum_posts(user_id,title,content)
+                       VALUES(%s,%s,%s)
+                    RETURNING id,user_id,title,content,created_at,updated_at""",
+                (int(user["id"]), title, content),
+            )
+            row = dict(cur.fetchone())
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    row["username"] = _forum_user_public_username(user)
+    row["comment_count"] = 0
+    row["is_mine"] = True
+    return {"success": True, "post": row}
+
+
+@app.get("/forum/posts/{post_id}/comments")
+def forum_list_comments(
+    post_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = require_active_user(authorization)
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,user_id,title,content,created_at FROM forum_posts WHERE id=%s LIMIT 1", (post_id,))
+            post = cur.fetchone()
+            if not post:
+                raise HTTPException(404, "Không tìm thấy bài viết.")
+            cur.execute(
+                """SELECT c.id,c.post_id,c.user_id,c.content,c.created_at,
+                          COALESCE(u.username,u.nickname,'user') AS username
+                     FROM forum_comments c
+                     JOIN users u ON u.id=c.user_id
+                    WHERE c.post_id=%s
+                    ORDER BY c.created_at ASC,c.id ASC""",
+                (post_id,),
+            )
+            comments = [dict(r) for r in cur.fetchall() or []]
+    finally:
+        conn.close()
+    for item in comments:
+        item["is_mine"] = int(item.get("user_id") or 0) == int(user["id"])
+    return {"post": dict(post), "comments": comments}
+
+
+@app.post("/forum/posts/{post_id}/comments")
+def forum_create_comment(
+    post_id: int,
+    data: dict,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = require_active_user(authorization)
+    content = _forum_clean_text(data.get("content"), FORUM_COMMENT_MAX)
+    if not content:
+        raise HTTPException(400, "Bình luận không được để trống.")
+
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id,user_id FROM forum_posts WHERE id=%s LIMIT 1", (post_id,))
+            post = cur.fetchone()
+            if not post:
+                raise HTTPException(404, "Không tìm thấy bài viết.")
+
+            cur.execute(
+                """INSERT INTO forum_comments(post_id,user_id,content)
+                       VALUES(%s,%s,%s)
+                    RETURNING id,post_id,user_id,content,created_at""",
+                (post_id, int(user["id"]), content),
+            )
+            comment = dict(cur.fetchone())
+
+            # Notify only the post owner and never notify a user about their own reply.
+            owner_id = int(post["user_id"])
+            commenter_id = int(user["id"])
+            if owner_id != commenter_id:
+                cur.execute(
+                    """INSERT INTO forum_notifications(user_id,post_id,comment_id,notification_type)
+                           VALUES(%s,%s,%s,'post_reply')
+                        RETURNING id,created_at""",
+                    (owner_id, post_id, int(comment["id"])),
+                )
+                notification = cur.fetchone()
+            else:
+                notification = None
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    comment["username"] = _forum_user_public_username(user)
+    comment["is_mine"] = True
+    return {"success": True, "comment": comment, "notification_created": bool(notification)}
+
+
+@app.get("/forum/notifications")
+def forum_notifications(
+    authorization: Optional[str] = Header(default=None),
+    unread_only: bool = True,
+    limit: int = 20,
+):
+    user = require_active_user(authorization)
+    limit = max(1, min(50, int(limit or 20)))
+    conn = db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            where = "n.user_id=%s"
+            params = [int(user["id"])]
+            if unread_only:
+                where += " AND n.is_read=FALSE"
+            cur.execute(
+                f"""SELECT n.id,n.post_id,n.comment_id,n.notification_type,n.is_read,n.created_at,
+                           p.title,p.user_id AS post_owner_id,
+                           COALESCE(u.username,u.nickname,'user') AS username,
+                           LEFT(c.content,160) AS comment_preview
+                      FROM forum_notifications n
+                      JOIN forum_posts p ON p.id=n.post_id
+                      JOIN forum_comments c ON c.id=n.comment_id
+                      JOIN users u ON u.id=c.user_id
+                     WHERE {where}
+                     ORDER BY n.created_at DESC,n.id DESC
+                     LIMIT %s""",
+                tuple(params + [limit]),
+            )
+            rows = [dict(r) for r in cur.fetchall() or []]
+            cur.execute(
+                "SELECT COUNT(*)::int AS unread_count FROM forum_notifications WHERE user_id=%s AND is_read=FALSE",
+                (int(user["id"]),),
+            )
+            unread_count = int((cur.fetchone() or {}).get("unread_count") or 0)
+    finally:
+        conn.close()
+    return {"notifications": rows, "unread_count": unread_count}
+
+
+@app.post("/forum/notifications/read")
+def forum_notifications_read(
+    data: dict,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = require_active_user(authorization)
+    notification_ids = data.get("notification_ids")
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            if isinstance(notification_ids, list) and notification_ids:
+                ids = []
+                for value in notification_ids[:100]:
+                    try:
+                        ids.append(int(value))
+                    except Exception:
+                        continue
+                if ids:
+                    cur.execute(
+                        "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND id=ANY(%s)",
+                        (int(user["id"]), ids),
+                    )
+            else:
+                cur.execute(
+                    "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND is_read=FALSE",
+                    (int(user["id"]),),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"success": True}
+
+
+@app.post("/forum/notifications/{notification_id}/read")
+def forum_notification_read_one(
+    notification_id: int,
+    authorization: Optional[str] = Header(default=None),
+):
+    user = require_active_user(authorization)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE forum_notifications SET is_read=TRUE WHERE id=%s AND user_id=%s",
+                (notification_id, int(user["id"])),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"success": True}
 
 
 @app.post("/api/proxy-chat")
@@ -21602,12 +21911,6 @@ def admin_status(user_id:int,data:dict):
         conn.commit()
     finally: conn.close()
     return {"success":True,"status":status}
-
-
-@app.get("/public/config")
-def public_config():
-    """Return non-sensitive public runtime configuration for the static landing page."""
-    return {"app_download_url": APP_DOWNLOAD_URL or None}
 
 
 @app.get("/")
