@@ -7945,8 +7945,9 @@ def forum_update_post(
                     raise HTTPException(403, "Cậu chỉ có thể sửa bài viết của chính mình.")
                 raise HTTPException(404, "Không tìm thấy bài Forum.")
             row = dict(row)
-            cur.execute("SELECT COUNT(*)::int FROM forum_comments WHERE post_id=%s", (int(post_id),))
-            row["comment_count"] = int((cur.fetchone() or [0])[0] or 0)
+            cur.execute("SELECT COUNT(*)::int AS comment_count FROM forum_comments WHERE post_id=%s", (int(post_id),))
+            count_row = cur.fetchone() or {}
+            row["comment_count"] = int(count_row.get("comment_count") or 0)
         conn.commit()
     except HTTPException:
         conn.rollback()
