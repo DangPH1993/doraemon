@@ -137,9 +137,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.134-forum-notification-delete-admin-unread-count")
-# VERSION: v33.18 — Delete read Forum notifications and add lightweight Admin unread count
-SERVER_VERSION = "33.18"
+print("[DORAEMON SERVER FINGERPRINT] 19.135-ga4-admin-settings")
+# VERSION: v33.19 — Admin settings for Google Analytics 4 with public runtime configuration
+SERVER_VERSION = "33.19"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -212,6 +212,11 @@ def init_db():
                 sender VARCHAR(20) NOT NULL, message TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 is_read BOOLEAN NOT NULL DEFAULT FALSE);""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS site_settings (
+                setting_key VARCHAR(100) PRIMARY KEY,
+                value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );""")
             cur.execute("""CREATE TABLE IF NOT EXISTS learning_progress (
                 id BIGSERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 course_id BIGINT,
@@ -19010,6 +19015,104 @@ def admin_forum_delete_bulk(data: dict):
     return {"success": True, "deleted": int(deleted), "requested": len(ids)}
 
 
+GA4_MEASUREMENT_ID_RE = re.compile(r"^G-[A-Z0-9]{4,20}$", re.I)
+
+
+def _get_google_analytics_settings():
+    """Read the small public GA4 configuration stored in PostgreSQL."""
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value_json FROM site_settings WHERE setting_key=%s", ("google_analytics",))
+            row = cur.fetchone()
+        value = (row[0] if row else {}) or {}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = {}
+        if not isinstance(value, dict):
+            value = {}
+        measurement_id = str(value.get("measurement_id") or "").strip().upper()
+        enabled = value.get("enabled") is True and bool(GA4_MEASUREMENT_ID_RE.fullmatch(measurement_id))
+        return {"enabled": enabled, "measurement_id": measurement_id if enabled else ""}
+    finally:
+        conn.close()
+
+
+@app.get("/public/analytics-config")
+def public_analytics_config():
+    """Public, non-secret config consumed by the static Web client at page load."""
+    try:
+        return _get_google_analytics_settings()
+    except Exception as exc:
+        # Analytics must never prevent the learning site from loading.
+        print("[GA4 PUBLIC CONFIG] unavailable:", type(exc).__name__)
+        return {"enabled": False, "measurement_id": ""}
+
+
+@app.get("/admin/api/analytics-settings")
+def admin_get_analytics_settings(password: str):
+    check_admin(password)
+    try:
+        # Return saved state too, so the Admin can edit a disabled config.
+        conn = db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value_json, updated_at FROM site_settings WHERE setting_key=%s", ("google_analytics",))
+                row = cur.fetchone()
+            value = (row[0] if row else {}) or {}
+            if isinstance(value, str):
+                value = json.loads(value)
+            if not isinstance(value, dict):
+                value = {}
+            return {
+                "enabled": value.get("enabled") is True,
+                "measurement_id": str(value.get("measurement_id") or "").strip().upper(),
+                "updated_at": row[1].isoformat() if row and row[1] else None,
+            }
+        finally:
+            conn.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("[GA4 ADMIN GET] failed:", type(exc).__name__)
+        raise HTTPException(500, "Không tải được cấu hình Google Analytics.")
+
+
+@app.post("/admin/api/analytics-settings")
+def admin_save_analytics_settings(payload: dict):
+    check_admin(str(payload.get("password") or "").strip())
+    enabled_value = payload.get("enabled", False)
+    if not isinstance(enabled_value, bool):
+        raise HTTPException(400, "Trạng thái bật/tắt phải là true hoặc false.")
+    enabled = enabled_value
+    measurement_id = str(payload.get("measurement_id") or "").strip().upper()
+    if measurement_id and not GA4_MEASUREMENT_ID_RE.fullmatch(measurement_id):
+        raise HTTPException(400, "Measurement ID không đúng định dạng. Hãy dùng mã GA4 bắt đầu bằng G-, ví dụ G-ABC1234567.")
+    if enabled and not measurement_id:
+        raise HTTPException(400, "Hãy nhập Measurement ID trước khi bật Google Analytics.")
+
+    saved = {"enabled": enabled, "measurement_id": measurement_id}
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO site_settings(setting_key,value_json,updated_at)
+                   VALUES(%s,%s::jsonb,NOW())
+                   ON CONFLICT(setting_key) DO UPDATE SET
+                     value_json=EXCLUDED.value_json, updated_at=NOW()""",
+                ("google_analytics", json.dumps(saved, ensure_ascii=False)),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"success": True, **saved}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_panel():
     return HTMLResponse("""<!doctype html>
@@ -19030,7 +19133,7 @@ button.gray{background:#666}button.red{background:#d93025}
 .user{padding:11px 12px;border-bottom:1px solid #eee;cursor:pointer;position:relative}.user:last-child{border-bottom:0}.user:hover{background:#f5f8ff}
 .user.sel{background:#e8f1ff}.status-ACTIVE{color:#16803c}.status-PENDING{color:#b76b00}.status-LOCKED{color:#c00}
 .user-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.user-identity{min-width:0;flex:1}.user-actions{display:flex;gap:6px;align-items:center;flex:0 0 auto}.user-unread{display:inline-flex;align-items:center;gap:4px;background:#fff0f0;color:#c00;border:1px solid #ffc7c7;border-radius:999px;padding:3px 7px;font-size:12px;font-weight:700}.user-unread-dot{width:7px;height:7px;border-radius:50%;background:#d93025;display:inline-block}.user-delete{background:#d93025!important;padding:6px 9px!important}.user-search-row{display:flex;gap:8px;align-items:center;margin:10px 0}.user-search-row input{flex:1;min-width:0}.user-search-row button{flex:0 0 auto}.user-list-note{font-size:12px;color:#667085;margin:-3px 0 10px}
-.admin-tabs{display:flex;gap:8px;margin:0 0 16px;padding:4px;background:#eaf0f8;border-radius:12px;position:sticky;top:0;z-index:5}.admin-tab{flex:1;background:transparent;color:#44546a;border:1px solid transparent;font-weight:700;padding:11px 14px;border-radius:9px}.admin-tab:hover{background:#fff;color:#1677ff}.admin-tab.active{background:#1677ff;color:#fff;box-shadow:0 2px 8px #1677ff33}.admin-tab-panel{min-width:0}.admin-tab-panel>.card:last-child{margin-bottom:0}
+.admin-tabs{display:flex;gap:8px;margin:0 0 16px;padding:4px;background:#eaf0f8;border-radius:12px;position:sticky;top:0;z-index:5}.admin-tab{flex:1;background:transparent;color:#44546a;border:1px solid transparent;font-weight:700;padding:11px 14px;border-radius:9px}.admin-tab:hover{background:#fff;color:#1677ff}.admin-tab.active{background:#1677ff;color:#fff;box-shadow:0 2px 8px #1677ff33}.admin-tabs{flex-wrap:wrap}.admin-tab{min-width:140px}.admin-tab-panel{min-width:0}.admin-tab-panel>.card:last-child{margin-bottom:0}
 #users{max-height:560px;overflow:auto;border:1px solid #e5e7eb;border-radius:10px;background:#fff}.chat{display:flex;flex-direction:column;height:610px}
 #messages{flex:1;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fafafa}
 .msg{margin:7px 0;padding:8px 10px;border-radius:10px;max-width:82%;white-space:pre-wrap}
@@ -19060,6 +19163,7 @@ button.gray{background:#666}button.red{background:#d93025}
   <button type="button" class="admin-tab active" data-admin-tab="users" role="tab" aria-selected="true">👥 Quản lý user</button>
   <button type="button" class="admin-tab" data-admin-tab="content" role="tab" aria-selected="false">📚 Quản lý nội dung</button>
   <button type="button" class="admin-tab" data-admin-tab="forum" role="tab" aria-selected="false">💬 Quản lý Forum</button>
+  <button type="button" class="admin-tab" data-admin-tab="settings" role="tab" aria-selected="false">⚙️ Cài đặt</button>
 </div>
 <div id="adminTabUsers" class="admin-tab-panel" data-admin-panel="users">
   <div id="adminUserInbox" class="layout" style="margin-bottom:18px">
@@ -19121,6 +19225,36 @@ button.gray{background:#666}button.red{background:#d93025}
       <button type="button" class="forum-admin-muted" id="forumAdminPrevBtn" onclick="changeForumAdminPage(-1)">← Trang trước</button>
       <span id="forumAdminPageInfo" class="small" style="font-weight:800"></span>
       <button type="button" class="forum-admin-muted" id="forumAdminNextBtn" onclick="changeForumAdminPage(1)">Trang sau →</button>
+    </div>
+  </div>
+</div>
+<div id="adminTabSettings" class="admin-tab-panel" data-admin-panel="settings" style="display:none">
+  <div class="card">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <div>
+        <h3 style="margin:0 0 5px">📊 Google Analytics 4</h3>
+        <div class="small">Kết nối Doraemon Web với GA4 để theo dõi lượt truy cập cơ bản.</div>
+      </div>
+      <span id="gaStatusBadge" style="display:inline-flex;align-items:center;border-radius:999px;padding:6px 10px;background:#f2f4f7;color:#475467;font-size:12px;font-weight:700">Chưa cấu hình</span>
+    </div>
+    <div style="display:grid;grid-template-columns:minmax(0,1fr);gap:14px;margin-top:18px;max-width:760px">
+      <label for="gaMeasurementId" style="display:block;font-weight:700">Measurement ID</label>
+      <input id="gaMeasurementId" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="G-XXXXXXXXXX" maxlength="32" style="width:100%;font-family:ui-monospace,monospace;letter-spacing:.04em">
+      <div class="small" style="margin-top:-8px">Lấy tại Google Analytics → Quản trị (Admin) → Luồng dữ liệu (Data streams) → chọn luồng Web → Measurement ID. Mã thường có dạng <code>G-XXXXXXXXXX</code>.</div>
+      <label for="gaEnabled" style="display:flex;align-items:flex-start;gap:10px;padding:13px;border:1px solid #d0d5dd;border-radius:10px;background:#f8fbff;cursor:pointer">
+        <input id="gaEnabled" type="checkbox" style="width:18px;height:18px;margin-top:2px;flex:0 0 auto">
+        <span><strong>Bật Google Analytics trên Web</strong><span class="small" style="display:block;margin-top:3px">Khi bật, Web sẽ tải Google tag và ghi nhận lượt xem trang Landing/App sau khi tải lại trang.</span></span>
+      </label>
+      <div style="padding:12px 14px;border:1px solid #dbeafe;border-radius:10px;background:#eff6ff;color:#1e3a8a;font-size:13px;line-height:1.55">
+        <strong>Quyền riêng tư</strong><br>
+        Doraemon chỉ khai báo event page_view và không đính kèm email, username, user ID hoặc nội dung chat. Google Analytics có thể tự thu thập thêm event theo cài đặt của Property. Thay đổi có hiệu lực khi người dùng tải lại Doraemon Web; hãy cập nhật chính sách quyền riêng tư/consent phù hợp trước khi bật tracking cho người dùng thật.
+      </div>
+      <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+        <button type="button" id="saveAnalyticsSettings">💾 Lưu cấu hình</button>
+        <button type="button" class="gray" onclick="loadAnalyticsSettings()">🔄 Tải lại</button>
+        <a href="https://analytics.google.com/" target="_blank" rel="noopener noreferrer" style="font-size:13px">Mở Google Analytics ↗</a>
+      </div>
+      <div id="gaSettingsMessage" role="status" aria-live="polite" class="small" style="min-height:20px"></div>
     </div>
   </div>
 </div>
@@ -19227,17 +19361,18 @@ let pw="", ws=null, wsToken="", selectedUser=null, seenMessageIds=new Set(), pol
 
 function initAdminTabs(){
   const tabs=[...document.querySelectorAll("[data-admin-tab]")];
-  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent"),forum:document.getElementById("adminTabForum")};
-  if(!tabs.length || !panels.users || !panels.content || !panels.forum) return;
+  const panels={users:document.getElementById("adminTabUsers"),content:document.getElementById("adminTabContent"),forum:document.getElementById("adminTabForum"),settings:document.getElementById("adminTabSettings")};
+  if(!tabs.length || !panels.users || !panels.content || !panels.forum || !panels.settings) return;
   const activate=(name)=>{
     tabs.forEach(btn=>{const active=btn.dataset.adminTab===name;btn.classList.toggle("active",active);btn.setAttribute("aria-selected",String(active));});
     Object.entries(panels).forEach(([key,panel])=>{panel.style.display=key===name?"block":"none";});
     sessionStorage.setItem("doraemon_admin_tab",name);
     if(name==="forum" && pw) loadForumAdminPosts().catch(e=>console.error('[ADMIN FORUM] load failed',e));
+    if(name==="settings" && pw) loadAnalyticsSettings().catch(e=>console.error('[ADMIN GA4] load failed',e));
   };
   tabs.forEach(btn=>btn.addEventListener("click",()=>activate(btn.dataset.adminTab)));
   const saved=sessionStorage.getItem("doraemon_admin_tab");
-  activate(saved==="content"?"content":saved==="forum"?"forum":"users");
+  activate(saved==="content"?"content":saved==="forum"?"forum":saved==="settings"?"settings":"users");
 }
 
 function ensureVocabularyAdminSection(){
@@ -19483,6 +19618,43 @@ async function deleteAllCollocations(){
 }
 
 function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+async function loadAnalyticsSettings(){
+  const idInput=document.getElementById("gaMeasurementId");
+  const enabledInput=document.getElementById("gaEnabled");
+  const msg=document.getElementById("gaSettingsMessage");
+  const badge=document.getElementById("gaStatusBadge");
+  if(!idInput||!enabledInput)return;
+  if(msg)msg.textContent="Đang tải cấu hình…";
+  try{
+    const d=await api("/admin/api/analytics-settings?password="+encodeURIComponent(pw));
+    idInput.value=String(d.measurement_id||"");
+    enabledInput.checked=d.enabled===true;
+    if(badge){badge.textContent=enabledInput.checked?"Đang bật":"Đang tắt";badge.style.background=enabledInput.checked?"#dcfce7":"#f2f4f7";badge.style.color=enabledInput.checked?"#166534":"#475467";}
+    if(msg)msg.textContent="Đã tải cấu hình hiện tại.";
+  }catch(e){if(msg)msg.textContent="Không tải được cấu hình: "+(e.message||e);throw e;}
+}
+async function saveAnalyticsSettings(){
+  const idInput=document.getElementById("gaMeasurementId");
+  const enabledInput=document.getElementById("gaEnabled");
+  const btn=document.getElementById("saveAnalyticsSettings");
+  const msg=document.getElementById("gaSettingsMessage");
+  if(!idInput||!enabledInput)return;
+  const measurement_id=String(idInput.value||"").trim().toUpperCase();
+  const enabled=enabledInput.checked;
+  if(enabled&&!measurement_id){if(msg)msg.textContent="Hãy nhập Measurement ID trước khi bật.";idInput.focus();return;}
+  if(measurement_id&&!/^G-[A-Z0-9]{4,20}$/.test(measurement_id)){if(msg)msg.textContent="Measurement ID chưa đúng định dạng. Ví dụ: G-ABC1234567.";idInput.focus();return;}
+  if(btn){btn.disabled=true;btn.textContent="Đang lưu…";}
+  if(msg)msg.textContent="Đang lưu cấu hình…";
+  try{
+    const d=await api("/admin/api/analytics-settings",{method:"POST",body:{password:pw,enabled,measurement_id}});
+    idInput.value=d.measurement_id||"";
+    if(msg)msg.textContent=d.enabled?"✅ Đã lưu. Google Analytics sẽ bắt đầu theo dõi khi Web được tải lại.":"✅ Đã lưu. Google Analytics đang tắt.";
+    const badge=document.getElementById("gaStatusBadge");
+    if(badge){badge.textContent=d.enabled?"Đang bật":"Đang tắt";badge.style.background=d.enabled?"#dcfce7":"#f2f4f7";badge.style.color=d.enabled?"#166534":"#475467";}
+  }catch(e){if(msg)msg.textContent="❌ "+(e.message||e);}
+  finally{if(btn){btn.disabled=false;btn.textContent="💾 Lưu cấu hình";}}
+}
+
 async function api(u,o={}) {
   o={...o,headers:{"Content-Type":"application/json",...(o.headers||{})}};
   if(o.body && typeof o.body === "object" && !(o.body instanceof FormData) && !(o.body instanceof Blob)) {
@@ -19515,6 +19687,8 @@ async function login(){
     loginBox.style.display="none";
     panel.style.display="block";
     initAdminTabs();
+    const gaSaveButton=document.getElementById("saveAnalyticsSettings");
+    if(gaSaveButton && !gaSaveButton.dataset.bound){gaSaveButton.addEventListener("click",saveAnalyticsSettings);gaSaveButton.dataset.bound="1";}
     document.getElementById("wsState").textContent="● Đã đăng nhập Admin";
 
     const initStep=async(label,fn)=>{
