@@ -7942,9 +7942,12 @@ def _forum_user_public_username(user):
 def forum_list_posts(
     authorization: Optional[str] = Header(default=None),
     limit: int = FORUM_DEFAULT_LIMIT,
+    offset: int = 0,
 ):
+    """Return Forum posts in pages for the Web client's lazy loader."""
     user = require_active_user(authorization)
     limit = max(1, min(FORUM_MAX_LIMIT, int(limit or FORUM_DEFAULT_LIMIT)))
+    offset = max(0, int(offset or 0))
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -7957,8 +7960,8 @@ def forum_list_posts(
                      LEFT JOIN forum_comments c ON c.post_id=p.id
                     GROUP BY p.id,u.id
                     ORDER BY p.created_at DESC,p.id DESC
-                    LIMIT %s""",
-                (limit,),
+                    LIMIT %s OFFSET %s""",
+                (limit, offset),
             )
             rows = [dict(r) for r in cur.fetchall() or []]
     finally:
@@ -7967,7 +7970,14 @@ def forum_list_posts(
     for row in rows:
         row["is_mine"] = int(row.get("user_id") or 0) == int(user["id"])
         row["comment_count"] = int(row.get("comment_count") or 0)
-    return {"posts": rows, "limit": limit}
+    has_more = len(rows) >= limit
+    return {
+        "posts": rows,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": offset + len(rows),
+        "has_more": has_more,
+    }
 
 
 @app.post("/forum/posts")
