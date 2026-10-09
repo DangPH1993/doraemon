@@ -7012,72 +7012,178 @@ def _extract_grammar_question_block(text, number):
     return block[:6000]
 
 
+def _parse_grammar_review_status(text):
+    """Read the hidden, machine-readable per-question grading status from GenAI."""
+    raw=str(text or "")
+    m=re.search(
+        r"###GRAMMAR_REVIEW_STATUS###\s*(?:```json\s*)?(\{.*?\})(?:\s*```)?",
+        raw,
+        flags=re.I|re.S,
+    )
+    if not m:
+        return None
+    try:
+        payload=json.loads(m.group(1))
+    except Exception:
+        return None
+    if not isinstance(payload,dict) or not isinstance(payload.get("wrong"),list):
+        return None
+
+    def numbers(key):
+        out=set()
+        vals=payload.get(key,[])
+        if not isinstance(vals,list):
+            return out
+        for value in vals:
+            try:
+                number=int(value)
+            except Exception:
+                continue
+            if number > 0:
+                out.add(number)
+        return out
+
+    result={
+        "correct":numbers("correct"),
+        "wrong":numbers("wrong"),
+        "unanswered":numbers("unanswered"),
+    }
+    # A question cannot be both correct and wrong; invalid/ambiguous markers
+    # are rejected rather than accidentally adding correct answers to review.
+    if result["correct"] & result["wrong"]:
+        return None
+    return result
+
+
+def _strip_grammar_review_status_marker(text):
+    """Remove the internal review-status marker from the learner-visible feedback."""
+    raw=str(text or "")
+    raw=re.sub(r"(?is)\s*###GRAMMAR_REVIEW_STATUS###.*$", "", raw).strip()
+    return raw
+
+
 def _persist_grammar_b1_wrong_review(user_id, course_id, lesson, b1_text, student_text, b2_text):
-    """Persist each grammar B1 question answered incorrectly into the wrong-review queue."""
-    official=_exercise_answer_map_from_text(b2_text)
-    numbers=_exercise_question_numbers_from_text(b1_text)
-    if not numbers and official:
-        numbers=sorted(official.keys())
-    if not official:
-        print(f"[GRAMMAR WRONG REVIEW] skipped user={user_id} course_id={course_id} lesson={lesson!r} reason=no_official_answer_map")
+    """Persist only questions explicitly judged wrong by the GenAI grammar grader."""
+    status=_parse_grammar_review_status(b2_text)
+    if not status:
+        print(
+            f"[GRAMMAR WRONG REVIEW] skipped user={user_id} course_id={course_id} "
+            f"lesson={lesson!r} reason=missing_or_invalid_genai_status_marker"
+        )
         return 0
-    student={} if _is_exercise_no_answer(student_text) else _exercise_student_answer_map_from_text(student_text)
-    saved=0; labels=[]
-    for n in numbers or sorted(official.keys()):
-        expected=str(official.get(n) or '').strip()
-        if not expected:
-            continue
-        got=str(student.get(n) or '').strip()
-        if not got:
-            wrong=True
-        else:
-            norm=lambda x: re.sub(r'\s+','',str(x or '').strip().casefold())
-            wrong=norm(got) != norm(expected)
-            if wrong:
-                m1=re.fullmatch(r'[A-D]',norm(got))
-                m2=re.fullmatch(r'[A-D]',norm(expected))
-                if m1 and m2:
-                    wrong=(m1.group(0)!=m2.group(0))
-        if not wrong:
+
+    official_text=_strip_grammar_review_status_marker(b2_text)
+    official=_exercise_answer_map_from_text(official_text)
+    numbers=set(_exercise_question_numbers_from_text(b1_text))
+    if not numbers and official:
+        numbers.update(official.keys())
+    numbers.update(status["correct"])
+    numbers.update(status["wrong"])
+    numbers.update(status["unanswered"])
+
+    lesson_key=str(lesson or "").strip().casefold()
+    if course_id in (None, "") or not lesson_key:
+        print(f"[GRAMMAR WRONG REVIEW] skipped user={user_id} reason=missing_course_or_lesson")
+        return 0
+
+    # Correct and unanswered questions must not remain in the review queue from
+    # an earlier buggy attempt. Clear only rows belonging to this exact lesson
+    # and question. Wrong questions are then upserted below.
+    non_wrong=status["correct"] | status["unanswered"]
+    removed=0
+    if non_wrong:
+        conn=db()
+        try:
+            with conn.cursor() as cur:
+                for number in sorted(non_wrong - status["wrong"]):
+                    key=f"__b1__{int(course_id)}__{lesson_key}__q{int(number)}"
+                    cur.execute(
+                        """DELETE FROM user_grammar_review
+                           WHERE user_id=%s AND course_id=%s
+                             AND grammar_id IN (
+                               SELECT id FROM curriculum_grammar_master
+                               WHERE course_id=%s AND normalized_key=%s
+                             )""",
+                        (user_id,int(course_id),int(course_id),key),
+                    )
+                    removed += max(0, cur.rowcount or 0)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    saved=0
+    labels=[]
+    for n in sorted(status["wrong"]):
+        # Respect the current B1 question list when it was parseable; this keeps
+        # a malformed model marker from scheduling an unrelated question.
+        if numbers and n not in numbers:
             continue
         block=_extract_grammar_question_block(b1_text,n)
         option_map,question_text=_review_extract_choice_map(block)
-        expected_clean=re.sub(r'[`*_~]+','',str(expected or '')).strip()
+
+        expected=str(official.get(n) or "").strip()
+        answer_match=re.search(
+            r"(?:đáp án(?: đúng)?|đáp án chính xác)\s*[:：]\s*(.+?)(?=\s*(?:\\n|\\\\|giải thích|diễn giải|bằng chứng|học sinh|$))",
+            expected,
+            flags=re.I|re.S,
+        )
+        if answer_match:
+            expected=answer_match.group(1).strip().rstrip(".")
+        expected_clean=re.sub(r"[`*_~]+","",expected).strip()
         correct_letter=None
         for letter,val in option_map.items():
-            vclean=re.sub(r'[`*_~]+','',str(val or '')).strip()
-            if vclean.casefold()==expected_clean.casefold() or expected_clean.casefold() in vclean.casefold() or vclean.casefold() in expected_clean.casefold():
+            vclean=re.sub(r"[`*_~]+","",str(val or "")).strip()
+            if expected_clean and (
+                vclean.casefold()==expected_clean.casefold()
+                or expected_clean.casefold() in vclean.casefold()
+                or vclean.casefold() in expected_clean.casefold()
+            ):
                 correct_letter=letter
                 break
+
         proxy_id=_ensure_review_grammar_master(
             int(course_id),lesson,
             question_text=block,
             answer=(correct_letter or expected),
             pattern=f"{lesson} · Câu {n}",
-            meaning=f"Đáp án đúng: {expected}",
-            explanation='Ôn lại cách áp dụng ngữ pháp trong câu hỏi gốc của B1.',
-            normalized_key=f"__b1__{int(course_id)}__{lesson.casefold()}__q{int(n)}"
+            meaning=f"Đáp án đúng: {expected or 'Xem giải thích của bài gốc'}",
+            explanation="Ôn lại câu Ngữ pháp đã được GenAI xác định là trả lời sai.",
+            normalized_key=f"__b1__{int(course_id)}__{lesson_key}__q{int(n)}",
         )
-        target_id=proxy_id
         if proxy_id:
             snapshot={
-                'item_type':'grammar','item_id':int(proxy_id),'question_type':'multiple_choice',
-                'question':question_text or _review_source_text(block),
-                'options':[f'{k}. {option_map[k]}' for k in ('A','B','C','D')] if set(option_map)==set('ABCD') else [],
-                'option_letters':{k:option_map[k] for k in ('A','B','C','D')} if set(option_map)==set('ABCD') else {},
-                'answer':correct_letter or expected.upper() if str(correct_letter or expected).upper() in {'A','B','C','D'} else '',
-                'answer_text':option_map.get(correct_letter,'') if correct_letter else expected,
-                'answer_criteria':expected,
-                'pattern':f"{lesson} · Câu {n}",
-                'meaning':f"Đáp án đúng: {expected}",
-                'explanation':'Ôn lại cách áp dụng ngữ pháp trong câu hỏi gốc của B1.',
-                'example':question_text or _review_source_text(block),
-                'source_lesson':lesson,
-                'wrong_answer':got,
+                "item_type":"grammar",
+                "item_id":int(proxy_id),
+                "question_type":"multiple_choice",
+                "question":question_text or _review_source_text(block),
+                "options":[f"{k}. {option_map[k]}" for k in ("A","B","C","D")] if set(option_map)==set("ABCD") else [],
+                "option_letters":{k:option_map[k] for k in ("A","B","C","D")} if set(option_map)==set("ABCD") else {},
+                "answer":correct_letter or (expected.upper() if expected.upper() in {"A","B","C","D"} else ""),
+                "answer_text":option_map.get(correct_letter,"") if correct_letter else expected,
+                "answer_criteria":expected,
+                "pattern":f"{lesson} · Câu {n}",
+                "meaning":f"Đáp án đúng: {expected or 'Xem giải thích của bài gốc'}",
+                "explanation":"Ôn lại câu Ngữ pháp đã được GenAI xác định là trả lời sai.",
+                "example":question_text or _review_source_text(block),
+                "source_lesson":lesson,
             }
-            _schedule_failed_review(user_id,int(course_id),'grammar',target_id,question=snapshot,wrong_answer=got)
-            saved+=1; labels.append(f"Q{n}:master={proxy_id}:snapshot={int(bool(snapshot.get('question')) and len(snapshot.get('options') or [])==4)}")
-    print(f"[GRAMMAR WRONG REVIEW] user={user_id} course_id={course_id} lesson={lesson!r} saved={saved} items={', '.join(labels) if labels else 'none'}")
+            _schedule_failed_review(
+                user_id,int(course_id),"grammar",proxy_id,
+                question=snapshot,
+                wrong_answer=str((status.get("wrong_answers") or {}).get(str(n)) or ""),
+            )
+            saved+=1
+            labels.append(f"Q{n}:master={proxy_id}")
+
+    print(
+        f"[GRAMMAR WRONG REVIEW] user={user_id} course_id={course_id} lesson={lesson!r} "
+        f"saved_wrong={saved} removed_stale_correct_or_unanswered={removed} "
+        f"correct={sorted(status['correct'])} wrong={sorted(status['wrong'])} "
+        f"unanswered={sorted(status['unanswered'])} items={', '.join(labels) if labels else 'none'}"
+    )
     return saved
 
 
@@ -10405,7 +10511,13 @@ YÊU CẦU:
 - Không chấm điểm tổng.
 - Không dùng ✅ hoặc ❌.
 - Không tạo thêm bài tập.
-- Bắt đầu bằng: **B2 · Đáp án**"""
+- Bắt đầu bằng: **B2 · Đáp án**
+- Ở CUỐI phản hồi, thêm đúng một marker nội bộ để hệ thống lập lịch ôn tập. Marker phải là JSON hợp lệ, không đặt trong code fence:
+###GRAMMAR_REVIEW_STATUS###
+{{"correct":[danh sách số câu GenAI xác định người học đã trả lời đúng],"wrong":[danh sách số câu GenAI xác định người học đã trả lời sai],"unanswered":[danh sách số câu người học bỏ trống]}}
+- Chỉ đưa vào "wrong" khi phần chấm nói rõ câu đó sai/cần sửa. Không đưa câu đúng hoặc câu chưa trả lời vào "wrong".
+- Phân loại dựa trên toàn bộ bài làm và kết luận trong phần chấm; không tự suy ra rằng mọi câu không map được bằng code là câu sai.
+- Marker này là dữ liệu nội bộ; server sẽ xóa trước khi hiển thị phản hồi cho người học."""
                 gen_started=time.perf_counter()
                 answer,response_model,gen_elapsed=_generate_chat_reply(grammar_prompt,content_type='Ngữ pháp',request_id=request_id,gen_started=gen_started,user_text=query_text.strip(),reasoning_profile='low',max_output_tokens=3000)
                 answer=(answer or '').strip() or 'Doraemon chưa tạo được phần đáp án. Cậu thử gửi lại bài làm nhé.'
@@ -10415,6 +10527,7 @@ YÊU CẦU:
                     )
                 except Exception as exc:
                     print(f"[GRAMMAR WRONG REVIEW] persist failed user={user['id']} lesson={requested_lesson!r}: {type(exc).__name__}: {exc}")
+                answer=_strip_grammar_review_status_marker(answer)
                 _set_curriculum_global_exercise_result(user['id'],answer)
                 _set_curriculum_flow(user['id'],step=current_step+1,waiting='continue',exercise_answered=True)
                 study_session['curriculum_step']=current_step+1
