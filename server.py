@@ -137,9 +137,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v33.17 — Notify post owner and all prior commenters on new comments
-SERVER_VERSION = "33.17"
+print("[DORAEMON SERVER FINGERPRINT] 19.134-forum-notification-delete-admin-unread-count")
+# VERSION: v33.18 — Delete read Forum notifications and add lightweight Admin unread count
+SERVER_VERSION = "33.18"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -1218,6 +1218,24 @@ def history(limit: int = 100, mark_read: bool = False, authorization: Optional[s
     finally:
         conn.close()
     return {"messages": rows}
+
+
+@app.get("/admin-chat/unread-count")
+def admin_chat_unread_count(authorization: Optional[str] = Header(default=None)):
+    """Return only the current user's unread Admin-message count for the menu badge."""
+    user = current_user(bearer(authorization))
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*)::int FROM admin_messages
+                   WHERE user_id=%s AND sender='admin' AND COALESCE(is_read,FALSE)=FALSE""",
+                (user["id"],),
+            )
+            unread_count = int((cur.fetchone() or [0])[0] or 0)
+    finally:
+        conn.close()
+    return {"unread_count": unread_count}
 
 
 @app.post("/admin-chat/send")
@@ -8312,6 +8330,12 @@ def forum_notifications(
     conn = db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Migrate away legacy read rows lazily: notifications are ephemeral,
+            # so a read notification should never reappear after reload.
+            cur.execute(
+                "DELETE FROM forum_notifications WHERE user_id=%s AND is_read=TRUE",
+                (int(user["id"]),),
+            )
             where = "n.user_id=%s"
             params = [int(user["id"])]
             if unread_only:
@@ -8336,6 +8360,10 @@ def forum_notifications(
                 (int(user["id"]),),
             )
             unread_count = int((cur.fetchone() or {}).get("unread_count") or 0)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     return {"notifications": rows, "unread_count": unread_count}
@@ -8360,12 +8388,12 @@ def forum_notifications_read(
                         continue
                 if ids:
                     cur.execute(
-                        "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND id=ANY(%s)",
+                        "DELETE FROM forum_notifications WHERE user_id=%s AND id=ANY(%s)",
                         (int(user["id"]), ids),
                     )
             else:
                 cur.execute(
-                    "UPDATE forum_notifications SET is_read=TRUE WHERE user_id=%s AND is_read=FALSE",
+                    "DELETE FROM forum_notifications WHERE user_id=%s",
                     (int(user["id"]),),
                 )
         conn.commit()
@@ -8387,7 +8415,7 @@ def forum_notification_read_one(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE forum_notifications SET is_read=TRUE WHERE id=%s AND user_id=%s",
+                "DELETE FROM forum_notifications WHERE id=%s AND user_id=%s",
                 (notification_id, int(user["id"])),
             )
         conn.commit()
