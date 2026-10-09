@@ -138,8 +138,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 print("[DORAEMON SERVER FINGERPRINT] 19.133-grammar-b1-navigation-fix")
-# VERSION: v33.03 — Forum UX refresh + Admin Forum management
-SERVER_VERSION = "33.10"
+# VERSION: v33.17 — Notify post owner and all prior commenters on new comments
+SERVER_VERSION = "33.17"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 pc = None
 index = None
@@ -8263,19 +8263,27 @@ def forum_create_comment(
             )
             comment = dict(cur.fetchone())
 
-            # Notify only the post owner and never notify a user about their own reply.
+            # Notify the post owner and every user who has commented on this post.
+            # Use a set so the owner/commenters receive only one notification per new comment,
+            # and exclude the current commenter even if they commented here before.
             owner_id = int(post["user_id"])
             commenter_id = int(user["id"])
-            if owner_id != commenter_id:
+            recipients = {owner_id}
+            cur.execute(
+                "SELECT DISTINCT user_id FROM forum_comments WHERE post_id=%s",
+                (post_id,),
+            )
+            recipients.update(int(row["user_id"]) for row in (cur.fetchall() or []))
+            recipients.discard(commenter_id)
+
+            notifications_created = 0
+            for recipient_id in recipients:
                 cur.execute(
                     """INSERT INTO forum_notifications(user_id,post_id,comment_id,notification_type)
-                           VALUES(%s,%s,%s,'post_reply')
-                        RETURNING id,created_at""",
-                    (owner_id, post_id, int(comment["id"])),
+                           VALUES(%s,%s,%s,'post_reply')""",
+                    (recipient_id, post_id, int(comment["id"])),
                 )
-                notification = cur.fetchone()
-            else:
-                notification = None
+                notifications_created += 1
         conn.commit()
     except Exception:
         conn.rollback()
@@ -8285,7 +8293,12 @@ def forum_create_comment(
 
     comment["username"] = _forum_user_public_username(user)
     comment["is_mine"] = True
-    return {"success": True, "comment": comment, "notification_created": bool(notification)}
+    return {
+        "success": True,
+        "comment": comment,
+        "notification_created": notifications_created > 0,
+        "notifications_created": notifications_created,
+    }
 
 
 @app.get("/forum/notifications")
