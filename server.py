@@ -105,7 +105,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_LOW = os.getenv("OPENAI_MODEL_LOW", "gpt-4.1-mini")
 OPENAI_MODEL_MEDIUM = os.getenv("OPENAI_MODEL_MEDIUM", "gpt-5-mini")
-OPENAI_REASONING_LOW = os.getenv("OPENAI_REASONING_LOW", "minimal")
+OPENAI_REASONING_LOW = os.getenv("OPENAI_REASONING_LOW", "low")
 OPENAI_REASONING_MEDIUM = os.getenv("OPENAI_REASONING_MEDIUM", "medium")
 
 GEMINI_MODEL = "gemini-3.6-flash"
@@ -7789,7 +7789,7 @@ def _generate_chat_reply(
     print(f"[GEMINI INPUT AUDIT] request={request_id} prompt_chars={len(prompt)} image_parts=0")
     provider = LLM_PROVIDER
     effective_profile = "medium" if reasoning_profile == "medium" else "low"
-    thinking_level = "medium" if effective_profile == "medium" else ("minimal" if content_type is None else "low")
+    thinking_level = "medium" if effective_profile == "medium" else ("low" if content_type is None else "low")
 
     if provider == "openai":
         if openai_client is None:
@@ -17163,7 +17163,7 @@ Return concise factual prose."""
         part=types.Part.from_bytes(data=page_png,mime_type='image/png')
         response=gemini.models.generate_content(
             model=GEMINI_MODEL, contents=[part,prompt],
-            config=types.GenerateContentConfig(temperature=0.0, thinking_config=types.ThinkingConfig(thinking_level='minimal'))
+            config=types.GenerateContentConfig(temperature=0.0, thinking_config=types.ThinkingConfig(thinking_level='low'))
         )
         _log_gemini_usage(response, operation=f'writing_vision_b0:page_{page_no}')
         return str(getattr(response,'text','') or '').strip()[:6000]
